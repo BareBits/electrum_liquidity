@@ -84,6 +84,9 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS = 7.0
         self.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY = 5
         self.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = 5
+        self.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED = False
+        self.INBOUND_LIQUIDITY_DEV_FEE_PCT = 0.1
+        self.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = "electrum_liqhelper@getbarebits.com"
 
 
 class _FakeStatusBar:
@@ -217,15 +220,18 @@ def test_apply_persists_and_clamps(qapp):
 
     # Set max_channels (third numeric field) to 5. (Automation on/off is the
     # slider, applied immediately and independently of this Apply button.)
+    # Settings-tab QLineEdit order: 0 min-onchain, 1 reserve, 2 max-channels,
+    # 3 max-cost, 4 trigger-%, 5 trigger-sat, 6 dev-fee-%, 7 dev-fee-address,
+    # 8 log-retention, then reliability/offline fields.
     line_edits[2].setText("5")              # Maximum number of channels
-    line_edits[6].setText("99999")          # log retention -> clamped
+    line_edits[8].setText("99999")          # log retention -> clamped
     apply_btn.click()
 
     assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 5
     from electrum.plugins.inbound_liquidity import MAX_LOG_RETENTION_DAYS  # noqa
     assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
     # Field reloaded to the clamped value.
-    assert line_edits[6].text() == str(MAX_LOG_RETENTION_DAYS)
+    assert line_edits[8].text() == str(MAX_LOG_RETENTION_DAYS)
 
 
 def test_apply_rejects_invalid_without_persisting(qapp):
