@@ -1,0 +1,52 @@
+name: Build & Release plugin
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read plugin version
+        id: meta
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("inbound_liquidity/manifest.json"))["version"])')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "zip=inbound_liquidity-${version}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Build plugin zip
+        run: |
+          # Package only the importable plugin package, excluding caches.
+          zip -r "${{ steps.meta.outputs.zip }}" inbound_liquidity \
+            -x '*/__pycache__/*' '*.pyc' '*/.pytest_cache/*'
+          echo "----- zip contents -----"
+          unzip -l "${{ steps.meta.outputs.zip }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.zip }}
+          path: ${{ steps.meta.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.meta.outputs.zip }}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. **Experimental — do not use with real funds.** Install by importing the attached zip into Electrum's plugin manager."
