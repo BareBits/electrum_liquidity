@@ -37,19 +37,35 @@ jobs:
       - name: Clone Electrum ${{ env.ELECTRUM_REF }}
         run: git clone --depth 1 --branch "${ELECTRUM_REF}" https://github.com/spesmilo/electrum.git electrum-src
 
-      - name: Install Electrum + test deps
+      - name: Install Electrum (editable) + test deps
+        # Editable so `import electrum` resolves to ./electrum-src, where we
+        # symlink the plugin below. A non-editable install would import from
+        # site-packages and never see the plugin.
         run: |
           python -m pip install --upgrade pip
-          pip install ./electrum-src
+          pip install -e ./electrum-src
           pip install cryptography PyQt6 pytest
 
       - name: Symlink plugin into Electrum's plugins dir
         run: ln -s "${GITHUB_WORKSPACE}/inbound_liquidity" electrum-src/electrum/plugins/inbound_liquidity
 
+      - name: Verify plugin imports (fail, don't silently skip)
+        # The glue tests use pytest.importorskip on this module; if the import
+        # breaks they would skip and the suite would go green on the engine
+        # tests alone. Import it directly here so a real breakage fails CI.
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -c "import electrum.plugins.inbound_liquidity; print('plugin import OK')"
+          python -c "import electrum.gui.qt.util; print('electrum qt import OK')"
+
       - name: Run tests (offscreen Qt)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests -q
+        # -rs prints the reason for any skip, so a silently-skipped glue module
+        # is visible in the log (the verify step above already hard-fails on the
+        # import error that would cause such a skip).
+        run: python -m pytest tests -q -rs
 
   build:
     needs: test
