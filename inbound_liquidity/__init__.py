@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import time
 from contextlib import asynccontextmanager
@@ -487,6 +488,13 @@ class LiquidityPlugin(BasePlugin):
         # the watchdog acts once and the force-close it triggers is not also
         # counted as a peer-initiated close fault.
         self._remediating_opens: Dict['Abstract_Wallet', set] = {}
+        # wallet -> channel_ids for closes *we* initiated locally -- the user via
+        # the GUI/CLI/console, or this plugin's own auto-close. Populated by the
+        # close hooks installed on the lnworker (see _install_close_hooks), because
+        # Electrum does not persist who initiated a cooperative close. The health
+        # watchdog exempts these so our own close is never mis-blamed on the peer
+        # as a "closed by peer" hard fault.
+        self._local_closes: Dict['Abstract_Wallet', set] = {}
         # wallet -> channel_ids whose wedged open we have already faulted the peer
         # for. Decoupled from _remediating_opens so the fault is recorded exactly
         # once even when the remediating force-close is deferred by the daily
@@ -539,6 +547,7 @@ class LiquidityPlugin(BasePlugin):
         if wallet.network is None:
             return  # offline mode
         self._migrate_channel_peer()
+        self._install_close_hooks(wallet, wallet.lnworker)
         self.wallets.setdefault(wallet, asyncio.Lock())
         self._started_at[wallet] = time.time()
         self._peer_seen_online.setdefault(wallet, set())
@@ -569,6 +578,58 @@ class LiquidityPlugin(BasePlugin):
         self.wallets.pop(wallet, None)
         self._started_at.pop(wallet, None)
         self._peer_seen_online.pop(wallet, None)
+
+    def _install_close_hooks(self, wallet: 'Abstract_Wallet', lnworker) -> None:
+        """Wrap the lnworker's local close entry points so that a close *we*
+        initiate -- the user via the GUI ("Cooperative close" / force close) or
+        the CLI/console, and this plugin's own auto-close -- is recorded in
+        ``self._local_closes`` at the call site. The channel-health watchdog then
+        exempts those channels from the "closed by peer" hard fault.
+
+        This is necessary because Electrum keeps no persisted record of who
+        initiated a *cooperative* close (``is_local`` lives only transiently in
+        ``lnpeer._shutdown``; ``lnchannel.who_closed`` distinguishes sides only
+        for force-closes), so the only reliable signal is to capture it as the
+        close is requested. All manual close paths (GUI ``channels_list`` and CLI
+        ``commands``) route through these lnworker methods, so wrapping them here
+        -- purely on the plugin side, no Electrum change -- covers every case.
+
+        Idempotent per lnworker instance (guarded by a marker attribute) so a
+        re-managed wallet does not stack wrappers.
+        """
+        if lnworker is None or getattr(lnworker, "_inbound_liquidity_close_hooked", False):
+            return
+        local_closes = self._local_closes.setdefault(wallet, set())
+
+        def _record(chan_id) -> None:
+            try:
+                cid = chan_id.hex() if isinstance(chan_id, (bytes, bytearray)) else str(chan_id)
+            except Exception:
+                return
+            local_closes.add(cid)
+            self.logger.info(f"local close initiated for channel {cid[:12]}…; "
+                             f"will not be blamed on the peer")
+
+        def _wrap(name: str) -> None:
+            orig = getattr(lnworker, name, None)
+            if orig is None or not callable(orig):
+                return
+            if asyncio.iscoroutinefunction(orig):
+                @functools.wraps(orig)
+                async def _hooked(chan_id, *args, **kwargs):
+                    _record(chan_id)
+                    return await orig(chan_id, *args, **kwargs)
+            else:
+                @functools.wraps(orig)
+                def _hooked(chan_id, *args, **kwargs):
+                    _record(chan_id)
+                    return orig(chan_id, *args, **kwargs)
+            setattr(lnworker, name, _hooked)
+
+        for _name in ("close_channel", "force_close_channel",
+                      "request_force_close", "schedule_force_closing"):
+            _wrap(_name)
+        lnworker._inbound_liquidity_close_hooked = True
 
     def _wallet_ready(self, wallet: 'Abstract_Wallet') -> bool:
         """Whether ``wallet`` has settled enough to take automated action.
@@ -1363,6 +1424,7 @@ class LiquidityPlugin(BasePlugin):
         force_states = (ChannelState.FORCE_CLOSING, ChannelState.REQUESTED_FCLOSE)
         now = time.time()
         remediating = self._remediating_opens.setdefault(wallet, set())
+        local_closes = self._local_closes.setdefault(wallet, set())
         wedged_faulted = self._wedged_faulted.setdefault(wallet, set())
         close_capped_logged = self._close_capped_logged.setdefault(wallet, set())
         first_scan = wallet not in self._known_chan_states
@@ -1386,11 +1448,12 @@ class LiquidityPlugin(BasePlugin):
                          and getattr(chan, "unconfirmed_closing_txid", None))
             is_closing = state in closing_states or bool(remote_fc)
             was_closing = known.get(cid, False)
-            # Peer closed our channel (rising edge). Skip closes we initiated via
-            # remediation, and -- on the first scan -- channels already closed
-            # before we started watching (we can't attribute their timing).
+            # Peer closed our channel (rising edge). Skip closes *we* initiated --
+            # the user's own close (GUI/CLI, tracked in _local_closes) or our
+            # stuck-open remediation -- and, on the first scan, channels already
+            # closed before we started watching (we can't attribute their timing).
             if (is_closing and not was_closing and not first_scan
-                    and cid not in remediating):
+                    and cid not in remediating and cid not in local_closes):
                 is_force = state in force_states or bool(remote_fc)
                 self._record_peer_fault(
                     wallet, node_id,
@@ -1452,6 +1515,7 @@ class LiquidityPlugin(BasePlugin):
         # Forget bookkeeping for channels that are gone (redeemed/removed), so a
         # later reused channel_id starts fresh.
         remediating &= live_ids
+        local_closes &= live_ids
         wedged_faulted &= live_ids
         close_capped_logged &= live_ids
         for gone in [c for c in known if c not in live_ids]:

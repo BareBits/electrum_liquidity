@@ -55,6 +55,7 @@ def _plugin(**config_overrides) -> LiquidityPlugin:
     p = object.__new__(LiquidityPlugin)
     p.logger = logging.getLogger("test.inbound_liquidity.peer")
     p._remediating_opens = {}
+    p._local_closes = {}
     p._wedged_faulted = {}
     p._close_capped_logged = {}
     p._known_chan_states = {}
@@ -215,6 +216,106 @@ def test_watchdog_cooperative_close_is_a_fault() -> None:
     s = p._load_peer_reliability(w)[NODE_A.lower()]
     assert s["hard_fault_count"] == 1
     assert s["last_reason"] == "channel closed by peer"
+
+
+def _lnworker_closable(channels):
+    """An lnworker whose local close entry points are real (async/sync) callables,
+    so _install_close_hooks can wrap them and a call records the channel as a
+    local close. Records what was closed for assertions."""
+    coop: List[bytes] = []
+    forced: List[bytes] = []
+
+    async def _close_channel(chan_id):
+        coop.append(chan_id)
+        return "txid"
+
+    async def _force_close_channel(chan_id):
+        forced.append(chan_id)
+        return "txid"
+
+    async def _request_force_close(channel_id, *, connect_str=None):
+        forced.append(channel_id)
+
+    def _schedule_force_closing(chan_id):
+        forced.append(chan_id)
+
+    ln = SimpleNamespace(
+        channels={c.channel_id: c for c in channels},
+        close_channel=_close_channel,
+        force_close_channel=_force_close_channel,
+        request_force_close=_request_force_close,
+        schedule_force_closing=_schedule_force_closing,
+    )
+    return ln, coop, forced
+
+
+def test_install_close_hooks_records_and_is_idempotent() -> None:
+    import asyncio
+    from electrum.lnchannel import ChannelState
+    chan = _Chan(ChannelState.OPEN)
+    ln, coop, forced = _lnworker_closable([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    p._install_close_hooks(w, ln)
+    # Second install is a no-op (idempotent): the wrappers are not re-wrapped.
+    hooked = ln.close_channel
+    p._install_close_hooks(w, ln)
+    assert ln.close_channel is hooked
+    # The sync force-close path records the channel and still delegates.
+    ln.schedule_force_closing(chan.channel_id)
+    assert forced == [chan.channel_id]
+    assert chan.channel_id.hex() in p._local_closes[w]
+    # The async cooperative path records and still delegates (and returns).
+    p._local_closes[w].clear()
+    assert asyncio.run(ln.close_channel(chan.channel_id)) == "txid"
+    assert coop == [chan.channel_id]
+    assert chan.channel_id.hex() in p._local_closes[w]
+
+
+def test_watchdog_user_cooperative_close_not_blamed_on_peer() -> None:
+    import asyncio
+    from electrum.lnchannel import ChannelState
+    chan = _Chan(ChannelState.OPEN)
+    ln, _c, _f = _lnworker_closable([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    p._install_close_hooks(w, ln)
+    p._scan_channel_health(w)                                   # seed OPEN
+    asyncio.run(ln.close_channel(chan.channel_id))             # the user closes it
+    chan.state = ChannelState.CLOSING
+    p._scan_channel_health(w)
+    p._scan_channel_health(w)
+    assert p._load_peer_reliability(w) == {}                    # peer NOT faulted
+
+
+def test_watchdog_user_force_close_not_blamed_on_peer() -> None:
+    from electrum.lnchannel import ChannelState
+    chan = _Chan(ChannelState.OPEN)
+    ln, _c, _f = _lnworker_closable([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    p._install_close_hooks(w, ln)
+    p._scan_channel_health(w)                                   # seed OPEN
+    ln.schedule_force_closing(chan.channel_id)                 # the user force-closes it
+    chan.state = ChannelState.FORCE_CLOSING
+    p._scan_channel_health(w)
+    p._scan_channel_health(w)
+    assert p._load_peer_reliability(w) == {}                    # peer NOT faulted
+
+
+def test_watchdog_local_close_forgotten_after_channel_gone() -> None:
+    # Once the closed channel is redeemed/removed, its id is pruned from the
+    # local-close set so a later reused channel_id starts fresh.
+    from electrum.lnchannel import ChannelState
+    chan = _Chan(ChannelState.OPEN)
+    ln, _c, _f = _lnworker_closable([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    p._install_close_hooks(w, ln)
+    p._scan_channel_health(w)
+    ln.schedule_force_closing(chan.channel_id)
+    chan.state = ChannelState.FORCE_CLOSING
+    p._scan_channel_health(w)
+    assert chan.channel_id.hex() in p._local_closes[w]
+    ln.channels.clear()                                        # channel fully gone
+    p._scan_channel_health(w)
+    assert p._local_closes[w] == set()
 
 
 def test_watchdog_remote_force_close_detected_before_mined() -> None:
