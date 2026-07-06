@@ -55,6 +55,7 @@ def _plugin(**config_overrides) -> LiquidityPlugin:
     p = object.__new__(LiquidityPlugin)
     p.logger = logging.getLogger("test.inbound_liquidity.caps")
     p._remediating_opens = {}
+    p._local_closes = {}
     p._wedged_faulted = {}
     p._close_capped_logged = {}
     p._known_chan_states = {}

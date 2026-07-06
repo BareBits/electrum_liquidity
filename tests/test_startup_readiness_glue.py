@@ -114,6 +114,7 @@ def _plugin(clock: Optional[_Clock] = None, *, grace: float = GRACE,
     p._startup_grace_sec = grace
     # health-watchdog state
     p._remediating_opens = {}
+    p._local_closes = {}
     p._wedged_faulted = {}
     p._close_capped_logged = {}
     p._known_chan_states = {}
