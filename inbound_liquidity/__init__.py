@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncIterator, Dict, List, Optional, Tuple
@@ -185,6 +186,27 @@ MAX_ACTION_TIMESTAMPS = 1000
 DEFAULT_MAX_OPENS_PER_DAY = 5
 DEFAULT_MAX_CLOSES_PER_DAY = 5
 
+# --- channel-funding floor override ---------------------------------------
+# Electrum's stock MIN_FUNDING_SAT (lnutil, 200_000) is a hard floor on new-
+# channel funding. When the user's `min_onchain_to_open_sat` is set below it, we
+# lower the floor to that configured value so the plugin (and manual opens) can
+# create smaller channels. The override is re-asserted at startup and on every
+# evaluation tick, so the user's value always wins even if some code path resets
+# the constant.
+#
+# MIN_FUNDING_SAT is bound as an independent module-level name wherever it is
+# `from ...lnutil import`ed, so every module that gates an open must be patched.
+# We touch only modules already imported (never force-importing the GUI ones in
+# headless mode), and capture the stock value once, before we ever lower it.
+_MIN_FUNDING_CORE_MODULES = (
+    'electrum.lnutil',
+    'electrum.lnworker',
+    'electrum.wallet',
+    'electrum.gui.qt.main_window',
+    'electrum.gui.qt.new_channel_dialog',
+)
+_stock_min_funding_sat: Optional[int] = None
+
 # --- optional dev fee persistence -----------------------------------------
 # Running total (whole sats) of dev fee accrued on plugin-initiated reverse
 # swaps but not yet paid out. A single integer per wallet; incremented when a
@@ -250,9 +272,12 @@ SimpleConfig.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = ConfigVar(
                         "Off by default: the plugin loads and can be configured, but takes no "
                         "action — it moves no funds and alters no channels — until enabled."))
 SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
-    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=1_000_000, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=50_000, type_=int, plugin=__name__,
     short_desc=lambda: _("Min on-chain to open a channel (sat)"),
-    long_desc=lambda: _("Never open a Lightning channel while on-chain spendable funds are below this."))
+    long_desc=lambda: _("Never open a Lightning channel while on-chain spendable funds are below this. "
+                        "When this is below Electrum's stock channel-funding floor (MIN_FUNDING_SAT), "
+                        "the plugin lowers that floor to this value at startup so smaller channels can "
+                        "be opened."))
 SimpleConfig.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = ConfigVar(
     'plugins.inbound_liquidity.onchain_reserve_sat', default=10_000, type_=int, plugin=__name__,
     short_desc=lambda: _("On-chain reserve when opening (sat)"),
@@ -280,7 +305,7 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = ConfigVar(
                         "auto-freed until the window rolls over. 0 = unlimited."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.max_swap_fee_pct', default=0.6, type_=float, plugin=__name__,
-    short_desc=lambda: _("Max reverse-swap cost (%, all-in)"),
+    short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
     long_desc=lambda: _("Do not swap Lightning -> on-chain if the effective all-in cost "
                         "(percentage fee + provider mining fee + on-chain claim fee, as a "
                         "share of the amount) exceeds this."))
@@ -547,6 +572,9 @@ class LiquidityPlugin(BasePlugin):
         if wallet.network is None:
             return  # offline mode
         self._migrate_channel_peer()
+        # Lower Electrum's channel-funding floor to the configured min_onchain if
+        # it is smaller, so the plugin can open sub-stock channels from startup.
+        self._enforce_min_funding_floor()
         self._install_close_hooks(wallet, wallet.lnworker)
         self.wallets.setdefault(wallet, asyncio.Lock())
         self._started_at[wallet] = time.time()
@@ -560,6 +588,40 @@ class LiquidityPlugin(BasePlugin):
         # wallet has settled, even if no wallet event happens to fire by then.
         self.request_evaluation(wallet)
         self._schedule_post_grace_evaluation(wallet)
+
+    def _enforce_min_funding_floor(self) -> int:
+        """Lower Electrum's channel-funding floor (``MIN_FUNDING_SAT``) to the
+        configured ``min_onchain_to_open_sat`` when it is below the stock floor,
+        so the plugin (and manual opens) can create smaller channels. Only ever
+        lowers, never raises above stock. Re-applied at startup and on every tick
+        so the user's value always wins even if some code path resets it. Returns
+        the floor now in force (in sat)."""
+        global _stock_min_funding_sat
+        # Capture the stock floor exactly once, before we ever lower it, so
+        # re-assertion is always measured against the real default.
+        if _stock_min_funding_sat is None:
+            lnutil = sys.modules.get('electrum.lnutil')
+            stock = getattr(lnutil, 'MIN_FUNDING_SAT', None) if lnutil is not None else None
+            _stock_min_funding_sat = int(stock) if stock is not None else int(MIN_FUNDING_SAT)
+        stock = _stock_min_funding_sat
+        try:
+            configured = int(getattr(self.config, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', stock))
+        except (TypeError, ValueError):
+            configured = stock
+        desired = max(1, min(stock, configured))
+        # Patch every already-imported binding: Electrum's core/GUI modules plus
+        # this plugin's own engine mirror and glue import of the constant.
+        names = list(_MIN_FUNDING_CORE_MODULES) + [__name__ + '.liquidity_manager', __name__]
+        for name in names:
+            mod = sys.modules.get(name)
+            if mod is None or not hasattr(mod, 'MIN_FUNDING_SAT'):
+                continue
+            if getattr(mod, 'MIN_FUNDING_SAT') != desired:
+                try:
+                    setattr(mod, 'MIN_FUNDING_SAT', desired)
+                except Exception:
+                    self.logger.exception(f"could not lower MIN_FUNDING_SAT in {name}")
+        return desired
 
     def _schedule_post_grace_evaluation(self, wallet: 'Abstract_Wallet') -> None:
         """Fire one evaluation shortly after the startup grace elapses, so a
@@ -1926,6 +1988,11 @@ class LiquidityPlugin(BasePlugin):
             return  # an evaluation / action is already in flight; the next event re-checks
         async with lock:
             try:
+                # Re-assert the channel-funding floor every tick so the user's
+                # min_onchain value always wins, even if some code path reset the
+                # constant. Done before the automation gate so a lowered floor also
+                # applies to manual opens while automation is paused.
+                self._enforce_min_funding_floor()
                 config = self.read_config()
                 if not config.automation_enabled:
                     return

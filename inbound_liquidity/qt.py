@@ -329,53 +329,19 @@ class Plugin(LiquidityPlugin):
               "Lightning funds out to on-chain to keep inbound liquidity "
               "available. Disabled by default — review the settings below first.")))
 
-        reliability_cb = QCheckBox(_("Track provider reliability"))
-        reliability_cb.setChecked(bool(c.INBOUND_LIQUIDITY_RELIABILITY_ENABLED))
-        reliability_cb.setToolTip(_("Penalise providers that time out, error, or leave swaps "
-                                    "stuck, so reliable providers are preferred."))
-        vbox.addWidget(reliability_cb)
-
-        peer_reliability_cb = QCheckBox(_("Track channel-peer reliability"))
-        peer_reliability_cb.setChecked(bool(c.INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED))
-        peer_reliability_cb.setToolTip(_("Penalise channel peers that fail to open, go offline, or "
-                                         "force-close, and auto-ban serial offenders."))
-        vbox.addWidget(peer_reliability_cb)
-
-        auto_remediate_cb = QCheckBox(_("Force-close wedged channel opens"))
-        auto_remediate_cb.setChecked(bool(c.INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN))
-        auto_remediate_cb.setToolTip(_("When a channel open is wedged past the timeout, force-close "
-                                       "it to free the funds and resume automation (broadcasts a tx "
-                                       "and incurs a mining fee)."))
-        vbox.addWidget(auto_remediate_cb)
-
-        autoclose_cb = QCheckBox(_("Auto-close channels whose peer stays offline"))
-        autoclose_cb.setChecked(bool(c.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED))
-        autoclose_cb.setToolTip(_("For channels this plugin opened, when the peer has been effectively "
-                                  "offline for a sustained period, close the channel cooperatively, "
-                                  "and force-close it after the deadline if it still hasn't closed "
-                                  "(broadcasts a tx and incurs a mining fee)."))
-        vbox.addWidget(autoclose_cb)
-
-        diag_log_cb = QCheckBox(_("Write diagnostic log files"))
-        diag_log_cb.setChecked(bool(c.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED))
-        diag_log_cb.setToolTip(_("Append this plugin's decisions and errors to daily text files "
-                                 "(one folder per wallet, kept 30 days) under the Electrum data "
-                                 "directory. Contains no private keys or seeds. Off by default."))
-        vbox.addWidget(diag_log_cb)
-
         grid = QGridLayout()
-        # (label, current value as text, parser, setter) for each tunable.
+        # (label, current value as text, parser, setter) for each tunable kept on
+        # the main Settings tab. Power-user knobs (on-chain reserve, reliability
+        # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
+        # and the feature on/off toggles live on the Advanced sub-tab instead.
         fields = [
             (_("Min on-chain to open a channel (sat)"),
              str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', v)),
-            (_("On-chain reserve when opening (sat)"),
-             str(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT), int,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT', v)),
             (_("Maximum number of channels"),
              str(c.INBOUND_LIQUIDITY_MAX_CHANNELS), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', v)),
-            (_("Max reverse-swap cost (%, all-in)"),
+            (_("Max fee to move LN → on-chain (%, all-in)"),
              str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT', v)),
             (_("Swap-out trigger (% of capacity)"),
@@ -386,46 +352,11 @@ class Plugin(LiquidityPlugin):
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT', v)),
             # Optional development fee, charged on the on-chain amount received
             # from plugin-initiated reverse swaps (clamped to 0..DEV_FEE_MAX_PCT).
+            # The payout address is fixed (not user-editable) — see __init__.py.
             (_("Dev fee (%, 0–{:g}; 0 = off)").format(DEV_FEE_MAX_PCT),
              str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
                                max(0.0, min(float(v), DEV_FEE_MAX_PCT)))),
-            (_("Dev fee payout address (Lightning address / LNURL)"),
-             str(c.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS), str,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_ADDRESS', v.strip())),
-            # (Channel peer moved to the dedicated "Channel partners" sub-tab.)
-            (_("Keep decision log for (days, 1–{})").format(MAX_LOG_RETENTION_DAYS),
-             str(c.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS), int,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS',
-                               max(1, min(int(v), MAX_LOG_RETENTION_DAYS)))),
-            (_("Reliability penalty per fault (%)"),
-             str(c.INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT', max(0.0, v))),
-            (_("Max reliability penalty (%)"),
-             str(c.INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT', max(0.0, v))),
-            (_("Reliability recovery half-life (hours)"),
-             str(c.INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS', max(0.0, v))),
-            (_("Stuck-swap timeout (minutes)"),
-             str(c.INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN), int,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN', max(1, int(v)))),
-            (_("Auto-ban a peer after N hard faults (0 = off)"),
-             str(c.INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS), int,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS', max(0, int(v)))),
-            (_("Stuck channel-open timeout (minutes)"),
-             str(c.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN), int,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN', max(1, int(v)))),
-            # Offline-channel auto-close (applies to plugin-opened channels only).
-            (_("Offline auto-close: peer-uptime window (days)"),
-             str(c.INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS', max(0.0, v))),
-            (_("Offline auto-close: minimum peer uptime (%)"),
-             str(c.INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT', max(0.0, v))),
-            (_("Offline auto-close: force-close after trying to close (days)"),
-             str(c.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS), float,
-             lambda v: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, v))),
         ]
         edits = []
         for row, (label, value, parser, setter) in enumerate(fields):
@@ -475,18 +406,14 @@ class Plugin(LiquidityPlugin):
                     status_label.setText(_("Invalid value for: {}").format(label))
                     return
             # (Automation on/off is owned by the slider above and applied
-            # immediately, so the Apply button never touches it.)
-            setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_ENABLED', reliability_cb.isChecked())
-            setattr(c, 'INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED', peer_reliability_cb.isChecked())
-            setattr(c, 'INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN', auto_remediate_cb.isChecked())
-            setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED', autoclose_cb.isChecked())
-            setattr(c, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED', diag_log_cb.isChecked())
+            # immediately, so the Apply button never touches it. The feature
+            # toggles and tuning knobs live on the Advanced sub-tab.)
             for setter, value in parsed:
                 setter(value)
-            # Reflect any clamping (e.g. log retention) back into the fields.
-            self._reload_settings_fields(edits, _sync_toggle_from_config, reliability_cb,
-                                         peer_reliability_cb, auto_remediate_cb,
-                                         autoclose_cb)
+            # min_onchain may have changed: re-assert the channel-funding floor so
+            # a lowered floor keeps matching the (new) configured value at once.
+            self._enforce_min_funding_floor()
+            self._reload_settings_fields(edits, _sync_toggle_from_config)
             _refresh_dev_fee_label()
             status_label.setStyleSheet("color: green;")
             status_label.setText(_("Settings saved."))
@@ -535,53 +462,145 @@ class Plugin(LiquidityPlugin):
 
     # --- advanced sub-tab -------------------------------------------------
     def _build_advanced_tab(self, wallet: 'Abstract_Wallet'):
-        """Build the Advanced sub-tab: daily (rolling-24h) ceilings on the
-        fund-spending action types, a runaway guard. Returns (widget, repopulate).
+        """Build the Advanced sub-tab: the feature on/off toggles, the daily
+        (rolling-24h) action ceilings (a runaway guard), and the power-user tuning
+        knobs (on-chain reserve, reliability tuning, offline auto-close, log
+        retention) moved off the main Settings tab. Returns (widget, repopulate).
         """
         from . import DEFAULT_MAX_OPENS_PER_DAY, DEFAULT_MAX_CLOSES_PER_DAY
 
+        c = self.config
         tab = QWidget()
         v = QVBoxLayout(tab)
         v.addWidget(_wrapped_label(_(
-            "Daily ceilings cap how many fund-spending actions the automation may "
-            "take in any rolling 24-hour window — a backstop against a runaway "
-            "loop that could drain available funds. 0 means unlimited.\n"
-            "The channel-close ceiling also covers the emergency force-close of a "
-            "channel whose open got wedged: once the ceiling is reached, a wedged "
-            "open is not auto-freed until the window rolls over.")))
+            "Advanced settings — feature toggles, runaway-guard ceilings, and "
+            "tuning knobs moved off the main Settings tab. The defaults are "
+            "sensible; change them only if you understand the effect.")))
 
-        c = self.config
+        # --- feature on/off toggles (moved from the Settings tab) ----------
+        reliability_cb = QCheckBox(_("Track provider reliability"))
+        reliability_cb.setToolTip(_("Penalise providers that time out, error, or leave swaps "
+                                    "stuck, so reliable providers are preferred."))
+        v.addWidget(reliability_cb)
+
+        peer_reliability_cb = QCheckBox(_("Track channel-peer reliability"))
+        peer_reliability_cb.setToolTip(_("Penalise channel peers that fail to open, go offline, or "
+                                         "force-close, and auto-ban serial offenders."))
+        v.addWidget(peer_reliability_cb)
+
+        auto_remediate_cb = QCheckBox(_("Force-close wedged channel opens"))
+        auto_remediate_cb.setToolTip(_("When a channel open is wedged past the timeout, force-close "
+                                       "it to free the funds and resume automation (broadcasts a tx "
+                                       "and incurs a mining fee)."))
+        v.addWidget(auto_remediate_cb)
+
+        autoclose_cb = QCheckBox(_("Auto-close channels whose peer stays offline"))
+        autoclose_cb.setToolTip(_("For channels this plugin opened, when the peer has been effectively "
+                                  "offline for a sustained period, close the channel cooperatively, "
+                                  "and force-close it after the deadline if it still hasn't closed "
+                                  "(broadcasts a tx and incurs a mining fee)."))
+        v.addWidget(autoclose_cb)
+
+        diag_log_cb = QCheckBox(_("Write diagnostic log files"))
+        diag_log_cb.setToolTip(_("Append this plugin's decisions and errors to daily text files "
+                                 "(one folder per wallet, kept 30 days) under the Electrum data "
+                                 "directory. Contains no private keys or seeds. Off by default."))
+        v.addWidget(diag_log_cb)
+
+        checkboxes = [
+            (reliability_cb, 'INBOUND_LIQUIDITY_RELIABILITY_ENABLED'),
+            (peer_reliability_cb, 'INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
+            (auto_remediate_cb, 'INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
+            (autoclose_cb, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
+            (diag_log_cb, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
+        ]
+
         grid = QGridLayout()
-        # (label, ConfigVar attr, default, usage-kind) for each ceiling.
-        specs = [
+        row = 0
+        # --- daily action ceilings (with a live 24h usage read-out) --------
+        # Kept as the first two grid rows so their line-edits stay at
+        # findChildren(QLineEdit) index 0/1 (the Advanced-tab tests rely on it).
+        ceiling_specs = [
             (_("Max channel opens per day (0 = unlimited)"),
              'INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY', DEFAULT_MAX_OPENS_PER_DAY, "open"),
             (_("Max channel closes per day (0 = unlimited)"),
              'INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY', DEFAULT_MAX_CLOSES_PER_DAY, "close"),
         ]
-        rows = []  # (edit, attr, usage_label, kind)
-        for row, (label, attr, default, kind) in enumerate(specs):
+        ceiling_rows = []  # (edit, attr, default, usage_label, kind)
+        for (label, attr, default, kind) in ceiling_specs:
             grid.addWidget(QLabel(label), row, 0)
             edit = QLineEdit(str(getattr(c, attr, default)))
             grid.addWidget(edit, row, 1)
             usage = QLabel("")
             usage.setStyleSheet("color: gray;")
             grid.addWidget(usage, row, 2)
-            rows.append((edit, attr, default, usage, kind))
+            ceiling_rows.append((edit, attr, default, usage, kind))
+            row += 1
+
+        # --- tuning knobs (moved from the Settings tab) --------------------
+        # (label, reload-attr, parser, setter) — the setter embeds any clamping.
+        fields = [
+            (_("On-chain reserve when opening (sat)"),
+             'INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT', val)),
+            (_("Keep decision log for (days, 1–{})").format(MAX_LOG_RETENTION_DAYS),
+             'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS',
+                                 max(1, min(int(val), MAX_LOG_RETENTION_DAYS)))),
+            (_("Reliability penalty per fault (%)"),
+             'INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT', max(0.0, val))),
+            (_("Max reliability penalty (%)"),
+             'INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT', max(0.0, val))),
+            (_("Reliability recovery half-life (hours)"),
+             'INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS', max(0.0, val))),
+            (_("Stuck-swap timeout (minutes)"),
+             'INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN', max(1, int(val)))),
+            (_("Auto-ban a peer after N hard faults (0 = off)"),
+             'INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS', max(0, int(val)))),
+            (_("Stuck channel-open timeout (minutes)"),
+             'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN', max(1, int(val)))),
+            (_("Offline auto-close: peer-uptime window (days)"),
+             'INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS', max(0.0, val))),
+            (_("Offline auto-close: minimum peer uptime (%)"),
+             'INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT', max(0.0, val))),
+            (_("Offline auto-close: force-close after trying to close (days)"),
+             'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, val))),
+        ]
+        field_rows = []  # (edit, attr, parser, setter, label)
+        for (label, attr, parser, setter) in fields:
+            grid.addWidget(QLabel(label), row, 0)
+            edit = QLineEdit(str(getattr(c, attr)))
+            grid.addWidget(edit, row, 1)
+            field_rows.append((edit, attr, parser, setter, label))
+            row += 1
         v.addLayout(grid)
 
         status = QLabel("")
         v.addWidget(status)
 
         def repopulate() -> None:
-            for edit, attr, default, usage, kind in rows:
+            for cb, attr in checkboxes:
+                cb.setChecked(bool(getattr(c, attr)))
+            for edit, attr, default, usage, kind in ceiling_rows:
                 edit.setText(str(getattr(c, attr, default)))
                 used = self._count_actions_last_24h(wallet, kind)
                 usage.setText(_("{} in last 24h").format(used))
+            for edit, attr, parser, setter, label in field_rows:
+                edit.setText(str(getattr(c, attr)))
 
         def on_apply() -> None:
-            parsed = []
-            for edit, attr, default, usage, kind in rows:
+            # Validate everything before persisting anything.
+            parsed_ceilings = []
+            for edit, attr, default, usage, kind in ceiling_rows:
                 text = edit.text().strip()
                 try:
                     value = int(text)
@@ -593,9 +612,22 @@ class Plugin(LiquidityPlugin):
                     status.setStyleSheet("color: red;")
                     status.setText(_("Value cannot be negative: {}").format(text))
                     return
-                parsed.append((attr, value))
-            for attr, value in parsed:
+                parsed_ceilings.append((attr, value))
+            parsed_fields = []
+            for edit, attr, parser, setter, label in field_rows:
+                text = edit.text().strip()
+                try:
+                    parsed_fields.append((setter, parser(text)))
+                except ValueError:
+                    status.setStyleSheet("color: red;")
+                    status.setText(_("Invalid value for: {}").format(label))
+                    return
+            for attr, value in parsed_ceilings:
                 setattr(c, attr, value)
+            for cb, attr in checkboxes:
+                setattr(c, attr, cb.isChecked())
+            for setter, value in parsed_fields:
+                setter(value)
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))
@@ -959,43 +991,21 @@ class Plugin(LiquidityPlugin):
 
         return tab, repopulate
 
-    def _reload_settings_fields(self, edits, sync_toggle: Optional[Callable[[], None]] = None,
-                                reliability_cb: Optional[QCheckBox] = None,
-                                peer_reliability_cb: Optional[QCheckBox] = None,
-                                auto_remediate_cb: Optional[QCheckBox] = None,
-                                autoclose_cb: Optional[QCheckBox] = None) -> None:
-        """Re-read persisted config back into the editable fields, so any
-        clamping/normalisation done on save is visible to the user."""
+    def _reload_settings_fields(self, edits,
+                                sync_toggle: Optional[Callable[[], None]] = None) -> None:
+        """Re-read persisted config back into the editable Settings-tab fields, so
+        any clamping/normalisation done on save is visible to the user. (The
+        Advanced tab reloads its own fields via its repopulate().)"""
         c = self.config
         if sync_toggle is not None:
             sync_toggle()
-        if reliability_cb is not None:
-            reliability_cb.setChecked(bool(c.INBOUND_LIQUIDITY_RELIABILITY_ENABLED))
-        if peer_reliability_cb is not None:
-            peer_reliability_cb.setChecked(bool(c.INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED))
-        if auto_remediate_cb is not None:
-            auto_remediate_cb.setChecked(bool(c.INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN))
-        if autoclose_cb is not None:
-            autoclose_cb.setChecked(bool(c.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED))
         values = [
             str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
-            str(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
             str(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
             str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
             str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT),
-            str(c.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS),
-            str(c.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS),
-            str(c.INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT),
-            str(c.INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT),
-            str(c.INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS),
-            str(c.INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN),
-            str(c.INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS),
-            str(c.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN),
-            str(c.INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS),
-            str(c.INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT),
-            str(c.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS),
         ]
         for (edit, _parser, _setter, _label), value in zip(edits, values):
             edit.setText(value)
