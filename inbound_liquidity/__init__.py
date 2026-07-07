@@ -124,6 +124,18 @@ _TRIGGER_EVENTS = [
 # redundant swaps on the same channel before the first one is reflected.
 SWAP_COOLDOWN_SEC = 180.0
 
+# Coarse backstop (seconds) on a whole reverse-swap attempt. The precise hang --
+# a provider that never replies to the createswap RPC -- is already bounded in
+# TargetedNostrTransport (RPC_REPLY_TIMEOUT_SEC); this is a belt-and-suspenders
+# guard around the entire ``sm.reverse_swap`` call so that NO reverse swap can
+# hold the per-wallet evaluation lock indefinitely, whatever hangs inside it.
+# Sized well above a healthy attempt -- the bounded createswap RPC (~60s) plus
+# Electrum's own Lightning payment ceiling (PAYMENT_TIMEOUT = 120s, which
+# reverse_swap races against funding detection) -- so it fires only on a genuine
+# wedge, never on a slow-but-succeeding payment. Referenced via
+# ``self._reverse_swap_timeout_sec`` so tests can shrink it.
+REVERSE_SWAP_TIMEOUT_SEC = 300.0
+
 # Startup settle window. For this long after a wallet is loaded, the plugin takes
 # NO automated action (open / swap / close) and does not judge any peer offline:
 # the Lightning layer connects to its peers asynchronously after load, so a peer
@@ -562,6 +574,9 @@ class LiquidityPlugin(BasePlugin):
         # Fixed startup grace, as an instance attribute so tests can shrink it
         # (the module constant stays the production default).
         self._startup_grace_sec: float = STARTUP_GRACE_SEC
+        # Coarse backstop on a whole reverse-swap attempt, as an instance
+        # attribute so tests can shrink it (the module constant is the default).
+        self._reverse_swap_timeout_sec: float = REVERSE_SWAP_TIMEOUT_SEC
         util.register_callback(self._on_wallet_event, _TRIGGER_EVENTS)
 
     # --- lifecycle --------------------------------------------------------
@@ -1993,13 +2008,34 @@ class LiquidityPlugin(BasePlugin):
             inflight_swap_count = len(sm.get_pending_swaps())
         except Exception:
             inflight_swap_count = 0
-        percentage = float(sm.percentage) if sm.percentage is not None else None
+        # Each provider-economics field is read defensively: the swap manager
+        # populates them from the provider's advertised terms, so a not-yet-ready
+        # or misbehaving provider can leave one unset or make its accessor raise.
+        # Degrade that single field to None (the engine already treats None as
+        # "unknown" and just declines the swap) rather than letting one bad field
+        # abort the whole snapshot -- which would also drop the channel-open
+        # decision this snapshot carries.
+        try:
+            percentage = float(sm.percentage) if sm.percentage is not None else None
+        except Exception:
+            percentage = None
         # Amount-independent reverse-swap costs, for the effective-cost gate.
-        mining_fee = int(sm.mining_fee) if sm.mining_fee is not None else None
+        try:
+            mining_fee = int(sm.mining_fee) if sm.mining_fee is not None else None
+        except Exception:
+            mining_fee = None
         try:
             claim_fee = int(sm.get_fee_for_txbatcher())
         except Exception:
             claim_fee = None
+        try:
+            provider_max_reverse = sm.get_provider_max_forward_amount() or None
+        except Exception:
+            provider_max_reverse = None
+        try:
+            provider_min_amount = sm.get_min_amount() or None
+        except Exception:
+            provider_min_amount = None
         offers = self._offers_from_transport(transport)
         # Fold each provider's reliability penalty (from persisted fault history,
         # decayed to now) onto its offer, so the pure selector ranks flaky
@@ -2018,8 +2054,8 @@ class LiquidityPlugin(BasePlugin):
             # Cap for a client reverse swap is the provider's max_forward (see the
             # note in _offers_from_transport); the single-provider path must use
             # the same field or it would overshoot exactly like the offers path.
-            provider_max_reverse_sat=sm.get_provider_max_forward_amount() or None,
-            provider_min_amount_sat=sm.get_min_amount() or None,
+            provider_max_reverse_sat=provider_max_reverse,
+            provider_min_amount_sat=provider_min_amount,
             swap_mining_fee_sat=mining_fee,
             swap_claim_fee_sat=claim_fee,
             provider_offers=tuple(offers),
@@ -2408,11 +2444,21 @@ class LiquidityPlugin(BasePlugin):
             # create and, if it never funds, attribute the stall to this provider.
             swaps_before = set(getattr(sm, "_swaps", {}).keys())
             try:
-                funding_txid = await sm.reverse_swap(
-                    transport=tr,
-                    lightning_amount_sat=lightning_amount_sat,
-                    expected_onchain_amount_sat=expected_onchain_sat,
-                    prepayment_sat=prepayment_sat,
+                # Bounded so no single swap can hold the per-wallet evaluation
+                # lock indefinitely. The precise hang (a provider that never
+                # answers the createswap RPC) is already bounded inside the
+                # transport; this coarse backstop covers anything else that could
+                # stall (see REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as
+                # asyncio.TimeoutError, handled below like any unresponsive
+                # provider.
+                funding_txid = await asyncio.wait_for(
+                    sm.reverse_swap(
+                        transport=tr,
+                        lightning_amount_sat=lightning_amount_sat,
+                        expected_onchain_amount_sat=expected_onchain_sat,
+                        prepayment_sat=prepayment_sat,
+                    ),
+                    timeout=self._reverse_swap_timeout_sec,
                 )
             except UserFacingException as e:
                 # e.g. the provider deems the swap uneconomical for this amount.
@@ -2424,8 +2470,16 @@ class LiquidityPlugin(BasePlugin):
                                  detail=f"{lightning_amount_sat} sat: {e}")
                 return
             except asyncio.TimeoutError as e:
-                # No response at all from the provider: a genuine reliability fault
-                # (it is unreachable / not answering), so escalate normally.
+                # Either the createswap RPC reply never arrived (bounded in the
+                # transport) or the whole attempt exceeded the coarse backstop
+                # while its Lightning payment was in flight. Both mean an
+                # unresponsive provider -> a genuine reliability fault, so
+                # escalate normally. If a swap object was already created (the
+                # payment leg had started before the backstop fired), track it so
+                # reconciliation still attributes its eventual outcome (funded ->
+                # success, never funds -> stuck) instead of silently losing it.
+                self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                      expected_onchain_sat)
                 self.logger.warning(f"reverse swap timed out [DO NOT TRUST]: {e!r}")
                 self._record_provider_fault(wallet, npub, f"RPC timeout: {type(e).__name__}")
                 self._diag_event(wallet, category="error", kind="swap",
@@ -2465,7 +2519,6 @@ class LiquidityPlugin(BasePlugin):
                                  reason="reverse swap internal error", source=npub,
                                  detail=f"{type(e).__name__}: {e}")
                 return
-            new_swaps = set(getattr(sm, "_swaps", {}).keys()) - swaps_before
         if funding_txid:
             # The provider created the on-chain funding output: it honoured the
             # swap. Count it as a success straight away (the claim is Electrum's
@@ -2476,14 +2529,9 @@ class LiquidityPlugin(BasePlugin):
         else:
             # Accepted but no funding yet -- watch it; reconciliation records a
             # success once it funds, a provider stuck fault if it never does, or a
-            # peer fault if our Lightning payment for it fails. Stash the channel's
-            # peer so a payment failure can be attributed to it, and the expected
-            # on-chain amount so the dev fee is accrued iff it later completes.
-            peer_node_id = self._channel_peer_node_id(wallet, action.channel_id)
-            for ph_hex in new_swaps:
-                self._track_pending_swap(wallet, ph_hex, npub,
-                                         node_id=peer_node_id, channel_id=action.channel_id,
-                                         fee_basis_sat=expected_onchain_sat)
+            # peer fault if our Lightning payment for it fails.
+            self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                  expected_onchain_sat)
         self.logger.info(f"reverse swap funding txid: {funding_txid}")
         self._log_action(
             wallet, kind="swap", amount_sat=lightning_amount_sat,
@@ -2494,6 +2542,25 @@ class LiquidityPlugin(BasePlugin):
             state=state)
         self.on_action_done(
             wallet, _("Reverse swap {} sat from {}").format(lightning_amount_sat, action.short_id))
+
+    def _track_new_swaps(self, wallet: 'Abstract_Wallet', sm, swaps_before: set,
+                         npub: str, action: ReverseSwapAction,
+                         expected_onchain_sat: int) -> None:
+        """Track any reverse swap the swap manager gained during this attempt
+        (``sm._swaps`` keys not present in ``swaps_before``) for later
+        reconciliation. Stashes the channel's peer so a failed Lightning payment
+        can be attributed to it, and the expected on-chain amount so the dev fee
+        is accrued iff the swap later completes. Used both on the accepted-but-
+        not-yet-funded path and on a timeout that fired after the swap object was
+        already created (its payment leg was in flight)."""
+        new_swaps = set(getattr(sm, "_swaps", {}).keys()) - swaps_before
+        if not new_swaps:
+            return
+        peer_node_id = self._channel_peer_node_id(wallet, action.channel_id)
+        for ph_hex in new_swaps:
+            self._track_pending_swap(wallet, ph_hex, npub,
+                                     node_id=peer_node_id, channel_id=action.channel_id,
+                                     fee_basis_sat=expected_onchain_sat)
 
     # --- helpers ----------------------------------------------------------
     def _migrate_channel_peer(self) -> None:

@@ -38,6 +38,7 @@ def _plugin() -> LiquidityPlugin:
     p.logger = logging.getLogger("test.inbound_liquidity.glue")
     p._last_offers = {}
     p._swap_cooldown_until = {}
+    p._reverse_swap_timeout_sec = 30.0
     return p
 
 
