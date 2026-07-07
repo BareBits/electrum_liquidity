@@ -140,6 +140,25 @@ SWAP_COOLDOWN_SEC = 180.0
 # ``self._reverse_swap_timeout_sec`` so tests can shrink it.
 REVERSE_SWAP_TIMEOUT_SEC = 300.0
 
+# Substrings that identify an UNAMBIGUOUS provider cheat among the bare
+# ``Exception``s Electrum's ``reverse_swap`` raises from its pre-payment sanity
+# checks (submarine_swaps.py): a short-changed on-chain amount, an invoice whose
+# payment hash does not match the RHASH we sent, or an invoice for the wrong
+# amount. These fire BEFORE any Lightning payment, so no funds are ever at risk,
+# but they are deterministic provider misbehaviour -- so we charge an escalating
+# fault (repeat offenders sink toward a ban). The remaining bare Exceptions from
+# that method are our-side conditions (a stale local tip, a too-close locktime
+# relative to our height) or genuine bugs, which must NOT penalise the provider.
+# Markers are matched against Electrum's own format strings, not provider-
+# supplied text, so a hostile provider cannot forge them (and would only harm
+# itself if it could). Revisit if the pinned Electrum version changes these
+# messages. See the ``except Exception`` arm of ``_reverse_swap``.
+_REVERSE_SWAP_CHEAT_MARKERS = (
+    "onchain_amount is less",      # onchain_amount < expected_onchain_amount_sat
+    "inconsistent RHASH",          # invoice payment hash != our RHASH
+    "invoice_amount",              # invoice amount != what we requested
+)
+
 # Startup settle window. For this long after a wallet is loaded, the plugin takes
 # NO automated action (open / swap / close) and does not judge any peer offline:
 # the Lightning layer connects to its peers asynchronously after load, so a peer
@@ -2727,13 +2746,33 @@ class LiquidityPlugin(BasePlugin):
                                  source=npub, detail=f"{type(e).__name__}: {e}")
                 return
             except Exception as e:
-                # Any other exception here is almost certainly a bug on our side
-                # (e.g. a bad argument to reverse_swap), not the provider
-                # misbehaving. Log it loudly with a traceback and record it as an
-                # internal error -- do NOT penalize the provider's reliability for
-                # our own bug (a healthy provider must not be de-prioritised or
-                # banned because of it).
-                self.logger.error(f"reverse swap failed (internal error): {e!r}", exc_info=True)
+                if any(m in str(e) for m in _REVERSE_SWAP_CHEAT_MARKERS):
+                    # Electrum's pre-payment sanity checks caught an UNAMBIGUOUS
+                    # provider cheat (short-changed on-chain amount, mismatched
+                    # RHASH, or wrong invoice amount). No funds are at risk -- these
+                    # fire before any Lightning payment -- but the provider tried to
+                    # cheat, so charge an escalating (hard) fault: repeat offenders
+                    # sink in the ranking toward a ban, and we stop wasting cycles
+                    # re-picking them. The message carries provider-influenced
+                    # numbers, so scrub it before logging/recording.
+                    self.logger.warning(
+                        f"provider failed reverse-swap sanity check (possible cheat) "
+                        f"[DO NOT TRUST]: {scrub_text(e)}")
+                    self._record_provider_fault(
+                        wallet, npub,
+                        f"failed swap sanity check: {scrub_text(e, max_len=80)}")
+                    self._diag_event(
+                        wallet, category="error", kind="swap",
+                        reason="provider failed reverse-swap sanity check (possible cheat)",
+                        source=npub, detail=scrub_text(e))
+                    return
+                # Any other exception is our-side, not the provider misbehaving: a
+                # stale local tip or too-close locktime relative to OUR height, or a
+                # genuine bug (e.g. a bad argument to reverse_swap). Log it with a
+                # traceback and record it as an internal error -- do NOT penalise
+                # the provider's reliability for our own condition (a healthy
+                # provider must not be de-prioritised or banned because of it).
+                self.logger.error(f"reverse swap failed (internal/our-side): {e!r}", exc_info=True)
                 self._diag_event(wallet, category="error", kind="swap",
                                  reason="reverse swap internal error", source=npub,
                                  detail=f"{type(e).__name__}: {e}")

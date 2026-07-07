@@ -154,16 +154,53 @@ def test_swap_server_error_is_soft_fault() -> None:
     assert p.successes == [] and p.dev_fees == []
 
 
-# --- any other exception -> internal error, provider NOT faulted ----------
-def test_generic_exception_does_not_fault_provider() -> None:
+# --- exception classification (Phase 3) -----------------------------------
+def test_generic_our_side_exception_does_not_fault_provider() -> None:
+    # An exception carrying none of the cheat markers is treated as our-side
+    # (a bug / local condition): logged as internal error, provider NOT faulted.
     async def _rs(**kw):
         raise RuntimeError("bad argument on our side")
     p = _plugin()
     _run(p, _wallet(_sm(_rs)), _action(), _transport())
-    # Current behaviour: treated as our bug, provider spared. (Phase 3 will
-    # reclassify genuinely provider-caused failures; this locks today's contract.)
     assert p.faults == []
     assert p.successes == []
+    assert any(d.get("reason") == "reverse swap internal error" for d in p.diags)
+
+
+@pytest.mark.parametrize("msg", [
+    # Electrum's real pre-payment sanity-check messages (submarine_swaps.py).
+    "rswap check failed: onchain_amount is less than what we expected: 100 < 200",
+    "rswap check failed: inconsistent RHASH and invoice",
+    "rswap check failed: invoice_amount (399000) not what we requested (400000)",
+])
+def test_provider_cheat_records_escalating_fault(msg) -> None:
+    # An unambiguous cheat caught before any payment -> an escalating (hard)
+    # provider fault so repeat offenders sink toward a ban. No funds moved, so
+    # no success/dev-fee.
+    async def _rs(**kw):
+        raise Exception(msg)
+    p = _plugin()
+    _run(p, _wallet(_sm(_rs)), _action(), _transport())
+    assert len(p.faults) == 1
+    npub, reason, kw = p.faults[0]
+    assert npub == NPUB
+    assert kw.get("soft") is not True          # escalating, not a soft fault
+    assert "sanity check" in reason
+    assert p.successes == [] and p.dev_fees == []
+    assert any("possible cheat" in d.get("reason", "") for d in p.diags)
+
+
+@pytest.mark.parametrize("msg", [
+    "our blockchain tip is stale",             # our node is behind
+    "rswap check failed: locktime too close",  # locktime vs OUR height
+])
+def test_our_side_swap_condition_does_not_fault_provider(msg) -> None:
+    # Ambiguous / our-side conditions must never penalise the provider.
+    async def _rs(**kw):
+        raise Exception(msg)
+    p = _plugin()
+    _run(p, _wallet(_sm(_rs)), _action(), _transport())
+    assert p.faults == []
     assert any(d.get("reason") == "reverse swap internal error" for d in p.diags)
 
 
