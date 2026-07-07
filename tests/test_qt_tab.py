@@ -218,20 +218,20 @@ def test_apply_persists_and_clamps(qapp):
     apply_btn = next(b for b in settings_tab.findChildren(QPushButton)
                      if b.text() == "Apply")
 
-    # Set max_channels (third numeric field) to 5. (Automation on/off is the
-    # slider, applied immediately and independently of this Apply button.)
-    # Settings-tab QLineEdit order: 0 min-onchain, 1 reserve, 2 max-channels,
-    # 3 max-cost, 4 trigger-%, 5 trigger-sat, 6 dev-fee-%, 7 dev-fee-address,
-    # 8 log-retention, then reliability/offline fields.
-    line_edits[2].setText("5")              # Maximum number of channels
-    line_edits[8].setText("99999")          # log retention -> clamped
+    # Settings-tab QLineEdit order after the Advanced-tab reorg: 0 min-onchain,
+    # 1 max-channels, 2 max-cost, 3 trigger-%, 4 trigger-sat, 5 dev-fee-%.
+    # (Automation on/off is the slider, applied immediately and independently of
+    # this Apply button. Reserve / log-retention / tuning knobs live on Advanced.)
+    assert len(line_edits) == 6
+    line_edits[1].setText("5")              # Maximum number of channels
+    line_edits[5].setText("99")             # dev fee % -> clamped to DEV_FEE_MAX_PCT
     apply_btn.click()
 
     assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 5
-    from electrum.plugins.inbound_liquidity import MAX_LOG_RETENTION_DAYS  # noqa
-    assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
+    from electrum.plugins.inbound_liquidity import DEV_FEE_MAX_PCT  # noqa
+    assert p.config.INBOUND_LIQUIDITY_DEV_FEE_PCT == DEV_FEE_MAX_PCT
     # Field reloaded to the clamped value.
-    assert line_edits[8].text() == str(MAX_LOG_RETENTION_DAYS)
+    assert line_edits[5].text() == str(DEV_FEE_MAX_PCT)
 
 
 def test_apply_rejects_invalid_without_persisting(qapp):
@@ -244,7 +244,7 @@ def test_apply_rejects_invalid_without_persisting(qapp):
     from PyQt6.QtWidgets import QLineEdit, QPushButton
     line_edits = settings_tab.findChildren(QLineEdit)
     before = p.config.INBOUND_LIQUIDITY_MAX_CHANNELS
-    line_edits[2].setText("not-a-number")
+    line_edits[1].setText("not-a-number")   # max-channels is index 1 post-reorg
     apply_btn = next(b for b in settings_tab.findChildren(QPushButton)
                      if b.text() == "Apply")
     apply_btn.click()
@@ -325,7 +325,7 @@ def test_apply_does_not_disturb_slider_state(qapp):
     assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
 
     settings_tab = _settings_tab(p, wallet)
-    settings_tab.findChildren(QLineEdit)[2].setText("4")
+    settings_tab.findChildren(QLineEdit)[1].setText("4")   # max-channels index 1
     next(b for b in settings_tab.findChildren(QPushButton)
          if b.text() == "Apply").click()
 
@@ -465,6 +465,50 @@ def test_advanced_tab_rejects_invalid_without_persisting(qapp):
     # Neither invalid value is written; defaults are untouched.
     assert p.config.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 5
     assert p.config.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 5
+
+
+def test_settings_tab_omits_moved_and_removed_fields(qapp):
+    """Reserve and log-retention moved to Advanced; the dev-fee payout address
+    field is removed entirely (the address is no longer user-editable). The cost
+    field is renamed to 'Max fee to move LN -> on-chain'."""
+    from PyQt6.QtWidgets import QLabel
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    settings_tab = _settings_tab(p, wallet)
+    labels = [lbl.text() for lbl in settings_tab.findChildren(QLabel)]
+    assert not any("payout address" in t for t in labels)
+    assert not any(t.startswith("On-chain reserve") for t in labels)
+    assert not any(t.startswith("Keep decision log") for t in labels)
+    assert any("Max fee to move LN" in t for t in labels)
+    # The removed address field must not have disturbed the persisted default.
+    assert p.config.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS == "electrum_liqhelper@getbarebits.com"
+
+
+def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
+    from PyQt6.QtWidgets import QCheckBox, QLineEdit, QPushButton
+    from electrum.plugins.inbound_liquidity import MAX_LOG_RETENTION_DAYS
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    edits = advanced_tab.findChildren(QLineEdit)
+    # Advanced QLineEdit order: 0 opens/day, 1 closes/day, 2 on-chain reserve,
+    # 3 log retention, then the reliability/offline tuning knobs.
+    edits[2].setText("7500")                 # on-chain reserve (moved from Settings)
+    edits[3].setText("99999")                # log retention -> clamped
+    for cb in advanced_tab.findChildren(QCheckBox):
+        cb.setChecked(False)                 # flip every feature toggle off
+    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
+                     if b.text() == "Apply")
+    apply_btn.click()
+
+    assert p.config.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
+    assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
+    assert edits[3].text() == str(MAX_LOG_RETENTION_DAYS)
+    assert p.config.INBOUND_LIQUIDITY_RELIABILITY_ENABLED is False
+    assert p.config.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED is False
+    assert p.config.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED is False
 
 
 # --- description text wrapping -------------------------------------------
