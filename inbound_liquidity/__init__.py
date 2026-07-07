@@ -13,6 +13,7 @@ import functools
 import os
 import sys
 import time
+from concurrent import futures
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -147,6 +148,19 @@ REVERSE_SWAP_TIMEOUT_SEC = 300.0
 # comfortably covers peer (re)connection without noticeably delaying automation.
 STARTUP_GRACE_SEC = 120.0
 
+# Heartbeat cadence. The plugin is otherwise entirely event-driven (see
+# _TRIGGER_EVENTS), but every time-based watchdog -- the stuck channel-open
+# timeout, the offline auto-close uptime sampling / force-close deadline, the
+# stuck-swap reconciliation and freeze escape, the dev-fee retry backoff -- only
+# advances when an evaluation runs. A dead peer on an otherwise-quiet wallet
+# produces *fewer* events, so the very condition those watchdogs exist to detect
+# is the one under which they would never run. A fixed periodic tick makes them
+# fire on a predictable cadence regardless of wallet activity. Each tick just
+# calls _evaluate, which is fully guarded (per-wallet lock, automation gate,
+# startup-readiness), so a heartbeat tick is safe and idempotent. Referenced via
+# ``self._heartbeat_interval_sec`` so tests can shrink it.
+HEARTBEAT_INTERVAL_SEC = 600.0
+
 # When opening a nostr swap session, how long to wait for relays to connect, and
 # then for the first provider offers to arrive, before proceeding with whatever
 # we have. Bounded so an evaluation never hangs on an unreachable network.
@@ -171,6 +185,15 @@ PEER_RELIABILITY_DB_KEY = "inbound_liquidity_peer_reliability"
 # by payment_hash hex -> {npub, started_ts, node_id, channel_id}. Survives
 # restarts so a swap stuck across a restart is still attributed.
 PENDING_SWAPS_DB_KEY = "inbound_liquidity_pending_swap_providers"
+# First time (epoch sec) each still-pending reverse swap was observed freezing
+# automation: payment_hash hex -> first_seen_ts. A swap whose funding is broadcast
+# but not yet swept freezes the engine (see the in-flight freeze); this lets a
+# swap that has been pending far too long stop counting toward that freeze --
+# mirroring the stuck channel-open escape -- so one wedged swap can't block all
+# automation forever. Pruned to the currently-pending set on every snapshot, and
+# persisted so a swap wedged across a restart still ages out. See
+# ``INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN`` and ``_count_freezing_swaps``.
+SWAP_FIRST_SEEN_DB_KEY = "inbound_liquidity_swap_first_seen"
 # Retention bounds for the decision log (days). The default keeps a month;
 # the operator can stretch it up to ~3 years from the settings dialog.
 DEFAULT_LOG_RETENTION_DAYS = 30
@@ -460,6 +483,14 @@ SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN = ConfigVar(
     long_desc=lambda: _("A channel that has been opening (not yet usable) for longer than this is "
                         "treated as wedged by an unresponsive peer: it stops freezing automation and "
                         "is counted as a hard fault against the peer."))
+SimpleConfig.INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN = ConfigVar(
+    'plugins.inbound_liquidity.stuck_swap_timeout_min', default=180, type_=int, plugin=__name__,
+    short_desc=lambda: _("Stuck reverse-swap timeout (minutes)"),
+    long_desc=lambda: _("A reverse swap whose funding has been broadcast but not swept for longer "
+                        "than this is treated as wedged: it stops freezing automation so channel "
+                        "opens and other swaps can resume. The swap is still tracked and its "
+                        "provider still faulted separately. Give on-chain funding ample time to "
+                        "confirm before escaping (default 3 hours)."))
 SimpleConfig.INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN = ConfigVar(
     'plugins.inbound_liquidity.auto_remediate_stuck_open', default=True, type_=bool, plugin=__name__,
     short_desc=lambda: _("Force-close wedged channel opens"),
@@ -577,6 +608,17 @@ class LiquidityPlugin(BasePlugin):
         # Coarse backstop on a whole reverse-swap attempt, as an instance
         # attribute so tests can shrink it (the module constant is the default).
         self._reverse_swap_timeout_sec: float = REVERSE_SWAP_TIMEOUT_SEC
+        # wallet -> payment_hash hexes of stuck swaps we have already logged as
+        # having aged out of the freeze, so the escape is logged once per swap (not
+        # every tick) while it stays pending. Pruned against the live pending set.
+        self._swap_freeze_escaped_logged: Dict['Abstract_Wallet', set] = {}
+        # wallet -> the running heartbeat task (a concurrent.futures.Future from
+        # run_coroutine_threadsafe), so we can cancel it in stop_wallet and never
+        # leave a periodic loop running for a wallet we no longer manage.
+        self._heartbeat_tasks: Dict['Abstract_Wallet', "futures.Future"] = {}
+        # Fixed heartbeat cadence, as an instance attribute so tests can shrink it
+        # (the module constant stays the production default).
+        self._heartbeat_interval_sec: float = HEARTBEAT_INTERVAL_SEC
         util.register_callback(self._on_wallet_event, _TRIGGER_EVENTS)
 
     # --- lifecycle --------------------------------------------------------
@@ -603,6 +645,40 @@ class LiquidityPlugin(BasePlugin):
         # wallet has settled, even if no wallet event happens to fire by then.
         self.request_evaluation(wallet)
         self._schedule_post_grace_evaluation(wallet)
+        # Periodic heartbeat so time-based watchdogs advance without depending on
+        # wallet events (see HEARTBEAT_INTERVAL_SEC).
+        self._start_heartbeat(wallet)
+
+    def _start_heartbeat(self, wallet: 'Abstract_Wallet') -> None:
+        """Launch the per-wallet heartbeat loop on the network's asyncio loop, if
+        one is not already running. The loop re-evaluates the wallet every
+        ``_heartbeat_interval_sec`` until the wallet is no longer managed; each
+        tick is a guarded, idempotent ``_evaluate``. Stored so ``stop_wallet`` can
+        cancel it."""
+        existing = self._heartbeat_tasks.get(wallet)
+        if existing is not None and not existing.done():
+            return  # already beating for this wallet
+        loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
+        if loop is None:
+            return
+        async def _heartbeat() -> None:
+            while wallet in self.wallets:
+                try:
+                    await asyncio.sleep(self._heartbeat_interval_sec)
+                except asyncio.CancelledError:
+                    return  # cancelled by stop_wallet / on_close
+                if wallet not in self.wallets:
+                    return
+                try:
+                    await self._evaluate(wallet)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    # A heartbeat must never die on a transient error; log and let
+                    # the next tick try again. (_evaluate already swallows its own
+                    # errors, so this is only a backstop for anything outside it.)
+                    self.logger.info(f"heartbeat tick error: {e!r}")
+        self._heartbeat_tasks[wallet] = asyncio.run_coroutine_threadsafe(_heartbeat(), loop)
 
     def _enforce_min_funding_floor(self) -> int:
         """Lower Electrum's channel-funding floor (``MIN_FUNDING_SAT``) to the
@@ -651,10 +727,51 @@ class LiquidityPlugin(BasePlugin):
                 await self._evaluate(wallet)
         asyncio.run_coroutine_threadsafe(_wait_then_evaluate(), loop)
 
+    # Every per-wallet dict, so stop_wallet can drop all of a wallet's state in
+    # one place. Keeping this list next to the fields it mirrors means a new
+    # per-wallet dict is a one-line add here, not a silent leak. NB: `wallets`
+    # (the lock map) is popped first and separately in stop_wallet, because the
+    # heartbeat loop watches it to know when to exit.
+    _PER_WALLET_STATE_ATTRS = (
+        "_eval_pending", "_last_decline_sigs", "_last_offers", "_remediating_opens",
+        "_local_closes", "_wedged_faulted", "_close_capped_logged",
+        "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
+        "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
+        "_heartbeat_tasks",
+    )
+
+    def _forget_wallet(self, wallet: 'Abstract_Wallet') -> None:
+        """Drop every scrap of per-wallet state, so a stopped wallet leaks nothing
+        and a later reload of the same wallet object starts clean (no stale
+        cooldown, no wedged _dev_fee_paying / _eval_pending guard flag)."""
+        for attr_name in self._PER_WALLET_STATE_ATTRS:
+            store = getattr(self, attr_name, None)
+            if isinstance(store, dict):
+                store.pop(wallet, None)
+
     def stop_wallet(self, wallet: 'Abstract_Wallet') -> None:
+        # Remove from the managed set first so the heartbeat loop sees it gone and
+        # exits, then cancel it outright so we don't wait out a whole interval.
         self.wallets.pop(wallet, None)
-        self._started_at.pop(wallet, None)
-        self._peer_seen_online.pop(wallet, None)
+        hb = self._heartbeat_tasks.get(wallet)
+        if hb is not None:
+            hb.cancel()
+        self._forget_wallet(wallet)
+
+    def on_close(self) -> None:
+        """Plugin teardown (Electrum calls BasePlugin.close -> on_close on disable/
+        unload): stop every heartbeat and unregister our global event callback, so
+        a disabled plugin leaves no running loops or live callbacks behind."""
+        for hb in list(self._heartbeat_tasks.values()):
+            try:
+                hb.cancel()
+            except Exception:
+                pass
+        self._heartbeat_tasks.clear()
+        try:
+            util.unregister_callback(self._on_wallet_event)
+        except Exception as e:
+            self.logger.info(f"could not unregister event callback: {e!r}")
 
     def _install_close_hooks(self, wallet: 'Abstract_Wallet', lnworker) -> None:
         """Wrap the lnworker's local close entry points so that a close *we*
@@ -676,14 +793,15 @@ class LiquidityPlugin(BasePlugin):
         """
         if lnworker is None or getattr(lnworker, "_inbound_liquidity_close_hooked", False):
             return
-        local_closes = self._local_closes.setdefault(wallet, set())
 
         def _record(chan_id) -> None:
             try:
                 cid = chan_id.hex() if isinstance(chan_id, (bytes, bytearray)) else str(chan_id)
             except Exception:
                 return
-            local_closes.add(cid)
+            # Look the set up at call time (not captured once) so it stays the
+            # live one even after stop_wallet cleared and start_wallet re-seeded it.
+            self._local_closes.setdefault(wallet, set()).add(cid)
             self.logger.info(f"local close initiated for channel {cid[:12]}…; "
                              f"will not be blamed on the peer")
 
@@ -1954,6 +2072,68 @@ class LiquidityPlugin(BasePlugin):
                 continue
         return False
 
+    def _stuck_swap_timeout_sec(self) -> float:
+        """The stuck-reverse-swap freeze-escape timeout (seconds). A pending swap
+        older than this stops counting toward the in-flight freeze."""
+        return max(1, int(getattr(
+            self.config, "INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN", 180))) * 60.0
+
+    def _count_freezing_swaps(self, wallet: 'Abstract_Wallet', sm, now: float) -> int:
+        """How many in-flight reverse swaps should still FREEZE automation.
+
+        A reverse swap whose funding is broadcast but not yet swept
+        (``sm.get_pending_swaps()``) freezes the engine until it settles -- we must
+        stay online for it and shouldn't stack more actions on top. But a swap
+        wedged far past the stuck-swap timeout stops counting, so one stuck swap
+        can't block every open and swap forever (mirrors the stuck channel-open
+        escape). The provider is still faulted separately by
+        ``_reconcile_pending_swaps``; this governs only the freeze. First-seen
+        times are persisted, so a swap wedged across a restart still ages out."""
+        try:
+            pending = sm.get_pending_swaps()
+        except Exception:
+            return 0
+        pending_set: set = set()
+        for swap in pending:
+            try:
+                ph = swap.payment_hash
+            except Exception:
+                ph = None
+            if ph:
+                pending_set.add(ph.hex())
+        first_seen = self._load_json_dict(wallet, SWAP_FIRST_SEEN_DB_KEY)
+        changed = False
+        for ph_hex in pending_set:
+            if ph_hex not in first_seen:
+                first_seen[ph_hex] = now
+                changed = True
+        # Prune first-seen entries (and their once-logged marks) for swaps that are
+        # no longer pending -- settled, swept, or refunded -- so a reused id is fresh.
+        for ph_hex in [k for k in first_seen if k not in pending_set]:
+            del first_seen[ph_hex]
+            changed = True
+        if changed:
+            self._save_json(wallet, SWAP_FIRST_SEEN_DB_KEY, first_seen)
+        # In-memory "already logged the escape" set, purely to avoid re-logging a
+        # stuck swap every tick. Tolerate a partially-built plugin (tests that
+        # bypass __init__): fall back to a throwaway set rather than crash the
+        # snapshot on it.
+        logged_map = getattr(self, "_swap_freeze_escaped_logged", None)
+        escaped_logged = logged_map.setdefault(wallet, set()) if logged_map is not None else set()
+        escaped_logged &= pending_set
+        timeout = self._stuck_swap_timeout_sec()
+        count = 0
+        for ph_hex in pending_set:
+            ts = float(first_seen.get(ph_hex, now) or now)
+            if now - ts <= timeout:
+                count += 1
+            elif ph_hex not in escaped_logged:
+                escaped_logged.add(ph_hex)
+                self.logger.warning(
+                    f"reverse swap {ph_hex[:10]}… still unswept after "
+                    f"{int(timeout // 60)} min; no longer freezing automation")
+        return count
+
     def build_snapshot(self, wallet: 'Abstract_Wallet',
                        transport: Optional['SwapServerTransport'] = None) -> LiquiditySnapshot:
         from electrum.lnutil import LOCAL, REMOTE
@@ -2003,11 +2183,10 @@ class LiquidityPlugin(BasePlugin):
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
-        # a failed swap won't freeze the plugin forever.
-        try:
-            inflight_swap_count = len(sm.get_pending_swaps())
-        except Exception:
-            inflight_swap_count = 0
+        # a healthy swap won't freeze the plugin. A swap wedged past the stuck-swap
+        # timeout is excluded here (freeze escape) so one stuck swap can't block
+        # automation forever -- see _count_freezing_swaps.
+        inflight_swap_count = self._count_freezing_swaps(wallet, sm, now)
         # Each provider-economics field is read defensively: the swap manager
         # populates them from the provider's advertised terms, so a not-yet-ready
         # or misbehaving provider can leave one unset or make its accessor raise.
@@ -2777,6 +2956,7 @@ class LiquidityPlugin(BasePlugin):
                 "swap_trigger_sat": config.swap_trigger_sat,
                 "max_opens_per_day": config.max_opens_per_day,
                 "max_closes_per_day": self._max_closes_per_day(),
+                "stuck_swap_timeout_min": int(self._stuck_swap_timeout_sec() // 60),
                 "preferred_npubs": sorted(config.preferred_npubs),
                 "banned_npubs": sorted(config.banned_npubs),
             },
