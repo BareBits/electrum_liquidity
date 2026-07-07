@@ -246,6 +246,12 @@ class _FakeChan:
         return self._spendable
 
 
+class _FakePendingSwap:
+    """Minimal stand-in for SwapData: only the payment_hash the freeze-count reads."""
+    def __init__(self, payment_hash: bytes) -> None:
+        self.payment_hash = payment_hash
+
+
 class _FakeSwapManager:
     def __init__(self, pending_swaps) -> None:
         self._pending = pending_swaps
@@ -304,7 +310,8 @@ def test_build_snapshot_counts_pending_channels_and_inflight_swaps() -> None:
         cid=b"\xcc" * 32, short=None, capacity=2_000_000,
         local_msat=0, remote_msat=2_000_000_000,
         spendable_msat=0, state=ChannelState.FUNDED, active=False)
-    sm = _FakeSwapManager(pending_swaps=["swap1", "swap2"])
+    sm = _FakeSwapManager(pending_swaps=[
+        _FakePendingSwap(b"\x11" * 32), _FakePendingSwap(b"\x22" * 32)])
     ln = _FakeLnworker([open_chan, opening_chan, funded_chan], sm)
     wallet = _FakeSnapWallet(ln, onchain_sat=5_000_000)
 
@@ -312,7 +319,9 @@ def test_build_snapshot_counts_pending_channels_and_inflight_swaps() -> None:
     assert snap.onchain_spendable_sat == 5_000_000
     assert len(snap.channels) == 3
     assert snap.pending_channel_count == 2          # OPENING + FUNDED
-    assert snap.inflight_swap_count == 2            # len(get_pending_swaps())
+    # Two fresh (just-seen) pending swaps still freeze; neither has aged past the
+    # stuck-swap timeout yet.
+    assert snap.inflight_swap_count == 2
     # msat -> sat conversion and short-id fallback to channel_id[:8]
     open_snap = next(c for c in snap.channels if c.short_id == "117x1x0")
     assert open_snap.local_sat == 1_000_000 and open_snap.spendable_local_sat == 900_000

@@ -74,11 +74,25 @@ ops regardless of who started them:
 This stops the plugin from, e.g., opening a second channel every tick while the
 first open is still confirming.
 
-One exception: a channel that has been stuck *opening* past the **stuck
-channel-open timeout** (Advanced tab) is treated as wedged by an unresponsive
-peer — it no longer counts toward the freeze, so automation can resume (and, if
-"Force-close wedged channel opens" is enabled, the wedged open is force-closed to
-free the funds).
+Two exceptions keep one wedged operation from freezing automation forever:
+
+- a channel stuck *opening* past the **stuck channel-open timeout** (Advanced
+  tab) is treated as wedged by an unresponsive peer — it no longer counts toward
+  the freeze, so automation can resume (and, if "Force-close wedged channel
+  opens" is enabled, the wedged open is force-closed to free the funds), and
+- a reverse swap whose funding is broadcast but still unswept past the **stuck
+  reverse-swap timeout** (Advanced tab, default 3 h) likewise stops counting
+  toward the freeze. The swap is still tracked and its provider still faulted
+  separately — this only releases the freeze so other opens/swaps can proceed.
+
+### Heartbeat
+
+The main loop is event-driven, but a **periodic heartbeat** (every 10 minutes
+per wallet) also re-evaluates, so time-based checks — the stuck-open / stuck-swap
+timeouts, offline auto-close uptime sampling and force-close deadline, stuck-swap
+reconciliation, and the dev-fee retry backoff — keep advancing even on a quiet
+wallet that emits no events (exactly the situation a dead peer creates). Each
+heartbeat tick is the same guarded, idempotent evaluation as an event-driven one.
 
 ### Decision log
 
