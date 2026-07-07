@@ -151,9 +151,14 @@ watch swaps actually execute against the rig provider.
 
 ## Tests
 
+Run from this plugin directory, using the rig's shared `.venv-electrum` one
+level up (it has Electrum installed editable, so the Qt/glue tests can import
+it). Don't run from the workspace root: the `electrum/` clone dir there shadows
+the installed `electrum` package and the glue tests fail to import.
+
 ```bash
-# unit (pure rules engine)
-.venv-electrum/bin/python -m pytest tests/ -q
+# unit (pure rules engine) + Electrum-glue tests
+../.venv-electrum/bin/python -m pytest tests/ -q
 
 # end-to-end: launch the regtest rig, which installs + loads the plugin
 python ../run.py --exit-when-ready
