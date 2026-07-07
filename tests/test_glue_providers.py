@@ -83,23 +83,75 @@ def test_offers_from_transport_translation() -> None:
     # ProviderOffer.max_reverse_sat must be sourced from pairs.max_forward. The
     # decoy pairs.max_reverse below (a different value) must be ignored -- if the
     # glue regresses to reading it, this test fails.
+    npub = "npub1" + "q" * 58  # valid npub shape (see clean_npub)
     offer = SimpleNamespace(
-        server_npub="npubXYZ",
+        server_npub=npub,
         pairs=SimpleNamespace(percentage=0.4, mining_fee=1234, min_amount=20_000,
                               max_forward=1_800_000, max_reverse=999_999),
         pow_bits=18)
     transport = SimpleNamespace(get_recent_offers=lambda: [offer])
-    out = LiquidityPlugin._offers_from_transport(transport)
+    out = _plugin()._offers_from_transport(None, transport)
     assert len(out) == 1
     o = out[0]
     assert (o.npub, o.percentage_fee, o.mining_fee_sat, o.min_amount_sat,
-            o.max_reverse_sat, o.pow_bits) == ("npubXYZ", 0.4, 1234, 20_000, 1_800_000, 18)
+            o.max_reverse_sat, o.pow_bits) == (npub, 0.4, 1234, 20_000, 1_800_000, 18)
 
 
 def test_offers_from_transport_none_or_http() -> None:
     # None transport, or an HTTP transport with no get_recent_offers, yields [].
-    assert LiquidityPlugin._offers_from_transport(None) == []
-    assert LiquidityPlugin._offers_from_transport(SimpleNamespace()) == []
+    p = _plugin()
+    assert p._offers_from_transport(None, None) == []
+    assert p._offers_from_transport(None, SimpleNamespace()) == []
+
+
+def test_offers_from_transport_drops_and_faults_bad_offers() -> None:
+    # A hostile provider cannot poison discovery: malformed / out-of-range offers
+    # are dropped (never crash the batch), and an *identifiable* offender is
+    # recorded as a soft reliability fault; an offer with an unusable identity is
+    # dropped silently (nothing to attribute).
+    good_npub = "npub1" + "q" * 58
+    bad_npub_1 = "npub1" + "p" * 58
+    bad_npub_2 = "npub1" + "r" * 58
+
+    def _offer(npub, *, pct=0.3, mining=0, lo=200_000, mx=1_000_000):
+        return SimpleNamespace(
+            server_npub=npub, pow_bits=0,
+            pairs=SimpleNamespace(percentage=pct, mining_fee=mining,
+                                  min_amount=lo, max_forward=mx))
+
+    good = _offer(good_npub)
+    negative_fee = _offer(bad_npub_1, pct=-5.0)             # would look "free"
+    non_numeric = _offer(bad_npub_2, pct="not-a-number")    # would raise on int/float
+    dup_bad = _offer(bad_npub_1, mining=-1)                 # same id, still bad
+    no_identity = _offer("bad id", pct=0.3)                # unusable npub
+
+    transport = SimpleNamespace(
+        get_recent_offers=lambda: [good, negative_fee, non_numeric, dup_bad, no_identity])
+
+    p = _plugin()
+    faults = []
+    p._record_provider_fault = lambda wallet, npub, reason, **kw: faults.append((npub, kw))
+    wallet = object()
+
+    out = p._offers_from_transport(wallet, transport)
+
+    # Only the sane offer survives; a single bad offer never takes out the rest.
+    assert [o.npub for o in out] == [good_npub]
+    # Each identifiable-but-bad provider is faulted exactly once per pass (the
+    # duplicate bad offer under bad_npub_1 does not amplify into a second fault);
+    # the good provider is not faulted, and the unidentifiable offer records none.
+    faulted_npubs = [npub for npub, _ in faults]
+    assert sorted(faulted_npubs) == sorted([bad_npub_1, bad_npub_2])
+    assert good_npub not in faulted_npubs
+    assert all(kw.get("soft") for _, kw in faults)
+
+
+def test_offers_from_transport_survives_raising_feed() -> None:
+    # A transport whose offer feed itself raises must not propagate the error.
+    def _boom():
+        raise RuntimeError("relay exploded")
+    transport = SimpleNamespace(get_recent_offers=_boom)
+    assert _plugin()._offers_from_transport(None, transport) == []
 
 
 # --- provider-needed gate -------------------------------------------------
@@ -214,7 +266,10 @@ def test_targeted_transport_routes_to_target_pubkey() -> None:
     import logging
     t.logger = logging.getLogger("test.targeted")
     t.dm_replies = {}
-    t.target_pubkey = "targetpub"
+    # A 64-hex pubkey (the real shape of SwapOffer.server_pubkey); the transport
+    # now refuses to address a DM to anything else (see looks_like_hex_pubkey).
+    target = "ab" * 32
+    t.target_pubkey = target
 
     sent = {}
 
@@ -229,11 +284,34 @@ def test_targeted_transport_routes_to_target_pubkey() -> None:
             t.send_request_to_server("createswap", {"foo": "bar"}))
         # Let the request register its reply future, then resolve it.
         await asyncio.sleep(0)
-        fut = t.dm_replies[("targetpub", "evt-1")]
+        fut = t.dm_replies[(target, "evt-1")]
         fut.set_result({"ok": True})
         return await task
 
     resp = asyncio.run(run())
     assert resp == {"ok": True}
-    assert sent["pubkey"] == "targetpub"      # addressed to the chosen provider
+    assert sent["pubkey"] == target           # addressed to the chosen provider
     assert '"method": "createswap"' in sent["content"]
+
+
+def test_targeted_transport_refuses_malformed_pubkey() -> None:
+    # A provider whose advertised server_pubkey is not a 64-hex value must never
+    # be addressed: the RPC fails cleanly (SwapServerError) and no DM is sent.
+    from electrum.submarine_swaps import SwapServerError  # type: ignore
+
+    t = object.__new__(TargetedNostrTransport)
+    import logging
+    t.logger = logging.getLogger("test.targeted.bad")
+    t.dm_replies = {}
+    t.target_pubkey = "not-a-hex-pubkey"
+
+    sent = []
+
+    async def fake_send_dm(pubkey, content, *, retries=0):
+        sent.append(pubkey)
+        return "evt-x"
+    t.send_direct_message = fake_send_dm
+
+    with pytest.raises(SwapServerError):
+        asyncio.run(t.send_request_to_server("createswap", {"foo": "bar"}))
+    assert sent == []  # never addressed a DM to the malformed pubkey

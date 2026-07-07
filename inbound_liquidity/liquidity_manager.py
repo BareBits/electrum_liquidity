@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -31,6 +32,78 @@ MIN_FUNDING_SAT: int = 200_000
 # 24 hours), not a calendar day -- so they cannot be sidestepped by a burst
 # straddling midnight, and there is no reset boundary to reason about.
 DAILY_WINDOW_SEC: float = 86_400.0
+
+
+# --- untrusted-input hardening --------------------------------------------
+# Strings that originate from parties we do not control -- a swap provider's
+# nostr announcement, its RPC error replies, a channel peer's id -- must never
+# reach a log line, a decision-log ``reason``/``detail`` field, or a terminal
+# verbatim: an embedded CR/LF can forge a second log entry, and an ANSI escape
+# can rewrite an operator's terminal. These pure helpers (no I/O, no Electrum)
+# neutralise such strings and enforce a safe shape on provider/peer identities,
+# so the glue can scrub-on-ingest and scrub-on-log. See the write-ups in the
+# plugin's SECURITY notes and the callers in ``__init__.py``/``swap_transport.py``.
+
+# Default cap on a scrubbed string's length. Provider error text and the like are
+# for human diagnosis only; an unbounded field is itself a (log-flooding) vector.
+SCRUB_MAX_LEN: int = 200
+_SCRUB_NAMED = {ord("\n"): r"\n", ord("\r"): r"\r", ord("\t"): r"\t"}
+
+
+def scrub_text(s: Optional[object], *, max_len: int = SCRUB_MAX_LEN) -> str:
+    """Return ``s`` with every control character escaped to a visible, inert form
+    (``\\n``/``\\r``/``\\t`` for those three, ``\\xNN`` for any other C0/C1 or
+    DEL byte), and truncated to ``max_len``.
+
+    Escaping (rather than stripping) preserves the forensic fact that the bytes
+    were present while making them harmless: the result can be safely written to
+    a shared log file or printed to a terminal. Ordinary printable text --
+    including non-ASCII/Unicode -- passes through unchanged. ``None`` becomes
+    ``""``; non-strings are coerced via ``str`` first (so a provider exception
+    object is scrubbed too)."""
+    if s is None:
+        return ""
+    text = s if isinstance(s, str) else str(s)
+    out: List[str] = []
+    for ch in text:
+        code = ord(ch)
+        if code in _SCRUB_NAMED:
+            out.append(_SCRUB_NAMED[code])
+        elif code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    result = "".join(out)
+    if len(result) > max_len:
+        result = result[:max_len] + "…(truncated)"
+    return result
+
+
+# A 32-byte value as 64 hex chars: a raw nostr/secp256k1 pubkey (the shape of
+# ``SwapOffer.server_pubkey``, which we hand to the transport as a DM address).
+_HEX64_RE = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+# A bech32 npub identity: ``npub1`` + a bounded run of the bech32 alphabet. We do
+# NOT do full bech32 checksum validation here (that is Electrum/aionostr's job on
+# use) -- this is purely a safe-shape gate so a provider-supplied identity used as
+# a dict key / log token / list-match cannot smuggle control chars, whitespace, or
+# unbounded length. Case is preserved (matching semantics are unchanged); real
+# npubs are lowercase.
+_NPUB_RE = re.compile(r"\Anpub1[a-zA-Z0-9]{20,120}\Z")
+
+
+def looks_like_hex_pubkey(s: Optional[str]) -> bool:
+    """True iff ``s`` is exactly 64 hex characters (a raw 32-byte pubkey)."""
+    return bool(s) and bool(_HEX64_RE.match(s))
+
+
+def clean_npub(raw: Optional[str]) -> str:
+    """A provider's nostr identity if it has a safe npub shape, else ``""``.
+
+    Trims surrounding whitespace and requires the value to match a bounded
+    ``npub1…`` bech32 pattern. An unrecognisable identity yields ``""`` so the
+    caller can drop the offer without attributing anything to it."""
+    s = (raw or "").strip()
+    return s if _NPUB_RE.match(s) else ""
 
 
 def count_within_window(timestamps: Sequence[float], now: float,
@@ -458,6 +531,57 @@ class ProviderOffer:
     # from persisted fault/success history (see ``reliability_penalty_pct``); it
     # is always 0.0 in the pure tests unless explicitly set.
     reliability_penalty_pct: float = 0.0
+
+
+# Bounds a sane provider offer must fall inside. All-sat fields are capped at the
+# total bitcoin supply; the percentage fee at 100%; the announcement PoW at a
+# 32-byte hash's worth of bits. These reject a hostile provider's negative /
+# NaN / infinite / absurd economics (which would otherwise game the cost gate and
+# the cheapest-provider ranking) before they reach the engine.
+_MAX_SATS: int = 21_000_000 * 100_000_000
+_MAX_PERCENTAGE_FEE: float = 100.0
+_MAX_POW_BITS: int = 256
+
+
+def validate_offer(npub: str, percentage_fee: object, mining_fee_sat: object,
+                   min_amount_sat: object, max_reverse_sat: object,
+                   pow_bits: object, *,
+                   reliability_penalty_pct: float = 0.0) -> Optional[ProviderOffer]:
+    """Coerce + validate one provider's advertised terms into a ``ProviderOffer``,
+    or ``None`` if anything is untrustworthy.
+
+    Every field arrives from an untrusted nostr announcement. This returns
+    ``None`` unless: ``npub`` is a already-validated non-empty identity (see
+    :func:`clean_npub`); every numeric field coerces cleanly; the percentage is
+    finite and within ``[0, 100]``; and each sat field / the PoW is a
+    non-negative integer within a sane cap. Rejecting here (rather than trusting
+    ``float()``/``int()``) stops a negative or NaN fee from passing the cost gate
+    or corrupting the cheapest-provider ordering, and stops one malformed field
+    from raising and taking out the whole evaluation. Pure and unit-testable."""
+    if not npub:
+        return None
+    try:
+        pct = float(percentage_fee)
+        mining = int(mining_fee_sat)
+        min_amt = int(min_amount_sat)
+        max_rev = int(max_reverse_sat)
+        pow_b = int(pow_bits)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(pct) or not (0.0 <= pct <= _MAX_PERCENTAGE_FEE):
+        return None
+    if not (0 <= mining <= _MAX_SATS):
+        return None
+    if not (0 <= min_amt <= _MAX_SATS):
+        return None
+    if not (0 <= max_rev <= _MAX_SATS):
+        return None
+    if not (0 <= pow_b <= _MAX_POW_BITS):
+        return None
+    return ProviderOffer(
+        npub=npub, percentage_fee=pct, mining_fee_sat=mining,
+        min_amount_sat=min_amt, max_reverse_sat=max_rev, pow_bits=pow_b,
+        reliability_penalty_pct=reliability_penalty_pct)
 
 
 @dataclass(frozen=True)

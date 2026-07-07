@@ -179,12 +179,13 @@ def test_two_channels_one_provider_batches_without_fault() -> None:
     sm = _swap_manager(max_forward=1_000_000, min_amount=200_000)
     p, w = _plugin(), _wallet([a, b], sm)
 
-    snap = p.build_snapshot(w, transport=_transport_with_offer("npubA"))
+    npub = "npub1" + "a" * 58  # valid npub shape (see clean_npub)
+    snap = p.build_snapshot(w, transport=_transport_with_offer(npub))
     result = evaluate(snap, _config())
 
     swaps = [act for act in result.actions if isinstance(act, ReverseSwapAction)]
     assert len(swaps) == 1                                # provider only had room for one
-    assert swaps[0].provider_npub == "npubA"
+    assert swaps[0].provider_npub == npub
     committed = [d for d in result.declines
                  if d.kind == "swap" and "committed to earlier swaps this cycle" in d.reason]
     assert len(committed) == 1                            # the other channel: benign, not a fault
