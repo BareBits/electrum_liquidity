@@ -17,6 +17,8 @@ import electrum_aionostr.util  # noqa: F401  (ensures aionostr.util is bound)
 
 from electrum.submarine_swaps import NostrTransport, SwapServerError
 
+from .liquidity_manager import looks_like_hex_pubkey, scrub_text
+
 
 class TargetedNostrTransport(NostrTransport):
     """A ``NostrTransport`` whose swap RPCs go to ``target_pubkey`` when set.
@@ -50,11 +52,30 @@ class TargetedNostrTransport(NostrTransport):
         # than delegating the untargeted one to ``super()``).
         request_data['method'] = method
         if self.target_pubkey is not None:
+            # ``target_pubkey`` comes from a provider's untrusted nostr offer
+            # (``SwapOffer.server_pubkey``). Require the exact 64-hex shape of a
+            # 32-byte pubkey before we address a DM to it: a malformed value must
+            # fail cleanly here (surfacing as a provider fault upstream) rather
+            # than reaching aionostr's addressing / our reply-slot dict as an
+            # arbitrary string.
+            if not looks_like_hex_pubkey(self.target_pubkey):
+                self.logger.warning(
+                    f"refusing swap RPC to malformed provider pubkey "
+                    f"{scrub_text(self.target_pubkey, max_len=80)!r}")
+                raise SwapServerError()
             server_pubkey = self.target_pubkey
             self.logger.debug(f"swapserver req -> {server_pubkey[:8]}: method={method}")
         else:
             server_npub = self.config.SWAPSERVER_NPUB
-            server_pubkey = aionostr.util.from_nip19(server_npub)['object'].hex()
+            try:
+                server_pubkey = aionostr.util.from_nip19(server_npub)['object'].hex()
+            except Exception:
+                # A hand-edited / malformed SWAPSERVER_NPUB must not crash the
+                # RPC path with an opaque decode error.
+                self.logger.warning(
+                    f"configured SWAPSERVER_NPUB is not a valid npub "
+                    f"({scrub_text(server_npub, max_len=80)!r}); cannot send swap RPC")
+                raise SwapServerError()
             self.logger.debug(f"swapserver req: method: {method} relays: {self.relays}")
         event_id = await self.send_direct_message(server_pubkey, json.dumps(request_data), retries=1)
         if not event_id:
@@ -76,6 +97,11 @@ class TargetedNostrTransport(NostrTransport):
             raise
         assert isinstance(response, dict)
         if 'error' in response:
-            self.logger.warning(f"error from swap server [DO NOT TRUST THIS MESSAGE]: {response['error']}")
+            # The error text is an attacker-controlled string from the provider's
+            # DM reply. Scrub control characters (CR/LF/ANSI) before logging so it
+            # cannot forge a second log line or rewrite the operator's terminal.
+            self.logger.warning(
+                f"error from swap server [DO NOT TRUST THIS MESSAGE]: "
+                f"{scrub_text(response['error'])}")
             raise SwapServerError()
         return response

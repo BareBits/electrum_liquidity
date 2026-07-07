@@ -27,6 +27,7 @@ from electrum.logging import get_logger
 from .liquidity_manager import (
     Action,
     ChannelSnapshot,
+    clean_npub,
     DAILY_WINDOW_SEC,
     DeclineRecord,
     LiquidityConfig,
@@ -51,9 +52,11 @@ from .liquidity_manager import (
     order_channel_partners,
     record_uptime_sample,
     reliability_penalty_pct,
+    scrub_text,
     should_auto_ban,
     should_commit_offline_close,
     uptime_ratio,
+    validate_offer,
 )
 from .diag_log import DiagLog
 
@@ -2018,32 +2021,67 @@ class LiquidityPlugin(BasePlugin):
         finally:
             self._coop_closing.get(wallet, set()).discard(cid)
 
-    @staticmethod
-    def _offers_from_transport(transport: Optional['SwapServerTransport']) -> List[ProviderOffer]:
+    def _offers_from_transport(self, wallet: Optional['Abstract_Wallet'],
+                               transport: Optional['SwapServerTransport']
+                               ) -> List[ProviderOffer]:
         """Translate the transport's live nostr offers into the engine's pure
         ProviderOffer list. Empty for the HTTP/URL transport (single provider)
-        or when no transport / no offers are available."""
+        or when no transport / no offers are available.
+
+        Every field here is attacker-controlled (a provider's nostr
+        announcement), so each offer is validated (see ``validate_offer``) rather
+        than blindly coerced: a negative / NaN / infinite / absurd economic field
+        would otherwise sail through the cost gate and win the cheapest-provider
+        ranking, and one non-coercible field would raise and take out the whole
+        evaluation. Each offer is handled independently so a single bad one can
+        never poison discovery, and a provider that advertises a validly-signed
+        identity but out-of-range terms is recorded as a (soft) reliability fault
+        so a persistent offender sinks in the ranking. ``wallet`` may be ``None``
+        (no fault attribution possible then; the offer is simply dropped)."""
         get_recent = getattr(transport, "get_recent_offers", None)
         if get_recent is None:
             return []
+        try:
+            raw_offers = list(get_recent())
+        except Exception as e:
+            self.logger.warning(f"could not read discovered offers: {e!r}")
+            return []
         offers: List[ProviderOffer] = []
-        for o in get_recent():
-            offers.append(ProviderOffer(
-                npub=o.server_npub,
-                percentage_fee=float(o.pairs.percentage),
-                mining_fee_sat=int(o.pairs.mining_fee),
-                min_amount_sat=int(o.pairs.min_amount),
-                # A client-side reverse swap (LN->on-chain) is a *forward* swap
-                # from the provider's point of view, so the provider's cap on it
-                # is its `max_forward`, NOT `max_reverse`. Electrum core agrees:
-                # SwapManager.client_max_amount_reverse_swap() reads max_forward,
-                # and check_invoice_amount(is_reverse=True) validates against it.
-                # Using max_reverse here let the planner request more than the
-                # provider accepts, so get_recv_amount() returned None and the
-                # swap blew up with a TypeError (int - None).
-                max_reverse_sat=int(o.pairs.max_forward),
-                pow_bits=int(o.pow_bits),
-            ))
+        faulted_this_pass: set = set()  # fault each bad provider at most once/pass
+        for o in raw_offers:
+            # ``max_forward`` (not ``max_reverse``) is the provider's cap on a
+            # client reverse swap -- a client reverse swap is a *forward* swap
+            # from the provider's side. Electrum core agrees:
+            # SwapManager.client_max_amount_reverse_swap() reads max_forward, and
+            # check_invoice_amount(is_reverse=True) validates against it. (Using
+            # max_reverse let the planner request more than the provider accepts,
+            # so get_recv_amount() returned None and the swap blew up with an
+            # int - None TypeError.)
+            npub = clean_npub(getattr(o, "server_npub", None))
+            try:
+                pairs = o.pairs
+                offer = validate_offer(
+                    npub,
+                    getattr(pairs, "percentage", None),
+                    getattr(pairs, "mining_fee", None),
+                    getattr(pairs, "min_amount", None),
+                    getattr(pairs, "max_forward", None),
+                    getattr(o, "pow_bits", 0),
+                )
+            except Exception:
+                offer = None
+            if offer is not None:
+                offers.append(offer)
+            elif npub and wallet is not None and npub not in faulted_this_pass:
+                # Identifiable provider, but its advertised terms were malformed
+                # or out of range: a soft fault (de-prioritise, never exclude).
+                # At most once per pass, so a provider spamming many bad offers
+                # under one identity can't amplify into a burst of db writes.
+                faulted_this_pass.add(npub)
+                self._record_provider_fault(
+                    wallet, npub, "advertised malformed/out-of-range offer", soft=True)
+            elif not npub:
+                self.logger.info("dropping offer with unusable provider identity")
         return offers
 
     @staticmethod
@@ -2215,7 +2253,7 @@ class LiquidityPlugin(BasePlugin):
             provider_min_amount = sm.get_min_amount() or None
         except Exception:
             provider_min_amount = None
-        offers = self._offers_from_transport(transport)
+        offers = self._offers_from_transport(wallet, transport)
         # Fold each provider's reliability penalty (from persisted fault history,
         # decayed to now) onto its offer, so the pure selector ranks flaky
         # providers behind reliable ones. The penalty never changes the real cost
@@ -2424,7 +2462,7 @@ class LiquidityPlugin(BasePlugin):
         """Open a session, discover providers, cache and return them. Used by the
         Providers settings tab's refresh button."""
         async with self._swap_session(wallet) as transport:
-            offers = self._offers_from_transport(transport)
+            offers = self._offers_from_transport(wallet, transport)
             self._last_offers[wallet] = offers
             return offers
 
@@ -2643,7 +2681,9 @@ class LiquidityPlugin(BasePlugin):
                 # e.g. the provider deems the swap uneconomical for this amount.
                 # This is a legitimate response, NOT a reliability fault; just
                 # wait for the channel to grow.
-                self.logger.info(f"provider declined reverse swap of {lightning_amount_sat} sat: {e}")
+                self.logger.info(
+                    f"provider declined reverse swap of {lightning_amount_sat} sat: "
+                    f"{scrub_text(e)}")
                 self._diag_event(wallet, category="error", kind="swap",
                                  reason="provider declined reverse swap", source=npub,
                                  detail=f"{lightning_amount_sat} sat: {e}")
