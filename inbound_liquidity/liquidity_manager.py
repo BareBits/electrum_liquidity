@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import FrozenSet, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, Union
 
 # Electrum's hard floor for funding a new channel (lnutil.MIN_FUNDING_SAT).
 # Mirrored here so the engine stays import-free; asserted against the real value
@@ -423,6 +423,14 @@ class ChannelSnapshot:
     # the engine declines such a channel until it clears. Defaults False so the
     # pure tests (and any caller that does not populate it) keep prior behaviour.
     has_unsettled_htlcs: bool = False
+    # Whether those unsettled HTLCs belong to a submarine swap *we* initiated
+    # (matched by payment hash against the swap manager's own swap registry in the
+    # glue). When true, the unsettled HTLC is the in-flight leg of a reverse swap
+    # the plugin issued -- expected, not a stuck third-party payment -- so the
+    # engine logs it as "our swap is still settling" rather than raising a
+    # "possible stuck payment" near-miss. Defaults False so the pure tests and any
+    # non-populating caller keep prior behaviour.
+    unsettled_is_swap: bool = False
 
 
 @dataclass(frozen=True)
@@ -619,12 +627,27 @@ def eligible_providers(offers: Sequence[ProviderOffer],
     return out
 
 
+def _offer_available_sat(offer: ProviderOffer,
+                         consumed: Optional[Mapping[str, int]]) -> int:
+    """The provider's remaining reverse-swap capacity after subtracting the
+    Lightning amount already committed to it *earlier in this same decision pass*
+    (``consumed`` maps npub -> sat committed). This is how the engine avoids
+    planning a second swap that a provider's advertised ``max_forward`` cannot
+    host once an earlier swap this cycle has drawn it down -- which the provider
+    would reject server-side (its capacity only re-advertises every ~30s). Absent
+    a budget it is just the advertised max."""
+    if not consumed:
+        return offer.max_reverse_sat
+    return max(0, offer.max_reverse_sat - int(consumed.get(offer.npub, 0)))
+
+
 def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
-                    claim_fee_sat: int, config: LiquidityConfig) -> Optional[ProviderSelection]:
+                    claim_fee_sat: int, config: LiquidityConfig,
+                    consumed: Optional[Mapping[str, int]] = None) -> Optional[ProviderSelection]:
     """Pick the best eligible provider for a swap of up to ``desired_amount_sat``.
 
-    Each provider would swap ``min(desired, its max_reverse)`` (and must clear
-    its own minimum). Only providers whose *real* all-in cost passes the
+    Each provider would swap ``min(desired, its remaining capacity)`` (and must
+    clear its own minimum). Only providers whose *real* all-in cost passes the
     ``max_swap_fee_pct`` gate are considered. Among those, providers are ordered
     by all-in cost *plus* their reliability penalty (so a flaky provider sinks
     behind reliable ones -- soft de-prioritisation, never an outright exclusion);
@@ -632,11 +655,15 @@ def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
     Returns None if no eligible provider both can host the swap and passes the
     gate -- use :func:`cheapest_hosting_cost` to tell those two cases apart for
     logging.
+
+    ``consumed`` (npub -> sat) lets a caller draining several channels in one pass
+    subtract capacity already committed to each provider, so the engine never
+    plans two swaps that together exceed a provider's advertised ``max_forward``.
     """
     best: Optional[ProviderSelection] = None
     best_key: Optional[Tuple[float, int]] = None
     for offer in eligible_providers(offers, config):
-        amount = min(desired_amount_sat, offer.max_reverse_sat)
+        amount = min(desired_amount_sat, _offer_available_sat(offer, consumed))
         if amount <= 0 or amount < offer.min_amount_sat:
             continue
         cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
@@ -655,16 +682,20 @@ def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
 
 
 def cheapest_hosting_cost(offers: Sequence[ProviderOffer], desired_amount_sat: int,
-                          claim_fee_sat: int,
-                          config: LiquidityConfig) -> Optional[Tuple[int, float]]:
+                          claim_fee_sat: int, config: LiquidityConfig,
+                          consumed: Optional[Mapping[str, int]] = None) -> Optional[Tuple[int, float]]:
     """Among eligible providers that can host the amount (ignoring the cost
     gate), the (amount, real all-in cost %) of the cheapest. Used only to build
     an actionable decline reason: ``None`` means "below every provider's
     minimum"; a value whose cost exceeds the ceiling means "over ceiling".
+
+    ``consumed`` applies the same per-provider capacity budget as
+    :func:`select_provider`; pass it (vs. omit it) to tell "no provider can host
+    this at its *remaining* capacity" apart from "below every provider's minimum".
     """
     best: Optional[Tuple[int, float]] = None
     for offer in eligible_providers(offers, config):
-        amount = min(desired_amount_sat, offer.max_reverse_sat)
+        amount = min(desired_amount_sat, _offer_available_sat(offer, consumed))
         if amount <= 0 or amount < offer.min_amount_sat:
             continue
         cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
@@ -860,6 +891,12 @@ def _decide_reverse_swaps(
     offers = _candidate_offers(snapshot)
     eligible = eligible_providers(offers, config)
     claim_fee = snapshot.swap_claim_fee_sat or 0
+    # Lightning sat already committed to each provider (npub -> sat) by swaps
+    # planned earlier in THIS pass, so a later channel doesn't plan a swap the
+    # provider can no longer host (its advertised max_forward is drawn down by the
+    # earlier swap but only re-advertises every ~30s). Keyed by npub; the legacy
+    # single provider uses "" as its key.
+    consumed: Dict[str, int] = {}
     for chan in snapshot.channels:
         over_pct = chan.local_sat >= (config.swap_trigger_pct / 100.0) * chan.capacity_sat
         over_sat = chan.local_sat > config.swap_trigger_sat
@@ -876,14 +913,26 @@ def _decide_reverse_swaps(
                         f"active (peer offline / not yet OPEN); skipping"),
             ))
             continue
-        # Rule: don't add an HTLC to a channel that still has unsettled HTLCs --
-        # a possible stuck payment whose peer hasn't resolved it. Surface it
-        # rather than piling a swap HTLC on top.
+        # Rule: don't add an HTLC to a channel that still has unsettled HTLCs.
+        # But distinguish *why* it is unsettled:
+        #   * If the unsettled HTLC is the in-flight leg of a reverse swap WE
+        #     initiated (matched by payment hash in the glue), this is the
+        #     expected, healthy state between issuing the swap and its on-chain
+        #     funding confirming. Note it plainly -- it is not a near miss, and
+        #     emphatically not a "stuck payment".
+        #   * Otherwise it is a possible third-party stuck payment; surface it as a
+        #     near miss rather than piling a swap HTLC on top.
         if chan.has_unsettled_htlcs:
+            if chan.unsettled_is_swap:
+                reason = (f"channel {chan.short_id} over {trigger} trigger but a "
+                          f"reverse swap we initiated is still in flight on it "
+                          f"(waiting for it to settle); skipping")
+            else:
+                reason = (f"channel {chan.short_id} over {trigger} trigger but has "
+                          f"unsettled HTLCs (possible stuck payment); skipping")
             declines.append(DeclineRecord(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                reason=(f"channel {chan.short_id} over {trigger} trigger but has "
-                        f"unsettled HTLCs (possible stuck payment); skipping"),
+                reason=reason,
             ))
             continue
         # Rule: don't swap LN -> on-chain unless an *eligible* provider is known.
@@ -909,22 +958,40 @@ def _decide_reverse_swaps(
         # PoW. The cost gate (below) is enforced inside select_provider on the
         # REAL cost, so the penalty only reorders -- it never blocks a swap.
         desired = chan.spendable_local_sat
-        selection = select_provider(offers, desired, claim_fee, config)
+        selection = select_provider(offers, desired, claim_fee, config, consumed)
         if selection is None:
-            # No eligible provider both hosts the amount AND passes the cost gate.
-            # cheapest_hosting_cost tells the two cases apart for an actionable
-            # decline: None => below every provider's minimum; otherwise the
-            # cheapest real cost exceeded the ceiling.
-            host = cheapest_hosting_cost(offers, desired, claim_fee, config)
+            # No eligible provider both hosts the amount AND passes the cost gate,
+            # at the capacity that remains after swaps already planned this pass.
+            # cheapest_hosting_cost tells the cases apart for an actionable decline.
+            host = cheapest_hosting_cost(offers, desired, claim_fee, config, consumed)
             if host is None:
-                min_amount = min((o.min_amount_sat for o in eligible), default=0)
-                amount = min(desired, max((o.max_reverse_sat for o in eligible), default=desired))
-                declines.append(DeclineRecord(
-                    kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                    amount_sat=amount,
-                    reason=(f"channel {chan.short_id} swap amount {amount} below "
-                            f"provider minimum {min_amount}; skipping"),
-                ))
+                # Nobody can host it at their *remaining* capacity. Before blaming
+                # the amount for being below every provider's minimum, check whether
+                # a provider *could* have hosted it absent this pass's own earlier
+                # swaps -- if so, it is simply that we have already committed that
+                # provider's capacity this cycle, and this channel should just wait
+                # for the next cycle (after those swaps settle / it re-advertises).
+                # That is expected batching, NOT a fault or a real near miss.
+                host_full = cheapest_hosting_cost(offers, desired, claim_fee, config)
+                if host_full is not None:
+                    amount, _cost = host_full
+                    declines.append(DeclineRecord(
+                        kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                        amount_sat=amount,
+                        reason=(f"channel {chan.short_id} over {trigger} trigger but "
+                                f"the eligible provider(s)' capacity is already "
+                                f"committed to earlier swaps this cycle; will retry "
+                                f"next cycle"),
+                    ))
+                else:
+                    min_amount = min((o.min_amount_sat for o in eligible), default=0)
+                    amount = min(desired, max((o.max_reverse_sat for o in eligible), default=desired))
+                    declines.append(DeclineRecord(
+                        kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                        amount_sat=amount,
+                        reason=(f"channel {chan.short_id} swap amount {amount} below "
+                                f"provider minimum {min_amount}; skipping"),
+                    ))
             else:
                 amount, cost_pct = host
                 declines.append(DeclineRecord(
@@ -935,6 +1002,10 @@ def _decide_reverse_swaps(
                             f"(cheapest of {len(eligible)} provider(s)); skipping"),
                 ))
             continue
+        # Reserve the chosen provider's capacity so a later channel in this pass
+        # plans against what actually remains (see `consumed` above).
+        consumed[selection.offer.npub] = (
+            consumed.get(selection.offer.npub, 0) + selection.amount_sat)
         amount = selection.amount_sat
         cost_pct = selection.all_in_cost_pct
         provider_desc = (f"provider {selection.offer.npub[:12]}…"
