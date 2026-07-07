@@ -187,7 +187,10 @@ def test_reverse_swap_decline_is_not_a_fault() -> None:
     assert p._load_reliability(w) == {}     # no fault recorded
 
 
-def test_reverse_swap_rpc_error_is_a_fault() -> None:
+def test_reverse_swap_rpc_error_is_a_soft_fault() -> None:
+    # A createswap SwapServerError is ambiguous (the server masks the real cause)
+    # and is most often transient provider capacity, so it is a SOFT fault: it is
+    # recorded for visibility but does not escalate the ranking penalty.
     from electrum.submarine_swaps import SwapServerError
 
     def _raise(**kw):
@@ -195,7 +198,13 @@ def test_reverse_swap_rpc_error_is_a_fault() -> None:
     p, sm = _plugin(), _swap_manager(lambda **kw: _raise(**kw))
     w = _FakeWallet(sm)
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
-    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 1
+    stats = p._load_reliability(w)[NPUB]
+    assert stats["consecutive_faults"] == 1        # floored at one decaying level
+    assert stats["fault_count"] == 1
+    assert "capacity" in stats["last_reason"].lower()
+    # (Non-escalation across repeats is covered at the store level by
+    # test_soft_fault_floors_at_one_level_and_does_not_escalate; here a single
+    # channel would in any case be blocked from re-attempting by the swap cooldown.)
 
 
 def test_reverse_swap_unhostable_amount_is_skipped_not_a_fault() -> None:
@@ -292,6 +301,68 @@ def test_reconcile_young_unfunded_swap_waits() -> None:
     p._reconcile_pending_swaps(w)
     assert p._load_reliability(w) == {}              # nothing recorded yet
     assert "abcd" in p._load_pending_swaps(w)        # still tracked
+
+
+# --- soft vs hard provider fault ------------------------------------------
+def test_soft_fault_floors_at_one_level_and_does_not_escalate() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "transient", soft=True)
+    p._record_provider_fault(w, NPUB, "transient", soft=True)
+    p._record_provider_fault(w, NPUB, "transient", soft=True)
+    stats = p._load_reliability(w)[NPUB]
+    assert stats["consecutive_faults"] == 1        # floored, never compounds
+    assert stats["fault_count"] == 3               # each recorded for visibility
+    # Penalty is the single base level (0.5%), not 0.5 * 2^2.
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_hard_fault_still_escalates_over_soft_floor() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "transient", soft=True)   # floor -> 1
+    p._record_provider_fault(w, NPUB, "unreachable")            # hard -> 2
+    stats = p._load_reliability(w)[NPUB]
+    assert stats["consecutive_faults"] == 2
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_soft_fault_logs_soft_prefix() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "transient", soft=True)
+    log = w.db.get("inbound_liquidity_decision_log", [])
+    fault_entries = [e for e in log if e.get("category") == "fault"]
+    assert fault_entries and fault_entries[-1]["reason"].startswith("soft fault: ")
+
+
+# --- _chan_unsettled_is_swap ----------------------------------------------
+def _htlc(payment_hash: bytes) -> SimpleNamespace:
+    return SimpleNamespace(payment_hash=payment_hash)
+
+
+def _chan_with_htlcs(*payment_hashes: bytes) -> SimpleNamespace:
+    hm = SimpleNamespace(htlcs=lambda subject: [("dir", _htlc(ph)) for ph in payment_hashes])
+    return SimpleNamespace(hm=hm)
+
+
+def test_chan_unsettled_is_swap_matches_swap_payment_hash() -> None:
+    swap_ph = b"\xab" * 32
+    sm = SimpleNamespace(get_swap=lambda ph: object() if ph == swap_ph else None)
+    chan = _chan_with_htlcs(swap_ph)
+    assert LiquidityPlugin._chan_unsettled_is_swap(chan, sm) is True
+
+
+def test_chan_unsettled_is_swap_false_for_unknown_htlc() -> None:
+    sm = SimpleNamespace(get_swap=lambda ph: None)   # no swap matches
+    chan = _chan_with_htlcs(b"\x01" * 32, b"\x02" * 32)
+    assert LiquidityPlugin._chan_unsettled_is_swap(chan, sm) is False
+
+
+def test_chan_unsettled_is_swap_survives_lookup_errors() -> None:
+    def _boom(ph):
+        raise RuntimeError("adb not ready")
+    sm = SimpleNamespace(get_swap=_boom)
+    chan = _chan_with_htlcs(b"\x03" * 32)
+    # A lookup failure must degrade to False, never propagate.
+    assert LiquidityPlugin._chan_unsettled_is_swap(chan, sm) is False
 
 
 def _coro(value):

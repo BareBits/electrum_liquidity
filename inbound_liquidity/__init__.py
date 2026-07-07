@@ -1118,20 +1118,42 @@ class LiquidityPlugin(BasePlugin):
             out.append(dataclasses.replace(o, reliability_penalty_pct=penalty))
         return out
 
-    def _record_provider_fault(self, wallet: 'Abstract_Wallet', npub: str, reason: str) -> None:
+    def _record_provider_fault(self, wallet: 'Abstract_Wallet', npub: str, reason: str,
+                               *, soft: bool = False) -> None:
+        """Record a provider reliability fault.
+
+        A normal (hard) fault escalates: it increments ``consecutive_faults``, so
+        the decaying penalty doubles with each one -- the right response to a
+        provider we can pin real misbehaviour on (e.g. it went unreachable).
+
+        A *soft* fault is for an ambiguous signal we cannot cleanly attribute --
+        chiefly a swap-creation ``SwapServerError``, which the server masks as a
+        generic "Internal Server Error" and is most often just transient capacity
+        (frequently exhausted by our own concurrent swap; see the capacity
+        budgeting in the engine). It is recorded for visibility (fault_count, the
+        Faults log) but must NOT escalate: it only floors the penalty at one
+        decaying level, so a one-off barely registers and even a run of them tops
+        out at the base penalty rather than compounding a healthy provider into a
+        ban-adjacent score."""
         if not npub:
             return  # single-provider / URL mode has no per-provider identity
         data = self._load_reliability(wallet)
         s = data.get(npub, {})
-        s["consecutive_faults"] = int(s.get("consecutive_faults", 0)) + 1
+        if soft:
+            # Floor at one decaying level; never escalate on repeats.
+            s["consecutive_faults"] = max(int(s.get("consecutive_faults", 0)), 1)
+        else:
+            s["consecutive_faults"] = int(s.get("consecutive_faults", 0)) + 1
         s["fault_count"] = int(s.get("fault_count", 0)) + 1
         s["last_fault_ts"] = time.time()
         s["last_reason"] = reason
         data[npub] = s
         self._save_reliability(wallet, data)
         self.logger.info(
-            f"provider {npub[:12]}… fault #{s['consecutive_faults']} (total {s['fault_count']}): {reason}")
-        self._log_fault(wallet, kind="provider", ident=npub, reason=reason, hard=False)
+            f"provider {npub[:12]}… {'soft ' if soft else ''}fault "
+            f"#{s['consecutive_faults']} (total {s['fault_count']}): {reason}")
+        self._log_fault(wallet, kind="provider", ident=npub, reason=reason,
+                        hard=False, soft=soft)
         self.on_log_changed(wallet)
 
     def _record_provider_success(self, wallet: 'Abstract_Wallet', npub: str) -> None:
@@ -1891,6 +1913,32 @@ class LiquidityPlugin(BasePlugin):
             ))
         return offers
 
+    @staticmethod
+    def _chan_unsettled_is_swap(chan, sm) -> bool:
+        """True if any of ``chan``'s currently-unsettled HTLCs belongs to a
+        submarine swap known to the swap manager (matched by payment hash) -- i.e.
+        the in-flight leg of a reverse swap this wallet issued, rather than a
+        third-party payment stuck on the channel. Best-effort: any lookup failure
+        conservatively returns False (fall back to the "possible stuck payment"
+        treatment)."""
+        try:
+            from electrum.lnutil import LOCAL, REMOTE
+            htlcs = list(chan.hm.htlcs(LOCAL)) + list(chan.hm.htlcs(REMOTE))
+        except Exception:
+            return False
+        seen = set()
+        for _direction, htlc in htlcs:
+            ph = getattr(htlc, "payment_hash", None)
+            if ph is None or ph in seen:
+                continue
+            seen.add(ph)
+            try:
+                if sm.get_swap(ph) is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
     def build_snapshot(self, wallet: 'Abstract_Wallet',
                        transport: Optional['SwapServerTransport'] = None) -> LiquiditySnapshot:
         from electrum.lnutil import LOCAL, REMOTE
@@ -1920,6 +1968,13 @@ class LiquidityPlugin(BasePlugin):
                 has_unsettled = bool(chan.has_unsettled_htlcs())
             except Exception:
                 has_unsettled = False
+            # Distinguish an unsettled HTLC that is the in-flight leg of a reverse
+            # swap WE issued from a genuine third-party stuck payment: if any of the
+            # channel's pending HTLCs matches a swap in the swap manager's registry
+            # (by payment hash), it is our own swap still settling. This is what
+            # stops the engine from mislabelling our just-issued swap as a "possible
+            # stuck payment" while its on-chain funding confirms.
+            unsettled_is_swap = has_unsettled and self._chan_unsettled_is_swap(chan, sm)
             channels.append(ChannelSnapshot(
                 channel_id=chan.channel_id.hex(),
                 short_id=str(chan.short_channel_id) if chan.short_channel_id else chan.channel_id.hex()[:8],
@@ -1929,6 +1984,7 @@ class LiquidityPlugin(BasePlugin):
                 spendable_local_sat=chan.available_to_spend(LOCAL) // 1000,
                 is_active=chan.is_active(),
                 has_unsettled_htlcs=has_unsettled,
+                unsettled_is_swap=unsettled_is_swap,
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
@@ -2367,13 +2423,35 @@ class LiquidityPlugin(BasePlugin):
                                  reason="provider declined reverse swap", source=npub,
                                  detail=f"{lightning_amount_sat} sat: {e}")
                 return
-            except (SwapServerError, asyncio.TimeoutError) as e:
-                # RPC error / no response from the provider: a reliability fault.
-                self.logger.warning(f"reverse swap RPC failed [DO NOT TRUST]: {e!r}")
-                self._record_provider_fault(wallet, npub, f"RPC error: {type(e).__name__}")
+            except asyncio.TimeoutError as e:
+                # No response at all from the provider: a genuine reliability fault
+                # (it is unreachable / not answering), so escalate normally.
+                self.logger.warning(f"reverse swap timed out [DO NOT TRUST]: {e!r}")
+                self._record_provider_fault(wallet, npub, f"RPC timeout: {type(e).__name__}")
                 self._diag_event(wallet, category="error", kind="swap",
-                                 reason="reverse swap RPC failed", source=npub,
+                                 reason="reverse swap RPC timed out", source=npub,
                                  detail=f"{type(e).__name__}: {e}")
+                return
+            except SwapServerError as e:
+                # The server rejected createswap, but masks the real cause as a
+                # generic "Internal Server Error" (see NostrTransport), so we cannot
+                # cleanly attribute it. The overwhelmingly common cause is transient
+                # capacity: the provider's advertised max_forward was drawn down
+                # (often by our OWN earlier swap this cycle) between advertisement
+                # and execution, so its create_normal_swap hits "no onchain amount".
+                # The engine's per-provider capacity budgeting prevents most of
+                # these, so a residual one is treated as a SOFT (non-escalating)
+                # fault: recorded for visibility but not enough to poison a healthy
+                # provider's ranking. It self-heals next cycle once the provider
+                # re-advertises its reduced capacity.
+                self.logger.info(
+                    f"provider rejected reverse swap of {lightning_amount_sat} sat "
+                    f"(likely transient capacity) [DO NOT TRUST]: {e!r}")
+                self._record_provider_fault(
+                    wallet, npub, "swap rejected (likely transient capacity)", soft=True)
+                self._diag_event(wallet, category="error", kind="swap",
+                                 reason="provider rejected reverse swap (transient?)",
+                                 source=npub, detail=f"{type(e).__name__}: {e}")
                 return
             except Exception as e:
                 # Any other exception here is almost certainly a bug on our side
@@ -2583,13 +2661,16 @@ class LiquidityPlugin(BasePlugin):
         return max(1, min(days, MAX_LOG_RETENTION_DAYS))
 
     def _log_fault(self, wallet: 'Abstract_Wallet', *, kind: str, ident: str,
-                   reason: str, hard: bool) -> None:
+                   reason: str, hard: bool, soft: bool = False) -> None:
         """Append a reliability fault to the decision log (category "fault") so its
         reason is surfaced to the user in the Faults view. ``kind`` is "peer" or
-        "provider"; ``ident`` is the node id / npub. A no-op for db-less wallets
-        (unit-test mocks)."""
+        "provider"; ``ident`` is the node id / npub. ``soft`` marks an ambiguous,
+        non-escalating fault (see :meth:`_record_provider_fault`) so the Faults
+        view can show it is a low-severity/transient signal, not a real fault. A
+        no-op for db-less wallets (unit-test mocks)."""
         if getattr(wallet, "db", None) is None:
             return
+        prefix = "soft fault: " if soft else ("hard fault: " if hard else "fault: ")
         entry = {
             "ts": time.time(),
             "category": "fault",
@@ -2597,7 +2678,7 @@ class LiquidityPlugin(BasePlugin):
             "amount_sat": None,
             "source": self._abbrev(ident),
             "dest": None,
-            "reason": ("hard fault: " if hard else "fault: ") + reason,
+            "reason": prefix + reason,
             "detail": None,
             "state": {},
         }
