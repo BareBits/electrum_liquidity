@@ -1878,7 +1878,15 @@ class LiquidityPlugin(BasePlugin):
                 percentage_fee=float(o.pairs.percentage),
                 mining_fee_sat=int(o.pairs.mining_fee),
                 min_amount_sat=int(o.pairs.min_amount),
-                max_reverse_sat=int(o.pairs.max_reverse),
+                # A client-side reverse swap (LN->on-chain) is a *forward* swap
+                # from the provider's point of view, so the provider's cap on it
+                # is its `max_forward`, NOT `max_reverse`. Electrum core agrees:
+                # SwapManager.client_max_amount_reverse_swap() reads max_forward,
+                # and check_invoice_amount(is_reverse=True) validates against it.
+                # Using max_reverse here let the planner request more than the
+                # provider accepts, so get_recv_amount() returned None and the
+                # swap blew up with a TypeError (int - None).
+                max_reverse_sat=int(o.pairs.max_forward),
                 pow_bits=int(o.pow_bits),
             ))
         return offers
@@ -1951,7 +1959,10 @@ class LiquidityPlugin(BasePlugin):
             onchain_spendable_sat=int(wallet.get_spendable_balance_sat()),
             channels=tuple(channels),
             swap_percentage_fee=percentage,
-            provider_max_reverse_sat=sm.get_provider_max_reverse_amount() or None,
+            # Cap for a client reverse swap is the provider's max_forward (see the
+            # note in _offers_from_transport); the single-provider path must use
+            # the same field or it would overshoot exactly like the offers path.
+            provider_max_reverse_sat=sm.get_provider_max_forward_amount() or None,
             provider_min_amount_sat=sm.get_min_amount() or None,
             swap_mining_fee_sat=mining_fee,
             swap_claim_fee_sat=claim_fee,
@@ -2322,6 +2333,20 @@ class LiquidityPlugin(BasePlugin):
                 return
             lightning_amount_sat = action.lightning_amount_sat
             expected_onchain_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
+            # get_recv_amount() returns None when this amount isn't swappable with
+            # the chosen provider (outside its min/max bounds, or it nets below
+            # dust after fees). The max_forward cap fix above should keep the
+            # planner from picking such an amount, but guard regardless: feeding
+            # None into reverse_swap() crashes its cost sanity-check (int - None).
+            # This is "wait for the channel to grow / retry", NOT a provider fault.
+            if expected_onchain_sat is None or sm.mining_fee is None:
+                self.logger.info(
+                    f"skipping reverse swap of {lightning_amount_sat} sat: provider "
+                    f"cannot host this amount right now (no receivable amount)")
+                self._diag_event(wallet, category="error", kind="swap",
+                                 reason="amount not swappable with provider", source=npub,
+                                 detail=f"{lightning_amount_sat} sat")
+                return
             prepayment_sat = 2 * sm.mining_fee
             # Snapshot the swap set so we can identify the swap we are about to
             # create and, if it never funds, attribute the stall to this provider.
@@ -2351,12 +2376,15 @@ class LiquidityPlugin(BasePlugin):
                                  detail=f"{type(e).__name__}: {e}")
                 return
             except Exception as e:
-                # Protocol violation / malformed response (the provider misbehaved):
-                # also a reliability fault. Truly unexpected errors are rare here.
-                self.logger.warning(f"reverse swap failed: {e!r}")
-                self._record_provider_fault(wallet, npub, f"swap error: {type(e).__name__}")
+                # Any other exception here is almost certainly a bug on our side
+                # (e.g. a bad argument to reverse_swap), not the provider
+                # misbehaving. Log it loudly with a traceback and record it as an
+                # internal error -- do NOT penalize the provider's reliability for
+                # our own bug (a healthy provider must not be de-prioritised or
+                # banned because of it).
+                self.logger.error(f"reverse swap failed (internal error): {e!r}", exc_info=True)
                 self._diag_event(wallet, category="error", kind="swap",
-                                 reason="reverse swap failed", source=npub,
+                                 reason="reverse swap internal error", source=npub,
                                  detail=f"{type(e).__name__}: {e}")
                 return
             new_swaps = set(getattr(sm, "_swaps", {}).keys()) - swaps_before

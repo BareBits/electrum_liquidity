@@ -198,6 +198,32 @@ def test_reverse_swap_rpc_error_is_a_fault() -> None:
     assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 1
 
 
+def test_reverse_swap_unhostable_amount_is_skipped_not_a_fault() -> None:
+    # get_recv_amount() returns None => the provider can't host this amount right
+    # now (outside its min/max, or nets below dust). The swap must be skipped
+    # cleanly: reverse_swap() is never called and the provider is NOT penalised.
+    # (Regression guard for the int-minus-None TypeError that used to be charged
+    # to the provider as a bogus "swap error" fault.)
+    attempted: List[dict] = []
+    p, sm = _plugin(), _swap_manager(lambda **kw: attempted.append(kw) or _coro("txid"))
+    sm.get_recv_amount = lambda amt, *, is_reverse: None
+    w = _FakeWallet(sm)
+    asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
+    assert attempted == []                   # reverse_swap never attempted
+    assert p._load_reliability(w) == {}      # provider not penalised
+
+
+def test_reverse_swap_internal_error_is_not_a_fault() -> None:
+    # An unexpected exception from reverse_swap() is treated as a bug on our side,
+    # logged as an internal error, and NOT charged to the provider's reliability.
+    def _raise(**kw):
+        raise TypeError("unsupported operand type(s) for -: 'int' and 'NoneType'")
+    p, sm = _plugin(), _swap_manager(lambda **kw: _raise(**kw))
+    w = _FakeWallet(sm)
+    asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
+    assert p._load_reliability(w) == {}      # provider not penalised for our bug
+
+
 def test_reverse_swap_timeout_is_a_fault(monkeypatch) -> None:
     async def _never(**kw):
         return "unused"
