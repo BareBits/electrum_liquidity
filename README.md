@@ -149,8 +149,8 @@ per-wallet decision log.
 Internal Electrum plugins are auto-authorized, so the plugin is **symlinked**
 into the Electrum checkout's `electrum/plugins/` and enabled with
 `setconfig plugins.inbound_liquidity.enabled true`. In the regtest rig this is
-done automatically (`rig/services.ensure_plugin_installed()` +
-`run.py`); the rig starts it paused (`automation_enabled=false`, which is also
+done automatically (`e2e/rig/services.ensure_plugin_installed()` +
+`e2e/run.py`); the rig starts it paused (`automation_enabled=false`, which is also
 the shipped default) so it doesn't race the rig's own channel setup — flip the
 large **ENABLED/DISABLED** slider at the top of the **Liquidity** tab's Settings
 sub-tab to arm it (it applies immediately, no **Apply** needed).
@@ -165,15 +165,18 @@ watch swaps actually execute against the rig provider.
 
 ## Tests
 
-Run from this plugin directory, using the rig's shared `.venv-electrum` one
-level up (it has Electrum installed editable, so the Qt/glue tests can import
-it). Don't run from the workspace root: the `electrum/` clone dir there shadows
-the installed `electrum` package and the glue tests fail to import.
+Two tiers. The fast **unit + Electrum-glue** tests live in `tests/`; the heavy
+**regtest end-to-end** rig lives in `e2e/` (see [`e2e/README.md`](e2e/README.md)).
+
+The tests import from a real Electrum, so they need a venv with Electrum
+installed editable. `e2e/setup.sh` builds one at `e2e/.venv-electrum`.
 
 ```bash
-# unit (pure rules engine) + Electrum-glue tests
-../.venv-electrum/bin/python -m pytest tests/ -q
+# unit (pure rules engine) + Electrum-glue tests — from this plugin directory
+e2e/.venv-electrum/bin/python -m pytest tests/ -q
 
-# end-to-end: launch the regtest rig, which installs + loads the plugin
-python ../run.py --exit-when-ready
+# end-to-end (heavy; needs bitcoind + Fulcrum + docker):
+cd e2e && ./setup.sh                        # one-time: builds the venv, clones Electrum
+python e2e/run.py --exit-when-ready         # smoke: bring the whole stack up
+RUN_RIG_E2E=1 e2e/.venv-electrum/bin/python -m pytest e2e/tests -q -s   # full e2e suite
 ```
