@@ -78,10 +78,14 @@ def test_parse_npub_set_variants() -> None:
 
 # --- offer translation ----------------------------------------------------
 def test_offers_from_transport_translation() -> None:
+    # A client reverse swap is capped by the provider's max_forward, so
+    # ProviderOffer.max_reverse_sat must be sourced from pairs.max_forward. The
+    # decoy pairs.max_reverse below (a different value) must be ignored -- if the
+    # glue regresses to reading it, this test fails.
     offer = SimpleNamespace(
         server_npub="npubXYZ",
         pairs=SimpleNamespace(percentage=0.4, mining_fee=1234, min_amount=20_000,
-                              max_reverse=1_800_000),
+                              max_forward=1_800_000, max_reverse=999_999),
         pow_bits=18)
     transport = SimpleNamespace(get_recent_offers=lambda: [offer])
     out = LiquidityPlugin._offers_from_transport(transport)

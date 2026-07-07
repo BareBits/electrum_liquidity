@@ -258,6 +258,11 @@ class _FakeSwapManager:
     def get_fee_for_txbatcher(self):
         return 22_500
 
+    def get_provider_max_forward_amount(self):
+        # A client reverse swap is capped by the provider's max_forward; this is
+        # the field build_snapshot reads for provider_max_reverse_sat.
+        return 1_900_000
+
     def get_provider_max_reverse_amount(self):
         return 1_900_000
 

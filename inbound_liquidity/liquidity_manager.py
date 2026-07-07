@@ -438,7 +438,11 @@ class ProviderOffer:
     percentage_fee: float    # provider's % fee (e.g. 0.5 for 0.5%)
     mining_fee_sat: int      # provider's fixed base/mining fee
     min_amount_sat: int      # smallest swap this provider accepts
-    max_reverse_sat: int     # largest reverse swap this provider accepts
+    # Largest client reverse swap (LN->on-chain) this provider accepts. NB: this
+    # is sourced from the provider's `max_forward` capacity, because a client
+    # reverse swap is a forward swap from the provider's side (see the glue in
+    # __init__.py). It is NOT the provider's `max_reverse`.
+    max_reverse_sat: int
     pow_bits: int = 0        # nostr announcement proof-of-work (tie-breaker; higher = more established)
     # Reliability penalty (percentage points) added to this provider's all-in
     # cost *for ranking only* -- it pushes a flaky provider behind reliable ones
@@ -531,7 +535,7 @@ class LiquiditySnapshot:
     onchain_spendable_sat: int
     channels: Sequence[ChannelSnapshot]
     swap_percentage_fee: Optional[float]      # provider's % fee, None if no provider known
-    provider_max_reverse_sat: Optional[int]   # largest reverse swap the provider accepts
+    provider_max_reverse_sat: Optional[int]   # largest client reverse swap the provider accepts (its max_forward; see ProviderOffer.max_reverse_sat)
     provider_min_amount_sat: Optional[int]    # smallest swap the provider accepts
     # Amount-independent reverse-swap costs (sat), used to compute the effective
     # all-in cost of a swap. Mirror SwapManager: the provider's mining/base fee
