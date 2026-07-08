@@ -67,3 +67,36 @@ def test_offset_property_animates_toward_target(qapp):
     sw.offset = 0.5
     assert sw.offset == 0.5
     sw.grab()  # force a paintEvent; must not raise
+
+
+def test_sync_knob_snaps_to_checked_state(qapp):
+    # sync_knob() must move the knob to match isChecked() immediately, with no
+    # dependence on the toggled-signal-driven animation.
+    sw = ToggleSwitch()
+    sw.setChecked(True)
+    sw.offset = 0.0  # knob left, but state is on -> desynced
+    sw.sync_knob()
+    assert sw.offset == 1.0
+
+    sw.setChecked(False)
+    sw.offset = 1.0  # knob right, but state is off -> desynced
+    sw.sync_knob()
+    assert sw.offset == 0.0
+
+
+def test_sync_knob_recovers_from_blocked_setchecked(qapp):
+    # Regression: pushing a new state in with signals blocked (as the settings
+    # tab does to re-read the config without re-firing its handler) suppresses
+    # the toggled signal that slides the knob, so isChecked() and the knob would
+    # disagree -- a green ENABLED label over a knob still parked off. sync_knob()
+    # must reconcile them.
+    for enabled in (True, False):
+        sw = ToggleSwitch()
+        sw.blockSignals(True)
+        sw.setChecked(enabled)
+        sw.blockSignals(False)
+        # Before the fix the knob lagged here; sync_knob() is what the settings
+        # tab now calls to keep them in step.
+        sw.sync_knob()
+        knob_on = sw.offset > 0.5
+        assert knob_on == sw.isChecked() == enabled
