@@ -2236,6 +2236,19 @@ class LiquidityPlugin(BasePlugin):
         now = time.time()
         pending_channel_count = 0
         for chan in lnworker.channels.values():
+            # Skip dead channels. Electrum keeps CLOSED/REDEEMED channel records
+            # in ``lnworker.channels`` indefinitely (they are only dropped when the
+            # user forgets them), but such a channel holds no liquidity, can never
+            # be reverse-swapped, and must NOT count toward ``max_channels`` --
+            # otherwise, once the user closes their channels, the lingering dead
+            # records permanently occupy the channel budget and the plugin never
+            # opens replacements. Threshold mirrors the one-channel-per-peer guard
+            # (`_current_peer_node_ids`), which already frees a peer at >= CLOSED.
+            try:
+                if chan.get_state() >= ChannelState.CLOSED:
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
             capacity = chan.get_capacity() or 0
             if chan.get_state() in pending_states and not self._open_age_exceeded(
                     chan, stuck_open_sec, now):
@@ -2717,6 +2730,33 @@ class LiquidityPlugin(BasePlugin):
                                  detail=f"{lightning_amount_sat} sat")
                 return
             prepayment_sat = 2 * sm.mining_fee
+            # Pin the reverse swap's Lightning payment to the channel the engine
+            # chose to drain. Without this, lnworker routes the payment over ANY
+            # channel with enough outbound -- so when several channels share a
+            # peer, a swap planned to drain channel X can instead drain channel Y,
+            # leaving X permanently over its trigger while we keep re-issuing (and
+            # mis-attributing) swaps for it. Resolve defensively: if the channel
+            # can't be looked up, fall back to unpinned routing (old behaviour)
+            # rather than abort the swap.
+            target_channels = None
+            try:
+                if action.channel_id:
+                    chan = wallet.lnworker.get_channel_by_id(
+                        bytes.fromhex(action.channel_id))
+                    if chan is not None:
+                        target_channels = [chan]
+            except Exception as e:  # noqa: BLE001
+                self.logger.info(
+                    f"could not resolve channel {action.short_id} to pin the swap "
+                    f"payment ({e!r}); routing unpinned")
+            reverse_swap_kwargs = dict(
+                transport=tr,
+                lightning_amount_sat=lightning_amount_sat,
+                expected_onchain_amount_sat=expected_onchain_sat,
+                prepayment_sat=prepayment_sat,
+            )
+            if target_channels is not None:
+                reverse_swap_kwargs["channels"] = target_channels
             # Snapshot the swap set so we can identify the swap we are about to
             # create and, if it never funds, attribute the stall to this provider.
             swaps_before = set(getattr(sm, "_swaps", {}).keys())
@@ -2729,12 +2769,7 @@ class LiquidityPlugin(BasePlugin):
                 # asyncio.TimeoutError, handled below like any unresponsive
                 # provider.
                 funding_txid = await asyncio.wait_for(
-                    sm.reverse_swap(
-                        transport=tr,
-                        lightning_amount_sat=lightning_amount_sat,
-                        expected_onchain_amount_sat=expected_onchain_sat,
-                        prepayment_sat=prepayment_sat,
-                    ),
+                    sm.reverse_swap(**reverse_swap_kwargs),
                     timeout=self._reverse_swap_timeout_sec,
                 )
             except UserFacingException as e:

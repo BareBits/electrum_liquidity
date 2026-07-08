@@ -226,3 +226,48 @@ def test_accepted_not_funded_is_tracked() -> None:
     assert p.successes == [] and p.dev_fees == []
     assert p.tracked == [(NPUB, 399_500)]    # queued for reconciliation
     assert len(p.logged) == 1
+
+
+# --- payment is pinned to the target channel ------------------------------
+def test_reverse_swap_pins_payment_to_target_channel() -> None:
+    """The engine drains a specific channel; the reverse swap's Lightning
+    payment must be restricted to that channel (channels=[chan]). Otherwise,
+    when several channels share a peer, the payment can drain the wrong one and
+    the target channel never empties (see the multi-channel drain bug)."""
+    captured = {}
+
+    async def _rs(**kw):
+        captured.update(kw)
+        return "funding-txid-abc"
+
+    action = _action(channel_id="cc" * 32)
+    sentinel_chan = SimpleNamespace(node_id=b"\x22" * 33, tag="TARGET")
+    sm = _sm(_rs)
+    wallet = SimpleNamespace(lnworker=SimpleNamespace(
+        swap_manager=sm, channels={},
+        # Only resolves for THIS action's channel id, proving the right one is used.
+        get_channel_by_id=lambda cid: sentinel_chan
+        if cid == bytes.fromhex(action.channel_id) else None))
+    p = _plugin()
+    asyncio.run(p._reverse_swap(wallet, action, state={}, transport=_transport()))
+    assert captured.get("channels") == [sentinel_chan]
+
+
+# --- unresolvable channel falls back to unpinned routing ------------------
+def test_reverse_swap_unresolvable_channel_routes_unpinned() -> None:
+    """If the target channel can't be resolved, the swap still proceeds with no
+    `channels` restriction (graceful degradation, never abort the swap)."""
+    captured = {}
+
+    async def _rs(**kw):
+        captured.update(kw)
+        return "funding-txid-abc"
+
+    sm = _sm(_rs)
+    wallet = SimpleNamespace(lnworker=SimpleNamespace(
+        swap_manager=sm, channels={},
+        get_channel_by_id=lambda cid: None))   # cannot resolve
+    p = _plugin()
+    asyncio.run(p._reverse_swap(wallet, _action(), state={}, transport=_transport()))
+    assert "channels" not in captured           # unpinned
+    assert p.successes == [NPUB]                 # but the swap still completed

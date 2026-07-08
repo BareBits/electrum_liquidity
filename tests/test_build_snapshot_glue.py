@@ -189,3 +189,47 @@ def test_two_channels_one_provider_batches_without_fault() -> None:
     committed = [d for d in result.declines
                  if d.kind == "swap" and "committed to earlier swaps this cycle" in d.reason]
     assert len(committed) == 1                            # the other channel: benign, not a fault
+
+
+# --- dead (CLOSED/REDEEMED) channels must not count ----------------------
+class _StateChan(_FakeChan):
+    """A channel with a configurable on-chain state (the base fake is always
+    OPEN). Used to exercise the closed-channel filter in build_snapshot."""
+    def __init__(self, *, state, **kw) -> None:
+        super().__init__(**kw)
+        self._state = state
+
+    def get_state(self):
+        return self._state
+
+    def is_active(self) -> bool:
+        return self._state == ChannelState.OPEN
+
+
+def test_build_snapshot_excludes_closed_and_redeemed_channels() -> None:
+    live = _FakeChan(cid=b"\x05" * 32, short="200x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000)
+    closed = _StateChan(state=ChannelState.CLOSED, cid=b"\x06" * 32, short="closed",
+                        capacity=2_000_000, local_msat=1_000_000 * 1000, spendable=900_000)
+    redeemed = _StateChan(state=ChannelState.REDEEMED, cid=b"\x07" * 32, short="redeemed",
+                          capacity=2_000_000, local_msat=1_000_000 * 1000, spendable=900_000)
+    p, w = _plugin(), _wallet([live, closed, redeemed], _swap_manager())
+    snap = p.build_snapshot(w, transport=None)
+    # Only the live channel survives; the dead ones are filtered out.
+    assert [c.short_id for c in snap.channels] == ["200x1x0"]
+
+
+def test_reopen_not_blocked_by_dead_channels() -> None:
+    """The multi-channel close -> auto-reopen scenario: two REDEEMED channels
+    linger in lnworker.channels, but with max_channels=2 they must NOT count,
+    so an OpenChannelAction is still decided from the on-chain balance."""
+    from electrum.plugins.inbound_liquidity.liquidity_manager import OpenChannelAction
+    dead = [_StateChan(state=ChannelState.REDEEMED, cid=bytes([i]) * 32,
+                       short=f"dead{i}", capacity=2_000_000, local_msat=0, spendable=0)
+            for i in (8, 9)]
+    p, w = _plugin(), _wallet(dead, _swap_manager())
+    w.get_spendable_balance_sat = lambda: 50_000_000    # plenty to fund an open
+    snap = p.build_snapshot(w, transport=None)
+    assert snap.channels == ()                          # both dead channels filtered
+    result = evaluate(snap, _config(max_channels=2, min_onchain_to_open_sat=1_000_000))
+    assert any(isinstance(a, OpenChannelAction) for a in result.actions)
