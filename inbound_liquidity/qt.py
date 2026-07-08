@@ -301,6 +301,11 @@ class Plugin(LiquidityPlugin):
             toggle.blockSignals(True)
             toggle.setChecked(bool(c.INBOUND_LIQUIDITY_AUTOMATION_ENABLED))
             toggle.blockSignals(False)
+            # blockSignals also muted the toggled signal that slides the knob, so
+            # snap it to the freshly-read state -- otherwise the knob can lag the
+            # label (e.g. a green ENABLED over a knob still parked off on first
+            # show).
+            toggle.sync_knob()
             _sync_toggle_label()
 
         def on_toggle(checked: bool) -> None:

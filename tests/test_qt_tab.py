@@ -315,6 +315,37 @@ def test_slider_disables_immediately_without_eval(qapp):
     assert _has_label(_settings_tab(p, wallet), "DISABLED")
 
 
+def test_slider_knob_matches_enabled_config_on_build(qapp):
+    # Regression: when the tab is built with automation already enabled, the
+    # knob must be parked ON to match the green ENABLED label -- not lag behind
+    # in the off position. The config is read into the switch through a
+    # signal-blocked setChecked() (to avoid re-firing the toggle handler), which
+    # mutes the slide animation; the tab must snap the knob so the two agree on
+    # the very first paint. Asserting on `offset` (the knob position), not just
+    # isChecked(), is what catches the desync.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = True
+    p.request_evaluation = lambda w: None  # type: ignore[assignment]
+    p._add_liquidity_tab(window, wallet)  # refresh() -> _sync_toggle_from_config
+    sw = _slider(p, wallet)
+    assert sw.isChecked() is True
+    assert sw.offset == 1.0   # knob ON, matching the ENABLED label
+    assert _has_label(_settings_tab(p, wallet), "ENABLED")
+
+
+def test_slider_knob_matches_disabled_config_on_build(qapp):
+    # The shipped default: automation off -> knob parked OFF, DISABLED label.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
+    p._add_liquidity_tab(window, wallet)
+    sw = _slider(p, wallet)
+    assert sw.isChecked() is False
+    assert sw.offset == 0.0   # knob OFF, matching the DISABLED label
+    assert _has_label(_settings_tab(p, wallet), "DISABLED")
+
+
 def test_apply_does_not_disturb_slider_state(qapp):
     # The Apply button (other fields) must leave automation on/off untouched.
     from PyQt6.QtWidgets import QLineEdit, QPushButton

@@ -61,6 +61,21 @@ class ToggleSwitch(QAbstractButton):
         self._anim.setEndValue(1.0 if checked else 0.0)
         self._anim.start()
 
+    def sync_knob(self) -> None:
+        """Snap the knob to the current checked state at once, cancelling any
+        in-flight slide.
+
+        The slide is normally driven by the ``toggled`` signal. A caller that
+        pushes a new state in with ``blockSignals(True)`` -- e.g. to re-read the
+        config into the switch WITHOUT re-firing its ``toggled`` handler --
+        suppresses that signal too, so the knob would otherwise stay put and
+        disagree with ``isChecked()`` (green ``ENABLED`` label over a knob still
+        parked in the off position). Call this right after such a change so the
+        knob matches the checked state on the first paint.
+        """
+        self._anim.stop()
+        self._set_offset(1.0 if self.isChecked() else 0.0)
+
     # --- sizing -----------------------------------------------------------
     def sizeHint(self) -> QSize:
         return QSize(self._track_width, self._track_height)
