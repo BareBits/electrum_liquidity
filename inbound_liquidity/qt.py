@@ -329,6 +329,43 @@ class Plugin(LiquidityPlugin):
               "Lightning funds out to on-chain to keep inbound liquidity "
               "available. Disabled by default — review the settings below first.")))
 
+        # --- "Manual run only" mode + the manual trigger ------------------
+        # A middle ground for a cautious user: keep the master switch armed but
+        # let the plugin act ONLY when "Run now" is pressed -- never on a wallet
+        # event, the heartbeat, or the post-load timer. Applied immediately (like
+        # the master switch), since it changes runtime behaviour rather than a
+        # tunable that waits for Apply.
+        manual_only_cb = QCheckBox(_("Manual run only (never act on its own)"))
+        manual_only_cb.setToolTip(_(
+            "Let the plugin evaluate and act only when you press \"Run now\" — "
+            "never on its own, not on a timer and not in response to incoming "
+            "payments or channel updates. Use this to try the plugin without "
+            "trusting full automation. The Automation switch above must still be "
+            "enabled for a manual run to move any funds."))
+        manual_only_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', False)))
+
+        def on_manual_only(checked: bool) -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', bool(checked))
+
+        manual_only_cb.toggled.connect(on_manual_only)
+        vbox.addWidget(manual_only_cb)
+
+        run_now_btn = QPushButton(_("Run now"))
+        run_now_btn.setToolTip(_(
+            "Evaluate once right now and take any warranted action, regardless of "
+            "the \"Manual run only\" setting. Requires the Automation switch to be "
+            "enabled."))
+
+        def on_run_now() -> None:
+            self.request_evaluation(wallet, manual=True)
+            self.on_action_done(wallet, _("Manual evaluation triggered."))
+
+        run_now_btn.clicked.connect(on_run_now)
+        run_now_row = QHBoxLayout()
+        run_now_row.addWidget(run_now_btn)
+        run_now_row.addStretch(1)
+        vbox.addLayout(run_now_row)
+
         grid = QGridLayout()
         # (label, current value as text, parser, setter) for each tunable kept on
         # the main Settings tab. Power-user knobs (on-chain reserve, reliability
@@ -449,6 +486,10 @@ class Plugin(LiquidityPlugin):
 
         def refresh() -> None:
             _sync_toggle_from_config()
+            # Re-read the manual-run-only checkbox without re-firing its handler.
+            manual_only_cb.blockSignals(True)
+            manual_only_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', False)))
+            manual_only_cb.blockSignals(False)
             self._populate_log_tree(actions_tree, self.get_decision_log(wallet, "action"))
             self._populate_log_tree(declines_tree, self.get_decision_log(wallet, "decline"))
             self._populate_log_tree(faults_tree, self.get_decision_log(wallet, "fault"))
