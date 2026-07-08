@@ -66,6 +66,12 @@ WEDGE_AGE_WAIT = 75.0
 # Closing/closed channel states as reported by `list_channels`.
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
+# The plugin defers ALL automation for STARTUP_GRACE_SEC (120s) after wallet
+# load -- the startup settle window in which a not-yet-connected peer would look
+# offline (see inbound_liquidity/__init__.py STARTUP_GRACE_SEC). Its first
+# evaluation therefore lands ~120s after load, so a first-open wait must
+# comfortably exceed that grace or it races the plugin's very first tick.
+FIRST_OPEN_TIMEOUT = 200.0
 
 
 # --- helpers driving the live client daemon over the CLI -----------------
@@ -149,8 +155,13 @@ def test_open_ceiling_enforced_end_to_end(rig):
     # Configure the client so the ONLY thing that can stop a further open is the
     # daily ceiling: give channel headroom, cap each open small (funds remain),
     # and disable reverse swaps (the rig channels sit far over the swap triggers,
-    # which would otherwise have the plugin busy swapping during the test).
+    # which would otherwise have the plugin busy swapping during the test). The
+    # rig's only reachable peer is the partner -- which already holds the two
+    # baseline channels -- so the one-channel-per-peer guard (ON by default) must
+    # be turned off, or the plugin would refuse every open regardless of the
+    # ceiling and this test could never observe an open.
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
+    _setcfg("plugins.inbound_liquidity.one_channel_per_peer", "false")
     _setcfg("plugins.inbound_liquidity.max_channels", "6")
     _setcfg("lightning_max_funding_sat", str(FUND_CAP_SAT))
     _setcfg("plugins.inbound_liquidity.max_opens_per_day", "1")
@@ -158,7 +169,8 @@ def test_open_ceiling_enforced_end_to_end(rig):
     _setcfg("plugins.inbound_liquidity.swap_trigger_pct", "100")
 
     # The plugin should open exactly ONE channel (opens_last_24h 0 -> 1)...
-    assert _wait_until(lambda: _live_channels() >= base + 1, rig=rig, timeout=120), \
+    assert _wait_until(lambda: _live_channels() >= base + 1, rig=rig,
+                       timeout=FIRST_OPEN_TIMEOUT), \
         "plugin never opened its first channel"
     # ...and let it reach OPEN so the next evaluation is not frozen on a pending
     # open but actually reaches the open decision (and hits the ceiling).

@@ -65,6 +65,23 @@ def _setcfg(key: str, value: str) -> None:
     electrum_cli("setconfig", key, value, inst=CLIENT)
 
 
+def _setcfg_float(key: str, value: float) -> None:
+    """Set a *float* plugin config value over the CLI so it actually persists.
+
+    ``setconfig`` runs the value through ``json_decode``, which parses floats as
+    ``Decimal``; and for any ``plugins.*`` key it stores the result via raw
+    ``SimpleConfig.set_key`` -- bypassing the ConfigVar's float coercion (see
+    commands._setconfig / plugin.is_plugin_enabler_config_key). ``set_key`` then
+    cannot ``json.dumps`` a ``Decimal``, so it logs "json error: cannot save" and
+    SILENTLY DROPS the value, leaving the plugin on its multi-day default -- which
+    made this test's tiny timers never take effect. A leading ``+`` makes the
+    token invalid JSON (so json_decode leaves it a string) yet a valid Python
+    float literal, so the CLI's ``ast.literal_eval`` fallback yields a real,
+    JSON-serializable ``float`` that persists correctly.
+    """
+    _setcfg(key, f"+{value:.8f}")
+
+
 def _channels() -> List[Dict]:
     return json.loads(electrum_cli("list_channels", inst=CLIENT))
 
@@ -157,9 +174,9 @@ def test_offline_plugin_channel_is_force_closed(rig):
     _setcfg("plugins.inbound_liquidity.swap_trigger_sat", "9999999999")
     _setcfg("plugins.inbound_liquidity.swap_trigger_pct", "100")
     _setcfg("plugins.inbound_liquidity.offline_autoclose_enabled", "true")
-    _setcfg("plugins.inbound_liquidity.offline_uptime_window_days", f"{UPTIME_WINDOW_DAYS:.8f}")
+    _setcfg_float("plugins.inbound_liquidity.offline_uptime_window_days", UPTIME_WINDOW_DAYS)
     _setcfg("plugins.inbound_liquidity.offline_min_uptime_pct", "10")
-    _setcfg("plugins.inbound_liquidity.offline_force_close_days", f"{FORCE_CLOSE_DAYS:.8f}")
+    _setcfg_float("plugins.inbound_liquidity.offline_force_close_days", FORCE_CLOSE_DAYS)
 
     # The plugin opens its own channel...
     assert _wait_until(lambda: _live_channels() >= 3, rig=rig, timeout=150), \
