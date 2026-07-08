@@ -328,6 +328,16 @@ SimpleConfig.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = ConfigVar(
     long_desc=lambda: _("Master switch (the ENABLED/DISABLED slider on the Settings tab). "
                         "Off by default: the plugin loads and can be configured, but takes no "
                         "action — it moves no funds and alters no channels — until enabled."))
+SimpleConfig.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = ConfigVar(
+    'plugins.inbound_liquidity.manual_run_only', default=False, type_=bool, plugin=__name__,
+    short_desc=lambda: _("Manual run only"),
+    long_desc=lambda: _("When on, the plugin never evaluates on its own — neither on the "
+                        "post-load/heartbeat schedule nor in response to wallet activity "
+                        "(incoming payments, channel updates, swap events). It acts only when "
+                        "you press \"Run now\" on the Settings tab. Lets a cautious user keep the "
+                        "master Automation switch armed while withholding all unattended action — "
+                        "a way to use the plugin without trusting full automation. The master "
+                        "Automation switch must still be enabled for a manual run to move funds."))
 SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
     'plugins.inbound_liquidity.min_onchain_to_open_sat', default=50_000, type_=int, plugin=__name__,
     short_desc=lambda: _("Min on-chain to open a channel (sat)"),
@@ -866,7 +876,7 @@ class LiquidityPlugin(BasePlugin):
         return is_wallet_ready(connected, time.time() - started,
                                self._startup_grace_sec)
 
-    def request_evaluation(self, wallet: 'Abstract_Wallet') -> None:
+    def request_evaluation(self, wallet: 'Abstract_Wallet', *, manual: bool = False) -> None:
         """Schedule one evaluation of `wallet` on the network's asyncio loop.
 
         Used both on wallet load and when the user arms the plugin from the UI
@@ -874,10 +884,15 @@ class LiquidityPlugin(BasePlugin):
         rather than waiting for the next wallet event. A no-op when the wallet is
         offline (no loop) or not managed; `_evaluate` re-reads config and returns
         early when automation is disabled, so a stray call is harmless.
+
+        `manual=True` marks this as a user-initiated "Run now": it bypasses the
+        "manual run only" gate (see `_evaluate`) so the plugin acts even when
+        automatic evaluation is switched off. Callers on the automatic paths
+        (wallet load, the arm-switch kick) leave it False.
         """
         loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
         if loop is not None:
-            asyncio.run_coroutine_threadsafe(self._evaluate(wallet), loop)
+            asyncio.run_coroutine_threadsafe(self._evaluate(wallet, manual=manual), loop)
 
     # --- config -> engine -------------------------------------------------
     def read_config(self) -> LiquidityConfig:
@@ -894,6 +909,15 @@ class LiquidityPlugin(BasePlugin):
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
         )
+
+    def _manual_run_only(self) -> bool:
+        """Whether the user has put the plugin in "manual run only" mode: no
+        automatic evaluation fires (wallet events, the heartbeat, the post-grace
+        one-shot, and the arm-switch kick are all no-ops); the plugin acts only on
+        an explicit "Run now". A pure glue concern -- the rules engine never sees
+        this flag, so a manual run still flows through the engine and acts
+        normally."""
+        return bool(getattr(self.config, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", False))
 
     # --- daily action ceilings (rolling 24h) ------------------------------
     # A runaway guard: at most N opens / N closes in any trailing 24h window.
@@ -2319,7 +2343,15 @@ class LiquidityPlugin(BasePlugin):
         self._eval_pending[wallet] = False
         await self._evaluate(wallet)
 
-    async def _evaluate(self, wallet: 'Abstract_Wallet') -> None:
+    async def _evaluate(self, wallet: 'Abstract_Wallet', *, manual: bool = False) -> None:
+        """Evaluate `wallet` and take any warranted action.
+
+        Every automatic trigger (wallet events via `_debounced_evaluate`, the
+        heartbeat, the post-grace one-shot, the arm-switch kick via
+        `request_evaluation`) routes here with `manual=False`, so a single "manual
+        run only" guard below gates them all. A user-initiated "Run now" passes
+        `manual=True` to bypass that guard (but still respects the master switch
+        and the startup grace)."""
         lock = self.wallets.get(wallet)
         if lock is None:
             return
@@ -2334,6 +2366,15 @@ class LiquidityPlugin(BasePlugin):
                 self._enforce_min_funding_floor()
                 config = self.read_config()
                 if not config.automation_enabled:
+                    return
+                # "Manual run only": the user keeps the plugin armed but wants no
+                # unattended action. Every automatic trigger is a no-op; only an
+                # explicit "Run now" (manual=True) gets past here. Placed after the
+                # master-switch gate so a manual run still needs automation enabled
+                # to move funds (the rules engine also gates on that).
+                if not manual and self._manual_run_only():
+                    self.logger.debug(
+                        f"{wallet.basename()} manual-run-only: skipping automatic evaluation")
                     return
                 # Startup/shutdown race guard: until the wallet has settled (a
                 # live server connection AND the startup grace elapsed), defer ALL

@@ -55,6 +55,7 @@ class _FakeConfig:
     """Plain attribute bag mirroring the INBOUND_LIQUIDITY_* ConfigVars."""
     def __init__(self) -> None:
         self.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = False
+        self.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = False
         self.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = 1_000_000
         self.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = 10_000
         self.INBOUND_LIQUIDITY_MAX_CHANNELS = 2
@@ -334,6 +335,69 @@ def test_apply_does_not_disturb_slider_state(qapp):
     # Slider (and its config) unchanged by Apply.
     assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
     assert sw.isChecked() is True
+
+
+# --- "Manual run only" checkbox + "Run now" button -----------------------
+def _manual_only_cb(p, wallet):
+    from PyQt6.QtWidgets import QCheckBox
+    return next(
+        cb for cb in _settings_tab(p, wallet).findChildren(QCheckBox)
+        if "Manual run only" in cb.text())
+
+
+def _run_now_btn(p, wallet):
+    from PyQt6.QtWidgets import QPushButton
+    return next(
+        b for b in _settings_tab(p, wallet).findChildren(QPushButton)
+        if b.text() == "Run now")
+
+
+def test_manual_run_only_checkbox_present_and_reflects_default(qapp):
+    # The Settings tab (next to the master switch) carries the "Manual run only"
+    # checkbox and a "Run now" button; the checkbox mirrors the shipped default.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
+    p._add_liquidity_tab(window, wallet)
+    cb = _manual_only_cb(p, wallet)
+    assert cb.isChecked() is False
+    assert _run_now_btn(p, wallet) is not None
+
+
+def test_manual_run_only_checkbox_persists_immediately(qapp):
+    # Like the master switch, flipping the checkbox persists at once (no Apply).
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    cb = _manual_only_cb(p, wallet)
+
+    cb.setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is True
+    cb.setChecked(False)
+    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
+
+
+def test_manual_run_only_checkbox_reflects_config_on_build(qapp):
+    # Built against an already-on config, the checkbox shows checked.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    p._add_liquidity_tab(window, wallet)
+    assert _manual_only_cb(p, wallet).isChecked() is True
+
+
+def test_run_now_button_triggers_manual_evaluation(qapp):
+    # "Run now" calls request_evaluation with manual=True (bypassing the guard),
+    # even while manual-run-only is on.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    seen: List = []
+    p.request_evaluation = lambda w, *, manual=False: seen.append((w, manual))  # type: ignore[assignment]
+    p._add_liquidity_tab(window, wallet)
+
+    _run_now_btn(p, wallet).click()
+    assert seen == [(wallet, True)]
 
 
 # --- Providers sub-tab ---------------------------------------------------
