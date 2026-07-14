@@ -106,6 +106,15 @@ def _parse_banned_partners(raw: Optional[str]) -> frozenset:
 
 _logger = get_logger(__name__)
 
+# The bare plugin name ("inbound_liquidity"), independent of how this package was
+# imported. Electrum's ConfigVar(plugin=...) enforces that the value has no dots:
+# it strips the "electrum.plugins." prefix for INTERNAL plugins, but NOT the
+# "electrum_external_plugins." prefix used when the plugin is installed as a zip.
+# Passing the raw ``__name__`` therefore blows up with an AssertionError at import
+# time under a zip install (``__name__`` = "electrum_external_plugins.<name>").
+# Deriving the last path component works for both load paths.
+_PLUGIN_NAME = __name__.rsplit(".", 1)[-1]
+
 # Events that mean "wallet funds may have changed" -- an inbound payment
 # (on-chain or Lightning) arrived, a channel balance shifted, or the swap
 # provider became known. These carry different argument shapes (some pass the
@@ -323,13 +332,13 @@ COOP_CLOSE_COOLDOWN_SEC = 300.0
 # All keys live under `plugins.inbound_liquidity.*` and are editable from the
 # plugin's settings dialog (the "status menu").
 SimpleConfig.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = ConfigVar(
-    'plugins.inbound_liquidity.automation_enabled', default=False, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.automation_enabled', default=False, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Automation enabled"),
     long_desc=lambda: _("Master switch (the ENABLED/DISABLED slider on the Settings tab). "
                         "Off by default: the plugin loads and can be configured, but takes no "
                         "action — it moves no funds and alters no channels — until enabled."))
 SimpleConfig.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = ConfigVar(
-    'plugins.inbound_liquidity.manual_run_only', default=False, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.manual_run_only', default=False, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Manual run only"),
     long_desc=lambda: _("When on, the plugin never evaluates on its own — neither on the "
                         "post-load/heartbeat schedule nor in response to wallet activity "
@@ -339,18 +348,18 @@ SimpleConfig.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = ConfigVar(
                         "a way to use the plugin without trusting full automation. The master "
                         "Automation switch must still be enabled for a manual run to move funds."))
 SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
-    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=50_000, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=50_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Min on-chain to open a channel (sat)"),
     long_desc=lambda: _("Never open a Lightning channel while on-chain spendable funds are below this. "
                         "When this is below Electrum's stock channel-funding floor (MIN_FUNDING_SAT), "
                         "the plugin lowers that floor to this value at startup so smaller channels can "
                         "be opened."))
 SimpleConfig.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = ConfigVar(
-    'plugins.inbound_liquidity.onchain_reserve_sat', default=10_000, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.onchain_reserve_sat', default=10_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("On-chain reserve when opening (sat)"),
     long_desc=lambda: _("When opening a channel, fund with the maximum available, leaving this much on-chain."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNELS = ConfigVar(
-    'plugins.inbound_liquidity.max_channels', default=2, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.max_channels', default=2, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Maximum number of channels"),
     long_desc=lambda: _("Never hold more than this many channels."))
 # Daily action ceilings (rolling 24h) -- a runaway guard that bounds how many
@@ -358,26 +367,26 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNELS = ConfigVar(
 # sub-tab. 0 disables a ceiling (unlimited). See DAILY_WINDOW_SEC.
 SimpleConfig.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY = ConfigVar(
     'plugins.inbound_liquidity.max_opens_per_day', default=DEFAULT_MAX_OPENS_PER_DAY,
-    type_=int, plugin=__name__,
+    type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max channel opens per day"),
     long_desc=lambda: _("Never open more than this many Lightning channels in any rolling "
                         "24-hour window, to bound a runaway automation loop. 0 = unlimited."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = ConfigVar(
     'plugins.inbound_liquidity.max_closes_per_day', default=DEFAULT_MAX_CLOSES_PER_DAY,
-    type_=int, plugin=__name__,
+    type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max channel closes per day"),
     long_desc=lambda: _("Never close more than this many channels in any rolling 24-hour "
                         "window. This includes the emergency force-close of a channel whose "
                         "open got wedged; once the ceiling is reached, a wedged open is not "
                         "auto-freed until the window rolls over. 0 = unlimited."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
-    'plugins.inbound_liquidity.max_swap_fee_pct', default=0.6, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.max_swap_fee_pct', default=0.6, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
     long_desc=lambda: _("Do not swap Lightning -> on-chain if the effective all-in cost "
                         "(percentage fee + provider mining fee + on-chain claim fee, as a "
                         "share of the amount) exceeds this."))
 SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_PCT = ConfigVar(
-    'plugins.inbound_liquidity.dev_fee_pct', default=0.1, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.dev_fee_pct', default=0.1, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Dev fee (% of amount swapped)"),
     long_desc=lambda: _("Optional fee to support plugin development, charged on the on-chain "
                         "amount received from reverse swaps the plugin initiates. Accrues until "
@@ -387,36 +396,36 @@ SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_PCT = ConfigVar(
                                       cap=DEV_FEE_DAILY_CAP_SAT, max=int(DEV_FEE_MAX_PCT)))
 SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = ConfigVar(
     'plugins.inbound_liquidity.dev_fee_address', default='electrum_liqhelper@getbarebits.com',
-    type_=str, plugin=__name__,
+    type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Dev fee payout address"),
     long_desc=lambda: _("Lightning address (user@domain) or LNURL-pay the accrued dev fee is "
                         "paid to. Leave at the default to support development of this plugin."))
 SimpleConfig.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = ConfigVar(
-    'plugins.inbound_liquidity.swap_trigger_pct', default=25.0, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.swap_trigger_pct', default=25.0, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Swap-out trigger (% of capacity)"),
     long_desc=lambda: _("Reverse-swap a channel once its local balance reaches this share of its capacity."))
 SimpleConfig.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = ConfigVar(
-    'plugins.inbound_liquidity.swap_trigger_sat', default=25_000, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.swap_trigger_sat', default=25_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Swap-out trigger (sat)"),
     long_desc=lambda: _("...or once a channel's local balance exceeds this many sats (whichever comes first)."))
 # Outbound-liquidity preservation. By default the plugin drains all outbound to
 # manufacture maximum inbound; these two knobs let a user hold some back.
 SimpleConfig.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = ConfigVar(
-    'plugins.inbound_liquidity.min_outbound_sat', default=0, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.min_outbound_sat', default=0, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Keep outbound per channel (sat)"),
     long_desc=lambda: _("Never let a reverse swap drain a channel's outbound (local) "
                         "balance below this, so the wallet keeps some ability to send. "
                         "Applied per channel to the swappable amount; 0 (the default) "
                         "drains everything for maximum inbound liquidity."))
 SimpleConfig.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = ConfigVar(
-    'plugins.inbound_liquidity.manage_plugin_opened_only', default=False, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.manage_plugin_opened_only', default=False, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Only drain channels the plugin opened"),
     long_desc=lambda: _("When on, the plugin only reverse-swaps channels it opened "
                         "itself; channels you opened by hand are left entirely alone "
                         "(their outbound is never drained). When off (the default), "
                         "every channel is managed."))
 SimpleConfig.INBOUND_LIQUIDITY_CHANNEL_PEER = ConfigVar(
-    'plugins.inbound_liquidity.channel_peer', default='', type_=str, plugin=__name__,
+    'plugins.inbound_liquidity.channel_peer', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Channel peer (node_id@host:port)"),
     long_desc=lambda: _("Node to open channels to. If empty, Electrum's suggested peer is used."))
 # Channel-partner selection. Channels are opened to Electrum's suggested peer by
@@ -427,16 +436,16 @@ SimpleConfig.INBOUND_LIQUIDITY_CHANNEL_PEER = ConfigVar(
 # its front on load. ``partners_strict`` turns it into a whitelist (never fall
 # back to suggestions). ``banned_partners`` are never opened to, matched by pubkey.
 SimpleConfig.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ConfigVar(
-    'plugins.inbound_liquidity.preferred_partners', default='', type_=str, plugin=__name__,
+    'plugins.inbound_liquidity.preferred_partners', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Preferred channel partners"),
     long_desc=lambda: _("Lightning nodes (node_id@host:port) to try opening channels to first, "
                         "in order, before falling back to Electrum's suggested peer."))
 SimpleConfig.INBOUND_LIQUIDITY_BANNED_PARTNERS = ConfigVar(
-    'plugins.inbound_liquidity.banned_partners', default='', type_=str, plugin=__name__,
+    'plugins.inbound_liquidity.banned_partners', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Banned channel partners"),
     long_desc=lambda: _("Lightning nodes (by node id) never opened to, even if Electrum suggests them."))
 SimpleConfig.INBOUND_LIQUIDITY_PARTNERS_STRICT = ConfigVar(
-    'plugins.inbound_liquidity.partners_strict', default=False, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.partners_strict', default=False, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Only open channels to preferred partners"),
     long_desc=lambda: _("When set, channels are ONLY opened to preferred partners; if none can be "
                         "reached, no channel is opened (Electrum's suggestion is not used)."))
@@ -447,13 +456,13 @@ SimpleConfig.INBOUND_LIQUIDITY_PARTNERS_STRICT = ConfigVar(
 # only once its existing channel is fully closed/redeemed. Governs the plugin's
 # OWN automated opens only -- manual opens through Electrum's UI are untouched.
 SimpleConfig.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = ConfigVar(
-    'plugins.inbound_liquidity.one_channel_per_peer', default=True, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.one_channel_per_peer', default=True, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Only one channel per peer"),
     long_desc=lambda: _("When set, the plugin will not open a second channel to a node it already "
                         "has a channel with (its automated opens go to new peers instead)."))
 SimpleConfig.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS = ConfigVar(
     'plugins.inbound_liquidity.log_retention_days', default=DEFAULT_LOG_RETENTION_DAYS,
-    type_=int, plugin=__name__,
+    type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Keep decision log for (days)"),
     long_desc=lambda: _("Decision-log entries older than this are pruned. "
                         "Default 30 days; up to 999."))
@@ -463,7 +472,7 @@ SimpleConfig.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS = ConfigVar(
 # (rotated daily, kept DIAG_LOG_RETENTION_DAYS). It carries no more than the GUI
 # log: ids are abbreviated and no key material is ever written. See diag_log.py.
 SimpleConfig.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED = ConfigVar(
-    'plugins.inbound_liquidity.diag_log_enabled', default=False, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.diag_log_enabled', default=False, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Write diagnostic log files"),
     long_desc=lambda: _("When set, the plugin writes a diagnostic log of its decisions and "
                         "errors to daily text files (one per wallet, kept 30 days) under the "
@@ -472,12 +481,12 @@ SimpleConfig.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED = ConfigVar(
 # cheapest one per swap; these two lists (comma-separated npubs) constrain that
 # choice. They are edited from the Providers sub-tab, not free-form normally.
 SimpleConfig.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ConfigVar(
-    'plugins.inbound_liquidity.preferred_npubs', default='', type_=str, plugin=__name__,
+    'plugins.inbound_liquidity.preferred_npubs', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Preferred swap providers (npubs)"),
     long_desc=lambda: _("If non-empty, ONLY these providers are ever used (the cheapest "
                         "among them). If none of them are currently available, no swap is made."))
 SimpleConfig.INBOUND_LIQUIDITY_BANNED_NPUBS = ConfigVar(
-    'plugins.inbound_liquidity.banned_npubs', default='', type_=str, plugin=__name__,
+    'plugins.inbound_liquidity.banned_npubs', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Banned swap providers (npubs)"),
     long_desc=lambda: _("Providers that are never used, even if they are the cheapest."))
 # Reliability tracking. The plugin remembers each provider's recent faults
@@ -485,27 +494,27 @@ SimpleConfig.INBOUND_LIQUIDITY_BANNED_NPUBS = ConfigVar(
 # provider's cost *for ranking only* -- a flaky provider sinks behind reliable
 # ones (soft de-prioritisation) but is still used when it is the only option.
 SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_ENABLED = ConfigVar(
-    'plugins.inbound_liquidity.reliability_enabled', default=True, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.reliability_enabled', default=True, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Track provider reliability"),
     long_desc=lambda: _("Remember providers that time out, return errors, or leave swaps stuck, "
                         "and prefer more reliable providers over them."))
 SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT = ConfigVar(
-    'plugins.inbound_liquidity.reliability_base_penalty_pct', default=0.5, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.reliability_base_penalty_pct', default=0.5, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Reliability penalty per fault (%)"),
     long_desc=lambda: _("Cost penalty (percentage points) added to a provider's ranking after one "
                         "fault; it doubles for each consecutive fault and decays over time."))
 SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_PENALTY_CAP_PCT = ConfigVar(
-    'plugins.inbound_liquidity.reliability_penalty_cap_pct', default=5.0, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.reliability_penalty_cap_pct', default=5.0, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max reliability penalty (%)"),
     long_desc=lambda: _("Upper bound on the ranking penalty, so even a chronically failing "
                         "provider is only de-prioritised, never excluded outright."))
 SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS = ConfigVar(
-    'plugins.inbound_liquidity.reliability_halflife_hours', default=6.0, type_=float, plugin=__name__,
+    'plugins.inbound_liquidity.reliability_halflife_hours', default=6.0, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Reliability recovery half-life (hours)"),
     long_desc=lambda: _("How fast a provider's penalty fades after its last fault: it halves every "
                         "this many hours, so a provider that stops failing recovers automatically."))
 SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN = ConfigVar(
-    'plugins.inbound_liquidity.reliability_stuck_timeout_min', default=60, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.reliability_stuck_timeout_min', default=60, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Stuck-swap timeout (minutes)"),
     long_desc=lambda: _("If a reverse swap is accepted but no on-chain funding appears within this "
                         "long, count it as a fault against the provider that accepted it."))
@@ -515,24 +524,24 @@ SimpleConfig.INBOUND_LIQUIDITY_RELIABILITY_STUCK_TIMEOUT_MIN = ConfigVar(
 # and adds an auto-ban after enough *hard* faults (force-close / repeated open
 # failure) plus a watchdog that force-closes a channel wedged opening too long.
 SimpleConfig.INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED = ConfigVar(
-    'plugins.inbound_liquidity.peer_reliability_enabled', default=True, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.peer_reliability_enabled', default=True, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Track channel-peer reliability"),
     long_desc=lambda: _("Remember channel peers that fail to open, go offline, or force-close, and "
                         "prefer more reliable peers when opening new channels."))
 SimpleConfig.INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS = ConfigVar(
-    'plugins.inbound_liquidity.peer_autoban_faults', default=3, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.peer_autoban_faults', default=3, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Auto-ban a peer after N hard faults"),
     long_desc=lambda: _("After this many hard faults (a force-close, or repeated channel-open "
                         "failures), a peer is added to the banned list automatically. 0 disables "
                         "auto-banning (peers are only de-prioritised, never banned)."))
 SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN = ConfigVar(
-    'plugins.inbound_liquidity.stuck_open_timeout_min', default=60, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.stuck_open_timeout_min', default=60, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Stuck channel-open timeout (minutes)"),
     long_desc=lambda: _("A channel that has been opening (not yet usable) for longer than this is "
                         "treated as wedged by an unresponsive peer: it stops freezing automation and "
                         "is counted as a hard fault against the peer."))
 SimpleConfig.INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN = ConfigVar(
-    'plugins.inbound_liquidity.stuck_swap_timeout_min', default=180, type_=int, plugin=__name__,
+    'plugins.inbound_liquidity.stuck_swap_timeout_min', default=180, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Stuck reverse-swap timeout (minutes)"),
     long_desc=lambda: _("A reverse swap whose funding has been broadcast but not swept for longer "
                         "than this is treated as wedged: it stops freezing automation so channel "
@@ -540,7 +549,7 @@ SimpleConfig.INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN = ConfigVar(
                         "provider still faulted separately. Give on-chain funding ample time to "
                         "confirm before escaping (default 3 hours)."))
 SimpleConfig.INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN = ConfigVar(
-    'plugins.inbound_liquidity.auto_remediate_stuck_open', default=True, type_=bool, plugin=__name__,
+    'plugins.inbound_liquidity.auto_remediate_stuck_open', default=True, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Force-close wedged channel opens"),
     long_desc=lambda: _("When a channel open is wedged past the timeout, force-close it to free the "
                         "funds and resume automation. This broadcasts an on-chain transaction and "
@@ -552,28 +561,28 @@ SimpleConfig.INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN = ConfigVar(
 # horizon it is force-closed. Enabled by default (like the wedged-open remedy).
 SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED = ConfigVar(
     'plugins.inbound_liquidity.offline_autoclose_enabled',
-    default=DEFAULT_OFFLINE_AUTOCLOSE_ENABLED, type_=bool, plugin=__name__,
+    default=DEFAULT_OFFLINE_AUTOCLOSE_ENABLED, type_=bool, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Auto-close channels whose peer stays offline"),
     long_desc=lambda: _("For channels this plugin opened, when the peer has been effectively offline "
                         "for a sustained period, try to close the channel cooperatively, and "
                         "force-close it if it still hasn't closed after the force-close deadline."))
 SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS = ConfigVar(
     'plugins.inbound_liquidity.offline_uptime_window_days',
-    default=DEFAULT_OFFLINE_UPTIME_WINDOW_DAYS, type_=float, plugin=__name__,
+    default=DEFAULT_OFFLINE_UPTIME_WINDOW_DAYS, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Peer-uptime window (days)"),
     long_desc=lambda: _("How far back the peer's uptime is measured when deciding whether it is gone. "
                         "A peer whose uptime over this window falls below the minimum is treated as "
                         "offline and the channel is closed."))
 SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT = ConfigVar(
     'plugins.inbound_liquidity.offline_min_uptime_pct',
-    default=DEFAULT_OFFLINE_MIN_UPTIME_PCT, type_=float, plugin=__name__,
+    default=DEFAULT_OFFLINE_MIN_UPTIME_PCT, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Minimum peer uptime (%)"),
     long_desc=lambda: _("If a channel peer is reachable less than this percent of the uptime window, "
                         "the peer is considered gone and the channel is closed. Lower = more tolerant "
                         "of a flaky peer before closing."))
 SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS = ConfigVar(
     'plugins.inbound_liquidity.offline_force_close_days',
-    default=DEFAULT_OFFLINE_FORCE_CLOSE_DAYS, type_=float, plugin=__name__,
+    default=DEFAULT_OFFLINE_FORCE_CLOSE_DAYS, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Force-close after trying to close for (days)"),
     long_desc=lambda: _("Once the plugin has been trying to close an offline channel for this many "
                         "days without success (the peer never agreed / stayed offline), it force-closes "
