@@ -181,12 +181,16 @@ def test_read_config_parses_provider_lists() -> None:
         INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT=0.6,
         INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT=25.0,
         INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT=25_000,
+        INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT=0,
+        INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY=False,
         INBOUND_LIQUIDITY_PREFERRED_NPUBS="npubA, npubB",
         INBOUND_LIQUIDITY_BANNED_NPUBS="npubC",
     )
     cfg = p.read_config()
     assert cfg.preferred_npubs == frozenset({"npubA", "npubB"})
     assert cfg.banned_npubs == frozenset({"npubC"})
+    assert cfg.min_outbound_sat == 0
+    assert cfg.manage_plugin_opened_only is False
 
 
 # --- _reverse_swap points at the chosen provider --------------------------

@@ -3,6 +3,6 @@
   "fullname": "Inbound Liquidity Manager",
   "description": "Automatically manages inbound Lightning liquidity by opening channels and doing submarine (reverse) swaps according to simple, configurable rules. Builds on Electrum's Nostr submarine-swap extension.",
   "author": "electrum_liquidity",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "available_for": ["qt", "cmdline"]
 }

@@ -25,7 +25,10 @@ pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 from electrum.lnutil import LOCAL, REMOTE  # type: ignore  # noqa: E402
 from electrum.lnchannel import ChannelState  # type: ignore  # noqa: E402
 
-from electrum.plugins.inbound_liquidity import LiquidityPlugin  # type: ignore  # noqa: E402
+from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
+    LiquidityPlugin,
+    PLUGIN_OPENED_CHANNELS_DB_KEY,
+)
 from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore  # noqa: E402
     LiquidityConfig,
     ReverseSwapAction,
@@ -233,3 +236,58 @@ def test_reopen_not_blocked_by_dead_channels() -> None:
     assert snap.channels == ()                          # both dead channels filtered
     result = evaluate(snap, _config(max_channels=2, min_onchain_to_open_sat=1_000_000))
     assert any(isinstance(a, OpenChannelAction) for a in result.actions)
+
+
+# --- outbound preservation: the snapshot carries the plugin-opened flag ----
+def test_build_snapshot_marks_plugin_opened_from_persisted_tag() -> None:
+    plugin_chan = _FakeChan(cid=b"\x07" * 32, short="107x1x0", capacity=2_000_000,
+                            local_msat=1_000_000 * 1000, spendable=900_000)
+    manual_chan = _FakeChan(cid=b"\x08" * 32, short="108x1x0", capacity=2_000_000,
+                            local_msat=1_000_000 * 1000, spendable=900_000)
+    sm = _swap_manager()
+    p, w = _plugin(), _wallet([plugin_chan, manual_chan], sm)
+    # Only the first channel is tagged as plugin-opened in the wallet db.
+    w.db.put(PLUGIN_OPENED_CHANNELS_DB_KEY, [plugin_chan.channel_id.hex()])
+
+    snap = p.build_snapshot(w, transport=None)
+    by_short = {c.short_id: c for c in snap.channels}
+    assert by_short["107x1x0"].is_plugin_opened is True
+    assert by_short["108x1x0"].is_plugin_opened is False
+
+
+def test_scope_switch_spares_manual_channel_end_to_end() -> None:
+    """With the scope switch on, the real snapshot+engine drain only the
+    plugin-opened channel and spare the user-opened one."""
+    plugin_chan = _FakeChan(cid=b"\x09" * 32, short="109x1x0", capacity=2_000_000,
+                            local_msat=1_000_000 * 1000, spendable=900_000)
+    manual_chan = _FakeChan(cid=b"\x0a" * 32, short="110x1x0", capacity=2_000_000,
+                            local_msat=1_000_000 * 1000, spendable=900_000)
+    sm = _swap_manager(max_forward=2_000_000, min_amount=200_000)
+    p, w = _plugin(), _wallet([plugin_chan, manual_chan], sm)
+    w.db.put(PLUGIN_OPENED_CHANNELS_DB_KEY, [plugin_chan.channel_id.hex()])
+
+    npub = "npub1" + "a" * 58
+    snap = p.build_snapshot(w, transport=_transport_with_offer(npub, max_forward=2_000_000))
+    result = evaluate(snap, _config(manage_plugin_opened_only=True))
+
+    swaps = [act for act in result.actions if isinstance(act, ReverseSwapAction)]
+    assert len(swaps) == 1
+    assert swaps[0].short_id == "109x1x0"                 # only the plugin-opened one
+    spared = [d for d in result.declines if "not opened by the plugin" in d.reason]
+    assert spared and spared[0].short_id == "110x1x0"
+
+
+def test_outbound_floor_end_to_end() -> None:
+    """With a floor set, the real snapshot+engine swap only spendable-minus-floor."""
+    chan = _FakeChan(cid=b"\x0b" * 32, short="111x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000)
+    sm = _swap_manager(max_forward=2_000_000, min_amount=200_000)
+    p, w = _plugin(), _wallet([chan], sm)
+
+    npub = "npub1" + "a" * 58
+    snap = p.build_snapshot(w, transport=_transport_with_offer(npub, max_forward=2_000_000))
+    result = evaluate(snap, _config(min_outbound_sat=300_000))
+
+    swaps = [act for act in result.actions if isinstance(act, ReverseSwapAction)]
+    assert len(swaps) == 1
+    assert swaps[0].lightning_amount_sat == 600_000       # 900k spendable - 300k floor

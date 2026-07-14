@@ -24,6 +24,7 @@ import time
 from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
+    PLUGIN_OPENED_CHANNELS_DB_KEY,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
 from .liquidity_manager import normalize_node_id
@@ -32,6 +33,62 @@ from .qt_widgets import ToggleSwitch
 if TYPE_CHECKING:
     from electrum.gui.qt.main_window import ElectrumWindow
     from electrum.wallet import Abstract_Wallet
+
+
+# --- Electrum "Channels" tab: a "Managed by" column ------------------------
+# The plugin drains outbound from channels; a user needs to see, on Electrum's
+# own Channels tab, which channels the plugin opened (and so will manage) versus
+# ones they opened by hand. Electrum's ChannelsList has no plugin hook for an
+# extra column, so -- consistent with how this plugin already monkeypatches
+# Electrum (it rebinds MIN_FUNDING_SAT and wraps lnworker methods) -- we extend
+# the widget's column enum at load. The enum is a 0-based, contiguous IntEnum
+# (see MyTreeView.BaseColumnsEnum); we rebuild it preserving every existing
+# member's value and append MANAGED at the end, so all the existing
+# ``items[self.Columns.X]`` index math keeps working. Idempotent and defensive:
+# any failure leaves the stock Channels tab untouched.
+def _managed_label_for_channel(wallet: 'Abstract_Wallet', chan) -> str:
+    """"Plugin" if the plugin opened this channel, else "Manual". Read fresh from
+    the wallet's persisted plugin-opened tag so it tracks new opens."""
+    try:
+        raw = wallet.db.get(PLUGIN_OPENED_CHANNELS_DB_KEY, [])
+        ids = set(raw) if isinstance(raw, list) else set()
+        return _("Plugin") if chan.channel_id.hex() in ids else _("Manual")
+    except Exception:
+        return ""
+
+
+def _patch_channels_list_managed_column() -> bool:
+    """Add a "Managed by" column to Electrum's Channels tab. Returns True once the
+    class carries the column (already-patched is a no-op success)."""
+    try:
+        import enum
+        from electrum.gui.qt.channels_list import ChannelsList
+    except Exception:
+        return False
+    orig_cols = getattr(ChannelsList, "Columns", None)
+    if orig_cols is None:
+        return False
+    if hasattr(orig_cols, "MANAGED"):
+        return True  # already patched
+    try:
+        members = [(m.name, m.value) for m in orig_cols]
+        members.append(("MANAGED", max(m.value for m in orig_cols) + 1))
+        # Subclass the same BaseColumnsEnum via the functional API, preserving the
+        # 0-based contiguous values so the widget's index math is unchanged.
+        new_cols = orig_cols.__base__("Columns", members)
+        orig_format_fields = ChannelsList.format_fields
+
+        def format_fields(self, chan):
+            fields = orig_format_fields(self, chan)
+            fields[self.Columns.MANAGED] = _managed_label_for_channel(self.wallet, chan)
+            return fields
+
+        ChannelsList.Columns = new_cols
+        ChannelsList.headers = {**ChannelsList.headers, new_cols.MANAGED: _("Managed by")}
+        ChannelsList.format_fields = format_fields
+        return True
+    except Exception:
+        return False
 
 
 def _wrapped_label(text: str) -> QLabel:
@@ -111,6 +168,13 @@ class Plugin(LiquidityPlugin):
             self.signals.log_changed.connect(self._on_log_changed_ui)
             self.signals.providers_changed.connect(self._on_providers_changed_ui)
         self._add_liquidity_tab(window, wallet)
+        # Add the "Managed by" column to Electrum's Channels tab (once, globally),
+        # then refresh this window's already-built list so the column appears now.
+        if _patch_channels_list_managed_column():
+            try:
+                window.channels_list.update_rows.emit(wallet)
+            except Exception:
+                self.logger.debug("could not refresh channels list after column patch")
         self.start_wallet(wallet)
 
     @hook
@@ -547,6 +611,13 @@ class Plugin(LiquidityPlugin):
                                   "(broadcasts a tx and incurs a mining fee)."))
         v.addWidget(autoclose_cb)
 
+        plugin_only_cb = QCheckBox(_("Only drain channels the plugin opened"))
+        plugin_only_cb.setToolTip(_("When on, the plugin only reverse-swaps channels it opened "
+                                    "itself; channels you opened by hand are left entirely alone "
+                                    "(their outbound is never drained). When off, every channel is "
+                                    "managed."))
+        v.addWidget(plugin_only_cb)
+
         diag_log_cb = QCheckBox(_("Write diagnostic log files"))
         diag_log_cb.setToolTip(_("Append this plugin's decisions and errors to daily text files "
                                  "(one folder per wallet, kept 30 days) under the Electrum data "
@@ -558,6 +629,7 @@ class Plugin(LiquidityPlugin):
             (peer_reliability_cb, 'INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
             (auto_remediate_cb, 'INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
             (autoclose_cb, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
+            (plugin_only_cb, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY'),
             (diag_log_cb, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
         ]
 
@@ -589,6 +661,9 @@ class Plugin(LiquidityPlugin):
             (_("On-chain reserve when opening (sat)"),
              'INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT', val)),
+            (_("Keep outbound per channel (sat, 0 = drain all)"),
+             'INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT', max(0, int(val)))),
             (_("Keep decision log for (days, 1–{})").format(MAX_LOG_RETENTION_DAYS),
              'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS',

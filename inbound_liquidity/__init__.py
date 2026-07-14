@@ -399,6 +399,22 @@ SimpleConfig.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = ConfigVar(
     'plugins.inbound_liquidity.swap_trigger_sat', default=25_000, type_=int, plugin=__name__,
     short_desc=lambda: _("Swap-out trigger (sat)"),
     long_desc=lambda: _("...or once a channel's local balance exceeds this many sats (whichever comes first)."))
+# Outbound-liquidity preservation. By default the plugin drains all outbound to
+# manufacture maximum inbound; these two knobs let a user hold some back.
+SimpleConfig.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = ConfigVar(
+    'plugins.inbound_liquidity.min_outbound_sat', default=0, type_=int, plugin=__name__,
+    short_desc=lambda: _("Keep outbound per channel (sat)"),
+    long_desc=lambda: _("Never let a reverse swap drain a channel's outbound (local) "
+                        "balance below this, so the wallet keeps some ability to send. "
+                        "Applied per channel to the swappable amount; 0 (the default) "
+                        "drains everything for maximum inbound liquidity."))
+SimpleConfig.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = ConfigVar(
+    'plugins.inbound_liquidity.manage_plugin_opened_only', default=False, type_=bool, plugin=__name__,
+    short_desc=lambda: _("Only drain channels the plugin opened"),
+    long_desc=lambda: _("When on, the plugin only reverse-swaps channels it opened "
+                        "itself; channels you opened by hand are left entirely alone "
+                        "(their outbound is never drained). When off (the default), "
+                        "every channel is managed."))
 SimpleConfig.INBOUND_LIQUIDITY_CHANNEL_PEER = ConfigVar(
     'plugins.inbound_liquidity.channel_peer', default='', type_=str, plugin=__name__,
     short_desc=lambda: _("Channel peer (node_id@host:port)"),
@@ -905,6 +921,8 @@ class LiquidityPlugin(BasePlugin):
             max_swap_fee_pct=float(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
+            min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
+            manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
@@ -2235,6 +2253,9 @@ class LiquidityPlugin(BasePlugin):
             self.config, "INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN", 60))) * 60.0
         now = time.time()
         pending_channel_count = 0
+        # Set of channel ids (hex) the plugin opened itself, for the
+        # manage-plugin-opened-only scope switch. Read once per snapshot.
+        plugin_opened = self._plugin_opened_channels(wallet)
         for chan in lnworker.channels.values():
             # Skip dead channels. Electrum keeps CLOSED/REDEEMED channel records
             # in ``lnworker.channels`` indefinitely (they are only dropped when the
@@ -2274,6 +2295,7 @@ class LiquidityPlugin(BasePlugin):
                 is_active=chan.is_active(),
                 has_unsettled_htlcs=has_unsettled,
                 unsettled_is_swap=unsettled_is_swap,
+                is_plugin_opened=chan.channel_id.hex() in plugin_opened,
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
@@ -3109,6 +3131,8 @@ class LiquidityPlugin(BasePlugin):
                 "max_swap_fee_pct": config.max_swap_fee_pct,
                 "swap_trigger_pct": config.swap_trigger_pct,
                 "swap_trigger_sat": config.swap_trigger_sat,
+                "min_outbound_sat": config.min_outbound_sat,
+                "manage_plugin_opened_only": config.manage_plugin_opened_only,
                 "max_opens_per_day": config.max_opens_per_day,
                 "max_closes_per_day": self._max_closes_per_day(),
                 "stuck_swap_timeout_min": int(self._stuck_swap_timeout_sec() // 60),
@@ -3123,6 +3147,7 @@ class LiquidityPlugin(BasePlugin):
                     "remote_sat": c.remote_sat,
                     "spendable_local_sat": c.spendable_local_sat,
                     "is_active": c.is_active,
+                    "is_plugin_opened": c.is_plugin_opened,
                 }
                 for c in snapshot.channels
             ],

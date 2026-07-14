@@ -62,6 +62,8 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = 0.6
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = 25.0
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = 25_000
+        self.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = 0
+        self.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = False
         self.INBOUND_LIQUIDITY_CHANNEL_PEER = ""
         self.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
         self.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ""
@@ -590,9 +592,10 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
     advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
     edits = advanced_tab.findChildren(QLineEdit)
     # Advanced QLineEdit order: 0 opens/day, 1 closes/day, 2 on-chain reserve,
-    # 3 log retention, then the reliability/offline tuning knobs.
+    # 3 keep-outbound-per-channel, 4 log retention, then the reliability/offline
+    # tuning knobs.
     edits[2].setText("7500")                 # on-chain reserve (moved from Settings)
-    edits[3].setText("99999")                # log retention -> clamped
+    edits[4].setText("99999")                # log retention -> clamped
     for cb in advanced_tab.findChildren(QCheckBox):
         cb.setChecked(False)                 # flip every feature toggle off
     apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
@@ -601,7 +604,7 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
 
     assert p.config.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
     assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
-    assert edits[3].text() == str(MAX_LOG_RETENTION_DAYS)
+    assert edits[4].text() == str(MAX_LOG_RETENTION_DAYS)
     assert p.config.INBOUND_LIQUIDITY_RELIABILITY_ENABLED is False
     assert p.config.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED is False
     assert p.config.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED is False

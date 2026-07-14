@@ -504,6 +504,13 @@ class ChannelSnapshot:
     # "possible stuck payment" near-miss. Defaults False so the pure tests and any
     # non-populating caller keep prior behaviour.
     unsettled_is_swap: bool = False
+    # Whether this channel was opened by the plugin itself (matched against the
+    # glue's persisted plugin-opened tag). Consulted only when
+    # ``LiquidityConfig.manage_plugin_opened_only`` is set: a user-opened channel
+    # (False) is then never reverse-swapped. Defaults True so the pure tests and
+    # any non-populating caller keep the "manage every channel" behaviour when the
+    # scope switch is off (where the flag is irrelevant anyway).
+    is_plugin_opened: bool = True
 
 
 @dataclass(frozen=True)
@@ -647,6 +654,20 @@ class LiquidityConfig:
     max_swap_fee_pct: float        # skip reverse swaps whose effective all-in cost % exceeds this (rule: 0.6)
     swap_trigger_pct: float        # reverse-swap a channel at/over this % of capacity local (rule: 25)
     swap_trigger_sat: int          # ...OR once local balance exceeds this many sats (rule: 25_000)
+    # Outbound-preservation floor (sat), per channel. A reverse swap never drains a
+    # channel's outbound (local) balance below this, so the wallet retains some
+    # ability to *send*. Enforced against the swappable amount: the engine plans
+    # ``spendable_local_sat - min_outbound_sat`` (never below the provider minimum,
+    # and never at all once the floor covers the whole spendable balance). 0 (the
+    # default) preserves the original "drain everything" behaviour.
+    min_outbound_sat: int = 0
+    # Scope switch. When True, the engine only ever reverse-swaps channels the
+    # plugin itself opened (``ChannelSnapshot.is_plugin_opened``); channels the
+    # user opened by hand are left entirely alone (their outbound is never
+    # drained). When False (the default), every channel is managed -- the original
+    # behaviour. The glue supplies the per-channel flag from its persisted
+    # plugin-opened tag; the engine stays pure.
+    manage_plugin_opened_only: bool = False
     # Runaway guard: at most this many channel opens in any rolling 24h window
     # (0 = unlimited). Counted from the executed-open history the glue passes in
     # via ``LiquiditySnapshot.opens_last_24h``. The matching close ceiling is
@@ -1030,6 +1051,18 @@ def _decide_reverse_swaps(
         trigger = "pct" if over_pct else "sat"
         # The channel wants to be drained; from here on, anything that blocks it
         # is a near miss worth logging.
+        # Scope switch: in plugin-opened-only mode, a channel the user opened by
+        # hand is left entirely alone -- we never touch its outbound. Logged as a
+        # near miss (it was over the trigger and would otherwise have been drained)
+        # so the decision trail explains why an eligible-looking channel was spared.
+        if config.manage_plugin_opened_only and not chan.is_plugin_opened:
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                reason=(f"channel {chan.short_id} over {trigger} trigger but was not "
+                        f"opened by the plugin (manage-plugin-opened-only is on); "
+                        f"leaving its outbound untouched"),
+            ))
+            continue
         if not chan.is_active:
             declines.append(DeclineRecord(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
@@ -1081,7 +1114,25 @@ def _decide_reverse_swaps(
         # penalty (flaky providers sink behind reliable ones); ties favour higher
         # PoW. The cost gate (below) is enforced inside select_provider on the
         # REAL cost, so the penalty only reorders -- it never blocks a swap.
-        desired = chan.spendable_local_sat
+        # Outbound-preservation floor: never drain below `min_outbound_sat` of
+        # local balance. We can only move the *spendable* portion, so the amount we
+        # are willing to swap is the spendable balance minus the floor. Because
+        # local_sat >= spendable_local_sat, swapping this much leaves at least
+        # `min_outbound_sat` of outbound behind (usually more -- the channel
+        # reserve on top). If the floor already covers the whole spendable balance,
+        # there is nothing to drain: a near miss worth logging (the channel was
+        # over the trigger but the floor protects it).
+        desired = max(0, chan.spendable_local_sat - config.min_outbound_sat)
+        if desired <= 0:
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                amount_sat=0,
+                reason=(f"channel {chan.short_id} over {trigger} trigger but its "
+                        f"spendable {chan.spendable_local_sat} is within the "
+                        f"{config.min_outbound_sat} sat outbound floor; keeping it as "
+                        f"outbound liquidity"),
+            ))
+            continue
         selection = select_provider(offers, desired, claim_fee, config, consumed)
         if selection is None:
             # No eligible provider both hosts the amount AND passes the cost gate,

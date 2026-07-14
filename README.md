@@ -49,15 +49,24 @@ ceilings, diagnostics, etc.).
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on the on-chain amount received from plugin-initiated reverse swaps (0 = off). Paid automatically to a fixed payout address | `0.1` |
 | `onchain_reserve_sat` | Advanced | Always leave this much on-chain when opening | `10_000` |
+| `min_outbound_sat` | Advanced | **Keep outbound per channel** — never let a reverse swap drain a channel's outbound (local) balance below this, so the wallet keeps some ability to send. Applied per channel to the swappable amount; `0` drains everything for maximum inbound | `0` |
+| `manage_plugin_opened_only` | Advanced | **Only drain channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; channels you opened by hand are left entirely alone. When off, every channel is managed | `false` |
 | `log_retention_days` | Advanced | How long to keep decision-log entries (1–999) | `30` |
 | `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before Electrum's suggested peer | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
-(bounded by the channel's spendable balance). Opening a channel funds with the
-**maximum minus the on-chain reserve**, with the mining fee deducted so the
-transaction is feasible.
+(bounded by the channel's spendable balance, minus any `min_outbound_sat`
+floor). Opening a channel funds with the **maximum minus the on-chain reserve**,
+with the mining fee deducted so the transaction is feasible.
+
+By default the plugin manages **every** channel in the wallet, not only the ones
+it opened. To preserve some outbound (send) capacity you have two knobs:
+`min_outbound_sat` holds back a per-channel floor, and
+`manage_plugin_opened_only` restricts draining to plugin-opened channels. Which
+channels the plugin opened is shown in the **Managed by** column the plugin adds
+to Electrum's own **Channels** tab (`Plugin` vs `Manual`).
 
 ### In-flight freeze
 
