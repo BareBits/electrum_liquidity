@@ -1,18 +1,25 @@
-"""Regression test for the zip-install crash.
+"""Regression test for the external-ZIP install crash.
 
-When Electrum installs the plugin as an external ZIP, it imports the package
-under the module name ``electrum_external_plugins.inbound_liquidity`` (not the
-internal ``electrum.plugins.inbound_liquidity`` the rest of the suite uses).
-Electrum's ``ConfigVar(plugin=...)`` strips the ``electrum.plugins.`` prefix but
-NOT the ``electrum_external_plugins.`` one, then asserts the remainder has no
-dots -- so passing the raw ``__name__`` used to blow up at import with
-``AssertionError`` and crash the app on install. We now pass the bare plugin
-name (:data:`inbound_liquidity._PLUGIN_NAME`) instead.
+Electrum installs this plugin as a ZIP and loads it with a loader that is subtly
+different from a normal import (see ``Plugins.maybe_load_plugin_init_method``):
 
-This test imports the plugin under the external name in a SUBPROCESS (a clean
-interpreter, so it does not collide with the internal copy the session already
-imported) and asserts it loads without raising. Skipped outside the Electrum
-venv.
+  * the __init__ module is exec'd from a spec whose ``name`` is the bare package
+    directory (``"inbound_liquidity"``), so the module's ``__name__`` /
+    ``__package__`` are the bare name -- NOT ``electrum_external_plugins.
+    inbound_liquidity``;
+  * yet the module is registered in ``sys.modules`` under that longer external
+    key.
+
+Because Python resolves relative imports against ``__package__``, the plugin's
+``from .liquidity_manager import ...`` used to look for a top-level
+``inbound_liquidity`` package that is not on ``sys.path`` in a real install,
+raising ``ModuleNotFoundError`` and crashing Electrum on install. ``__init__``
+now adopts its real ``sys.modules`` key as ``__package__`` to fix this.
+
+This test reproduces Electrum's exact loader naming against a freshly-built ZIP,
+in a SUBPROCESS whose ``sys.path`` cannot import the on-disk source (mimicking a
+real user, where the plugin exists only inside the ZIP). It fails loudly if the
+compatibility shim is ever removed. Skipped outside the Electrum venv.
 """
 from __future__ import annotations
 
@@ -20,6 +27,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import zipfile
 
 import pytest
 
@@ -28,37 +36,55 @@ pytest.importorskip("electrum.simple_config")
 _PKG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "inbound_liquidity")
 
-# Loads the plugin package from disk under the EXTERNAL module name, exactly the
-# way Electrum's zip loader names it, and imports the qt submodule too (that is
-# what triggers the __init__ ConfigVar registrations). Prints a sentinel on
-# success; any AssertionError from ConfigVar surfaces as a non-zero exit.
+
+def _build_zip(dest_dir: str) -> str:
+    """Package inbound_liquidity/ into a zip the way the release workflow does."""
+    zip_path = os.path.join(dest_dir, "inbound_liquidity.zip")
+    root = os.path.dirname(_PKG_DIR)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for dirpath, dirnames, filenames in os.walk(_PKG_DIR):
+            if "__pycache__" in dirpath:
+                continue
+            for fn in filenames:
+                if fn.endswith((".pyc",)):
+                    continue
+                full = os.path.join(dirpath, fn)
+                zf.write(full, os.path.relpath(full, root))
+    return zip_path
+
+
+# Reproduces Electrum's zip loader EXACTLY: exec __init__ from a spec named after
+# the bare package dir, but registered in sys.modules under the external key.
+# Then loads the qt submodule the way load_plugin_by_name does. Run with a
+# sys.path that cannot import the on-disk source, so a real user's crash surfaces.
 _CHILD = textwrap.dedent(
     """
-    import importlib.util, os, sys, types
+    import importlib, importlib.util, os, sys, types, zipimport
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    pkg_dir = sys.argv[1]
-    ext_name = "electrum_external_plugins.inbound_liquidity"
-    parent = types.ModuleType("electrum_external_plugins")
-    parent.__path__ = [os.path.dirname(pkg_dir)]
-    sys.modules["electrum_external_plugins"] = parent
-    spec = importlib.util.spec_from_file_location(
-        ext_name, os.path.join(pkg_dir, "__init__.py"),
-        submodule_search_locations=[pkg_dir])
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[ext_name] = mod
-    spec.loader.exec_module(mod)
-    assert mod._PLUGIN_NAME == "inbound_liquidity", mod._PLUGIN_NAME
-    importlib.import_module(ext_name + ".qt")   # exercises the qt entry point too
-    print("EXTERNAL_LOAD_OK")
+    zip_path = sys.argv[1]
+    # Make sure the bare 'inbound_liquidity' source cannot be imported from disk.
+    sys.path[:] = [p for p in sys.path
+                   if not os.path.isdir(os.path.join(p or '.', 'inbound_liquidity'))]
+    assert not any(os.path.isdir(os.path.join(p or '.', 'inbound_liquidity')) for p in sys.path)
+
+    imp = zipimport.zipimporter(zip_path)
+    base = "electrum_external_plugins.inbound_liquidity"
+    init_spec = imp.find_spec("inbound_liquidity")   # spec.name == bare dir, like Electrum
+    module = importlib.util.module_from_spec(init_spec)
+    sys.modules[base] = module                        # stored under the external key
+    init_spec.loader.exec_module(module)              # <-- crashed here before the fix
+    importlib.import_module(base + ".qt")             # qt entry point, loaded later by Electrum
+    print("EXTERNAL_ZIP_LOAD_OK")
     """
 )
 
 
-def test_plugin_loads_under_external_zip_namespace() -> None:
+def test_plugin_loads_the_way_electrum_loads_an_external_zip(tmp_path) -> None:
+    zip_path = _build_zip(str(tmp_path))
     proc = subprocess.run(
-        [sys.executable, "-c", _CHILD, _PKG_DIR],
-        capture_output=True, text=True, timeout=120)
+        [sys.executable, "-c", _CHILD, zip_path],
+        capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
     assert proc.returncode == 0, (
-        f"external-namespace load failed (this is the zip-install crash):\n"
+        "external-zip load failed the way it would crash Electrum on install:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    assert "EXTERNAL_LOAD_OK" in proc.stdout, proc.stdout
+    assert "EXTERNAL_ZIP_LOAD_OK" in proc.stdout, proc.stdout

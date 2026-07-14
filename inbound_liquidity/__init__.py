@@ -24,6 +24,26 @@ from electrum.simple_config import ConfigVar, SimpleConfig
 from electrum.util import log_exceptions, ignore_exceptions
 from electrum.logging import get_logger
 
+# --- external-zip load compatibility --------------------------------------
+# When Electrum installs this plugin as an external ZIP, its loader execs this
+# __init__ with __name__/__package__ set to the bare package directory
+# ("inbound_liquidity") while registering the module in sys.modules under a
+# different key ("electrum_external_plugins.inbound_liquidity"). Python resolves
+# the relative imports below (``from .liquidity_manager import ...``) against
+# __package__, so under a zip install they would look for a top-level
+# ``inbound_liquidity`` package that is not on sys.path -- raising
+# ModuleNotFoundError and crashing Electrum on install. (Internal/symlinked
+# loads are unaffected: there __name__ already equals the sys.modules key, so
+# this is a no-op.) Adopt the real sys.modules key as this module's
+# __name__/__package__ so the relative imports here -- and the qt submodule,
+# which Electrum later loads under that same key -- all resolve to one
+# consistent package object (avoiding duplicate submodule copies too).
+_real_key = next((_k for _k, _m in sys.modules.items()
+                  if getattr(_m, "__dict__", None) is globals()), None)
+if _real_key and _real_key != __name__:
+    __name__ = _real_key
+    __package__ = _real_key
+
 from .liquidity_manager import (
     Action,
     ChannelSnapshot,
