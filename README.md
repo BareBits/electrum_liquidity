@@ -1,15 +1,12 @@
 # Inbound Liquidity Manager — Electrum plugin
 
-> ## ⚠️ EXPERIMENTAL SOFTWARE — DO NOT USE WITH REAL FUNDS ⚠️
+> ## ⚠️ AS-IS SOFTWARE — DO NOT USE WITH SIGNIFICANT FUNDS ⚠️
 >
-> This plugin is **experimental, unaudited, alpha-quality software**. It moves
+> This moves
 > money **automatically and without confirmation**: it opens Lightning channels
-> and broadcasts on-chain / submarine-swap transactions on your behalf.
->
-> **Bugs, edge cases, or provider failures can cause partial or total LOSS OF
-> FUNDS.** Use it **only** on regtest / testnet, or with amounts you are fully
-> prepared to lose. There is **NO WARRANTY** of any kind. You alone are
-> responsible for any funds you place under its control.
+> and broadcasts on-chain / submarine-swap transactions on your behalf. While we are using this plugin in production, **Bugs, edge cases, or provider failures can cause partial or total LOSS OF
+> FUNDS.** Use it **only** with amounts you are fully prepared to lose. There is **NO WARRANTY** of any kind. You alone are responsible for any funds you place under its control.
+> For this reason, we suggest using this pattern: use this plugin on a wallet that has a dedicated purpose of receiving payments. Forward those funds to a cold wallet when they reach any significant amount.
 
 An Electrum plugin that automatically manages **inbound Lightning liquidity** by
 opening channels and performing **submarine (reverse) swaps**, on top of
