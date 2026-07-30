@@ -7,10 +7,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QCheckBox, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from electrum.i18n import _
@@ -19,15 +21,19 @@ from electrum.plugin import hook
 from electrum.gui.qt.util import read_QIcon
 
 import asyncio
+import logging
+import re
 import time
 
 from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
-    PLUGIN_OPENED_CHANNELS_DB_KEY,
+    MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
+    PLUGIN_OPENED_CHANNELS_DB_KEY, TERMINAL_STATUSES,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
 from .liquidity_manager import normalize_node_id
+from .log_buffer import LEVEL_CHOICES, clamp_max_lines
 from .qt_widgets import ToggleSwitch
 
 if TYPE_CHECKING:
@@ -103,24 +109,31 @@ class _Signals(QObject):
     activity = pyqtSignal(object, str)        # (wallet, message)
     log_changed = pyqtSignal(object)          # (wallet,)
     providers_changed = pyqtSignal(object)    # (wallet,) -- discovered provider list refreshed
+    status_changed = pyqtSignal(object, str)  # (wallet, tick status) -- from the asyncio thread
 
 
 class _TabState:
-    """Per-window UI handles for one open wallet's Liquidity tab."""
+    """Per-window UI handles for one open wallet's Liquidity tab.
+
+    Built from the handles dict :meth:`Plugin._build_liquidity_tab` returns, so
+    adding a sub-tab does not mean growing a positional tuple through three call
+    sites. Unknown keys are simply set as attributes.
+    """
 
     def __init__(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet',
-                 container: QWidget, actions_tree: QTreeWidget,
-                 declines_tree: QTreeWidget, refresh: Callable[[], None],
-                 repopulate_providers: Callable[[], None],
-                 repopulate_partners: Callable[[], None]) -> None:
+                 container: QWidget, handles: Dict[str, object]) -> None:
         self.window = window
         self.wallet = wallet
         self.container = container
-        self.actions_tree = actions_tree
-        self.declines_tree = declines_tree
-        self.refresh = refresh
-        self.repopulate_providers = repopulate_providers
-        self.repopulate_partners = repopulate_partners
+        # Declared for the type checker / readability; overwritten from handles.
+        self.actions_tree: Optional[QTreeWidget] = None
+        self.declines_tree: Optional[QTreeWidget] = None
+        self.refresh: Callable[[], None] = lambda: None
+        self.repopulate_providers: Callable[[], None] = lambda: None
+        self.repopulate_partners: Callable[[], None] = lambda: None
+        self.set_status: Callable[[str], None] = lambda status: None
+        for key, value in handles.items():
+            setattr(self, key, value)
 
 
 def _fmt_sat(amount: Optional[int]) -> str:
@@ -132,6 +145,21 @@ def _fmt_time(ts: float) -> str:
         return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "?"
+
+
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_filename(wallet: 'Abstract_Wallet') -> str:
+    """The wallet's name reduced to a single safe path component, for the
+    suggested filename of a saved log. A wallet name is user-controlled and can
+    contain separators, so it never goes into a path unfiltered."""
+    try:
+        name = wallet.basename()
+    except Exception:
+        name = ""
+    cleaned = _UNSAFE_FILENAME_RE.sub("_", name or "").strip("._")
+    return cleaned or "wallet"
 
 
 def _fmt_age(ts: float) -> str:
@@ -167,6 +195,7 @@ class Plugin(LiquidityPlugin):
             self.signals.activity.connect(self._show_activity)
             self.signals.log_changed.connect(self._on_log_changed_ui)
             self.signals.providers_changed.connect(self._on_providers_changed_ui)
+            self.signals.status_changed.connect(self._on_status_changed_ui)
         self._add_liquidity_tab(window, wallet)
         # Add the "Managed by" column to Electrum's Channels tab (once, globally),
         # then refresh this window's already-built list so the column appears now.
@@ -218,16 +247,30 @@ class Plugin(LiquidityPlugin):
         if state is not None:
             state.repopulate_providers()
 
+    def on_status_changed(self, wallet: 'Abstract_Wallet', status: str) -> None:
+        # Called from the asyncio thread on every tick step; emit a queued signal
+        # so the Settings tab's Status section updates on the GUI thread.
+        if self.signals is not None:
+            self.signals.status_changed.emit(wallet, status)
+
+    def _on_status_changed_ui(self, wallet: 'Abstract_Wallet', status: str) -> None:
+        state = self._tabs.get(wallet)
+        if state is None:
+            return
+        try:
+            state.set_status(status)
+        except RuntimeError:
+            # The tab's widgets were deleted between the emit and its delivery
+            # (close_wallet races a queued signal). Nothing to update.
+            pass
+
     # --- tab lifecycle ----------------------------------------------------
     def _add_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet') -> None:
         if wallet in self._tabs:
             return
-        (container, actions_tree, declines_tree, refresh, repopulate_providers,
-         repopulate_partners) = self._build_liquidity_tab(window, wallet)
-        self._tabs[wallet] = _TabState(
-            window, wallet, container, actions_tree, declines_tree, refresh,
-            repopulate_providers, repopulate_partners)
-        refresh()
+        container, handles = self._build_liquidity_tab(window, wallet)
+        state = self._tabs[wallet] = _TabState(window, wallet, container, handles)
+        state.refresh()
         try:
             window.tabs.addTab(container, read_QIcon("lightning.png"), _("Liquidity"))
         except Exception:
@@ -325,10 +368,208 @@ class Plugin(LiquidityPlugin):
                 top.addChild(child)
             tree.addTopLevelItem(top)
 
+    # --- full log view ----------------------------------------------------
+    # How often the Log tab looks for new lines. Captured logging arrives with no
+    # Electrum event behind it, so the view has to poll -- but it polls a single
+    # integer (the ring's revision counter) and only re-renders when that moved,
+    # so an idle plugin costs one comparison twice a second and a debug firehose
+    # cannot flood the Qt event loop with one repaint per record.
+    _LOG_REFRESH_MS = 500
+
+    @staticmethod
+    def _decision_level(entry: Dict) -> int:
+        """Map a decision-log entry onto a logging level so one level filter can
+        govern both halves of the merged view. Faults are a warning by nature;
+        the file-only "error" category is an error; decisions are informational."""
+        category = str(entry.get("category") or "")
+        if category == "error":
+            return logging.ERROR
+        if category == "fault":
+            return logging.WARNING
+        return logging.INFO
+
+    @staticmethod
+    def _fmt_log_row(ts: float, level: str, source: str, message: str) -> str:
+        """One fixed-width row. Multi-line messages (tracebacks) get their
+        continuation lines indented under the message column, so a row is still
+        visually one event."""
+        head = f"{_fmt_time(ts)}  {level:<8} {source:<34}  "
+        lines = str(message).splitlines() or [""]
+        pad = " " * 24
+        return "\n".join([head + lines[0]] + [pad + line for line in lines[1:]])
+
+    def _merged_log_rows(self, wallet: 'Abstract_Wallet', *, min_level: int,
+                         needle: str) -> List[str]:
+        """The Log tab's content: captured logging plus this wallet's decision
+        log, in one chronological, filtered list.
+
+        The captured half is process-global (a Python logger has no idea which
+        wallet it is talking about), the decision half is per wallet -- which is
+        exactly right: the decisions are this wallet's, the surrounding evidence
+        is whatever the plugin was doing at the time.
+        """
+        rows: List[tuple] = []
+        for line in self.log_buffer.snapshot(min_level=min_level):
+            rows.append((line.ts, self._fmt_log_row(
+                line.ts, line.level_name, line.source, line.message)))
+        for entry in self.get_decision_log(wallet):
+            if self._decision_level(entry) < min_level:
+                continue
+            source = f"decision/{entry.get('category', '')}"
+            message = str(entry.get("reason") or "")
+            kind = entry.get("kind")
+            if kind:
+                message = f"[{kind}] {message}"
+            detail = entry.get("detail")
+            if detail:
+                message += f"\n{detail}"
+            ts = float(entry.get("ts") or 0.0)
+            rows.append((ts, self._fmt_log_row(ts, "DECISION", source, message)))
+        rows.sort(key=lambda row: row[0])
+        out = [text for _ts, text in rows]
+        if needle:
+            folded = needle.casefold()
+            out = [text for text in out if folded in text.casefold()]
+        return out
+
+    def _build_log_tab(self, wallet: 'Abstract_Wallet'):
+        """Build the Log sub-tab. Returns (widget, refresh_fn)."""
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.addWidget(_wrapped_label(_(
+            "Everything this plugin logged since Electrum started, merged with "
+            "this wallet's decision log. Held in memory only — nothing here is "
+            "written to disk. Use \"Save to file…\" to keep a copy; use the "
+            "Advanced tab to widen what is captured (Electrum's own Lightning "
+            "logs, debug level) or to change how many lines are kept.")))
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel(_("Level")))
+        level_combo = QComboBox()
+        for name, value in LEVEL_CHOICES:
+            level_combo.addItem(_(name), value)
+        level_combo.setCurrentIndex(len(LEVEL_CHOICES) - 1)   # everything, by default
+        controls.addWidget(level_combo)
+        controls.addWidget(QLabel(_("Filter")))
+        filter_edit = QLineEdit()
+        filter_edit.setPlaceholderText(_("substring, e.g. partner"))
+        controls.addWidget(filter_edit, 1)
+        follow_cb = QCheckBox(_("Follow"))
+        follow_cb.setChecked(True)
+        follow_cb.setToolTip(_("Keep the view scrolled to the newest line. Untick to read "
+                               "back through the log while it keeps growing."))
+        controls.addWidget(follow_cb)
+        v.addLayout(controls)
+
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        font = QFont("monospace")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        view.setFont(font)
+        v.addWidget(view, 1)
+
+        summary = QLabel("")
+        summary.setStyleSheet("color: gray;")
+
+        copy_btn = QPushButton(_("Copy"))
+        save_btn = QPushButton(_("Save to file…"))
+        clear_btn = QPushButton(_("Clear"))
+        clear_btn.setToolTip(_("Discard the captured log lines held in memory. Your decision "
+                               "log (Actions / Declines / Faults) is not affected."))
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(summary, 1)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(clear_btn)
+        v.addLayout(btn_row)
+
+        # Cheap change-detection: re-render only when the ring moved, the decision
+        # log grew, or the user changed a filter. `-1` forces the first render.
+        seen = {"revision": -1, "decisions": -1, "level": None, "needle": None}
+
+        def _current_rows() -> List[str]:
+            return self._merged_log_rows(
+                wallet,
+                min_level=int(level_combo.currentData() or 0),
+                needle=filter_edit.text().strip())
+
+        def refresh(force: bool = False) -> None:
+            try:
+                revision = self.log_buffer.revision
+                decisions = len(self.get_decision_log(wallet))
+                level = level_combo.currentData()
+                needle = filter_edit.text().strip()
+                if not force and (revision, decisions, level, needle) == (
+                        seen["revision"], seen["decisions"], seen["level"], seen["needle"]):
+                    return
+                seen.update(revision=revision, decisions=decisions,
+                            level=level, needle=needle)
+                rows = _current_rows()
+                bar = view.verticalScrollBar()
+                at_bottom = follow_cb.isChecked()
+                previous = bar.value()
+                view.setPlainText("\n".join(rows))
+                bar.setValue(bar.maximum() if at_bottom else min(previous, bar.maximum()))
+                stats = self.log_buffer.stats()
+                summary.setText(_("{} lines shown · {} captured (limit {}) · {} dropped").format(
+                    f"{len(rows):,}", f"{stats['count']:,}",
+                    f"{stats['max_lines']:,}", f"{stats['dropped']:,}"))
+            except RuntimeError:
+                # Widgets deleted underneath us (tab torn down mid-timer).
+                pass
+
+        def _force_refresh() -> None:
+            refresh(force=True)
+
+        level_combo.currentIndexChanged.connect(_force_refresh)
+        filter_edit.textChanged.connect(_force_refresh)
+        follow_cb.toggled.connect(_force_refresh)
+
+        def on_copy() -> None:
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(view.toPlainText())
+                self.on_action_done(wallet, _("Log copied to clipboard."))
+
+        def on_save() -> None:
+            default = f"inbound_liquidity_{_safe_filename(wallet)}_{int(time.time())}.log"
+            path, _sel = QFileDialog.getSaveFileName(tab, _("Save log"), default)
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(view.toPlainText())
+            except OSError as e:
+                summary.setStyleSheet("color: red;")
+                summary.setText(_("Could not save: {}").format(e))
+                return
+            summary.setStyleSheet("color: gray;")
+            self.on_action_done(wallet, _("Log saved to {}").format(path))
+
+        def on_clear() -> None:
+            self.log_buffer.clear()
+            refresh(force=True)
+
+        copy_btn.clicked.connect(on_copy)
+        save_btn.clicked.connect(on_save)
+        clear_btn.clicked.connect(on_clear)
+
+        # Parented to the tab, so it stops (and is destroyed) with it -- a timer
+        # outliving its widgets would fire into deleted C++ objects.
+        timer = QTimer(tab)
+        timer.setInterval(self._LOG_REFRESH_MS)
+        timer.timeout.connect(refresh)
+        timer.start()
+
+        refresh(force=True)
+        return tab, _force_refresh
+
     # --- tab construction -------------------------------------------------
     def _build_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet'):
         """Build the top-level Liquidity tab widget and return
-        (container, actions_tree, declines_tree, refresh_fn)."""
+        ``(container, handles)`` — the handles dict becomes the :class:`_TabState`
+        attributes the plugin later calls back into (refresh, set_status, …)."""
         container = QWidget()
         outer = QVBoxLayout(container)
 
@@ -397,6 +638,37 @@ class Plugin(LiquidityPlugin):
             _("When enabled, automatically opens channels and reverse-swaps "
               "Lightning funds out to on-chain to keep inbound liquidity "
               "available. Disabled by default — review the settings below first.")))
+
+        # --- Status ---------------------------------------------------------
+        # One evaluation can run for minutes (a nostr provider session, a channel
+        # open walking its candidate list, a reverse swap), and from outside that
+        # is indistinguishable from a plugin doing nothing. This says which step
+        # is running right now, and "sleeping" once the tick is done.
+        vbox.addSpacing(8)
+        status_header = QLabel(_("Status"))
+        _sf = status_header.font()
+        _sf.setBold(True)
+        status_header.setFont(_sf)
+        vbox.addWidget(status_header)
+
+        tick_status_label = _wrapped_label("")
+        vbox.addWidget(tick_status_label)
+        tick_since_label = QLabel("")
+        tick_since_label.setStyleSheet("color: gray;")
+        vbox.addWidget(tick_since_label)
+
+        def _set_tick_status(status: str) -> None:
+            """Render one tick status. Terminal states are muted, an in-flight
+            step is emphasised, so a glance tells you whether anything is
+            happening without reading the words."""
+            tick_status_label.setText(status)
+            resting = status in TERMINAL_STATUSES
+            tick_status_label.setStyleSheet(
+                "color: gray;" if resting else "color: #2ea043; font-weight: bold;")
+            tick_since_label.setText(
+                "" if resting else _("since {}").format(_fmt_time(time.time())))
+
+        _set_tick_status(self.tick_status(wallet))
 
         # --- "Manual run only" mode + the manual trigger ------------------
         # A middle ground for a cautious user: keep the master switch armed but
@@ -553,12 +825,17 @@ class Plugin(LiquidityPlugin):
         tabs.addTab(declines_tree, _("Declines"))
         tabs.addTab(faults_tree, _("Faults"))
 
+        # --- Full log sub-tab (last: it is the deepest / noisiest view) ----
+        log_tab, refresh_log = self._build_log_tab(wallet)
+        tabs.addTab(log_tab, _("Log"))
+
         def refresh() -> None:
             _sync_toggle_from_config()
             # Re-read the manual-run-only checkbox without re-firing its handler.
             manual_only_cb.blockSignals(True)
             manual_only_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', False)))
             manual_only_cb.blockSignals(False)
+            _set_tick_status(self.tick_status(wallet))
             self._populate_log_tree(actions_tree, self.get_decision_log(wallet, "action"))
             self._populate_log_tree(declines_tree, self.get_decision_log(wallet, "decline"))
             self._populate_log_tree(faults_tree, self.get_decision_log(wallet, "fault"))
@@ -566,9 +843,19 @@ class Plugin(LiquidityPlugin):
             repopulate_providers()
             repopulate_partners()
             repopulate_advanced()
+            refresh_log()
 
-        return (container, actions_tree, declines_tree, refresh,
-                repopulate_providers, repopulate_partners)
+        return container, {
+            "actions_tree": actions_tree,
+            "declines_tree": declines_tree,
+            "faults_tree": faults_tree,
+            "log_tab": log_tab,
+            "refresh": refresh,
+            "refresh_log": refresh_log,
+            "repopulate_providers": repopulate_providers,
+            "repopulate_partners": repopulate_partners,
+            "set_status": _set_tick_status,
+        }
 
     # --- advanced sub-tab -------------------------------------------------
     def _build_advanced_tab(self, wallet: 'Abstract_Wallet'):
@@ -624,6 +911,27 @@ class Plugin(LiquidityPlugin):
                                  "directory. Contains no private keys or seeds. Off by default."))
         v.addWidget(diag_log_cb)
 
+        # --- Log-tab capture -----------------------------------------------
+        # Two separate switches on purpose: WHICH loggers to record, and WHETHER
+        # to force debug level, are independent questions — and only the second
+        # has a side effect outside this plugin (see its tooltip).
+        capture_ln_cb = QCheckBox(_("Log tab: also capture Electrum Lightning logs"))
+        capture_ln_cb.setToolTip(_("Include Electrum's own Lightning and swap logging (peer "
+                                   "manager, node rater, channels, routing, submarine swaps) in "
+                                   "the Log tab. Useful when the plugin reports that no channel "
+                                   "partner is available — that decision is made inside those "
+                                   "subsystems. Noisy; off by default."))
+        v.addWidget(capture_ln_cb)
+
+        capture_debug_cb = QCheckBox(_("Log tab: capture debug-level logs"))
+        capture_debug_cb.setToolTip(_("Force debug-level logging while this is on. Electrum "
+                                      "normally produces debug records already (they are just "
+                                      "hidden), so this matters only if you started Electrum with "
+                                      "a reduced verbosity — in which case it also makes those "
+                                      "records appear in Electrum's own log file. The previous "
+                                      "setting is restored when you turn it off."))
+        v.addWidget(capture_debug_cb)
+
         checkboxes = [
             (reliability_cb, 'INBOUND_LIQUIDITY_RELIABILITY_ENABLED'),
             (peer_reliability_cb, 'INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
@@ -631,6 +939,8 @@ class Plugin(LiquidityPlugin):
             (autoclose_cb, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
             (plugin_only_cb, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY'),
             (diag_log_cb, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
+            (capture_ln_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN'),
+            (capture_debug_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG'),
         ]
 
         grid = QGridLayout()
@@ -698,6 +1008,11 @@ class Plugin(LiquidityPlugin):
             (_("Offline auto-close: force-close after trying to close (days)"),
              'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', float,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, val))),
+            # Appended last on purpose: the ceiling fields above must stay at
+            # findChildren(QLineEdit) index 0/1 for the Advanced-tab tests.
+            (_("Log tab buffer (lines, {}–{})").format(MIN_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES),
+             'INBOUND_LIQUIDITY_LOG_BUFFER_LINES', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_LOG_BUFFER_LINES', clamp_max_lines(val))),
         ]
         field_rows = []  # (edit, attr, parser, setter, label)
         for (label, attr, parser, setter) in fields:
@@ -752,6 +1067,9 @@ class Plugin(LiquidityPlugin):
                 setattr(c, attr, cb.isChecked())
             for setter, value in parsed_fields:
                 setter(value)
+            # Log capture reads all three of its settings from config, so bring
+            # the live handler/buffer in line with what was just saved.
+            self.apply_log_capture_settings()
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))

@@ -8,6 +8,7 @@ from liquidity_manager import (  # type: ignore
     is_channel_size_rejection,
     normalize_node_id,
     order_channel_partners,
+    resolve_channel_partners,
 )
 
 PUB_A = "02" + "aa" * 32
@@ -156,3 +157,75 @@ def test_non_size_failures_are_not_size_rejections():
 def test_size_rejection_handles_none_and_is_case_insensitive():
     assert not is_channel_size_rejection(None)
     assert is_channel_size_rejection("FUNDING AMOUNT TOO SMALL")
+
+
+# --- resolve_channel_partners: the counts behind the result ---------------
+# `order_channel_partners` answers "who do I try"; this answers "and why is that
+# list the length it is" -- the arithmetic the plugin shows when an open is
+# declined for having no reachable partner.
+def test_resolution_counts_a_clean_run():
+    res = resolve_channel_partners(
+        preferred=[PUB_A], banned=frozenset(), suggested=[PUB_B, PUB_C],
+        strict=False)
+    assert list(res.candidates) == [PUB_A, PUB_B, PUB_C]
+    assert (res.preferred_total, res.preferred_kept) == (1, 1)
+    assert (res.suggested_total, res.suggested_kept) == (2, 2)
+    assert res.banned_hits == res.guard_hits == res.duplicate_hits == 0
+    assert res.malformed_hits == 0
+    assert res.total_kept == 3
+
+
+def test_resolution_attributes_each_drop_to_one_rule():
+    # PUB_A banned, PUB_B blocked by the one-channel-per-peer guard, PUB_C listed
+    # twice. Each drop is charged to exactly one rule, checked banned -> guard ->
+    # duplicate, so the numbers reconcile.
+    res = resolve_channel_partners(
+        preferred=[PUB_A, PUB_B, PUB_C],
+        banned=frozenset({PUB_A}),
+        suggested=[PUB_C],
+        strict=False,
+        exclude=frozenset({PUB_B}))
+    assert list(res.candidates) == [PUB_C]
+    assert res.banned_hits == 1
+    assert res.guard_hits == 1
+    assert res.duplicate_hits == 1
+    kept = res.preferred_kept + res.suggested_kept
+    total = res.preferred_total + res.suggested_total
+    assert total - kept == res.banned_hits + res.guard_hits + res.duplicate_hits
+
+
+def test_resolution_flags_unparseable_entries_without_dropping_them():
+    # A typo'd preferred partner is named in the breakdown instead of looking
+    # like a peer that simply refused -- but it is still tried, so partner
+    # selection behaves exactly as it did before the counts existed.
+    res = resolve_channel_partners(
+        preferred=["not-a-pubkey", PUB_A], banned=frozenset(), suggested=[],
+        strict=False)
+    assert list(res.candidates) == ["not-a-pubkey", PUB_A]
+    assert res.malformed_hits == 1
+    assert res.preferred_total == res.preferred_kept == 2
+
+
+def test_resolution_reports_strict_mode():
+    res = resolve_channel_partners(
+        preferred=[PUB_A], banned=frozenset(), suggested=[PUB_B], strict=True)
+    assert list(res.candidates) == [PUB_A]
+    assert res.strict is True
+    assert (res.suggested_total, res.suggested_kept) == (0, 0)
+
+
+def test_resolution_applies_penalties_like_the_ordering_wrapper():
+    res = resolve_channel_partners(
+        preferred=[PUB_A, PUB_B], banned=frozenset(), suggested=[], strict=False,
+        penalties={PUB_A: 5.0})
+    assert list(res.candidates) == [PUB_B, PUB_A]     # flaky peer sinks
+
+
+def test_order_channel_partners_still_returns_a_plain_list():
+    # The wrapper is what most callers use; it must stay a mutable list of the
+    # same entries the resolution produced.
+    args = dict(preferred=[PUB_A], banned=frozenset(), suggested=[PUB_B],
+                strict=False)
+    out = order_channel_partners(**args)
+    assert isinstance(out, list)
+    assert out == list(resolve_channel_partners(**args).candidates)

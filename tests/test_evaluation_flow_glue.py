@@ -18,6 +18,7 @@ import electrum.plugins.inbound_liquidity as pkg  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity import LiquidityPlugin  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore  # noqa: E402
     OpenChannelAction,
+    PartnerResolution,
     ReverseSwapAction,
 )
 
@@ -53,14 +54,30 @@ def _fake_result(actions, declines=(), frozen=False):
     return SimpleNamespace(actions=list(actions), declines=list(declines), frozen=frozen)
 
 
+def _wire_resolution(p, candidates):
+    """Stub the partner-resolution seam _run_decision uses.
+
+    It resolves once per open and needs the *counts* alongside the candidates
+    (to explain an empty result without resolving again), so the seam is
+    ``_resolve_partners_detailed``, not the plain list-returning wrapper. Async
+    because the suggestion lookup has to be awaited (it runs off the loop).
+    """
+    async def _resolve(wallet, *, apply_peer_guard=True):
+        return PartnerResolution(
+            candidates=tuple(candidates),
+            preferred_total=len(candidates), preferred_kept=len(candidates),
+            suggested_total=0, suggested_kept=0,
+            banned_hits=0, guard_hits=0, duplicate_hits=0, malformed_hits=0,
+            strict=False)
+    p._resolve_partners_detailed = _resolve
+    p._partner_breakdown = lambda wallet, res: "stub breakdown"
+
+
 # --- _run_decision --------------------------------------------------------
 def test_run_decision_resolves_candidates_and_dispatches(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    # Async since the suggestion lookup must be awaited (it runs off the loop).
-    async def _resolve(wallet, *, apply_peer_guard=True):
-        return ["partnerA"]                                        # candidates exist
-    p._resolve_channel_partners = _resolve
+    _wire_resolution(p, ["partnerA"])                              # candidates exist
 
     open_act = OpenChannelAction(funding_sat=1_000_000, reason="grow")
     swap_act = ReverseSwapAction(channel_id="aa" * 32, short_id="1x1x1",
@@ -80,12 +97,10 @@ def test_run_decision_resolves_candidates_and_dispatches(monkeypatch) -> None:
 def test_run_decision_open_without_partner_becomes_decline(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    async def _resolve(wallet, *, apply_peer_guard=True):
-        return []                                             # no eligible partner
-    p._resolve_channel_partners = _resolve
+    _wire_resolution(p, [])                                   # no eligible partner
     sentinel_decline = object()
 
-    async def _decline(wallet, action):
+    async def _decline(wallet, action, resolution=None):
         return sentinel_decline
     p._no_partner_decline = _decline
 
@@ -103,9 +118,7 @@ def test_run_decision_open_without_partner_becomes_decline(monkeypatch) -> None:
 def test_run_decision_logs_engine_declines(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    async def _resolve(wallet, *, apply_peer_guard=True):
-        return ["partnerA"]
-    p._resolve_channel_partners = _resolve
+    _wire_resolution(p, ["partnerA"])
 
     decline = object()
     monkeypatch.setattr(pkg, "evaluate",

@@ -579,3 +579,114 @@ def test_open_walks_every_suggestion_until_one_accepts():
     assert opened and opened[0]["dest"] == accepted, \
         "the open should have fallen through to the last suggestion"
     assert faults == []
+
+
+# --- partner-resolution breakdown -----------------------------------------
+# "No reachable channel partner" collapses half a dozen distinct situations into
+# one sentence. These pin the arithmetic that tells them apart, which is what the
+# decline's detail line and the Log tab actually show.
+def _breakdown(p, wallet):
+    res = asyncio.run(p._resolve_partners_detailed(wallet))
+    return p._partner_breakdown(wallet, res)
+
+
+def test_breakdown_reports_kept_over_total_for_both_lists():
+    p = _plugin(INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_A}@h:1")
+    text = _breakdown(p, _wallet(suggestion=PUB_B))
+    assert "preferred 1/1" in text
+    assert "suggested 1/1" in text
+
+
+def test_breakdown_names_the_guard_that_emptied_the_list():
+    p = _plugin(INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_A}@h:1")
+    text = _breakdown(p, _wallet(channels=[_fake_channel(PUB_A)]))
+    assert "preferred 0/1" in text
+    assert "1 already have a channel with" in text
+
+
+def test_breakdown_names_banned_partners():
+    p = _plugin(INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_A}@h:1",
+                INBOUND_LIQUIDITY_BANNED_PARTNERS=PUB_A)
+    text = _breakdown(p, _wallet())
+    assert "1 banned" in text
+
+
+def test_breakdown_says_strict_mode_suppressed_suggestions():
+    p = _plugin(INBOUND_LIQUIDITY_PARTNERS_STRICT=True)
+    text = _breakdown(p, _wallet(suggestion=PUB_B))
+    assert "strict mode" in text
+
+
+def test_breakdown_flags_an_unparseable_preferred_partner():
+    p = _plugin(INBOUND_LIQUIDITY_PREFERRED_PARTNERS="oops-typo")
+    assert "1 unparseable" in _breakdown(p, _wallet())
+
+
+def test_breakdown_reports_the_routing_mode():
+    # trampoline vs gossip are entirely different suggestion paths, and each
+    # fails to produce a peer for its own reason.
+    p = _plugin()
+    wallet = _wallet()
+    wallet.lnworker.uses_trampoline = lambda: True
+    assert "routing trampoline" in _breakdown(p, wallet)
+    wallet.lnworker.uses_trampoline = lambda: False
+    assert "routing gossip" in _breakdown(p, wallet)
+
+
+def test_breakdown_reports_unknown_routing_when_electrum_cannot_say():
+    # _wallet()'s lnworker has no uses_trampoline at all -> reported honestly as
+    # unknown rather than guessed.
+    assert "routing unknown" in _breakdown(_plugin(), _wallet())
+
+
+def test_breakdown_names_a_failed_suggestion_lookup():
+    p = _plugin()
+
+    def _boom():
+        raise AssertionError("must not be called from the asyncio thread")
+    wallet = _Wallet(SimpleNamespace(suggest_peer=_boom, channels={}))
+    text = _breakdown(p, wallet)
+    assert "suggestion lookup failed" in text and "AssertionError" in text
+
+
+# --- the decline carries the breakdown ------------------------------------
+def test_no_partner_decline_carries_the_breakdown_as_detail():
+    p = _plugin(INBOUND_LIQUIDITY_PARTNERS_STRICT=True)
+    wallet = _wallet()
+    d = asyncio.run(p._no_partner_decline(
+        wallet, OpenChannelAction(funding_sat=1, reason="x")))
+    assert "no reachable channel partner" in d.reason
+    assert d.detail is not None and d.detail.startswith("partner resolution: ")
+    assert "preferred 0/0" in d.detail
+
+
+def test_decline_reason_is_unchanged_by_the_breakdown():
+    # The counts go in `detail`, NOT the reason, so the decline's dedup
+    # signature (kind, channel_id, reason) is stable and a steady state is still
+    # logged once rather than every tick.
+    p = _plugin(INBOUND_LIQUIDITY_PARTNERS_STRICT=True)
+    wallet = _wallet()
+    action = OpenChannelAction(funding_sat=1, reason="x")
+    first = asyncio.run(p._no_partner_decline(wallet, action))
+    p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = f"{PUB_A}@h:1"
+    p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = PUB_A
+    second = asyncio.run(p._no_partner_decline(wallet, action))
+    assert first.reason == second.reason        # same signature...
+    assert first.detail != second.detail        # ...different explanation
+
+
+def test_no_partner_decline_reuses_a_resolution_it_is_given():
+    # _run_decision has already resolved once; passing the result through must
+    # not trigger another suggest_peer round-trip (a thread hop + network call).
+    calls = {"n": 0}
+
+    def _suggest():
+        calls["n"] += 1
+        return None
+    p = _plugin(INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER=False)
+    wallet = _Wallet(SimpleNamespace(suggest_peer=_suggest, channels={}))
+    res = asyncio.run(p._resolve_partners_detailed(wallet))
+    before = calls["n"]
+    asyncio.run(p._no_partner_decline(
+        wallet, OpenChannelAction(funding_sat=1, reason="x"), res))
+    assert calls["n"] == before
