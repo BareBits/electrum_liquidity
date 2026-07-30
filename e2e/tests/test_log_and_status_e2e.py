@@ -58,7 +58,7 @@ from rig.services import (  # noqa: E402
 # plugin; duplicated rather than imported because the plugin package is only
 # importable inside the client daemon's environment).
 TERMINAL = ("sleeping", "automation disabled", "idle (manual run only)",
-            "warming up", "not started")
+            "warming up", "wallet locked", "not started")
 
 
 def _setcfg(key: str, value: str) -> None:

@@ -368,15 +368,17 @@ def deadline_reached(marked_ts: Optional[float], now: float,
 BLOCK_NOT_MANAGED = "wallet is not being managed"
 BLOCK_NO_CONNECTION = "no server connection"
 BLOCK_SYNCING = "wallet is still syncing with the server"
+BLOCK_LOCKED = "wallet is locked (unlock it in Electrum to allow automation)"
 BLOCK_STARTING_UP = "still in the startup window"
 
 
 def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
                            elapsed_sec: float, grace_sec: float, *,
-                           manual: bool = False) -> Optional[str]:
+                           manual: bool = False,
+                           wallet_unlocked: bool = True) -> Optional[str]:
     """Why the wallet cannot take automated action yet, or ``None`` if it can.
 
-    Three independent conditions, checked in the order the user would want them
+    Four independent conditions, checked in the order the user would want them
     reported:
 
       * **server connection** -- without one we can neither read fresh chain
@@ -384,6 +386,14 @@ def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
       * **wallet sync** -- an address-synchronizer that is still catching up
         reports a partial UTXO set, so a balance-driven decision (open / swap)
         would be taken on incomplete state. Also blocks manual runs;
+      * **unlocked** -- a password-protected wallet that the user has not
+        unlocked cannot sign, so no action that moves money can complete. This
+        gate is what keeps the tick from doing its (expensive) work and then
+        failing at the signing step: a channel open raises outright, and a
+        reverse swap is worse -- it starts, pays its Lightning leg, and only
+        then finds it cannot sign the on-chain claim. Blocks manual runs too:
+        "Run now" cannot conjure a password either, and the honest answer is to
+        tell the user to unlock. See ``LiquidityPlugin._get_password``;
       * **startup window** -- for ``grace_sec`` after load the plugin takes no
         automated action at all. The Lightning layer is still (re)connecting: a
         healthy peer reads as offline, and -- learned the hard way, see below --
@@ -410,6 +420,8 @@ def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
         return BLOCK_NO_CONNECTION
     if not wallet_synced:
         return BLOCK_SYNCING
+    if not wallet_unlocked:
+        return BLOCK_LOCKED
     if manual or elapsed_sec >= grace_sec:
         return None
     return BLOCK_STARTING_UP
@@ -417,11 +429,12 @@ def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
 
 def is_wallet_ready(network_connected: bool, wallet_synced: bool,
                     elapsed_sec: float, grace_sec: float, *,
-                    manual: bool = False) -> bool:
+                    manual: bool = False, wallet_unlocked: bool = True) -> bool:
     """Whether the wallet has settled enough for the plugin to take *any*
     automated action -- the boolean face of :func:`wallet_readiness_block`."""
     return wallet_readiness_block(network_connected, wallet_synced, elapsed_sec,
-                                  grace_sec, manual=manual) is None
+                                  grace_sec, manual=manual,
+                                  wallet_unlocked=wallet_unlocked) is None
 
 
 def classify_peer_observation(is_active: bool, seen_online_before: bool,

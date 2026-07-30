@@ -45,6 +45,7 @@ if _real_key and _real_key != __name__:
     __package__ = _real_key
 
 from .liquidity_manager import (
+    BLOCK_LOCKED,
     BLOCK_NOT_MANAGED,
     Action,
     ChannelSnapshot,
@@ -301,11 +302,16 @@ STATUS_MANUAL_ONLY = "idle (manual run only)"
 # unconfirmed balances, and the old wording read as "your coins aren't confirmed
 # yet". The specific blocking reason goes to the log (see `_readiness_block`).
 STATUS_SETTLING = "warming up"
+# Shown when the only thing standing between the plugin and acting is the wallet
+# password. Kept distinct from STATUS_SETTLING because it is not transient: no
+# amount of waiting clears it, the user has to unlock the wallet, and "warming
+# up" forever is exactly the kind of quiet lie the states above exist to avoid.
+STATUS_LOCKED = "wallet locked"
 # Terminal states, for the GUI (and tests): reaching any of these means the tick
 # is over and nothing is in flight.
 TERMINAL_STATUSES = frozenset({
     STATUS_NOT_STARTED, STATUS_SLEEPING, STATUS_DISABLED,
-    STATUS_MANUAL_ONLY, STATUS_SETTLING,
+    STATUS_MANUAL_ONLY, STATUS_SETTLING, STATUS_LOCKED,
 })
 
 # On-disk diagnostic log (opt-in; see INBOUND_LIQUIDITY_DIAG_LOG_ENABLED). Files
@@ -1016,7 +1022,12 @@ class LiquidityPlugin(BasePlugin):
         # come to rest on "warming up" -- the state it would have been blocked by
         # but was deliberately allowed to skip. A later automatic tick that really
         # is still deferred will set it back, so the display stays honest.
-        if not self._wallet_ready(wallet, manual=manual):
+        block = self._readiness_block(wallet, manual=manual)
+        if block == BLOCK_LOCKED:
+            # Not a transient state -- waiting will not clear it, so say what it
+            # is rather than resting on "warming up" indefinitely.
+            return STATUS_LOCKED
+        if block is not None:
             return STATUS_SETTLING
         return STATUS_SLEEPING
 
@@ -1126,8 +1137,8 @@ class LiquidityPlugin(BasePlugin):
         managing (no recorded load time) is never ready.
 
         ``manual=True`` marks a user-initiated "Run now", which skips the
-        time-based startup window only; a disconnected or still-syncing wallet is
-        refused either way."""
+        time-based startup window only; a disconnected, still-syncing or locked
+        wallet is refused either way."""
         started = self._started_at.get(wallet)
         if started is None:
             return BLOCK_NOT_MANAGED
@@ -1138,7 +1149,8 @@ class LiquidityPlugin(BasePlugin):
             connected = False
         return wallet_readiness_block(
             connected, self._wallet_synced(wallet), time.time() - started,
-            self._startup_grace_sec, manual=manual)
+            self._startup_grace_sec, manual=manual,
+            wallet_unlocked=self._signing_unlocked(wallet))
 
     def _wallet_ready(self, wallet: 'Abstract_Wallet', *,
                       manual: bool = False) -> bool:
@@ -3493,14 +3505,54 @@ class LiquidityPlugin(BasePlugin):
         except Exception:
             return ""
 
+    def _signing_unlocked(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether we can sign for ``wallet`` right now.
+
+        Gates on *keystore* encryption specifically, not ``has_password()``:
+        only keystore encryption makes signing require a password (see
+        ``Abstract_Wallet.has_keystore_encryption``). A wallet whose file is
+        storage-encrypted but whose keystore is not -- a hardware wallet, say --
+        signs without one, and must not be held back by this gate.
+
+        The password itself comes from Electrum's own unlock cache, which the
+        user fills via the Lock/Unlock button in the wallet window. We never
+        prompt: this runs on a background evaluation tick the user did not
+        initiate, and a modal appearing out of nowhere is both startling and, in
+        a headless run, unanswerable. Electrum's own background automation reads
+        the same cache (``txbatcher``, ``lnworker``, the swapserver plugin).
+
+        A wallet object that does not implement the password API at all is
+        treated as unlocked -- same reasoning as ``_wallet_synced``: assuming the
+        blocking answer would stall the plugin forever on a wallet type that
+        simply has no such concept. But one that *has* the API and then fails to
+        answer is treated as locked, because there we know a keystore is in play
+        and refusing to act is the recoverable direction."""
+        probe = getattr(wallet, "has_keystore_encryption", None)
+        if not callable(probe):
+            return True
+        try:
+            if not probe():
+                return True
+            return wallet.get_unlocked_password() is not None
+        except Exception as e:
+            self.logger.info(f"could not read unlock state: {e!r}; treating as locked")
+            return False
+
     def _get_password(self, wallet: 'Abstract_Wallet') -> Optional[str]:
-        # The rig wallet is unencrypted. Encrypted wallets are handled by the
-        # GUI subclass, which can prompt / cache; here we only proceed if the
-        # wallet does not require a password.
-        if wallet.has_keystore_encryption():
-            self.logger.warning(f"{wallet.basename()} is password-protected; cannot auto-open channel")
-            raise Exception("wallet requires password for channel open")
-        return None
+        """The password to sign with, or ``None`` when signing needs none.
+
+        Normally unreachable while locked -- ``_readiness_block`` turns that into
+        an early deferral (``BLOCK_LOCKED``) before the tick does any work -- so
+        the raise here is a backstop for direct callers, kept so a locked wallet
+        can never silently fall through to an unsigned action."""
+        if not self._signing_unlocked(wallet):
+            self.logger.warning(
+                f"{wallet.basename()} is password-protected and locked; "
+                f"unlock it in Electrum to allow automated channel opens")
+            raise Exception("wallet is locked; unlock it to open a channel")
+        if not getattr(wallet, "has_password", lambda: False)():
+            return None
+        return wallet.get_unlocked_password()
 
     def on_action_done(self, wallet: 'Abstract_Wallet', message: str) -> None:
         """Hook for GUI subclasses to surface activity. No-op in headless."""
