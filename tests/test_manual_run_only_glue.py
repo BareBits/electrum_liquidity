@@ -7,9 +7,9 @@ no-op: they all funnel through ``_evaluate`` with ``manual=False``, which the
 guard catches. A user-initiated "Run now" passes ``manual=True`` and must still
 run. Unchecked, behaviour is unchanged (fully automated).
 
-Heavy Electrum objects are faked; ``_wallet_ready`` is stubbed True so the guard
--- not the startup grace -- is what decides whether automation runs. Skipped
-outside the electrum venv (needs the package ``__init__``, which imports
+Heavy Electrum objects are faked; the readiness gate is stubbed "ready" so the
+guard -- not the startup window -- is what decides whether automation runs.
+Skipped outside the electrum venv (needs the package ``__init__``, which imports
 Electrum)."""
 from __future__ import annotations
 
@@ -45,8 +45,11 @@ def _plugin(*, manual_run_only: bool = False,
     p.config = SimpleNamespace(
         INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=manual_run_only)
     p.read_config = lambda: SimpleNamespace(automation_enabled=automation_enabled)
-    # Past the startup grace / connected: isolate the guard from the readiness gate.
-    p._wallet_ready = lambda wal: True
+    # Connected, synced, peers dialed: isolate the guard from the readiness gate.
+    # ``_evaluate`` consults ``_readiness_block`` (None == ready); the terminal
+    # status then re-checks via ``_wallet_ready``, so stub both.
+    p._readiness_block = lambda wal, **kw: None
+    p._wallet_ready = lambda wal, **kw: True
     # Stub every side-effecting sub-step so a run is a list of tags.
     called: List[str] = []
     p._enforce_min_funding_floor = lambda: called.append("floor")

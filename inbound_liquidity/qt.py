@@ -695,8 +695,9 @@ class Plugin(LiquidityPlugin):
         run_now_btn = QPushButton(_("Run now"))
         run_now_btn.setToolTip(_(
             "Evaluate once right now and take any warranted action, regardless of "
-            "the \"Manual run only\" setting. Requires the Automation switch to be "
-            "enabled."))
+            "the \"Manual run only\" setting, and without waiting for the startup "
+            "window that automatic runs observe. Requires the Automation switch to "
+            "be enabled, a server connection, and a fully synced wallet."))
 
         def on_run_now() -> None:
             self.request_evaluation(wallet, manual=True)

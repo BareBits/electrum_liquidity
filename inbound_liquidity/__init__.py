@@ -45,6 +45,9 @@ if _real_key and _real_key != __name__:
     __package__ = _real_key
 
 from .liquidity_manager import (
+    BLOCK_NOT_MANAGED,
+    BLOCK_NO_CONNECTION,
+    BLOCK_SYNCING,
     Action,
     ChannelSnapshot,
     clean_npub,
@@ -70,7 +73,6 @@ from .liquidity_manager import (
     eligible_providers,
     evaluate,
     is_channel_size_rejection,
-    is_wallet_ready,
     normalize_node_id,
     order_channel_partners,
     record_uptime_sample,
@@ -81,6 +83,7 @@ from .liquidity_manager import (
     should_commit_offline_close,
     uptime_ratio,
     validate_offer,
+    wallet_readiness_block,
 )
 from .diag_log import DiagLog
 from .log_buffer import (
@@ -201,15 +204,18 @@ _REVERSE_SWAP_CHEAT_MARKERS = (
     "invoice_amount",              # invoice amount != what we requested
 )
 
-# Startup settle window. For this long after a wallet is loaded, the plugin takes
-# NO automated action (open / swap / close) and does not judge any peer offline:
-# the Lightning layer connects to its peers asynchronously after load, so a peer
-# that is actually fine reads as "not connected" during this window. Acting then
-# would fault a healthy peer or poison its uptime metric (see the readiness
-# guards in liquidity_manager). Kept a fixed constant (not a ConfigVar) -- it is
-# infrastructure timing, not a strategy knob -- but referenced via
-# ``self._startup_grace_sec`` so tests can shrink it. A couple of minutes
-# comfortably covers peer (re)connection without noticeably delaying automation.
+# Startup window CEILING. While the Lightning layer is still dialing its peers
+# after a wallet loads, a peer that is actually fine reads as "not connected";
+# acting then would fault a healthy peer or poison its uptime metric (see the
+# readiness guards in liquidity_manager). The plugin therefore waits until every
+# open channel's peer has produced a trustworthy reading -- normally a few
+# seconds -- and this constant only *bounds* that wait, so a permanently dead
+# peer cannot defer automation forever. It is not a minimum: a wallet whose peers
+# connect quickly (or one with no channels yet) is ready well before this.
+# Kept a fixed constant (not a ConfigVar) -- infrastructure timing, not a
+# strategy knob -- but referenced via ``self._startup_grace_sec`` so tests can
+# shrink it. Also bounds the per-peer observation gate in
+# ``classify_peer_observation``.
 STARTUP_GRACE_SEC = 120.0
 
 # Heartbeat cadence. The plugin is otherwise entirely event-driven (see
@@ -278,7 +284,12 @@ STATUS_NOT_STARTED = "not started"
 STATUS_SLEEPING = "sleeping"
 STATUS_DISABLED = "automation disabled"
 STATUS_MANUAL_ONLY = "idle (manual run only)"
-STATUS_SETTLING = "waiting for wallet to settle"
+# Shown while the wallet is not yet ready (no server connection, still syncing,
+# or the Lightning layer is still dialing its peers). Deliberately NOT phrased in
+# terms of funds "settling" -- readiness has nothing to do with confirmations or
+# unconfirmed balances, and the old wording read as "your coins aren't confirmed
+# yet". The specific blocking reason goes to the log (see `_readiness_block`).
+STATUS_SETTLING = "warming up"
 # Terminal states, for the GUI (and tests): reaching any of these means the tick
 # is over and nothing is in flight.
 TERMINAL_STATUSES = frozenset({
@@ -736,9 +747,10 @@ class LiquidityPlugin(BasePlugin):
         # hammer the network every tick). The fee stays owed across the backoff.
         self._dev_fee_retry_until: Dict['Abstract_Wallet', float] = {}
         # wallet -> wall-clock time the wallet was loaded (start_wallet). Drives
-        # the startup settle window: until STARTUP_GRACE_SEC has elapsed the
-        # plugin defers all automation and treats not-yet-connected peers as
-        # "not observed" rather than offline.
+        # the startup window ceiling: until every open channel's peer has been
+        # observed OR STARTUP_GRACE_SEC has elapsed, the plugin defers automatic
+        # evaluation and treats not-yet-connected peers as "not observed" rather
+        # than offline.
         self._started_at: Dict['Abstract_Wallet', float] = {}
         # wallet -> set of node_ids (hex) we have seen ONLINE at least once since
         # load. A peer in this set that later reads inactive is a genuine offline
@@ -989,7 +1001,11 @@ class LiquidityPlugin(BasePlugin):
             return STATUS_DISABLED
         if not manual and self._manual_run_only():
             return STATUS_MANUAL_ONLY
-        if not self._wallet_ready(wallet):
+        # `manual` is threaded through so a "Run now" that actually ran does not
+        # come to rest on "warming up" -- the state it would have been blocked by
+        # but was deliberately allowed to skip. A later automatic tick that really
+        # is still deferred will set it back, so the display stays honest.
+        if not self._wallet_ready(wallet, manual=manual):
             return STATUS_SETTLING
         return STATUS_SLEEPING
 
@@ -1070,23 +1086,102 @@ class LiquidityPlugin(BasePlugin):
             _wrap(_name)
         lnworker._inbound_liquidity_close_hooked = True
 
-    def _wallet_ready(self, wallet: 'Abstract_Wallet') -> bool:
-        """Whether ``wallet`` has settled enough to take automated action.
+    def _wallet_synced(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether the address synchronizer has caught up with the server.
 
-        Defers everything until we have a live server connection AND the startup
-        grace has elapsed since load -- the window in which not-yet-connected
-        peers masquerade as offline. A wallet we are not managing (no recorded
-        load time) is never ready."""
+        This is the one readiness limb that *is* about funds: until the wallet is
+        up to date its UTXO set is partial, so a balance-driven decision (open /
+        swap) would be taken on incomplete state.
+
+        A wallet that cannot answer (no such method, or it raises) is treated as
+        synced. Assuming "not synced" would stall the plugin forever on any
+        wallet type that does not implement it, and the previous behaviour never
+        consulted sync state at all -- so defaulting to True is the no-regression
+        choice."""
+        probe = getattr(wallet, "is_up_to_date", None)
+        if not callable(probe):
+            return True
+        try:
+            return bool(probe())
+        except Exception:
+            return True
+
+    def _all_channel_peers_observed(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether every open channel's peer has produced a *trustworthy*
+        reachability reading this session.
+
+        This is what actually ends the startup window in practice: rather than
+        waiting out a fixed stopwatch, we wait only until the Lightning layer has
+        finished dialing, which normally takes seconds. ``_observe_peer`` already
+        encodes "is this reading trustworthy?" -- it returns None precisely when a
+        peer has not been dialed yet -- so readiness is just "no channel peer
+        still reads as not-yet-observed".
+
+        Only channels in state OPEN are considered: ``chan.is_active()`` can only
+        ever be true there, so requiring an observation from a channel that is
+        still opening (or already closing) would hold readiness to the grace
+        ceiling for no benefit. A wallet with no such channels -- a fresh wallet
+        about to open its first -- is trivially observed, and becomes ready as
+        soon as it is connected and synced.
+
+        Anything we cannot read (no lnworker, an lnworker that raises) counts as
+        observed, so an unexpected shape defers to the grace ceiling rather than
+        stalling automation forever."""
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return True
+        try:
+            channels = list(lnworker.channels.values())
+        except Exception:
+            return True
+        now = time.time()
+        for chan in channels:
+            try:
+                if not chan.is_open():
+                    continue
+            except Exception:
+                continue
+            # None == "not a trustworthy reading yet" (peer not dialed).
+            if self._observe_peer(wallet, chan, now) is None:
+                return False
+        return True
+
+    def _readiness_block(self, wallet: 'Abstract_Wallet', *,
+                         manual: bool = False) -> Optional[str]:
+        """Why ``wallet`` cannot take automated action yet, or None if it can.
+
+        Gathers the three live signals -- server connection, wallet sync, and
+        whether every open channel's peer has been observed -- and hands them to
+        the pure predicate. A wallet we are not managing (no recorded load time)
+        is never ready.
+
+        ``manual=True`` marks a user-initiated "Run now", which skips the
+        time-based peer limb only; a disconnected or still-syncing wallet is
+        refused either way."""
         started = self._started_at.get(wallet)
         if started is None:
-            return False
+            return BLOCK_NOT_MANAGED
         network = getattr(wallet, "network", None)
         try:
             connected = bool(network is not None and network.is_connected())
         except Exception:
             connected = False
-        return is_wallet_ready(connected, time.time() - started,
-                               self._startup_grace_sec)
+        # Short-circuited in the same order the pure predicate reports them, so
+        # the peer sweep is skipped when an earlier limb already blocks: a
+        # disconnected wallet must not record peer observations from readings we
+        # have just declared untrustworthy.
+        if not connected:
+            return BLOCK_NO_CONNECTION
+        if not self._wallet_synced(wallet):
+            return BLOCK_SYNCING
+        return wallet_readiness_block(
+            True, True, self._all_channel_peers_observed(wallet),
+            time.time() - started, self._startup_grace_sec, manual=manual)
+
+    def _wallet_ready(self, wallet: 'Abstract_Wallet', *,
+                      manual: bool = False) -> bool:
+        """Whether ``wallet`` has settled enough to take automated action."""
+        return self._readiness_block(wallet, manual=manual) is None
 
     def request_evaluation(self, wallet: 'Abstract_Wallet', *, manual: bool = False) -> None:
         """Schedule one evaluation of `wallet` on the network's asyncio loop.
@@ -2581,8 +2676,9 @@ class LiquidityPlugin(BasePlugin):
         heartbeat, the post-grace one-shot, the arm-switch kick via
         `request_evaluation`) routes here with `manual=False`, so a single "manual
         run only" guard below gates them all. A user-initiated "Run now" passes
-        `manual=True` to bypass that guard (but still respects the master switch
-        and the startup grace)."""
+        `manual=True` to bypass that guard, and also to skip the *time-based* limb
+        of the readiness gate -- it still respects the master switch, and still
+        requires a server connection and a synced wallet."""
         lock = self.wallets.get(wallet)
         if lock is None:
             return
@@ -2613,15 +2709,18 @@ class LiquidityPlugin(BasePlugin):
                     self.logger.debug(
                         f"{wallet.basename()} manual-run-only: skipping automatic evaluation")
                     return
-                # Startup/shutdown race guard: until the wallet has settled (a
-                # live server connection AND the startup grace elapsed), defer ALL
-                # automation. The Lightning layer connects to peers asynchronously
-                # after load, so acting now risks faulting a healthy-but-not-yet-
-                # connected peer or opening/swapping on incomplete state. A later
-                # tick (events, or the scheduled post-grace evaluation) re-checks.
-                if not self._wallet_ready(wallet):
+                # Startup/shutdown race guard: until the wallet is ready (server
+                # connected, wallet synced, and every open channel's peer dialed
+                # -- or the grace ceiling reached), defer ALL automation. Acting
+                # earlier risks faulting a healthy-but-not-yet-connected peer or
+                # opening/swapping on a partial UTXO set. A later tick (events,
+                # the heartbeat, or the scheduled post-grace evaluation)
+                # re-checks. A manual "Run now" skips the peer/time limb only.
+                block = self._readiness_block(wallet, manual=manual)
+                if block is not None:
                     self.logger.debug(
-                        f"{wallet.basename()} not settled yet; deferring evaluation")
+                        f"{wallet.basename()} not ready ({block}); deferring "
+                        f"evaluation")
                     return
                 # Resolve any reverse swaps we were watching (funded -> success,
                 # never funded -> stuck fault) before snapshotting, so the

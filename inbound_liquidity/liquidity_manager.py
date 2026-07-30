@@ -355,28 +355,69 @@ def deadline_reached(marked_ts: Optional[float], now: float,
 # blame the peer for *our* transitional state -- an immediate hard fault or a
 # poisoned uptime ratio that can force-close a channel to a peer that was fine.
 #
-# These two PURE predicates (no clock, no Electrum) encode the guard. The glue
+# These PURE predicates (no clock, no Electrum) encode the guard. The glue
 # supplies the wall clock (as ``elapsed_sec`` since the wallet was loaded), the
-# network-connected flag, and -- for the per-peer gate -- whether we have already
-# seen *this* peer online at least once since load. Keeping them here keeps the
-# race logic unit-testable in isolation.
+# network-connected flag, whether the wallet has finished syncing, whether every
+# open channel's peer has yielded a trustworthy reading, and -- for the per-peer
+# gate -- whether we have already seen *this* peer online at least once since
+# load. Keeping them here keeps the race logic unit-testable in isolation.
 
-def is_wallet_ready(network_connected: bool, elapsed_sec: float,
-                    grace_sec: float) -> bool:
-    """Whether the wallet has settled enough for the plugin to take *any*
-    automated action.
+# Reasons a wallet is not yet ready. Returned by ``wallet_readiness_block`` and
+# used verbatim in the deferral log line, so the log names the limb that is
+# actually blocking instead of an opaque "not settled yet".
+BLOCK_NOT_MANAGED = "wallet is not being managed"
+BLOCK_NO_CONNECTION = "no server connection"
+BLOCK_SYNCING = "wallet is still syncing with the server"
+BLOCK_PEERS = "still connecting to Lightning peers"
 
-    Ready only when we have a live server connection AND a bounded startup grace
-    has elapsed since load, giving the Lightning layer a fair chance to connect
-    to its peers first. Before that, every automated action (open / swap / close)
-    is deferred -- the tick becomes a no-op and a later tick re-checks. A
-    non-positive ``grace_sec`` disables the time gate (ready as soon as
-    connected), which the tests use to exercise the connected/disconnected axis
-    on its own.
+
+def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
+                           all_peers_observed: bool, elapsed_sec: float,
+                           grace_sec: float, *,
+                           manual: bool = False) -> Optional[str]:
+    """Why the wallet cannot take automated action yet, or ``None`` if it can.
+
+    Three independent conditions, checked in the order the user would want them
+    reported:
+
+      * **server connection** -- without one we can neither read fresh chain
+        state nor broadcast, so nothing may proceed (manual runs included);
+      * **wallet sync** -- an address-synchronizer that is still catching up
+        reports a partial UTXO set, so a balance-driven decision (open / swap)
+        would be taken on incomplete state. Also blocks manual runs;
+      * **Lightning peers** -- at load the LN layer dials its peers
+        asynchronously, so a healthy peer momentarily reads as offline. We wait
+        until every open channel's peer has produced a *trustworthy* reading, or
+        until ``grace_sec`` has elapsed as a ceiling so one permanently dead peer
+        cannot defer automation forever.
+
+    Only the last of the three is time-based, and only it is skipped for a
+    user-initiated "Run now" (``manual=True``): the user is present and asking,
+    and the per-peer guard (:func:`classify_peer_observation`) independently stops
+    the watchdogs from acting on a peer that has not been dialed yet, so no
+    healthy peer can be faulted by running early.
+
+    A non-positive ``grace_sec`` disables the time ceiling (the peer limb is then
+    satisfied immediately), which the tests use to exercise the other axes on
+    their own.
     """
     if not network_connected:
-        return False
-    return elapsed_sec >= grace_sec
+        return BLOCK_NO_CONNECTION
+    if not wallet_synced:
+        return BLOCK_SYNCING
+    if manual or all_peers_observed or elapsed_sec >= grace_sec:
+        return None
+    return BLOCK_PEERS
+
+
+def is_wallet_ready(network_connected: bool, wallet_synced: bool,
+                    all_peers_observed: bool, elapsed_sec: float,
+                    grace_sec: float, *, manual: bool = False) -> bool:
+    """Whether the wallet has settled enough for the plugin to take *any*
+    automated action -- the boolean face of :func:`wallet_readiness_block`."""
+    return wallet_readiness_block(network_connected, wallet_synced,
+                                  all_peers_observed, elapsed_sec, grace_sec,
+                                  manual=manual) is None
 
 
 def classify_peer_observation(is_active: bool, seen_online_before: bool,
