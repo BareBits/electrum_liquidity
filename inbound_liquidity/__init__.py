@@ -52,6 +52,7 @@ from .liquidity_manager import (
     DeclineRecord,
     LiquidityConfig,
     LiquiditySnapshot,
+    MAX_SUGGESTED_PARTNERS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
     ProviderOffer,
@@ -67,6 +68,7 @@ from .liquidity_manager import (
     decide_dev_fee_payout,
     eligible_providers,
     evaluate,
+    is_channel_size_rejection,
     is_wallet_ready,
     normalize_node_id,
     order_channel_partners,
@@ -629,6 +631,12 @@ class LiquidityPlugin(BasePlugin):
         # wallet -> last set of providers discovered on nostr, so the Providers
         # settings tab has something to show between/without live transports.
         self._last_offers: Dict['Abstract_Wallet', List[ProviderOffer]] = {}
+        # wallet -> why the last suggested-peer lookup failed ("TypeName: msg"), or
+        # absent if it succeeded. Asking Electrum for a peer suggestion can fail
+        # outright (no trampoline nodes on this network, no rater yet, ...); that is
+        # a different situation from "asked, got nothing", so it is remembered here
+        # and named in the decline reason instead of vanishing into a bare except.
+        self._suggest_errors: Dict['Abstract_Wallet', str] = {}
         # wallet -> channel_ids whose wedged open we have already remediated, so
         # the watchdog acts once and the force-close it triggers is not also
         # counted as a peer-initiated close fault.
@@ -810,7 +818,8 @@ class LiquidityPlugin(BasePlugin):
     # (the lock map) is popped first and separately in stop_wallet, because the
     # heartbeat loop watches it to know when to exit.
     _PER_WALLET_STATE_ATTRS = (
-        "_eval_pending", "_last_decline_sigs", "_last_offers", "_remediating_opens",
+        "_eval_pending", "_last_decline_sigs", "_last_offers", "_suggest_errors",
+        "_remediating_opens",
         "_local_closes", "_wedged_faulted", "_close_capped_logged",
         "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
         "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
@@ -2508,9 +2517,9 @@ class LiquidityPlugin(BasePlugin):
         executable: List[Tuple[Action, Optional[List[str]]]] = []
         for action in result.actions:
             if isinstance(action, OpenChannelAction):
-                candidates = self._resolve_channel_partners(wallet)
+                candidates = await self._resolve_channel_partners(wallet)
                 if not candidates:
-                    declines.append(self._no_partner_decline(wallet, action))
+                    declines.append(await self._no_partner_decline(wallet, action))
                     continue
                 executable.append((action, candidates))
             else:
@@ -2610,13 +2619,13 @@ class LiquidityPlugin(BasePlugin):
                             candidates: Optional[List[str]] = None) -> None:
         lnworker = wallet.lnworker
         # Ordered candidates: preferred partners first (in the user's order), then
-        # Electrum's suggested peer (unless strict). Banned peers -- and, under the
-        # one-channel-per-peer guard, peers we already have a channel with -- are
-        # excluded. Normally pre-resolved by the caller (_run_decision, which turns
-        # an empty result into a decline); re-resolve as a fallback for direct/test
-        # callers.
+        # up to MAX_SUGGESTED_PARTNERS of Electrum's suggested peers (unless
+        # strict). Banned peers -- and, under the one-channel-per-peer guard, peers
+        # we already have a channel with -- are excluded. Normally pre-resolved by
+        # the caller (_run_decision, which turns an empty result into a decline);
+        # re-resolve as a fallback for direct/test callers.
         if candidates is None:
-            candidates = self._resolve_channel_partners(wallet)
+            candidates = await self._resolve_channel_partners(wallet)
         if not candidates:
             self.logger.warning(
                 "no channel partner available (already have a channel with every "
@@ -2654,15 +2663,29 @@ class LiquidityPlugin(BasePlugin):
                 chan, funding_tx = await lnworker.open_channel_with_peer(
                     peer, funding_sat, push_sat=0, password=password)
             except Exception as e:
+                size_rejection = is_channel_size_rejection(str(e))
                 self.logger.warning(
-                    f"channel open to {connect_str[:24]}… failed: {e!r}; trying next")
-                # We connected but the open negotiation failed: a *hard* fault
-                # (counts toward auto-ban), charged to the peer we reached.
-                self._record_peer_fault(
-                    wallet, peer.pubkey.hex(),
-                    f"channel open failed: {type(e).__name__}", hard=True)
+                    f"channel open to {connect_str[:24]}… failed: {e!r}; trying next"
+                    + (" (channel-size rejection; not faulting the peer)"
+                       if size_rejection else ""))
+                # We connected but the open negotiation failed. Normally a *hard*
+                # fault (counts toward auto-ban), charged to the peer we reached --
+                # EXCEPT when the rejection was purely about the channel size
+                # (our funding amount vs. a local bound or the peer's min/max
+                # policy). That is not a reliability signal: the peer is healthy,
+                # it just does not want a channel this size, so it keeps a clean
+                # record and its place in the try-order. Walking up to
+                # MAX_SUGGESTED_PARTNERS peers per tick makes this matter -- a
+                # blanket hard fault would auto-ban swathes of the graph over a
+                # few ticks for something that was never their fault.
+                if not size_rejection:
+                    self._record_peer_fault(
+                        wallet, peer.pubkey.hex(),
+                        f"channel open failed: {type(e).__name__}", hard=True)
                 self._diag_event(wallet, category="error", kind="open",
-                                 reason="channel open failed", dest=peer.pubkey.hex(),
+                                 reason=("channel open rejected on size"
+                                         if size_rejection else "channel open failed"),
+                                 dest=peer.pubkey.hex(),
                                  detail=f"{type(e).__name__}: {e}")
                 last_error = e
                 continue
@@ -2963,11 +2986,75 @@ class LiquidityPlugin(BasePlugin):
         self.config.INBOUND_LIQUIDITY_CHANNEL_PEER = ''
         self.logger.info(f"migrated channel_peer {old[:24]}… into preferred partners")
 
-    def _resolve_channel_partners(self, wallet: 'Abstract_Wallet',
-                                  *, apply_peer_guard: bool = True) -> List[str]:
+    async def _suggest_peers(self, wallet: 'Abstract_Wallet',
+                             limit: int = MAX_SUGGESTED_PARTNERS) -> List[bytes]:
+        """Up to ``limit`` DISTINCT peer suggestions from Electrum, best-effort.
+
+        Must be awaited, and deliberately does its work in a worker thread: in
+        gossip mode ``LNWallet.suggest_peer()`` reaches
+        ``LNRater.maybe_analyze_graph()`` -> ``Network.run_from_another_thread()``,
+        which asserts it is NOT called from the asyncio thread (and would deadlock
+        on its own loop even without the assert). Every caller here runs inside the
+        evaluation coroutine *on* that loop, so the call is offloaded with
+        ``asyncio.to_thread``. Calling it inline is the bug this fixes: the
+        AssertionError was swallowed and every open silently declined for "no
+        reachable channel partner".
+
+        ``suggest_peer()`` yields ONE node per call (rating-weighted random in
+        gossip mode, a random trampoline node otherwise), so distinct suggestions
+        are gathered by calling it repeatedly inside a single thread hop -- bounded
+        by ``limit``, by an attempt ceiling, and by a run of consecutive duplicates
+        (a small trampoline set repeats immediately; no point spinning).
+
+        A failure is logged, remembered in ``_suggest_errors`` for the decline
+        reason, and surfaced as a diagnostics event -- never silently discarded.
+        """
+        max_attempts = max(1, limit * 3)
+        max_consecutive_dupes = 3
+
+        def _collect() -> List[bytes]:
+            # Runs OFF the asyncio loop -- see the docstring.
+            out: List[bytes] = []
+            seen: set = set()
+            dupes = 0
+            for _ in range(max_attempts):
+                node_id = wallet.lnworker.suggest_peer()
+                if not node_id:
+                    break  # Electrum has nothing (more) to suggest.
+                if node_id in seen:
+                    dupes += 1
+                    if dupes >= max_consecutive_dupes:
+                        break
+                    continue
+                dupes = 0
+                seen.add(node_id)
+                out.append(node_id)
+                if len(out) >= limit:
+                    break
+            return out
+
+        try:
+            suggestions = await asyncio.to_thread(_collect)
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            self.logger.warning(f"suggested-peer lookup failed: {e!r}", exc_info=e)
+            self._suggest_errors[wallet] = detail
+            self._diag_event(wallet, category="error", kind="partners",
+                             reason="suggested-peer lookup failed", detail=detail)
+            return []
+        self._suggest_errors.pop(wallet, None)
+        return suggestions
+
+    async def _resolve_channel_partners(self, wallet: 'Abstract_Wallet',
+                                        *, apply_peer_guard: bool = True) -> List[str]:
         """Ordered connect strings to attempt a channel open against: preferred
-        partners first (user order), then Electrum's suggested peer unless strict
-        mode is on. Banned partners (by pubkey) are excluded from both.
+        partners first (user order), then up to ``MAX_SUGGESTED_PARTNERS`` of
+        Electrum's suggested peers unless strict mode is on. Banned partners (by
+        pubkey) are excluded from both.
+
+        Several suggestions -- not just one -- so a peer that refuses the open
+        (its own channel-size policy, a stale address, ...) does not waste the
+        whole tick: ``_open_channel`` walks the list until one accepts.
 
         When the one-channel-per-peer guard is on (default), peers we already
         hold a non-closed channel with are excluded too, so the plugin spreads
@@ -2982,28 +3069,30 @@ class LiquidityPlugin(BasePlugin):
             exclude = self._current_peer_node_ids(wallet)
         suggested: List[str] = []
         if not strict:
-            try:
-                node_id = wallet.lnworker.suggest_peer()
-            except Exception:
-                node_id = None
-            if node_id:
-                suggested.append(node_id.hex())
+            suggested = [node_id.hex() for node_id in await self._suggest_peers(wallet)]
         # Sink flaky peers in the try-order (soft de-prioritisation); banned peers
         # are already excluded above. Auto-banned serial offenders never get here.
         penalties = self._peer_penalties(wallet)
         return order_channel_partners(preferred, banned, suggested, strict=strict,
                                       penalties=penalties, exclude=exclude)
 
-    def _no_partner_decline(self, wallet: 'Abstract_Wallet',
-                            action: OpenChannelAction) -> DeclineRecord:
+    async def _no_partner_decline(self, wallet: 'Abstract_Wallet',
+                                  action: OpenChannelAction) -> DeclineRecord:
         """Why an engine-approved open could not proceed: the one-channel-per-peer
-        guard eliminated every candidate, or there is simply no reachable partner.
-        Distinguished (by re-resolving without the guard) so the decision log is
-        actionable."""
+        guard eliminated every candidate, the suggestion lookup itself failed, or
+        there is simply no reachable partner. Distinguished (by re-resolving
+        without the guard, and by the remembered lookup error) so the decision log
+        is actionable rather than a dead end."""
         guard_on = bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER)
-        if guard_on and self._resolve_channel_partners(wallet, apply_peer_guard=False):
+        if guard_on and await self._resolve_channel_partners(wallet, apply_peer_guard=False):
             reason = ("have funds and room to open, but already hold a channel with "
                       "every available peer (one-channel-per-peer guard); not opening")
+        elif self._suggest_errors.get(wallet):
+            # The lookup itself broke -- name it, so this reads as "something is
+            # wrong" rather than "the network has nobody for you".
+            reason = ("have funds and room to open, but asking Electrum for a "
+                      f"suggested peer failed ({scrub_text(self._suggest_errors[wallet])}); "
+                      "not opening")
         else:
             reason = ("have funds and room to open, but no reachable channel partner "
                       "is available (no preferred/suggested peer); not opening")

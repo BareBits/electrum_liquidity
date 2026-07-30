@@ -57,7 +57,10 @@ def _fake_result(actions, declines=(), frozen=False):
 def test_run_decision_resolves_candidates_and_dispatches(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    p._resolve_channel_partners = lambda wallet: ["partnerA"]      # candidates exist
+    # Async since the suggestion lookup must be awaited (it runs off the loop).
+    async def _resolve(wallet, *, apply_peer_guard=True):
+        return ["partnerA"]                                        # candidates exist
+    p._resolve_channel_partners = _resolve
 
     open_act = OpenChannelAction(funding_sat=1_000_000, reason="grow")
     swap_act = ReverseSwapAction(channel_id="aa" * 32, short_id="1x1x1",
@@ -77,9 +80,14 @@ def test_run_decision_resolves_candidates_and_dispatches(monkeypatch) -> None:
 def test_run_decision_open_without_partner_becomes_decline(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    p._resolve_channel_partners = lambda wallet: []               # no eligible partner
+    async def _resolve(wallet, *, apply_peer_guard=True):
+        return []                                             # no eligible partner
+    p._resolve_channel_partners = _resolve
     sentinel_decline = object()
-    p._no_partner_decline = lambda wallet, action: sentinel_decline
+
+    async def _decline(wallet, action):
+        return sentinel_decline
+    p._no_partner_decline = _decline
 
     open_act = OpenChannelAction(funding_sat=1_000_000, reason="grow")
     monkeypatch.setattr(pkg, "evaluate", lambda snap, cfg: _fake_result([open_act]))
@@ -95,7 +103,9 @@ def test_run_decision_open_without_partner_becomes_decline(monkeypatch) -> None:
 def test_run_decision_logs_engine_declines(monkeypatch) -> None:
     p = _plugin()
     logged, executed = _wire_common_spies(p)
-    p._resolve_channel_partners = lambda wallet: ["partnerA"]
+    async def _resolve(wallet, *, apply_peer_guard=True):
+        return ["partnerA"]
+    p._resolve_channel_partners = _resolve
 
     decline = object()
     monkeypatch.setattr(pkg, "evaluate",

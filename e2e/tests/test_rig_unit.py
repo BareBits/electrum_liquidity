@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rig import paths, ports  # noqa: E402
+from rig import paths, ports, trampoline_stub  # noqa: E402
 from rig.procman import _proc_cmdline_is_ours, _proc_marker  # noqa: E402
 from rig.services import (  # noqa: E402
     CLIENT,
@@ -139,3 +139,73 @@ def test_proc_cmdline_match_requires_rundir_and_service(tmp_path, monkeypatch):
     finally:
         proc.kill()
         proc.wait()
+
+
+# -- trampoline injection scaffolding ---------------------------------------
+# The generated sitecustomize is what makes the suggested-peer e2e possible on
+# regtest (see rig/trampoline_stub). Exercised here without Electrum: the real
+# generated source is executed, and its patch applied to a stand-in module.
+def _exec_generated_sitecustomize(monkeypatch, tmp_path, json_path):
+    monkeypatch.setenv(trampoline_stub.TRAMPOLINE_JSON_ENV, str(json_path))
+    source = (trampoline_stub.write_sitecustomize() / "sitecustomize.py").read_text()
+    namespace = {"__name__": "sitecustomize"}
+    exec(compile(source, "sitecustomize.py", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+class _PeerAddr:
+    def __init__(self, *, host, port, pubkey):
+        self.host, self.port, self.pubkey = host, port, pubkey
+
+
+class _FakeTrampolineModule:
+    """Stands in for electrum.trampoline: the two names the patch touches."""
+
+    LNPeerAddr = _PeerAddr
+
+    @staticmethod
+    def hardcoded_trampoline_nodes():
+        return {}                      # regtest's real answer
+
+
+def test_sitecustomize_patch_serves_the_advertised_node(monkeypatch, tmp_path):
+    node_id = "02" + "ab" * 32
+    namespace = _exec_generated_sitecustomize(
+        monkeypatch, tmp_path, trampoline_stub.TRAMPOLINE_JSON)
+    module = _FakeTrampolineModule()
+    namespace["_patch"](module)
+
+    # Before anything is advertised the real (empty on regtest) answer stands.
+    trampoline_stub.clear()
+    assert module.hardcoded_trampoline_nodes() == {}
+
+    # Published AFTER the patch was installed -- the daemon is already running by
+    # then, so the file must be re-read on every call.
+    trampoline_stub.advertise(node_id, "127.0.0.1", 9911, name="rig partner")
+    nodes = module.hardcoded_trampoline_nodes()
+    assert list(nodes) == ["rig partner"]
+    addr = nodes["rig partner"]
+    assert (addr.host, addr.port, addr.pubkey) == ("127.0.0.1", 9911,
+                                                  bytes.fromhex(node_id))
+
+    trampoline_stub.clear()
+    assert module.hardcoded_trampoline_nodes() == {}, "clear() must restore reality"
+
+
+def test_sitecustomize_is_inert_without_the_env_var(monkeypatch, tmp_path):
+    monkeypatch.delenv(trampoline_stub.TRAMPOLINE_JSON_ENV, raising=False)
+    source = (trampoline_stub.write_sitecustomize() / "sitecustomize.py").read_text()
+    namespace = {"__name__": "sitecustomize"}
+    before = list(sys.meta_path)
+    exec(compile(source, "sitecustomize.py", "exec"), namespace)  # noqa: S102
+    assert sys.meta_path == before, "no import hook may be installed when unused"
+
+
+def test_env_for_prepends_pythonpath_and_keeps_existing():
+    env = trampoline_stub.env_for({"PYTHONPATH": "/somewhere/else", "HOME": "/h"})
+    first = env["PYTHONPATH"].split(os.pathsep)[0]
+    assert first == str(trampoline_stub.INJECT_DIR)
+    assert "/somewhere/else" in env["PYTHONPATH"]
+    assert env["HOME"] == "/h"
+    assert env[trampoline_stub.TRAMPOLINE_JSON_ENV] == str(trampoline_stub.TRAMPOLINE_JSON)
+    assert (trampoline_stub.INJECT_DIR / "sitecustomize.py").exists()

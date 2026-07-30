@@ -52,7 +52,7 @@ ceilings, diagnostics, etc.).
 | `min_outbound_sat` | Advanced | **Keep outbound per channel** — never let a reverse swap drain a channel's outbound (local) balance below this, so the wallet keeps some ability to send. Applied per channel to the swappable amount; `0` drains everything for maximum inbound | `0` |
 | `manage_plugin_opened_only` | Advanced | **Only drain channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; channels you opened by hand are left entirely alone. When off, every channel is managed | `false` |
 | `log_retention_days` | Advanced | How long to keep decision-log entries (1–999) | `30` |
-| `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before Electrum's suggested peer | `""` |
+| `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 10 suggestions are tried in turn if one refuses the open) | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
 
