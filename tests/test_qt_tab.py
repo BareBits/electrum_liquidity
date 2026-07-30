@@ -23,8 +23,8 @@ pytest.importorskip("electrum.plugins.inbound_liquidity")
 pytest.importorskip("electrum.gui.qt.util")
 
 from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication, QComboBox, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-    QTabWidget,
+    QApplication, QComboBox, QFrame, QLabel, QLineEdit, QPlainTextEdit,
+    QPushButton, QTabWidget,
 )
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -220,14 +220,26 @@ def test_on_log_changed_refreshes(qapp):
     p._on_log_changed_ui(_FakeWallet())
 
 
-def test_show_activity_uses_window_statusbar(qapp):
+def test_plugin_never_writes_to_electrums_status_bar(qapp):
+    """The plugin owns the Liquidity tab, not the space next to your balance.
+
+    It used to push transient notices into Electrum's main status bar. Those are
+    gone: completed actions live in the Actions / Log sub-tabs, and what a tick
+    is currently doing lives in the Settings tab's Status footer. This pins that
+    — including that `on_action_done` (still called from the base plugin when an
+    open or swap completes) resolves to the inherited no-op.
+    """
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    p._show_activity(wallet, "opened channel")
-    assert any("opened channel" in m for m in window._sb.messages)
-    # Unknown wallet: no-op.
-    p._show_activity(_FakeWallet(), "nope")
+
+    assert not hasattr(p, "_show_activity")
+    assert not hasattr(qt_mod._Signals, "activity")
+    # The base class's hook is what the Qt plugin inherits, and it is a no-op.
+    p.on_action_done(wallet, "Opened channel: 1,000,000 sat")
+    p._on_status_changed_ui(wallet, "connecting to partner 02aaaa…aaaa (1 of 2)")
+    p._on_log_changed_ui(wallet)
+    assert window._sb.messages == []
 
 
 def test_apply_persists_and_clamps(qapp):
@@ -865,4 +877,58 @@ def test_refresh_syncs_the_status_from_the_plugin(qapp):
     p.wallets[wallet] = object()
     p._tick_status[wallet] = "discovering swap providers"
     p._tabs[wallet].refresh()
+    assert "discovering swap providers" in _status_labels(p._tabs[wallet])
+
+
+def _settings_layout_order(state) -> List[str]:
+    """Ordered markers for the Settings tab's top-level layout rows.
+
+    Labels contribute their text, nested rows contribute their button labels, so
+    a test can assert *where* a section sits rather than merely that it exists.
+    """
+    settings = state.container.findChild(QTabWidget).widget(0)
+    layout = settings.layout()
+    out: List[str] = []
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        widget = item.widget()
+        if isinstance(widget, QLabel):          # QLabel before QFrame: it IS one
+            out.append(f"label:{widget.text()}")
+        elif isinstance(widget, QFrame):
+            out.append("separator")
+        elif widget is not None:
+            out.append(f"widget:{type(widget).__name__}")
+        elif item.layout() is not None:
+            buttons = [item.layout().itemAt(j).widget().text()
+                       for j in range(item.layout().count())
+                       if isinstance(item.layout().itemAt(j).widget(), QPushButton)]
+            out.append(f"row:{','.join(buttons)}")
+        else:
+            out.append("stretch")
+    return out
+
+
+def test_status_section_sits_at_the_bottom_of_the_settings_tab(qapp):
+    # It is a footer, below the Apply button and after the stretch that pins it
+    # to the bottom edge -- not a banner wedged between the automation switch
+    # and the settings fields.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    order = _settings_layout_order(p._tabs[wallet])
+
+    apply_row = next(i for i, m in enumerate(order) if m.startswith("row:") and "Apply" in m)
+    header = order.index("label:Status")
+    stretch = next(i for i, m in enumerate(order) if m == "stretch")
+
+    assert apply_row < stretch < header, order
+    assert order[-3:] == ["label:Status", f"label:{STATUS_NOT_STARTED}", "label:"], order
+    assert order[header - 1] == "separator", order
+
+
+def test_status_section_still_updates_from_its_new_position(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    p._on_status_changed_ui(wallet, "discovering swap providers")
     assert "discovering swap providers" in _status_labels(p._tabs[wallet])

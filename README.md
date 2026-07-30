@@ -108,8 +108,8 @@ heartbeat tick is the same guarded, idempotent evaluation as an event-driven one
 One evaluation ("tick") can run for minutes — opening a nostr provider session,
 walking a channel-open candidate list one peer at a time, or waiting out a
 reverse swap — and from outside that is indistinguishable from a plugin doing
-nothing. The **Settings** sub-tab therefore shows a **Status** line naming the
-step in flight (`resolving channel partners`, `connecting to partner 02b2a9…6501
+nothing. The **Settings** sub-tab therefore carries a **Status** footer at the
+bottom, naming the step in flight (`resolving channel partners`, `connecting to partner 02b2a9…6501
 (2 of 4)`, `attempting swap with npub1qx…8h2 (250,000 sat)`, …) together with
 when it started.
 
@@ -118,6 +118,10 @@ Between ticks it shows a *resting* state, and these are deliberately distinct so
 disabled`, `idle (manual run only)`, `waiting for wallet to settle` (the startup
 grace) and `not started`. Every exit path — including an error mid-tick — lands
 on one of them, so the line can never stick on a step that finished long ago.
+
+The plugin writes **nothing** into Electrum's own status bar (the area beside
+your balance). Everything it has to say lives inside the **Liquidity** tab: this
+footer for what a tick is doing now, and the log sub-tabs below for what it did.
 
 ### Decision log
 
