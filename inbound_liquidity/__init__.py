@@ -2716,6 +2716,11 @@ class LiquidityPlugin(BasePlugin):
                     self.logger.debug(
                         f"{wallet.basename()} not ready ({block}); deferring "
                         f"evaluation")
+                    if block == BLOCK_LOCKED:
+                        # The one deferral the user can act on immediately, and
+                        # the one that never clears on its own. Tell the GUI so
+                        # it can offer to unlock; headless ignores it.
+                        self.on_wallet_locked(wallet)
                     return
                 # Resolve any reverse swaps we were watching (funded -> success,
                 # never funded -> stuck fault) before snapshotting, so the
@@ -3556,6 +3561,18 @@ class LiquidityPlugin(BasePlugin):
 
     def on_action_done(self, wallet: 'Abstract_Wallet', message: str) -> None:
         """Hook for GUI subclasses to surface activity. No-op in headless."""
+        pass
+
+    def on_wallet_locked(self, wallet: 'Abstract_Wallet') -> None:
+        """Fired on every tick that defers because the wallet is locked.
+
+        Hook for GUI subclasses, which can offer to unlock. No-op in headless,
+        where there is nobody to ask -- the deferral just repeats until the
+        wallet is unlocked out of band (``electrum unlock``).
+
+        Deliberately fired on *every* such tick rather than once: the GUI decides
+        how often to actually ask (it rate-limits), and latching here would mean
+        a wallet locked again mid-session never prompts."""
         pass
 
     def on_log_changed(self, wallet: 'Abstract_Wallet') -> None:

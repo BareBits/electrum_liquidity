@@ -986,7 +986,10 @@ def test_status_section_sits_at_the_bottom_of_the_settings_tab(qapp):
     stretch = next(i for i, m in enumerate(order) if m == "stretch")
 
     assert apply_row < stretch < header, order
-    assert order[-3:] == ["label:Status", f"label:{STATUS_NOT_STARTED}", "label:"], order
+    # Status header, the status itself, the "since" line, and the Unlock button
+    # that appears with a "wallet locked" status (hidden otherwise).
+    assert order[-4:] == ["label:Status", f"label:{STATUS_NOT_STARTED}",
+                          "label:", "row:Unlock wallet…"], order
     assert order[header - 1] == "separator", order
 
 

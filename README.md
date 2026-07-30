@@ -131,13 +131,23 @@ swap whose Lightning leg cannot route yet. The log line names whichever of the
 three is actually blocking.
 
 `wallet locked` means your wallet is password-protected and currently locked, so
-nothing can be signed. Press **Unlock** in the wallet window (the padlock in the
-status bar) and the plugin resumes on the next tick — it uses Electrum's own
-in-memory unlock, exactly as Electrum's other background automation does, and
-never prompts you for a password itself. Unlike `warming up`, waiting does not
-clear this one, which is why it has its own name. "Run now" cannot bypass it
-either. Automation on a password-protected wallet therefore only runs while the
-wallet is unlocked.
+nothing can be signed. Note that this is *not* the same password prompt you get
+when opening the wallet: that one only decrypts the wallet file, and on desktop
+Electrum it does not unlock the keystore. Unlocking is a separate, deliberate
+step — **Wallet → Unlock**, or the **Unlock wallet…** button the plugin shows in
+the Status footer while it is locked.
+
+When an automatic run finds the wallet locked, the plugin offers to unlock it,
+and the dialog says it is the plugin asking. Dismissing it is fine: automation
+stays switched on, the plugin keeps deferring, and it will not ask again for an
+hour — the Unlock button stays there in the meantime. Unlocking by any route
+resumes the plugin immediately, without waiting for the next heartbeat. The
+password is Electrum's own in-memory unlock, exactly what its other background
+automation uses; the plugin never stores a password itself.
+
+Unlike `warming up`, waiting does not clear this one, which is why it has its own
+name. "Run now" cannot bypass it either. Automation on a password-protected
+wallet therefore only runs while the wallet is unlocked.
 
 Pressing **Run now** skips the startup window deliberately — you are there and
 watching, and can retry — but it still requires a connected, fully synced
