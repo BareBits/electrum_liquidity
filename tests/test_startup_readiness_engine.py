@@ -7,6 +7,7 @@ outage). No Electrum, no clock."""
 from __future__ import annotations
 
 from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
+    BLOCK_LOCKED,
     BLOCK_NO_CONNECTION,
     BLOCK_STARTING_UP,
     BLOCK_SYNCING,
@@ -75,6 +76,47 @@ def test_block_reason_names_the_failing_limb() -> None:
 def test_block_reason_reports_connection_before_sync() -> None:
     # Both broken -> report the one the user must fix first.
     assert wallet_readiness_block(False, False, 0.0, GRACE) == BLOCK_NO_CONNECTION
+
+
+# --- the locked-wallet limb ------------------------------------------------
+def test_locked_wallet_blocks_all_automation() -> None:
+    # Connected, synced, startup window long past: the only thing missing is the
+    # password, and without it nothing that moves money can be signed.
+    assert wallet_readiness_block(True, True, 10_000.0, GRACE,
+                                  wallet_unlocked=False) == BLOCK_LOCKED
+    assert is_wallet_ready(True, True, 10_000.0, GRACE, wallet_unlocked=False) is False
+
+
+def test_locked_wallet_blocks_manual_runs_too() -> None:
+    # Unlike the startup window, "Run now" cannot bypass this one -- the user
+    # being present does not put a password in the cache.
+    assert wallet_readiness_block(True, True, 10_000.0, GRACE, manual=True,
+                                  wallet_unlocked=False) == BLOCK_LOCKED
+    assert is_wallet_ready(True, True, 0.0, 0.0, manual=True,
+                           wallet_unlocked=False) is False
+
+
+def test_locked_is_reported_after_connection_and_sync() -> None:
+    # A locked *and* disconnected wallet reports the connection first: unlocking
+    # would not have helped, and the user should fix the outer problem first.
+    assert wallet_readiness_block(False, True, 0.0, GRACE,
+                                  wallet_unlocked=False) == BLOCK_NO_CONNECTION
+    assert wallet_readiness_block(True, False, 0.0, GRACE,
+                                  wallet_unlocked=False) == BLOCK_SYNCING
+
+
+def test_locked_is_reported_before_the_startup_window() -> None:
+    # Both apply inside the grace: name the one that will not clear on its own.
+    assert wallet_readiness_block(True, True, 0.0, GRACE,
+                                  wallet_unlocked=False) == BLOCK_LOCKED
+
+
+def test_unlocked_defaults_to_true_so_the_gate_is_opt_in() -> None:
+    # Callers that never pass the flag (and every wallet without a password)
+    # behave exactly as before this limb existed.
+    assert wallet_readiness_block(True, True, GRACE + 1, GRACE) is None
+    assert wallet_readiness_block(True, True, GRACE + 1, GRACE,
+                                  wallet_unlocked=True) is None
 
 
 # --- classify_peer_observation --------------------------------------------

@@ -117,9 +117,10 @@ when it started.
 
 Between ticks it shows a *resting* state, and these are deliberately distinct so
 "armed and idle" never reads the same as "switched off": `sleeping`, `automation
-disabled`, `idle (manual run only)`, `warming up` (see below) and `not started`.
-Every exit path — including an error mid-tick — lands on one of them, so the line
-can never stick on a step that finished long ago.
+disabled`, `idle (manual run only)`, `warming up` (see below), `wallet locked`
+(see below) and `not started`. Every exit path — including an error mid-tick —
+lands on one of them, so the line can never stick on a step that finished long
+ago.
 
 `warming up` is not about your funds: it means the plugin is waiting for a server
 connection, for the wallet to finish syncing, or for its startup window (2
@@ -128,6 +129,15 @@ reconnects to peers asynchronously — acting inside it could blame a healthy pe
 for being "offline" when it simply has not been dialed yet, or fire a reverse
 swap whose Lightning leg cannot route yet. The log line names whichever of the
 three is actually blocking.
+
+`wallet locked` means your wallet is password-protected and currently locked, so
+nothing can be signed. Press **Unlock** in the wallet window (the padlock in the
+status bar) and the plugin resumes on the next tick — it uses Electrum's own
+in-memory unlock, exactly as Electrum's other background automation does, and
+never prompts you for a password itself. Unlike `warming up`, waiting does not
+clear this one, which is why it has its own name. "Run now" cannot bypass it
+either. Automation on a password-protected wallet therefore only runs while the
+wallet is unlocked.
 
 Pressing **Run now** skips the startup window deliberately — you are there and
 watching, and can retry — but it still requires a connected, fully synced
