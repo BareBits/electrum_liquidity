@@ -122,13 +122,16 @@ Every exit path — including an error mid-tick — lands on one of them, so the
 can never stick on a step that finished long ago.
 
 `warming up` is not about your funds: it means the plugin is waiting for a server
-connection, for the wallet to finish syncing, or — most often, and only for a few
-seconds after a wallet loads — for Lightning to finish connecting to your channel
-partners. Acting before then could blame a healthy peer for being "offline" when
-it simply has not been dialed yet. A 2-minute ceiling bounds that wait so one
-dead peer cannot defer automation forever, and the log line names whichever of
-the three is actually blocking. Pressing **Run now** skips the peer wait
-deliberately — it still requires a connected, synced wallet.
+connection, for the wallet to finish syncing, or for its startup window (2
+minutes after a wallet loads) to elapse. That window exists because Lightning
+reconnects to peers asynchronously — acting inside it could blame a healthy peer
+for being "offline" when it simply has not been dialed yet, or fire a reverse
+swap whose Lightning leg cannot route yet. The log line names whichever of the
+three is actually blocking.
+
+Pressing **Run now** skips the startup window deliberately — you are there and
+watching, and can retry — but it still requires a connected, fully synced
+wallet.
 
 The plugin writes **nothing** into Electrum's own status bar (the area beside
 your balance). Everything it has to say lives inside the **Liquidity** tab: this

@@ -34,8 +34,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List
 
 import pytest
 
@@ -111,25 +110,6 @@ def _last_status() -> str:
     condition can be evaluated before the plugin has said anything)."""
     lines = _status_lines()
     return lines[-1] if lines else ""
-
-
-def _log_ts(line: str) -> Optional[float]:
-    """Epoch seconds from an Electrum log line's leading
-    ``20260730T043030.709224Z`` timestamp, or None if the line has none."""
-    stamp = line.split(" ", 1)[0].strip()
-    try:
-        return datetime.strptime(
-            stamp, "%Y%m%dT%H%M%S.%f%z").timestamp()
-    except ValueError:
-        return None
-
-
-def _first_ts_containing(needle: str) -> Optional[float]:
-    """When the first log line containing ``needle`` was written."""
-    for line in _client_log_text().splitlines():
-        if needle in line:
-            return _log_ts(line)
-    return None
 
 
 def _mine(rig, n: int = 1) -> None:
@@ -250,20 +230,14 @@ def test_no_partner_decline_carries_the_breakdown(rig):
     assert "channel partners: 0 candidate(s)" in _client_log_text()
 
 
-def test_first_tick_does_not_wait_out_the_startup_ceiling(rig):
-    """Readiness ends when the wallet is actually ready, not on a stopwatch.
+def test_deferrals_name_the_blocking_limb(rig):
+    """The reported bug was half wording: every deferral logged "not settled
+    yet", which read as "your funds are unconfirmed" when readiness has nothing
+    to do with funds. A deferral must now name which limb is blocking.
 
-    The reported bug: for two minutes after a wallet loaded, every evaluation --
-    including a user's "Run now" -- logged "waiting for wallet to settle" and did
-    nothing, which read as "my funds are unconfirmed". Readiness is now three
-    live signals (server connected, wallet synced, every open channel's peer
-    dialed) with STARTUP_GRACE_SEC only as a ceiling, so on a healthy wallet the
-    first real tick lands in seconds.
-
-    The rig's client has live channels to a running partner, so its peers connect
-    almost immediately. Asserting "well inside the ceiling" rather than an exact
-    number keeps this robust on a slow CI box while still failing outright if the
-    gate regresses to waiting out the full 120s.
+    The automatic startup window itself is deliberately unchanged (shortening it
+    broke reverse swaps -- see wallet_readiness_block), so what is asserted here
+    is the wording, not the timing.
     """
     _quiet_config()
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
@@ -272,22 +246,14 @@ def test_first_tick_does_not_wait_out_the_startup_ceiling(rig):
                        rig=rig, timeout=240), \
         f"no tick ever ran; statuses seen: {_status_lines()!r}"
 
-    started = _first_ts_containing("managing inbound liquidity for")
-    first_tick = _first_ts_containing(" | status: reading wallet state")
-    assert started is not None and first_tick is not None, \
-        "could not locate the load / first-tick log lines"
-    delay = first_tick - started
-    assert delay < 60.0, (
-        f"first tick took {delay:.1f}s after wallet load -- the readiness gate "
-        f"looks like it is waiting out the 120s ceiling again")
-
-    # And any deferrals it logged name the blocking limb, not a funds-sounding
-    # "not settled yet". Opportunistic: the deferral line is DEBUG, so these bite
-    # only when the daemon happens to be running verbose. The wording itself is
-    # pinned unconditionally by tests/test_startup_readiness_glue.py.
     log = _client_log_text()
     assert "not settled yet" not in log, \
         "the old funds-sounding deferral wording is back"
+    assert "waiting for wallet to settle" not in log, \
+        "the old funds-sounding status wording is back"
+    # Whatever it rested on before the first tick must be the new wording.
+    assert "warming up" in _status_lines(), _status_lines()
+    # Any deferral it logged (DEBUG, so only when running verbose) names a limb.
     for line in log.splitlines():
         if "deferring evaluation" in line:
             assert "not ready (" in line, f"deferral gives no reason: {line!r}"

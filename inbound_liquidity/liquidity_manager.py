@@ -368,12 +368,11 @@ def deadline_reached(marked_ts: Optional[float], now: float,
 BLOCK_NOT_MANAGED = "wallet is not being managed"
 BLOCK_NO_CONNECTION = "no server connection"
 BLOCK_SYNCING = "wallet is still syncing with the server"
-BLOCK_PEERS = "still connecting to Lightning peers"
+BLOCK_STARTING_UP = "still in the startup window"
 
 
 def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
-                           all_peers_observed: bool, elapsed_sec: float,
-                           grace_sec: float, *,
+                           elapsed_sec: float, grace_sec: float, *,
                            manual: bool = False) -> Optional[str]:
     """Why the wallet cannot take automated action yet, or ``None`` if it can.
 
@@ -385,39 +384,44 @@ def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
       * **wallet sync** -- an address-synchronizer that is still catching up
         reports a partial UTXO set, so a balance-driven decision (open / swap)
         would be taken on incomplete state. Also blocks manual runs;
-      * **Lightning peers** -- at load the LN layer dials its peers
-        asynchronously, so a healthy peer momentarily reads as offline. We wait
-        until every open channel's peer has produced a *trustworthy* reading, or
-        until ``grace_sec`` has elapsed as a ceiling so one permanently dead peer
-        cannot defer automation forever.
+      * **startup window** -- for ``grace_sec`` after load the plugin takes no
+        automated action at all. The Lightning layer is still (re)connecting: a
+        healthy peer reads as offline, and -- learned the hard way, see below --
+        a channel whose peer has just come up still cannot necessarily *route*.
 
-    Only the last of the three is time-based, and only it is skipped for a
-    user-initiated "Run now" (``manual=True``): the user is present and asking,
-    and the per-peer guard (:func:`classify_peer_observation`) independently stops
-    the watchdogs from acting on a peer that has not been dialed yet, so no
-    healthy peer can be faulted by running early.
+    Only the last is time-based, and only it is skipped for a user-initiated
+    "Run now" (``manual=True``): the user is present, watching, and can retry.
 
-    A non-positive ``grace_sec`` disables the time ceiling (the peer limb is then
-    satisfied immediately), which the tests use to exercise the other axes on
+    Why this stayed a plain stopwatch. An earlier version of this gate ended the
+    window as soon as every open channel's peer had been observed, which normally
+    happened within seconds. It was measurably worse: ``chan.is_active()`` only
+    means the peer connection is up, NOT that the channel can carry a large
+    payment yet, so reverse swaps fired in that window had their Lightning
+    payment fail fast (``NoPathFound``) and returned no funding txid. The rig's
+    reverse-swap e2e failed 2 runs in 3 that way. "Ready to observe a peer" is
+    not "ready to move money", and we had no trustworthy signal for the latter --
+    so automatic action waits out the full window, as it always has.
+
+    A non-positive ``grace_sec`` disables the time gate (ready as soon as
+    connected and synced), which the tests use to exercise the other axes on
     their own.
     """
     if not network_connected:
         return BLOCK_NO_CONNECTION
     if not wallet_synced:
         return BLOCK_SYNCING
-    if manual or all_peers_observed or elapsed_sec >= grace_sec:
+    if manual or elapsed_sec >= grace_sec:
         return None
-    return BLOCK_PEERS
+    return BLOCK_STARTING_UP
 
 
 def is_wallet_ready(network_connected: bool, wallet_synced: bool,
-                    all_peers_observed: bool, elapsed_sec: float,
-                    grace_sec: float, *, manual: bool = False) -> bool:
+                    elapsed_sec: float, grace_sec: float, *,
+                    manual: bool = False) -> bool:
     """Whether the wallet has settled enough for the plugin to take *any*
     automated action -- the boolean face of :func:`wallet_readiness_block`."""
-    return wallet_readiness_block(network_connected, wallet_synced,
-                                  all_peers_observed, elapsed_sec, grace_sec,
-                                  manual=manual) is None
+    return wallet_readiness_block(network_connected, wallet_synced, elapsed_sec,
+                                  grace_sec, manual=manual) is None
 
 
 def classify_peer_observation(is_active: bool, seen_online_before: bool,

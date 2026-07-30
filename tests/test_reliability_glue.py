@@ -370,3 +370,63 @@ def _coro(value):
     async def _c():
         return value
     return _c()
+
+
+# --- pending-swap tracking must survive hostile input ---------------------
+# Regression: `JsonDB.put` deep-copies what it is given and raises on anything
+# it cannot copy. A non-primitive reaching this map produced
+# `TypeError: cannot pickle '_thread.RLock' object` from inside db.put, which
+# escaped `_reverse_swap` and killed the executor *after* a swap had been
+# created -- losing the tracking record that exists to reconcile it.
+def test_track_pending_swap_persists_only_json_primitives() -> None:
+    import threading
+
+    class _Rich:
+        """Stands in for a SwapData / Channel / offer: carries a lock, so a
+        deepcopy of it raises exactly as JsonDB's would."""
+        def __init__(self, label: str) -> None:
+            self._lock = threading.RLock()
+            self.label = label
+
+        def __str__(self) -> str:
+            return self.label
+
+    p, w = _plugin(), _FakeWallet()
+    p._track_pending_swap(w, "ph_rich", _Rich("npubX"),
+                          node_id=_Rich("02aa"), channel_id=_Rich("cid"),
+                          fee_basis_sat="not-a-number")
+    rec = p._load_pending_swaps(w)["ph_rich"]
+    assert rec == {"npub": "npubX", "node_id": "02aa", "channel_id": "cid",
+                   "fee_basis_sat": 0, "started_ts": rec["started_ts"]}
+    for value in rec.values():
+        assert isinstance(value, (str, int, float)), rec
+    # The whole record is deep-copyable, which is what db.put actually requires.
+    import copy
+    copy.deepcopy(p._load_pending_swaps(w))
+
+
+def test_track_pending_swap_coerces_numeric_fee_basis() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._track_pending_swap(w, "ph1", "npubA", node_id="02bb", channel_id="cid1",
+                          fee_basis_sat=12_345)
+    assert p._load_pending_swaps(w)["ph1"]["fee_basis_sat"] == 12_345
+
+
+def test_save_pending_swaps_never_raises_out_of_the_executor() -> None:
+    # Persistence failing must not sink an action that already happened: the
+    # swap exists on the wire whether or not we managed to write it down.
+    class _BoomDB(_FakeDB):
+        def put(self, key, value):
+            raise TypeError("cannot pickle '_thread.RLock' object")
+
+    p, w = _plugin(), _FakeWallet()
+    w.db = _BoomDB()
+    p._track_pending_swap(w, "ph2", "npubA")      # must not raise
+    assert p._load_pending_swaps(w) == {}
+
+
+def test_track_pending_swap_ignores_an_empty_payment_hash() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._track_pending_swap(w, "", "npubA")
+    p._track_pending_swap(w, None, "npubA")       # type: ignore[arg-type]
+    assert p._load_pending_swaps(w) == {}

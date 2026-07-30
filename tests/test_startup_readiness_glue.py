@@ -94,10 +94,6 @@ class _Chan:
     def get_state(self):
         return self.state
 
-    def is_open(self):
-        from electrum.lnchannel import ChannelState
-        return self.state == ChannelState.OPEN
-
     def is_active(self):
         return self.active
 
@@ -161,15 +157,15 @@ def _mark_started(p, w, clock) -> None:
 
 
 # --- _wallet_ready --------------------------------------------------------
-def test_wallet_ready_requires_connection_and_sync(clock) -> None:
+def test_wallet_ready_requires_connection_sync_and_the_window(clock) -> None:
     ln, _ = _lnworker_with([])
     p, w = _plugin(clock), _FakeWallet(ln)
     # Not managed yet (no recorded load time) -> never ready.
     assert p._wallet_ready(w) is False
     _mark_started(p, w, clock)
-    # No channels -> the peer limb is trivially satisfied, so a connected and
-    # synced wallet is ready at once. It does NOT sit out the grace ceiling.
-    assert p._wallet_ready(w) is True
+    assert p._wallet_ready(w) is False            # inside the startup window
+    clock.advance(GRACE + 1)
+    assert p._wallet_ready(w) is True             # window elapsed
     w._connected = False
     assert p._wallet_ready(w) is False            # shutdown: connection gone
     w._connected, w._synced = True, False
@@ -178,46 +174,14 @@ def test_wallet_ready_requires_connection_and_sync(clock) -> None:
     assert p._wallet_ready(w) is True
 
 
-def test_wallet_ready_waits_for_channel_peers_then_ceiling(clock) -> None:
-    # The peer limb: one OPEN channel whose peer has not been dialed yet.
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
-    p, w = _plugin(clock), _FakeWallet(ln)
-    _mark_started(p, w, clock)
-    assert p._wallet_ready(w) is False            # peer not observed yet
-    clock.advance(GRACE + 1)
-    assert p._wallet_ready(w) is True             # ceiling reached -> proceed
-
-
-def test_wallet_ready_as_soon_as_the_peer_connects(clock) -> None:
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
-    p, w = _plugin(clock), _FakeWallet(ln)
-    _mark_started(p, w, clock)
-    assert p._wallet_ready(w) is False
-    clock.advance(3.0)
-    chan.active = True                            # LN layer finished dialing
-    assert p._wallet_ready(w) is True             # ready in 3s, not 120s
-
-
-def test_wallet_ready_ignores_non_open_channels(clock) -> None:
-    # A channel still opening (or closing) can never read active, so requiring an
-    # observation from it would pin readiness to the ceiling for no benefit.
-    ln, _ = _lnworker_with([_Chan(_open("FUNDED"), active=False),
-                            _Chan(_open("CLOSING"), cid="bb" * 32, active=False)])
-    p, w = _plugin(clock), _FakeWallet(ln)
-    _mark_started(p, w, clock)
-    assert p._wallet_ready(w) is True
-
-
-def test_wallet_ready_manual_bypasses_peer_wait_only(clock) -> None:
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
+def test_wallet_ready_manual_bypasses_the_window_only(clock) -> None:
+    """The reported bug. A manual run skips the startup window, but a
+    disconnected or still-syncing wallet is refused either way."""
+    ln, _ = _lnworker_with([_Chan(_open("OPEN"), active=False)])
     p, w = _plugin(clock), _FakeWallet(ln)
     _mark_started(p, w, clock)
     assert p._wallet_ready(w) is False                    # automatic: defers
     assert p._wallet_ready(w, manual=True) is True        # "Run now": proceeds
-    # ...but a manual run still needs a server and a synced wallet.
     w._connected = False
     assert p._wallet_ready(w, manual=True) is False
     w._connected, w._synced = True, False
@@ -227,15 +191,14 @@ def test_wallet_ready_manual_bypasses_peer_wait_only(clock) -> None:
 def test_readiness_block_names_the_reason(clock) -> None:
     from electrum.plugins.inbound_liquidity import BLOCK_NOT_MANAGED  # type: ignore
     from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
-        BLOCK_NO_CONNECTION, BLOCK_PEERS, BLOCK_SYNCING,
+        BLOCK_NO_CONNECTION, BLOCK_STARTING_UP, BLOCK_SYNCING,
     )
 
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
+    ln, _ = _lnworker_with([])
     p, w = _plugin(clock), _FakeWallet(ln)
     assert p._readiness_block(w) == BLOCK_NOT_MANAGED
     _mark_started(p, w, clock)
-    assert p._readiness_block(w) == BLOCK_PEERS
+    assert p._readiness_block(w) == BLOCK_STARTING_UP
     w._synced = False
     assert p._readiness_block(w) == BLOCK_SYNCING
     w._connected = False
@@ -254,24 +217,8 @@ def test_wallet_synced_defaults_true_when_wallet_cannot_answer(clock) -> None:
     assert p._wallet_synced(SimpleNamespace(is_up_to_date=_boom)) is True
 
 
-def test_all_peers_observed_survives_a_broken_lnworker(clock) -> None:
-    # An unreadable lnworker must defer to the grace ceiling, not stall.
-    p, w = _plugin(clock), _FakeWallet(None)
-    _mark_started(p, w, clock)
-    assert p._all_channel_peers_observed(w) is True
-
-    class _Boom:
-        @property
-        def channels(self):
-            raise RuntimeError("nope")
-
-    w.lnworker = _Boom()
-    assert p._all_channel_peers_observed(w) is True
-
-
 def test_evaluate_defers_all_automation_until_ready(clock) -> None:
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
+    ln, _ = _lnworker_with([])
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
@@ -286,10 +233,10 @@ def test_evaluate_defers_all_automation_until_ready(clock) -> None:
     p._run_decision = _run_decision
 
     _mark_started(p, w, clock)
-    asyncio.run(p._evaluate(w))                   # peer not dialed -> deferred
+    asyncio.run(p._evaluate(w))                   # inside the window -> deferred
     assert called == []
 
-    clock.advance(GRACE + 1)                      # ceiling reached -> runs
+    clock.advance(GRACE + 1)                      # window elapsed -> runs
     asyncio.run(p._evaluate(w))
     assert "health" in called and "autoclose" in called
 
@@ -297,8 +244,7 @@ def test_evaluate_defers_all_automation_until_ready(clock) -> None:
 def test_evaluate_manual_run_acts_inside_the_startup_window(clock) -> None:
     """The reported bug: "Run now" during the startup window logged "waiting for
     wallet to settle" and did nothing. A manual run must act."""
-    chan = _Chan(_open("OPEN"), active=False)
-    ln, _ = _lnworker_with([chan])
+    ln, _ = _lnworker_with([])
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []

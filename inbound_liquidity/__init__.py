@@ -46,8 +46,6 @@ if _real_key and _real_key != __name__:
 
 from .liquidity_manager import (
     BLOCK_NOT_MANAGED,
-    BLOCK_NO_CONNECTION,
-    BLOCK_SYNCING,
     Action,
     ChannelSnapshot,
     clean_npub,
@@ -99,6 +97,16 @@ from .log_buffer import (
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
     from electrum.submarine_swaps import SwapServerTransport
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """``int(value)`` for anything that can be one, else ``default``. Used where a
+    value is about to be written into a JSON-backed store and must be a plain
+    number no matter what the caller handed us."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_npub_set(raw: Optional[str]) -> frozenset:
@@ -204,17 +212,20 @@ _REVERSE_SWAP_CHEAT_MARKERS = (
     "invoice_amount",              # invoice amount != what we requested
 )
 
-# Startup window CEILING. While the Lightning layer is still dialing its peers
-# after a wallet loads, a peer that is actually fine reads as "not connected";
-# acting then would fault a healthy peer or poison its uptime metric (see the
-# readiness guards in liquidity_manager). The plugin therefore waits until every
-# open channel's peer has produced a trustworthy reading -- normally a few
-# seconds -- and this constant only *bounds* that wait, so a permanently dead
-# peer cannot defer automation forever. It is not a minimum: a wallet whose peers
-# connect quickly (or one with no channels yet) is ready well before this.
-# Kept a fixed constant (not a ConfigVar) -- infrastructure timing, not a
+# Startup window. For this long after a wallet is loaded, the plugin takes NO
+# *automatic* action (open / swap / close) and does not judge any peer offline:
+# the Lightning layer connects to its peers asynchronously after load, so a peer
+# that is actually fine reads as "not connected" during this window, and a
+# channel whose peer has only just come up cannot necessarily route a payment
+# yet. Acting then would fault a healthy peer, poison its uptime metric, or fire
+# a reverse swap whose Lightning leg fails immediately (see the long note in
+# ``wallet_readiness_block`` -- shortening this window was tried and measurably
+# broke swaps). A user-initiated "Run now" skips it deliberately.
+#
+# Kept a fixed constant (not a ConfigVar) -- it is infrastructure timing, not a
 # strategy knob -- but referenced via ``self._startup_grace_sec`` so tests can
-# shrink it. Also bounds the per-peer observation gate in
+# shrink it. A couple of minutes comfortably covers peer (re)connection without
+# noticeably delaying automation. Also bounds the per-peer observation gate in
 # ``classify_peer_observation``.
 STARTUP_GRACE_SEC = 120.0
 
@@ -748,10 +759,9 @@ class LiquidityPlugin(BasePlugin):
         # hammer the network every tick). The fee stays owed across the backoff.
         self._dev_fee_retry_until: Dict['Abstract_Wallet', float] = {}
         # wallet -> wall-clock time the wallet was loaded (start_wallet). Drives
-        # the startup window ceiling: until every open channel's peer has been
-        # observed OR STARTUP_GRACE_SEC has elapsed, the plugin defers automatic
-        # evaluation and treats not-yet-connected peers as "not observed" rather
-        # than offline.
+        # the startup window: until STARTUP_GRACE_SEC has elapsed the plugin
+        # defers all automatic evaluation and treats not-yet-connected peers as
+        # "not observed" rather than offline.
         self._started_at: Dict['Abstract_Wallet', float] = {}
         # wallet -> set of node_ids (hex) we have seen ONLINE at least once since
         # load. A peer in this set that later reads inactive is a genuine offline
@@ -1107,57 +1117,16 @@ class LiquidityPlugin(BasePlugin):
         except Exception:
             return True
 
-    def _all_channel_peers_observed(self, wallet: 'Abstract_Wallet') -> bool:
-        """Whether every open channel's peer has produced a *trustworthy*
-        reachability reading this session.
-
-        This is what actually ends the startup window in practice: rather than
-        waiting out a fixed stopwatch, we wait only until the Lightning layer has
-        finished dialing, which normally takes seconds. ``_observe_peer`` already
-        encodes "is this reading trustworthy?" -- it returns None precisely when a
-        peer has not been dialed yet -- so readiness is just "no channel peer
-        still reads as not-yet-observed".
-
-        Only channels in state OPEN are considered: ``chan.is_active()`` can only
-        ever be true there, so requiring an observation from a channel that is
-        still opening (or already closing) would hold readiness to the grace
-        ceiling for no benefit. A wallet with no such channels -- a fresh wallet
-        about to open its first -- is trivially observed, and becomes ready as
-        soon as it is connected and synced.
-
-        Anything we cannot read (no lnworker, an lnworker that raises) counts as
-        observed, so an unexpected shape defers to the grace ceiling rather than
-        stalling automation forever."""
-        lnworker = getattr(wallet, "lnworker", None)
-        if lnworker is None:
-            return True
-        try:
-            channels = list(lnworker.channels.values())
-        except Exception:
-            return True
-        now = time.time()
-        for chan in channels:
-            try:
-                if not chan.is_open():
-                    continue
-            except Exception:
-                continue
-            # None == "not a trustworthy reading yet" (peer not dialed).
-            if self._observe_peer(wallet, chan, now) is None:
-                return False
-        return True
-
     def _readiness_block(self, wallet: 'Abstract_Wallet', *,
                          manual: bool = False) -> Optional[str]:
         """Why ``wallet`` cannot take automated action yet, or None if it can.
 
-        Gathers the three live signals -- server connection, wallet sync, and
-        whether every open channel's peer has been observed -- and hands them to
-        the pure predicate. A wallet we are not managing (no recorded load time)
-        is never ready.
+        Gathers the live signals -- server connection, wallet sync, and how long
+        since load -- and hands them to the pure predicate. A wallet we are not
+        managing (no recorded load time) is never ready.
 
         ``manual=True`` marks a user-initiated "Run now", which skips the
-        time-based peer limb only; a disconnected or still-syncing wallet is
+        time-based startup window only; a disconnected or still-syncing wallet is
         refused either way."""
         started = self._started_at.get(wallet)
         if started is None:
@@ -1167,17 +1136,9 @@ class LiquidityPlugin(BasePlugin):
             connected = bool(network is not None and network.is_connected())
         except Exception:
             connected = False
-        # Short-circuited in the same order the pure predicate reports them, so
-        # the peer sweep is skipped when an earlier limb already blocks: a
-        # disconnected wallet must not record peer observations from readings we
-        # have just declared untrustworthy.
-        if not connected:
-            return BLOCK_NO_CONNECTION
-        if not self._wallet_synced(wallet):
-            return BLOCK_SYNCING
         return wallet_readiness_block(
-            True, True, self._all_channel_peers_observed(wallet),
-            time.time() - started, self._startup_grace_sec, manual=manual)
+            connected, self._wallet_synced(wallet), time.time() - started,
+            self._startup_grace_sec, manual=manual)
 
     def _wallet_ready(self, wallet: 'Abstract_Wallet', *,
                       manual: bool = False) -> bool:
@@ -1860,14 +1821,25 @@ class LiquidityPlugin(BasePlugin):
         return dict(raw) if isinstance(raw, dict) else {}
 
     def _save_pending_swaps(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
+        """Persist the pending-swap tracking map.
+
+        The whole write is guarded. ``JsonDB.put`` deep-copies what it is given
+        and raises on anything it cannot copy; unguarded, that exception escaped
+        all the way out of ``_reverse_swap`` and aborted the executor *after* a
+        swap had already been created -- losing the very tracking record that
+        exists to reconcile it. Persistence failing must never be able to sink an
+        action that already happened, so it is logged and swallowed here. (See
+        ``_track_pending_swap``, which also keeps non-primitives out of the map
+        in the first place.)"""
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(PENDING_SWAPS_DB_KEY, data)
         try:
+            db.put(PENDING_SWAPS_DB_KEY, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist pending-swap tracking: {e!r}")
+            self.logger.error(f"could not persist pending-swap tracking: {e!r}",
+                              exc_info=True)
 
     def _track_pending_swap(self, wallet: 'Abstract_Wallet', payment_hash_hex: str,
                             npub: str, node_id: str = "", channel_id: str = "",
@@ -1876,14 +1848,23 @@ class LiquidityPlugin(BasePlugin):
         funds can be charged to the right party: the ``npub`` provider if it never
         funded, or the channel ``node_id`` peer if our Lightning payment failed.
         ``fee_basis_sat`` (the expected net on-chain amount) is stashed so the dev
-        fee can be accrued if and only if the swap later completes."""
-        if not payment_hash_hex:
+        fee can be accrued if and only if the swap later completes.
+
+        Every field is coerced to a JSON primitive on the way in. This store is
+        JSON-backed (``JsonDB.put`` deep-copies, and the wallet file must stay
+        plain JSON), so a caller that hands us a rich object -- a SwapData, a
+        Channel, an offer -- rather than its id must not be able to poison the
+        write. That was observed in the wild as ``TypeError: cannot pickle
+        '_thread.RLock' object`` raised from deep inside ``db.put``, which took
+        the surrounding reverse swap down with it."""
+        key = str(payment_hash_hex or "")
+        if not key:
             return
         data = self._load_pending_swaps(wallet)
-        data[payment_hash_hex] = {
-            "npub": npub, "started_ts": time.time(),
-            "node_id": node_id, "channel_id": channel_id,
-            "fee_basis_sat": int(fee_basis_sat)}
+        data[key] = {
+            "npub": str(npub or ""), "started_ts": float(time.time()),
+            "node_id": str(node_id or ""), "channel_id": str(channel_id or ""),
+            "fee_basis_sat": _safe_int(fee_basis_sat)}
         self._save_pending_swaps(wallet, data)
 
     def _ln_payment_failed(self, wallet: 'Abstract_Wallet', payment_hash_hex: str) -> bool:
@@ -2710,13 +2691,14 @@ class LiquidityPlugin(BasePlugin):
                     self.logger.debug(
                         f"{wallet.basename()} manual-run-only: skipping automatic evaluation")
                     return
-                # Startup/shutdown race guard: until the wallet is ready (server
-                # connected, wallet synced, and every open channel's peer dialed
-                # -- or the grace ceiling reached), defer ALL automation. Acting
-                # earlier risks faulting a healthy-but-not-yet-connected peer or
-                # opening/swapping on a partial UTXO set. A later tick (events,
-                # the heartbeat, or the scheduled post-grace evaluation)
-                # re-checks. A manual "Run now" skips the peer/time limb only.
+                # Startup/shutdown race guard: until the wallet is ready
+                # (server connected, wallet synced, and the startup window
+                # elapsed), defer ALL automatic action. Acting earlier risks
+                # faulting a healthy-but-not-yet-connected peer, opening/swapping
+                # on a partial UTXO set, or firing a swap whose Lightning leg
+                # cannot route yet. A later tick (events, the heartbeat, or the
+                # scheduled post-grace evaluation) re-checks. A manual "Run now"
+                # skips the startup window only.
                 block = self._readiness_block(wallet, manual=manual)
                 if block is not None:
                     self.logger.debug(

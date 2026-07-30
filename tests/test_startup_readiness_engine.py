@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
     BLOCK_NO_CONNECTION,
-    BLOCK_PEERS,
+    BLOCK_STARTING_UP,
     BLOCK_SYNCING,
     classify_peer_observation,
     is_wallet_ready,
@@ -17,69 +17,64 @@ from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
 
 GRACE = 120.0
 
-# Positional order: connected, synced, all_peers_observed, elapsed, grace.
+# Positional order: connected, synced, elapsed, grace.
 
 
-# --- is_wallet_ready: the peer/time limb ----------------------------------
-def test_ready_once_every_peer_is_observed_without_waiting() -> None:
-    # The point of the fix: peers dialed 1s after load -> ready immediately,
-    # no need to sit out the grace ceiling.
-    assert is_wallet_ready(True, True, True, 1.0, GRACE) is True
+# --- is_wallet_ready: the startup window ----------------------------------
+def test_ready_once_the_startup_window_has_elapsed() -> None:
+    assert is_wallet_ready(True, True, GRACE + 1, GRACE) is True
+    assert is_wallet_ready(True, True, GRACE, GRACE) is True  # boundary inclusive
 
 
-def test_ready_past_grace_even_with_peers_unobserved() -> None:
-    # The ceiling: a peer that never comes back must not defer forever.
-    assert is_wallet_ready(True, True, False, GRACE + 1, GRACE) is True
-    assert is_wallet_ready(True, True, False, GRACE, GRACE) is True  # inclusive
-
-
-def test_not_ready_within_grace_while_peers_unobserved() -> None:
-    assert is_wallet_ready(True, True, False, 0.0, GRACE) is False
-    assert is_wallet_ready(True, True, False, GRACE - 0.001, GRACE) is False
+def test_not_ready_inside_the_startup_window() -> None:
+    # Deliberately a plain stopwatch: ending this window early on a
+    # "peers are connected" signal made reverse swaps fail (their Lightning leg
+    # cannot route yet). See the note in wallet_readiness_block.
+    assert is_wallet_ready(True, True, 0.0, GRACE) is False
+    assert is_wallet_ready(True, True, GRACE - 0.001, GRACE) is False
 
 
 # --- is_wallet_ready: the connection and sync limbs -----------------------
-def test_not_ready_when_disconnected_regardless_of_everything_else() -> None:
+def test_not_ready_when_disconnected_regardless_of_time() -> None:
     # Covers both startup (server not connected yet) and shutdown (torn down).
-    assert is_wallet_ready(False, True, True, 10_000.0, GRACE) is False
+    assert is_wallet_ready(False, True, 10_000.0, GRACE) is False
 
 
 def test_not_ready_while_wallet_is_still_syncing() -> None:
     # A partial UTXO set would make a balance-driven decision wrong, so this
-    # blocks even with peers observed and the grace long past.
-    assert is_wallet_ready(True, False, True, 10_000.0, GRACE) is False
+    # blocks even with the startup window long past.
+    assert is_wallet_ready(True, False, 10_000.0, GRACE) is False
 
 
 def test_zero_grace_ready_as_soon_as_connected_and_synced() -> None:
-    assert is_wallet_ready(True, True, False, 0.0, 0.0) is True
-    assert is_wallet_ready(False, True, False, 0.0, 0.0) is False
-    assert is_wallet_ready(True, False, False, 0.0, 0.0) is False
+    assert is_wallet_ready(True, True, 0.0, 0.0) is True
+    assert is_wallet_ready(False, True, 0.0, 0.0) is False
+    assert is_wallet_ready(True, False, 0.0, 0.0) is False
 
 
 # --- is_wallet_ready: the manual ("Run now") bypass ------------------------
-def test_manual_run_skips_the_peer_and_time_limb() -> None:
-    # Freshly loaded, peers not dialed yet: an automatic tick defers, but a
-    # user-initiated run goes ahead.
-    assert is_wallet_ready(True, True, False, 0.0, GRACE) is False
-    assert is_wallet_ready(True, True, False, 0.0, GRACE, manual=True) is True
+def test_manual_run_skips_the_startup_window() -> None:
+    # Freshly loaded: an automatic tick defers, a user-initiated run goes ahead.
+    assert is_wallet_ready(True, True, 0.0, GRACE) is False
+    assert is_wallet_ready(True, True, 0.0, GRACE, manual=True) is True
 
 
 def test_manual_run_still_requires_connection_and_sync() -> None:
-    assert is_wallet_ready(False, True, True, 10_000.0, GRACE, manual=True) is False
-    assert is_wallet_ready(True, False, True, 10_000.0, GRACE, manual=True) is False
+    assert is_wallet_ready(False, True, 10_000.0, GRACE, manual=True) is False
+    assert is_wallet_ready(True, False, 10_000.0, GRACE, manual=True) is False
 
 
 # --- wallet_readiness_block: the reported reason --------------------------
 def test_block_reason_names_the_failing_limb() -> None:
-    assert wallet_readiness_block(True, True, True, 0.0, GRACE) is None
-    assert wallet_readiness_block(False, True, True, 0.0, GRACE) == BLOCK_NO_CONNECTION
-    assert wallet_readiness_block(True, False, True, 0.0, GRACE) == BLOCK_SYNCING
-    assert wallet_readiness_block(True, True, False, 0.0, GRACE) == BLOCK_PEERS
+    assert wallet_readiness_block(True, True, GRACE + 1, GRACE) is None
+    assert wallet_readiness_block(False, True, 0.0, GRACE) == BLOCK_NO_CONNECTION
+    assert wallet_readiness_block(True, False, 0.0, GRACE) == BLOCK_SYNCING
+    assert wallet_readiness_block(True, True, 0.0, GRACE) == BLOCK_STARTING_UP
 
 
 def test_block_reason_reports_connection_before_sync() -> None:
     # Both broken -> report the one the user must fix first.
-    assert wallet_readiness_block(False, False, False, 0.0, GRACE) == BLOCK_NO_CONNECTION
+    assert wallet_readiness_block(False, False, 0.0, GRACE) == BLOCK_NO_CONNECTION
 
 
 # --- classify_peer_observation --------------------------------------------
