@@ -1,9 +1,14 @@
-"""Unit tests for the pure channel-partner ordering helpers in the rules engine
-(`normalize_node_id` / `order_channel_partners`). These import the engine module
-directly (via conftest's sys.path shim), with no Electrum dependency."""
+"""Unit tests for the pure channel-partner helpers in the rules engine
+(`normalize_node_id` / `order_channel_partners` / `is_channel_size_rejection`).
+These import the engine module directly (via conftest's sys.path shim), with no
+Electrum dependency."""
 from __future__ import annotations
 
-from liquidity_manager import normalize_node_id, order_channel_partners  # type: ignore
+from liquidity_manager import (  # type: ignore
+    is_channel_size_rejection,
+    normalize_node_id,
+    order_channel_partners,
+)
 
 PUB_A = "02" + "aa" * 32
 PUB_B = "03" + "bb" * 32
@@ -101,3 +106,53 @@ def test_exclude_and_banned_compose():
         banned=frozenset({PUB_A}), suggested=[], strict=False,
         exclude=frozenset({PUB_B}))
     assert out == [f"{PUB_C}@h:3"]
+
+
+# --- channel-size rejection classification --------------------------------
+# A failed open that was only ever about the channel SIZE must not be charged to
+# the peer (see is_channel_size_rejection's docstring and the _open_channel
+# caller): a node that declines a channel below its own minimum is healthy, and
+# the plugin now walks up to MAX_SUGGESTED_PARTNERS peers per tick, so faulting
+# on size would auto-ban swathes of the graph for nothing.
+def test_size_rejection_matches_electrum_local_bounds():
+    # Raised by lnutil.ChannelConfig.validate_params / cross_validate_params.
+    assert is_channel_size_rejection("funding_sat too low: 100000 sat < 200000")
+    assert is_channel_size_rejection(
+        "funding_sat too high: 20000000 sat > 16777215 (legacy limit)")
+    assert is_channel_size_rejection("remote. reserve too high: 50000, funding_sat: 200000")
+    assert is_channel_size_rejection(
+        "local. max_htlc_value_in_flight_msat is too small: 1000")
+
+
+def test_size_rejection_matches_peer_error_text_across_implementations():
+    # A peer's BOLT error, as Electrum relays it (lnpeer.wait_for_message ->
+    # GracefulDisconnect). The text is implementation-specific free text.
+    for text in (
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: channel too small",
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: chan size of 0.002 BTC "
+        "is below min chan size of 0.02 BTC",
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: funding amount is too small",
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: Amount too small",
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: funding_satoshis is too small",
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: exceeds maximum channel size",
+    ):
+        assert is_channel_size_rejection(text), text
+
+
+def test_non_size_failures_are_not_size_rejections():
+    # These stay faultable: they are real reliability signals.
+    for text in (
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: internal error",
+        "Received unexpected 'error'",
+        "minimum depth too high, 42",
+        "feerate lower than min relay fee. 100 sat/kw.",
+        "ConnectionError: [Errno 111] Connection refused",
+        "Channel type is not the one that we sent.",
+        "",
+    ):
+        assert not is_channel_size_rejection(text), text
+
+
+def test_size_rejection_handles_none_and_is_case_insensitive():
+    assert not is_channel_size_rejection(None)
+    assert is_channel_size_rejection("FUNDING AMOUNT TOO SMALL")

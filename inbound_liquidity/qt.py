@@ -957,11 +957,16 @@ class Plugin(LiquidityPlugin):
         tab = QWidget()
         v = QVBoxLayout(tab)
         v.addWidget(_wrapped_label(_(
-            "Channels are opened to Electrum's suggested peer by default. List "
-            "“Preferred” partners (node_id@host:port, one per line) to try them "
-            "first, in order, before falling back to a suggestion. “Banned” "
-            "partners (node id, or node_id@host:port) are never opened to. Tick "
-            "the rows below to prefer/ban a node you already have a channel with.")))
+            "Channels are opened to peers Electrum suggests by default (several are "
+            "tried in turn if one refuses). List “Preferred” partners "
+            "(node_id@host:port, one per line) to try them first, in order, before "
+            "falling back to those suggestions. “Banned” partners (node id, or "
+            "node_id@host:port) are never opened to.")))
+        v.addWidget(_wrapped_label(_(
+            "The rows below are the peers you ALREADY have a channel with (plus any "
+            "with a fault history) — they are not a list of candidates. Tick a row to "
+            "prefer/ban that node; a node you are not connected to yet goes in the "
+            "“Preferred partners” box.")))
 
         strict_cb = QCheckBox(_("Only open channels to preferred partners (never fall back to suggestions)"))
         strict_cb.setChecked(bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT))

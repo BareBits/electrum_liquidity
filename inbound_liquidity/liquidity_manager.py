@@ -425,6 +425,81 @@ def normalize_node_id(connect_str: Optional[str]) -> str:
     return connect_str.strip().split("@", 1)[0].strip().lower()
 
 
+# How many of Electrum's peer suggestions to collect (and therefore try) for one
+# channel open. Electrum's ``suggest_peer()`` returns ONE rating-weighted random
+# node per call, so N distinct suggestions means calling it N-ish times; this cap
+# bounds both that polling and how many peers a single open walks through before
+# giving up. Preferred partners are NOT counted against it -- they are always all
+# tried first (see :func:`order_channel_partners`).
+MAX_SUGGESTED_PARTNERS: int = 10
+
+# Substrings identifying a channel-open failure caused purely by the CHANNEL SIZE
+# being unacceptable -- either our own funding amount tripping a local BOLT/config
+# bound, or the peer rejecting it against *their* min/max channel policy. Such a
+# rejection says nothing about the peer's reliability (a node that only accepts
+# channels above our funding amount is perfectly healthy), so the glue records NO
+# fault for it: see the caller in ``__init__.py``'s ``_open_channel``.
+#
+# Two sources, both surfacing as free text:
+#   * local -- Electrum's own ``ChannelConfig.validate_params`` /
+#     ``cross_validate_params`` raise plain ``Exception``s with these messages
+#     before or just after ``accept_channel``;
+#   * remote -- the peer's BOLT ``error`` message, relayed by Electrum as
+#     ``GracefulDisconnect("remote peer sent error ...: <their text>")``. That
+#     text is implementation-specific, so the markers below cover the phrasings
+#     used by lnd / Core Lightning / Eclair. Matching is a heuristic on purpose:
+#     a miss just falls back to today's behaviour (a hard fault), and a false
+#     positive only means a genuinely bad peer escapes one fault.
+_CHANNEL_SIZE_REJECTION_MARKERS: Tuple[str, ...] = (
+    # Electrum-local (lnutil.ChannelConfig.validate_params / cross_validate_params)
+    "funding_sat too low",
+    "funding_sat too high",
+    "reserve too high",
+    "max_htlc_value_in_flight_msat is too small",
+    "insane initial_msat",
+    # lnd
+    "channel too small",
+    "channel too large",
+    "below min chan size",
+    "exceeds maximum channel size",
+    "exceeds the maximum channel size",
+    # Core Lightning
+    "funding_satoshis is too small",
+    "amount too small",
+    "amount too large",
+    # Eclair
+    "funding amount too small",
+    "funding amount is too small",
+    "funding amount too large",
+    "funding amount is too high",
+    "invalid funding amount",
+    # implementation-agnostic phrasings seen in the wild
+    "capacity too small",
+    "capacity too large",
+    "channel size",
+    "min_chan_size",
+)
+
+
+def is_channel_size_rejection(error_text: Optional[object]) -> bool:
+    """True if ``error_text`` describes a channel-open failure that is purely
+    about the CHANNEL SIZE (our funding amount vs. a local bound or the peer's
+    min/max channel policy).
+
+    Used to decide whether a failed open should count against the peer at all.
+    A size mismatch is not a reliability signal, so the caller records neither a
+    hard nor a soft fault for it -- the peer keeps a clean record and its place in
+    the try-order, and the open simply moves on to the next candidate.
+
+    Matching is case-insensitive substring matching over
+    :data:`_CHANNEL_SIZE_REJECTION_MARKERS`; ``None``/empty text is not a match.
+    """
+    if not error_text:
+        return False
+    lowered = str(error_text).lower()
+    return any(marker in lowered for marker in _CHANNEL_SIZE_REJECTION_MARKERS)
+
+
 def order_channel_partners(
     preferred: Sequence[str],
     banned: FrozenSet[str],
