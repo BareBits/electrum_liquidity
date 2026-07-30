@@ -262,7 +262,7 @@ def test_failed_suggestion_lookup_is_reported_not_swallowed(rig):
     diag = " ".join(
         open(path, errors="replace").read()
         for path in glob.glob(str(paths.CLIENT_DATADIR / "regtest"
-                                  / "inbound_liquidity_logs" / "*.log")))
+                                  / "inbound_liquidity_logs" / "*" / "*.log")))
     assert "suggested-peer lookup failed" in diag, diag
 
     # Nothing opened: there was genuinely no partner to open to.

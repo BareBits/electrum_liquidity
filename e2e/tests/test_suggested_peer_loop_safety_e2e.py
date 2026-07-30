@@ -16,15 +16,24 @@ even without that assert. The AssertionError was then swallowed by the bare
 ``except Exception`` beside it, so the rater was never consulted at all and every
 channel open was declined for "no reachable channel partner".
 
-The fix awaits the lookup in a worker thread. This test proves it against reality
-by looking for the one thing only a *successful* off-loop call can produce:
-``LNRater``'s own graph-analysis log line. Its analysis is unreachable if the call
-never gets past ``run_from_another_thread``, so its presence is direct evidence the
-plugin reached Electrum's rater from a decision tick.
+The fix awaits the lookup in a worker thread. This test drives a real gossip-mode
+daemon through a decision tick and asserts the guard never fires.
 
-A regtest graph is empty, so the rater legitimately has nobody to suggest; the
-plugin must then decline cleanly ("no preferred/suggested peer") with no lookup
-error recorded. Both halves are asserted: the rater ran, and nothing broke.
+What it can and cannot prove, honestly. ``LNRater.suggest_peer`` calls
+``maybe_analyze_graph()`` unconditionally, so ``run_from_another_thread`` -- and
+therefore its assert -- IS evaluated on every tick here. If the worker-thread hop
+regresses, that assert fires, and the plugin's own error reporting (the other half
+of this fix) writes "suggested-peer lookup failed: AssertionError(...)" to the
+Electrum log and to the diagnostics log. Those markers being absent, while a
+decision tick demonstrably ran to completion, is the regression signal.
+
+What it does NOT prove is that the rater found anything: a regtest node has no
+gossip peers, so ``get_sync_progress_estimate()`` returns ``None``, the graph
+analysis early-returns before it logs, and the rater has nobody to suggest. The
+correct outcome is therefore the plain "no preferred/suggested peer" decline --
+asserted below, because a lookup that *failed* would produce a different one.
+(That the call runs off the loop is also asserted directly, against Electrum's own
+``util.get_running_loop`` guard, in ``tests/test_channel_partners_glue.py``.)
 
 Heavy and slow (~4-6 min) and needs the electrum venv + docker. Function-scoped
 rig; it wipes ``.run`` and kills any previous rig, so it must NOT run while a
@@ -65,11 +74,10 @@ from rig.services import (  # noqa: E402
 
 FUND_CAP_SAT = 1_000_000
 
-# LNRater's own log line, emitted at the end of _collect_purged_stats -- i.e. only
-# after maybe_analyze_graph() actually ran. Unreachable from the asyncio thread.
-RATER_ANALYSED_MARKER = "node statistics done"
-# Network.run_from_another_thread's assertion message.
+# Network.run_from_another_thread's assertion message: what an on-loop call raises.
 ON_LOOP_ASSERT_MARKER = "must not be called from asyncio thread"
+# How the plugin reports any failed lookup (including that AssertionError).
+LOOKUP_FAILED_MARKER = "suggested-peer lookup failed"
 
 
 def _setcfg(key: str, value: str) -> None:
@@ -108,7 +116,7 @@ def _diag_log_text() -> str:
     return " ".join(
         open(path, errors="replace").read()
         for path in glob.glob(str(paths.CLIENT_DATADIR / "regtest"
-                                  / "inbound_liquidity_logs" / "*.log")))
+                                  / "inbound_liquidity_logs" / "*" / "*.log")))
 
 
 def _mine(rig, n: int = 1) -> None:
@@ -189,23 +197,28 @@ def test_gossip_mode_suggestion_runs_off_the_loop(rig):
         f"plugin never evaluated an open; declines={_declines()!r}"
 
     log_text = _client_log_text()
-
-    # The proof: LNRater actually analysed the graph. That code is reachable only
-    # through Network.run_from_another_thread, i.e. only from OFF the asyncio loop.
-    assert RATER_ANALYSED_MARKER in log_text, (
-        "LNRater never ran, so the suggested-peer lookup never got past "
-        "Network.run_from_another_thread -- the on-loop call is back"
-    )
-    # And the assertion that used to fire (and be swallowed) never did.
-    assert ON_LOOP_ASSERT_MARKER not in log_text, (
-        f"found {ON_LOOP_ASSERT_MARKER!r} in the Electrum log: the lookup ran on "
-        "the asyncio loop"
-    )
-
-    # Nothing was swallowed and nothing broke: an empty regtest graph is a clean
-    # "no suggestion", not a failure.
-    assert "suggested-peer lookup failed" not in log_text, log_text[-4000:]
-    assert "suggested-peer lookup failed" not in _diag_log_text()
+    diag_text = _diag_log_text()
     joined = " | ".join(_declines())
-    assert "no preferred/suggested peer" in joined, joined
+
+    # Electrum's own guard never fired: the lookup was not made from the loop.
+    assert ON_LOOP_ASSERT_MARKER not in log_text, (
+        f"found {ON_LOOP_ASSERT_MARKER!r} in the Electrum log: the suggested-peer "
+        "lookup ran on the asyncio loop again"
+    )
+    # Nor did anything else break. Were the hop removed, the AssertionError would
+    # land here (it is no longer swallowed) rather than passing silently.
+    assert LOOKUP_FAILED_MARKER not in log_text, log_text[-4000:]
+    assert LOOKUP_FAILED_MARKER not in diag_text, diag_text[-4000:]
     assert "asking Electrum for a suggested peer failed" not in joined, joined
+
+    # An empty regtest graph is a clean "nothing to suggest", so the tick that
+    # demonstrably ran must have produced exactly the plain decline.
+    assert "no preferred/suggested peer" in joined, joined
+
+    # The diagnostics log proves the tick reached the partner-resolution stage at
+    # all (it is where that decline is recorded), so the checks above are not
+    # vacuously passing on a plugin that never ran.
+    assert "have funds and room to open" in diag_text, (
+        "no open decision reached the diagnostics log; the assertions above would "
+        f"be vacuous. diag={diag_text[-2000:]!r}"
+    )
