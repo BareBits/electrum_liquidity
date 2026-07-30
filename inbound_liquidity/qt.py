@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from electrum.i18n import _
@@ -106,7 +106,11 @@ def _wrapped_label(text: str) -> QLabel:
 
 
 class _Signals(QObject):
-    activity = pyqtSignal(object, str)        # (wallet, message)
+    # NB: there is deliberately no "activity" signal. The plugin used to push
+    # transient notices into Electrum's main status bar (next to the balance);
+    # it no longer writes there at all. Everything it has to say now lives
+    # inside the Liquidity tab: the Status footer for what a tick is doing, and
+    # the Actions / Log sub-tabs for what it did.
     log_changed = pyqtSignal(object)          # (wallet,)
     providers_changed = pyqtSignal(object)    # (wallet,) -- discovered provider list refreshed
     status_changed = pyqtSignal(object, str)  # (wallet, tick status) -- from the asyncio thread
@@ -182,8 +186,8 @@ class Plugin(LiquidityPlugin):
     def __init__(self, *args) -> None:
         LiquidityPlugin.__init__(self, *args)
         # Created lazily in load_wallet so the QObject is affined to the GUI
-        # thread; on_action_done / on_log_changed (asyncio thread) then emit to
-        # it via queued connections.
+        # thread; the plugin's callbacks (asyncio thread) then emit to it via
+        # queued connections.
         self.signals: Optional[_Signals] = None
         # One Liquidity tab per open wallet (Electrum opens one window/wallet).
         self._tabs: Dict['Abstract_Wallet', _TabState] = {}
@@ -192,7 +196,6 @@ class Plugin(LiquidityPlugin):
     def load_wallet(self, wallet: 'Abstract_Wallet', window: 'ElectrumWindow') -> None:
         if self.signals is None:
             self.signals = _Signals()
-            self.signals.activity.connect(self._show_activity)
             self.signals.log_changed.connect(self._on_log_changed_ui)
             self.signals.providers_changed.connect(self._on_providers_changed_ui)
             self.signals.status_changed.connect(self._on_status_changed_ui)
@@ -215,27 +218,16 @@ class Plugin(LiquidityPlugin):
         # Settings now live in the Liquidity tab rather than a settings dialog.
         return False
 
-    def on_action_done(self, wallet: 'Abstract_Wallet', message: str) -> None:
-        # Called from the asyncio thread; emit a queued signal so the status
-        # update runs on the GUI thread.
-        if self.signals is not None:
-            self.signals.activity.emit(wallet, message)
+    # NB: on_action_done is deliberately NOT overridden here. The base class's
+    # no-op is what we want: completed actions are recorded in the decision log
+    # (Actions sub-tab) and the Log sub-tab, and the plugin no longer pushes
+    # anything into Electrum's main status bar.
 
     def on_log_changed(self, wallet: 'Abstract_Wallet') -> None:
         # Called from the asyncio thread whenever the decision log grows; emit a
         # queued signal so an open tab can refresh on the GUI thread.
         if self.signals is not None:
             self.signals.log_changed.emit(wallet)
-
-    def _show_activity(self, wallet: 'Abstract_Wallet', message: str) -> None:
-        state = self._tabs.get(wallet)
-        if state is None:
-            return
-        try:
-            state.window.statusBar().showMessage(
-                _("Inbound Liquidity") + ": " + message, 12000)
-        except Exception:
-            pass
 
     def _on_log_changed_ui(self, wallet: 'Abstract_Wallet') -> None:
         state = self._tabs.get(wallet)
@@ -471,6 +463,10 @@ class Plugin(LiquidityPlugin):
 
         summary = QLabel("")
         summary.setStyleSheet("color: gray;")
+        # Transient feedback for the buttons below. Separate from `summary`
+        # because the refresh timer rewrites that one out from under it.
+        feedback = QLabel("")
+        feedback.setStyleSheet("color: gray;")
 
         copy_btn = QPushButton(_("Copy"))
         save_btn = QPushButton(_("Save to file…"))
@@ -479,6 +475,7 @@ class Plugin(LiquidityPlugin):
                                "log (Actions / Declines / Faults) is not affected."))
         btn_row = QHBoxLayout()
         btn_row.addWidget(summary, 1)
+        btn_row.addWidget(feedback)
         btn_row.addWidget(copy_btn)
         btn_row.addWidget(save_btn)
         btn_row.addWidget(clear_btn)
@@ -530,7 +527,8 @@ class Plugin(LiquidityPlugin):
             clipboard = QApplication.clipboard()
             if clipboard is not None:
                 clipboard.setText(view.toPlainText())
-                self.on_action_done(wallet, _("Log copied to clipboard."))
+                feedback.setStyleSheet("color: gray;")
+                feedback.setText(_("Copied to clipboard."))
 
         def on_save() -> None:
             default = f"inbound_liquidity_{_safe_filename(wallet)}_{int(time.time())}.log"
@@ -541,14 +539,15 @@ class Plugin(LiquidityPlugin):
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(view.toPlainText())
             except OSError as e:
-                summary.setStyleSheet("color: red;")
-                summary.setText(_("Could not save: {}").format(e))
+                feedback.setStyleSheet("color: red;")
+                feedback.setText(_("Could not save: {}").format(e))
                 return
-            summary.setStyleSheet("color: gray;")
-            self.on_action_done(wallet, _("Log saved to {}").format(path))
+            feedback.setStyleSheet("color: gray;")
+            feedback.setText(_("Saved to {}").format(path))
 
         def on_clear() -> None:
             self.log_buffer.clear()
+            feedback.setText("")
             refresh(force=True)
 
         copy_btn.clicked.connect(on_copy)
@@ -620,9 +619,9 @@ class Plugin(LiquidityPlugin):
                 # Start acting on current state right away rather than waiting
                 # for the next wallet event.
                 self.request_evaluation(wallet)
-                self.on_action_done(wallet, _("Automation enabled."))
-            else:
-                self.on_action_done(wallet, _("Automation disabled."))
+            # No notice needed: the ENABLED/DISABLED label beside the switch
+            # already says what happened, and the Status footer picks up the
+            # tick this just kicked off.
 
         toggle.toggled.connect(on_toggle)
         _sync_toggle_label()
@@ -639,23 +638,25 @@ class Plugin(LiquidityPlugin):
               "Lightning funds out to on-chain to keep inbound liquidity "
               "available. Disabled by default — review the settings below first.")))
 
-        # --- Status ---------------------------------------------------------
+        # --- Status (widgets built here, placed at the BOTTOM of the tab) ----
         # One evaluation can run for minutes (a nostr provider session, a channel
         # open walking its candidate list, a reverse swap), and from outside that
         # is indistinguishable from a plugin doing nothing. This says which step
         # is running right now, and "sleeping" once the tick is done.
-        vbox.addSpacing(8)
+        #
+        # The widgets are created here, before the settings fields, because the
+        # refresh/handles closures below capture ``_set_tick_status``; they are
+        # added to the layout at the very end (see "status footer"), so the
+        # section renders as a footer under the Apply button rather than pushing
+        # the settings down.
         status_header = QLabel(_("Status"))
         _sf = status_header.font()
         _sf.setBold(True)
         status_header.setFont(_sf)
-        vbox.addWidget(status_header)
 
         tick_status_label = _wrapped_label("")
-        vbox.addWidget(tick_status_label)
         tick_since_label = QLabel("")
         tick_since_label.setStyleSheet("color: gray;")
-        vbox.addWidget(tick_since_label)
 
         def _set_tick_status(status: str) -> None:
             """Render one tick status. Terminal states are muted, an in-flight
@@ -699,7 +700,8 @@ class Plugin(LiquidityPlugin):
 
         def on_run_now() -> None:
             self.request_evaluation(wallet, manual=True)
-            self.on_action_done(wallet, _("Manual evaluation triggered."))
+            # The Status footer shows the run starting, so there is nothing
+            # useful to announce separately.
 
         run_now_btn.clicked.connect(on_run_now)
         run_now_row = QHBoxLayout()
@@ -802,7 +804,19 @@ class Plugin(LiquidityPlugin):
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
         vbox.addLayout(btn_row)
+
+        # --- status footer -------------------------------------------------
+        # The stretch goes FIRST so the section is pushed to the bottom edge of
+        # the tab and stays there as the panel is resized, rather than floating
+        # directly under the Apply button on a tall window.
         vbox.addStretch(1)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        vbox.addWidget(separator)
+        vbox.addWidget(status_header)
+        vbox.addWidget(tick_status_label)
+        vbox.addWidget(tick_since_label)
         tabs.addTab(settings_tab, _("Settings"))
 
         # --- Swap providers sub-tab ---------------------------------------
