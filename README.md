@@ -45,13 +45,13 @@ ceilings, diagnostics, etc.).
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on the on-chain amount received from plugin-initiated reverse swaps (0 = off). Paid automatically to a fixed payout address | `0.1` |
+| `manage_plugin_opened_only` | Settings | **Only manage channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; a channel you opened by hand is left entirely alone and its outbound is never drained. When off, every channel is managed. On by default, so an untouched install never touches a channel you set up yourself | `true` |
 | `onchain_reserve_sat` | Advanced | Always leave this much on-chain when opening | `10_000` |
 | `min_outbound_sat` | Advanced | **Keep outbound per channel** — never let a reverse swap drain a channel's outbound (local) balance below this, so the wallet keeps some ability to send. Applied per channel to the swappable amount; `0` drains everything for maximum inbound | `0` |
-| `manage_plugin_opened_only` | Advanced | **Only drain channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; channels you opened by hand are left entirely alone. When off, every channel is managed | `false` |
 | `log_retention_days` | Advanced | How long to keep decision-log entries (1–999) | `30` |
-| `log_buffer_lines` | Advanced | How many recent log lines the **Log** sub-tab keeps in memory (100–100 000). Never written to disk | `2000` |
-| `log_capture_ln` | Advanced | Also capture Electrum's own Lightning/swap logging (peer manager, node rater, channels, routing, submarine swaps) in the **Log** sub-tab. Noisy, but it is where "no channel partner available" is actually decided | `false` |
-| `log_capture_debug` | Advanced | Force debug-level logging while on. Electrum normally produces debug records already (just hidden), so this matters only if you started Electrum with a reduced verbosity — in which case it also makes those records appear in Electrum's own log file. The previous level is restored when you turn it off | `false` |
+| `log_buffer_lines` | Log | How many recent log lines the **Log** sub-tab keeps in memory (100–100 000). Never written to disk | `2000` |
+| `log_capture_ln` | Log | Also capture Electrum's own Lightning/swap logging (peer manager, node rater, channels, routing, submarine swaps) in the **Log** sub-tab. Noisy, but it is where "no channel partner available" is actually decided | `false` |
+| `log_capture_debug` | Log | Force debug-level logging while on. Electrum normally produces debug records already (just hidden), so this matters only if you started Electrum with a reduced verbosity — in which case it also makes those records appear in Electrum's own log file. The previous level is restored when you turn it off | `false` |
 | `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 10 suggestions are tried in turn if one refuses the open) | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
@@ -61,12 +61,14 @@ When a reverse swap fires it swaps out **the maximum the provider allows**
 floor). Opening a channel funds with the **maximum minus the on-chain reserve**,
 with the mining fee deducted so the transaction is feasible.
 
-By default the plugin manages **every** channel in the wallet, not only the ones
-it opened. To preserve some outbound (send) capacity you have two knobs:
-`min_outbound_sat` holds back a per-channel floor, and
-`manage_plugin_opened_only` restricts draining to plugin-opened channels. Which
-channels the plugin opened is shown in the **Managed by** column the plugin adds
-to Electrum's own **Channels** tab (`Plugin` vs `Manual`).
+By default the plugin manages **only the channels it opened itself**
+(`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a
+channel you set up by hand is never drained unless you turn that switch off.
+Which channels the plugin opened is shown in the **Managed by** column the plugin
+adds to Electrum's own **Channels** tab (`Plugin` vs `Manual`).
+
+To preserve some outbound (send) capacity within the channels it *does* manage,
+`min_outbound_sat` holds back a per-channel floor.
 
 ### In-flight freeze
 
@@ -165,8 +167,9 @@ tail, and **Copy** / **Save to file…** what you are looking at.
 
 This is the view to open when an open is declined for having no reachable
 channel partner. That decision is made partly inside Electrum's own Lightning
-subsystems, so tick `log_capture_ln` on the **Advanced** tab to include them
-(and `log_capture_debug` if you launched Electrum with a reduced verbosity).
+subsystems, so tick `log_capture_ln` in the capture options on the **Log** tab
+itself to include them (and `log_capture_debug` if you launched Electrum with
+a reduced verbosity).
 
 The buffer is **memory only** — nothing is written to disk, and it is cleared
 when Electrum restarts; "Save to file…" is the deliberate way to keep a copy.

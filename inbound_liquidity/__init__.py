@@ -483,12 +483,13 @@ SimpleConfig.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = ConfigVar(
                         "Applied per channel to the swappable amount; 0 (the default) "
                         "drains everything for maximum inbound liquidity."))
 SimpleConfig.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = ConfigVar(
-    'plugins.inbound_liquidity.manage_plugin_opened_only', default=False, type_=bool, plugin=_PLUGIN_NAME,
-    short_desc=lambda: _("Only drain channels the plugin opened"),
-    long_desc=lambda: _("When on, the plugin only reverse-swaps channels it opened "
-                        "itself; channels you opened by hand are left entirely alone "
-                        "(their outbound is never drained). When off (the default), "
-                        "every channel is managed."))
+    'plugins.inbound_liquidity.manage_plugin_opened_only', default=True, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Only manage channels the plugin opened"),
+    long_desc=lambda: _("When on (the default), the plugin only reverse-swaps channels "
+                        "it opened itself; channels you opened by hand are left entirely "
+                        "alone (their outbound is never drained). When off, every channel "
+                        "is managed. On by default so the plugin never touches a channel "
+                        "you set up for your own purposes without being asked."))
 SimpleConfig.INBOUND_LIQUIDITY_CHANNEL_PEER = ConfigVar(
     'plugins.inbound_liquidity.channel_peer', default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Channel peer (node_id@host:port)"),

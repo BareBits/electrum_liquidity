@@ -878,9 +878,15 @@ class LiquidityConfig:
     # Scope switch. When True, the engine only ever reverse-swaps channels the
     # plugin itself opened (``ChannelSnapshot.is_plugin_opened``); channels the
     # user opened by hand are left entirely alone (their outbound is never
-    # drained). When False (the default), every channel is managed -- the original
-    # behaviour. The glue supplies the per-channel flag from its persisted
-    # plugin-opened tag; the engine stays pure.
+    # drained). When False, every channel is managed. The glue supplies the
+    # per-channel flag from its persisted plugin-opened tag; the engine stays
+    # pure.
+    #
+    # NB: this dataclass default is False, but the SHIPPED default is ON -- see
+    # ``INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY``. They differ on purpose:
+    # ``read_config`` always passes the user's value explicitly, so this default
+    # is only ever seen by pure tests and non-populating callers, where False
+    # keeps the older "manage every channel" behaviour they were written against.
     manage_plugin_opened_only: bool = False
     # Runaway guard: at most this many channel opens in any rolling 24h window
     # (0 = unlimited). Counted from the executed-open history the glue passes in
