@@ -22,11 +22,22 @@ pytest.importorskip("PyQt6.QtWidgets")
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 pytest.importorskip("electrum.gui.qt.util")
 
-from PyQt6.QtWidgets import QApplication, QTabWidget  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
+    QApplication, QComboBox, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+    QTabWidget,
+)
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     LOG_DB_KEY,
+    DEFAULT_LOG_BUFFER_LINES,
     DEFAULT_LOG_RETENTION_DAYS,
+    STATUS_NOT_STARTED,
+    STATUS_SLEEPING,
+)
+from electrum.plugins.inbound_liquidity.log_buffer import (  # type: ignore  # noqa: E402
+    LogCapture,
+    LogLine,
+    LogRingBuffer,
 )
 from electrum.plugins.inbound_liquidity import qt as qt_mod  # type: ignore  # noqa: E402
 
@@ -89,6 +100,9 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY = 5
         self.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = 5
         self.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED = False
+        self.INBOUND_LIQUIDITY_LOG_BUFFER_LINES = DEFAULT_LOG_BUFFER_LINES
+        self.INBOUND_LIQUIDITY_LOG_CAPTURE_LN = False
+        self.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG = False
         self.INBOUND_LIQUIDITY_DEV_FEE_PCT = 0.1
         self.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = "electrum_liqhelper@getbarebits.com"
 
@@ -123,6 +137,12 @@ def _make_plugin() -> qt_mod.Plugin:
     p.signals = None
     p._tabs = {}
     p._last_offers = {}
+    p._tick_status = {}
+    p.wallets = {}
+    # The Log tab reads both of these; a fresh buffer per plugin keeps tests
+    # isolated, and the capture is left detached (no global handler installed).
+    p.log_buffer = LogRingBuffer()
+    p.log_capture = LogCapture(p.log_buffer, root_logger_name="test.inbound_liquidity.qt")
     return p
 
 
@@ -146,7 +166,7 @@ def test_add_tab_inserts_liquidity_tab(qapp):
     sub = state.container.findChild(QTabWidget)
     assert [sub.tabText(i) for i in range(sub.count())] == [
         "Settings", "Swap providers", "Channel partners", "Advanced",
-        "Actions", "Declines", "Faults"]
+        "Actions", "Declines", "Faults", "Log"]
 
 
 def test_add_tab_is_idempotent(qapp):
@@ -631,3 +651,218 @@ def test_settings_sub_tabs_have_wrapping_descriptions(qapp):
     for idx in range(4):  # Settings, Swap providers, Channel partners, Advanced
         assert _has_wrapped_paragraph(sub.widget(idx)), \
             f"sub-tab {sub.tabText(idx)!r} has no word-wrapped description label"
+
+
+# --- Log sub-tab ----------------------------------------------------------
+# The Log tab is the merged view: this wallet's decision log plus whatever the
+# plugin's own logging captured. These pin the merge, the filters, and the
+# blast radius of "Clear".
+def _log_view(state) -> QPlainTextEdit:
+    return state.log_tab.findChild(QPlainTextEdit)
+
+
+def _log_text(state) -> str:
+    return _log_view(state).toPlainText()
+
+
+def _level_combo(state) -> QComboBox:
+    return state.log_tab.findChild(QComboBox)
+
+
+def _filter_edit(state) -> QLineEdit:
+    return state.log_tab.findChild(QLineEdit)
+
+
+def _capture(p, level: int, message: str, ts: float, source: str = "plugin") -> None:
+    p.log_buffer.append(LogLine(ts=ts, level=level,
+                                level_name=logging.getLevelName(level),
+                                source=source, message=message))
+
+
+def test_log_tab_merges_capture_and_decisions_in_time_order(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    _seed_log(wallet, [
+        {"ts": now + 1, "category": "decline", "kind": "open",
+         "reason": "no reachable channel partner",
+         "detail": "partner resolution: preferred 0/0, suggested 0/0"},
+    ])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.INFO, "resolving channel partners", ts=now)
+    _capture(p, logging.INFO, "sleeping", ts=now + 2)
+    state.refresh_log()
+
+    text = _log_text(state)
+    assert "resolving channel partners" in text
+    assert "no reachable channel partner" in text
+    assert "partner resolution: preferred 0/0" in text     # the decline's detail
+    # Chronological across both halves, not one list appended to the other.
+    assert (text.index("resolving channel partners")
+            < text.index("no reachable channel partner")
+            < text.index("sleeping"))
+
+
+def test_log_tab_level_filter_applies_to_both_halves(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    _seed_log(wallet, [
+        # Actions/declines are informational; a fault is a warning by nature.
+        {"ts": now, "category": "decline", "kind": "open", "reason": "cost too high"},
+        {"ts": now, "category": "fault", "kind": "peer", "reason": "force-closed on us"},
+    ])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.DEBUG, "chatty detail", ts=now)
+    _capture(p, logging.ERROR, "evaluation failed", ts=now)
+    state.refresh_log()
+    assert "chatty detail" in _log_text(state)              # default: everything
+
+    combo = _level_combo(state)
+    combo.setCurrentIndex(1)                                # Warning and above
+    text = _log_text(state)
+    assert "chatty detail" not in text
+    assert "cost too high" not in text                      # decline == INFO
+    assert "force-closed on us" in text                     # fault == WARNING
+    assert "evaluation failed" in text
+
+
+def test_log_tab_text_filter_narrows_the_view(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.INFO, "connecting to partner 02aaaa…aaaa", ts=now)
+    _capture(p, logging.INFO, "discovering swap providers", ts=now + 1)
+    state.refresh_log()
+
+    _filter_edit(state).setText("partner")
+    text = _log_text(state)
+    assert "connecting to partner" in text
+    assert "discovering swap providers" not in text
+    # Case-insensitive, and clearing the box restores everything.
+    _filter_edit(state).setText("PARTNER")
+    assert "connecting to partner" in _log_text(state)
+    _filter_edit(state).setText("")
+    assert "discovering swap providers" in _log_text(state)
+
+
+def test_log_tab_renders_a_multiline_record_as_one_indented_event(qapp):
+    # A traceback keeps its shape, but only its FIRST line starts at column 0 —
+    # so text smuggled into a log message can never look like a separate row.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.ERROR, "failed\nTraceback\n  ValueError: boom", ts=time.time())
+    state.refresh_log()
+
+    lines = _log_text(state).splitlines()
+    assert len(lines) == 3
+    assert not lines[0].startswith(" ")
+    assert lines[1].startswith(" ") and lines[2].startswith(" ")
+
+
+def test_log_tab_clear_drops_capture_but_not_the_decision_log(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    _seed_log(wallet, [
+        {"ts": now, "category": "action", "kind": "open", "reason": "new capacity"},
+    ])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.INFO, "captured line", ts=now)
+    state.refresh_log()
+    assert "captured line" in _log_text(state)
+
+    for button in state.log_tab.findChildren(QPushButton):
+        if button.text() == "Clear":
+            button.click()
+            break
+    else:                                                   # pragma: no cover
+        pytest.fail("no Clear button on the Log tab")
+
+    text = _log_text(state)
+    assert "captured line" not in text
+    assert "new capacity" in text                           # persisted log untouched
+    assert len(p.log_buffer.snapshot()) == 0
+
+
+def test_log_tab_summary_reports_the_ring_state(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.log_buffer = LogRingBuffer(100)
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    for i in range(120):
+        _capture(p, logging.INFO, f"line {i}", ts=time.time())
+    state.refresh_log()
+
+    labels = [w.text() for w in state.log_tab.findChildren(QLabel)]
+    summary = next(t for t in labels if "lines shown" in t)
+    assert "100 captured" in summary and "20 dropped" in summary
+
+
+# --- Status section -------------------------------------------------------
+def _status_labels(state) -> List[str]:
+    settings = state.container.findChild(QTabWidget).widget(0)
+    return [w.text() for w in settings.findChildren(QLabel)]
+
+
+def test_status_section_starts_on_a_terminal_state(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert "Status" in _status_labels(p._tabs[wallet])
+    assert STATUS_NOT_STARTED in _status_labels(p._tabs[wallet])
+
+
+def test_status_section_updates_from_the_plugin_signal(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+
+    p._on_status_changed_ui(wallet, "opening channel with 02aaaa…aaaa (1,000,000 sat)")
+    assert "opening channel with 02aaaa…aaaa (1,000,000 sat)" in _status_labels(p._tabs[wallet])
+    # An in-flight step also shows when it started; a terminal one does not.
+    assert any(t.startswith("since ") for t in _status_labels(p._tabs[wallet]))
+
+    p._on_status_changed_ui(wallet, STATUS_SLEEPING)
+    labels = _status_labels(p._tabs[wallet])
+    assert STATUS_SLEEPING in labels
+    assert not any(t.startswith("since ") for t in labels)
+
+
+def test_status_update_for_an_unknown_wallet_is_a_no_op(qapp):
+    p = _make_plugin()
+    p._on_status_changed_ui(_FakeWallet(), STATUS_SLEEPING)      # must not raise
+
+
+def test_status_update_after_tab_teardown_is_a_no_op(qapp):
+    # close_wallet can race a status already queued from the asyncio thread;
+    # delivering it must not touch deleted C++ objects.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    p._remove_liquidity_tab(wallet)
+    p._on_status_changed_ui(wallet, STATUS_SLEEPING)             # wallet is gone
+    # Even a stale handle held by a queued signal must degrade quietly.
+    state.container.deleteLater()
+    p._tabs[wallet] = state
+    p._on_status_changed_ui(wallet, "opening channel")
+    p._tabs.pop(wallet, None)
+
+
+def test_refresh_syncs_the_status_from_the_plugin(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    p.wallets[wallet] = object()
+    p._tick_status[wallet] = "discovering swap providers"
+    p._tabs[wallet].refresh()
+    assert "discovering swap providers" in _status_labels(p._tabs[wallet])

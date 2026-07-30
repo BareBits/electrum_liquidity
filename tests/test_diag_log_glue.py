@@ -138,12 +138,13 @@ def test_file_contains_no_key_material_and_abbreviates_ids(tmp_path) -> None:
 class _DummyDecline:
     """Stand-in for liquidity_manager.DeclineRecord (only fields the log reads)."""
     def __init__(self, *, kind, reason, channel_id=None, short_id=None,
-                 amount_sat=None) -> None:
+                 amount_sat=None, detail=None) -> None:
         self.kind = kind
         self.reason = reason
         self.channel_id = channel_id
         self.short_id = short_id
         self.amount_sat = amount_sat
+        self.detail = detail
 
 
 if __name__ == "__main__":

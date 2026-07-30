@@ -49,6 +49,9 @@ ceilings, diagnostics, etc.).
 | `min_outbound_sat` | Advanced | **Keep outbound per channel** — never let a reverse swap drain a channel's outbound (local) balance below this, so the wallet keeps some ability to send. Applied per channel to the swappable amount; `0` drains everything for maximum inbound | `0` |
 | `manage_plugin_opened_only` | Advanced | **Only drain channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; channels you opened by hand are left entirely alone. When off, every channel is managed | `false` |
 | `log_retention_days` | Advanced | How long to keep decision-log entries (1–999) | `30` |
+| `log_buffer_lines` | Advanced | How many recent log lines the **Log** sub-tab keeps in memory (100–100 000). Never written to disk | `2000` |
+| `log_capture_ln` | Advanced | Also capture Electrum's own Lightning/swap logging (peer manager, node rater, channels, routing, submarine swaps) in the **Log** sub-tab. Noisy, but it is where "no channel partner available" is actually decided | `false` |
+| `log_capture_debug` | Advanced | Force debug-level logging while on. Electrum normally produces debug records already (just hidden), so this matters only if you started Electrum with a reduced verbosity — in which case it also makes those records appear in Electrum's own log file. The previous level is restored when you turn it off | `false` |
 | `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 10 suggestions are tried in turn if one refuses the open) | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
@@ -100,6 +103,22 @@ reconciliation, and the dev-fee retry backoff — keep advancing even on a quiet
 wallet that emits no events (exactly the situation a dead peer creates). Each
 heartbeat tick is the same guarded, idempotent evaluation as an event-driven one.
 
+### Status
+
+One evaluation ("tick") can run for minutes — opening a nostr provider session,
+walking a channel-open candidate list one peer at a time, or waiting out a
+reverse swap — and from outside that is indistinguishable from a plugin doing
+nothing. The **Settings** sub-tab therefore shows a **Status** line naming the
+step in flight (`resolving channel partners`, `connecting to partner 02b2a9…6501
+(2 of 4)`, `attempting swap with npub1qx…8h2 (250,000 sat)`, …) together with
+when it started.
+
+Between ticks it shows a *resting* state, and these are deliberately distinct so
+"armed and idle" never reads the same as "switched off": `sleeping`, `automation
+disabled`, `idle (manual run only)`, `waiting for wallet to settle` (the startup
+grace) and `not started`. Every exit path — including an error mid-tick — lands
+on one of them, so the line can never stick on a step that finished long ago.
+
 ### Decision log
 
 Every evaluation is recorded so you can see **what the plugin did and why**. The
@@ -123,6 +142,42 @@ swaps, provider economics, the thresholds in force, and every channel's
 balances. Entries are persisted per-wallet in `wallet.db` and pruned to
 `log_retention_days`.
 
+### Log tab
+
+The three views above answer "what did the plugin decide". The **Log** sub-tab
+answers "and what did it see while deciding": it merges the decision log with the
+plugin's own Python logging, captured live into a bounded in-memory ring
+(`log_buffer_lines`, default 2000). Filter by level or by substring, follow the
+tail, and **Copy** / **Save to file…** what you are looking at.
+
+This is the view to open when an open is declined for having no reachable
+channel partner. That decision is made partly inside Electrum's own Lightning
+subsystems, so tick `log_capture_ln` on the **Advanced** tab to include them
+(and `log_capture_debug` if you launched Electrum with a reduced verbosity).
+
+The buffer is **memory only** — nothing is written to disk, and it is cleared
+when Electrum restarts; "Save to file…" is the deliberate way to keep a copy.
+**Clear** discards the captured lines only and never touches your decision log.
+For persistent on-disk records, enable **Write diagnostic log files** instead.
+
+### Why is there no channel partner?
+
+An empty channel-open candidate list collapses several different situations into
+one sentence, so the decline now carries the arithmetic behind it as an
+expandable detail line — for example:
+
+```
+partner resolution: preferred 0/1, suggested 3/3, routing gossip, 1 banned
+```
+
+`kept/total` for each list, the routing mode (`trampoline` vs `gossip` — entirely
+different suggestion paths, each of which comes up empty for its own reason), and
+a count per rule that dropped a candidate: banned, already-have-a-channel-with
+(the one-channel-per-peer guard), duplicate, or unparseable (a typo'd preferred
+partner). If asking Electrum for a suggestion failed outright, that is named too
+rather than reported as "the network has nobody for you". The same line is
+written to the log, so it shows up in the **Log** sub-tab as well.
+
 ## Layout
 
 ```
@@ -132,10 +187,11 @@ inbound_liquidity/
                         store, dev fee, daily ceilings, offline auto-close, MIN_FUNDING_SAT floor override
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
-                        Channel partners / Advanced / Actions / Declines / Faults sub-tabs)
+                        Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs)
   qt_widgets.py         custom Qt widgets (the ENABLED/DISABLED ToggleSwitch)
   swap_transport.py     nostr swap-provider discovery / transport helper
   diag_log.py           optional on-disk diagnostic log (opt-in; no key material)
+  log_buffer.py         bounded in-memory log capture backing the Log sub-tab (no Electrum imports)
   cmdline.py            headless entry point
 tests/                  pure-engine unit tests + Electrum-glue tests covering the rules engine,
                         decision log, provider/peer reliability, dev fee, daily caps, offline

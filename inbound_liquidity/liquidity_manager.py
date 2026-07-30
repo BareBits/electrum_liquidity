@@ -416,6 +416,18 @@ def classify_peer_observation(is_active: bool, seen_online_before: bool,
 # Electrum's own peer suggestion is the fallback. These two helpers are pure so
 # the ordering logic stays unit-testable; the glue gathers the candidates and
 # the wall-clock-free ordering lives here.
+# A Lightning node id: a 33-byte compressed pubkey as 66 hex chars. Used only to
+# *flag* an entry that cannot be one (see PartnerResolution.malformed_hits); it
+# is deliberately not a filter, so partner selection behaves exactly as before.
+_NODE_ID_RE = re.compile(r"^[0-9a-f]{66}$")
+
+
+def looks_like_node_id(normalized: Optional[str]) -> bool:
+    """True iff ``normalized`` (output of :func:`normalize_node_id`) has the
+    shape of a Lightning node id."""
+    return bool(normalized) and bool(_NODE_ID_RE.match(normalized))
+
+
 def normalize_node_id(connect_str: Optional[str]) -> str:
     """The node pubkey (lowercased) from a connect string ``pubkey@host:port``
     or a bare ``pubkey``. Used to match preferred/banned entries by identity,
@@ -500,6 +512,105 @@ def is_channel_size_rejection(error_text: Optional[object]) -> bool:
     return any(marker in lowered for marker in _CHANNEL_SIZE_REJECTION_MARKERS)
 
 
+@dataclass(frozen=True)
+class PartnerResolution:
+    """The outcome of building the channel-open try-order, *with its arithmetic*.
+
+    An empty ``candidates`` is the single most confusing state the plugin can be
+    in ("have funds and room to open, but no reachable channel partner"), because
+    half a dozen different situations collapse into it. Carrying the per-stage
+    counts alongside the result turns that dead end into an explanation: how many
+    partners the user configured, how many Electrum suggested, and exactly how
+    many were dropped by each rule.
+
+    ``*_total`` counts entries that named a pubkey at all; ``*_kept`` counts
+    those that survived every filter. The ``*_hits`` fields attribute each drop
+    to one rule, checked in the order banned -> guard -> duplicate, so the three
+    numbers always sum to ``total - kept`` across both lists.
+
+    ``malformed_hits`` is reported *alongside* those rather than as a filter: an
+    entry that does not look like a node id is still tried (unchanged behaviour
+    -- the connect attempt is where it fails), but a typo'd preferred partner is
+    named in the breakdown instead of looking like a peer that simply refused.
+    """
+    candidates: Tuple[str, ...]
+    preferred_total: int
+    preferred_kept: int
+    suggested_total: int
+    suggested_kept: int
+    banned_hits: int
+    guard_hits: int
+    duplicate_hits: int
+    malformed_hits: int
+    strict: bool
+
+    @property
+    def total_kept(self) -> int:
+        return len(self.candidates)
+
+
+def resolve_channel_partners(
+    preferred: Sequence[str],
+    banned: FrozenSet[str],
+    suggested: Sequence[str],
+    *,
+    strict: bool,
+    penalties: Optional[Mapping[str, float]] = None,
+    exclude: FrozenSet[str] = frozenset(),
+) -> PartnerResolution:
+    """:func:`order_channel_partners`, but returning the full
+    :class:`PartnerResolution` (ordered candidates *plus* the counts that explain
+    them). See that function for the ordering and filtering rules."""
+    out: List[str] = []
+    seen: set = set()
+    counts = {"banned": 0, "guard": 0, "duplicate": 0, "malformed": 0}
+    totals = {"preferred": 0, "suggested": 0}
+    kept = {"preferred": 0, "suggested": 0}
+
+    def consider(entries: Sequence[str], bucket: str) -> None:
+        for entry in entries:
+            if not entry or not entry.strip():
+                continue
+            nid = normalize_node_id(entry)
+            if not nid:
+                continue
+            if not looks_like_node_id(nid):
+                # Counted, not dropped -- see PartnerResolution's docstring.
+                counts["malformed"] += 1
+            totals[bucket] += 1
+            if nid in banned:
+                counts["banned"] += 1
+                continue
+            if nid in exclude:
+                counts["guard"] += 1
+                continue
+            if nid in seen:
+                counts["duplicate"] += 1
+                continue
+            seen.add(nid)
+            kept[bucket] += 1
+            out.append(entry.strip())
+
+    consider(preferred, "preferred")
+    if not strict:
+        consider(suggested, "suggested")
+    if penalties:
+        # Stable sort keeps the preferred-first order among equal penalties.
+        out.sort(key=lambda e: penalties.get(normalize_node_id(e), 0.0))
+    return PartnerResolution(
+        candidates=tuple(out),
+        preferred_total=totals["preferred"],
+        preferred_kept=kept["preferred"],
+        suggested_total=totals["suggested"],
+        suggested_kept=kept["suggested"],
+        banned_hits=counts["banned"],
+        guard_hits=counts["guard"],
+        duplicate_hits=counts["duplicate"],
+        malformed_hits=counts["malformed"],
+        strict=bool(strict),
+    )
+
+
 def order_channel_partners(
     preferred: Sequence[str],
     banned: FrozenSet[str],
@@ -532,27 +643,14 @@ def order_channel_partners(
     A heavily-penalised preferred peer can therefore fall behind a cleaner
     suggestion -- soft de-prioritisation, never an outright exclusion (banning is
     the engine-external hard stop).
+
+    A thin wrapper over :func:`resolve_channel_partners` for the callers that
+    only need the ordered list; use that one when you also need to explain an
+    empty result.
     """
-    out: List[str] = []
-    seen: set = set()
-
-    def consider(entries: Sequence[str]) -> None:
-        for entry in entries:
-            if not entry or not entry.strip():
-                continue
-            nid = normalize_node_id(entry)
-            if not nid or nid in banned or nid in exclude or nid in seen:
-                continue
-            seen.add(nid)
-            out.append(entry.strip())
-
-    consider(preferred)
-    if not strict:
-        consider(suggested)
-    if penalties:
-        # Stable sort keeps the preferred-first order among equal penalties.
-        out.sort(key=lambda e: penalties.get(normalize_node_id(e), 0.0))
-    return out
+    return list(resolve_channel_partners(
+        preferred, banned, suggested, strict=strict, penalties=penalties,
+        exclude=exclude).candidates)
 
 
 @dataclass(frozen=True)
@@ -981,6 +1079,12 @@ class DeclineRecord:
     channel_id: Optional[str] = None
     short_id: Optional[str] = None
     amount_sat: Optional[int] = None
+    # Optional supporting arithmetic, shown as an expandable child of the log
+    # row. Deliberately NOT part of the decline's dedup signature (kind,
+    # channel_id, reason), so detail that varies tick to tick -- e.g. how many
+    # peers were suggested this time -- cannot defeat the "log a steady state
+    # once" rule.
+    detail: Optional[str] = None
 
 
 @dataclass(frozen=True)

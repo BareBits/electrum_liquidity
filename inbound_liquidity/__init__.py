@@ -55,6 +55,7 @@ from .liquidity_manager import (
     MAX_SUGGESTED_PARTNERS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
+    PartnerResolution,
     ProviderOffer,
     ProviderReliability,
     ReverseSwapAction,
@@ -74,6 +75,7 @@ from .liquidity_manager import (
     order_channel_partners,
     record_uptime_sample,
     reliability_penalty_pct,
+    resolve_channel_partners,
     scrub_text,
     should_auto_ban,
     should_commit_offline_close,
@@ -81,6 +83,15 @@ from .liquidity_manager import (
     validate_offer,
 )
 from .diag_log import DiagLog
+from .log_buffer import (
+    DEFAULT_MAX_LINES as DEFAULT_LOG_BUFFER_LINES,
+    LogCapture,
+    LogLine,
+    LogRingBuffer,
+    MAX_MAX_LINES as MAX_LOG_BUFFER_LINES,
+    MIN_MAX_LINES as MIN_LOG_BUFFER_LINES,
+    clamp_max_lines,
+)
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
@@ -254,6 +265,27 @@ MAX_LOG_RETENTION_DAYS = 999
 # How many entries to keep regardless of age, as a hard backstop so a busy
 # wallet can't grow the log without bound between prunes.
 MAX_LOG_ENTRIES = 2000
+# --- tick status ----------------------------------------------------------
+# A single evaluation ("tick") can take a while: opening a nostr session waits up
+# to OFFER_CONNECT_TIMEOUT_SEC + OFFER_DISCOVERY_TIMEOUT_SEC, a channel open
+# walks its candidate list one peer at a time, and a reverse swap is bounded only
+# by REVERSE_SWAP_TIMEOUT_SEC. From outside, all of that looks identical to a
+# plugin doing nothing at all. These are the *terminal* states -- what the plugin
+# shows when no tick is running -- and they are deliberately distinct so "armed
+# and idle" never reads the same as "switched off" or "not started yet". The
+# in-tick strings are built at each step boundary (see _set_status callers).
+STATUS_NOT_STARTED = "not started"
+STATUS_SLEEPING = "sleeping"
+STATUS_DISABLED = "automation disabled"
+STATUS_MANUAL_ONLY = "idle (manual run only)"
+STATUS_SETTLING = "waiting for wallet to settle"
+# Terminal states, for the GUI (and tests): reaching any of these means the tick
+# is over and nothing is in flight.
+TERMINAL_STATUSES = frozenset({
+    STATUS_NOT_STARTED, STATUS_SLEEPING, STATUS_DISABLED,
+    STATUS_MANUAL_ONLY, STATUS_SETTLING,
+})
+
 # On-disk diagnostic log (opt-in; see INBOUND_LIQUIDITY_DIAG_LOG_ENABLED). Files
 # live in this subdirectory of the Electrum data dir, one folder per wallet, one
 # JSON-lines file per UTC day, retained for this many days.
@@ -499,6 +531,33 @@ SimpleConfig.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED = ConfigVar(
     long_desc=lambda: _("When set, the plugin writes a diagnostic log of its decisions and "
                         "errors to daily text files (one per wallet, kept 30 days) under the "
                         "Electrum data directory. Contains no private keys or seeds. Off by default."))
+# --- live log capture (the "Log" sub-tab) ---------------------------------
+# The plugin's own logging is always captured into a bounded in-memory ring; the
+# two toggles below only widen what is captured. They are separate on purpose:
+# WHICH loggers to record and WHETHER to force DEBUG are independent questions,
+# and the second one has a side effect the first does not (see below).
+SimpleConfig.INBOUND_LIQUIDITY_LOG_BUFFER_LINES = ConfigVar(
+    'plugins.inbound_liquidity.log_buffer_lines', default=DEFAULT_LOG_BUFFER_LINES,
+    type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Log tab buffer (lines)"),
+    long_desc=lambda: _("How many recent log lines the Log tab keeps in memory. Older lines are "
+                        "discarded. The buffer is never written to disk — use the Log tab's "
+                        "\"Save to file…\" button to keep a copy."))
+SimpleConfig.INBOUND_LIQUIDITY_LOG_CAPTURE_LN = ConfigVar(
+    'plugins.inbound_liquidity.log_capture_ln', default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Also capture Electrum Lightning logs"),
+    long_desc=lambda: _("Include Electrum's own Lightning and swap logging (peer manager, node "
+                        "rater, channels, routing, submarine swaps) in the Log tab. Useful when "
+                        "the plugin reports that no channel partner is available — that decision "
+                        "is made inside those subsystems. Noisy; off by default."))
+SimpleConfig.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG = ConfigVar(
+    'plugins.inbound_liquidity.log_capture_debug', default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Capture debug-level logs"),
+    long_desc=lambda: _("Force debug-level logging while the Log tab is open. Electrum normally "
+                        "produces debug records already (they are just hidden), so this only "
+                        "matters if you started Electrum with a reduced verbosity — in which case "
+                        "turning it on also makes those records appear in Electrum's own log file. "
+                        "The previous setting is restored when you turn it off."))
 # Provider selection. The plugin discovers swap providers on nostr and uses the
 # cheapest one per swap; these two lists (comma-separated npubs) constrain that
 # choice. They are edited from the Providers sub-tab, not free-form normally.
@@ -704,6 +763,17 @@ class LiquidityPlugin(BasePlugin):
         # Fixed heartbeat cadence, as an instance attribute so tests can shrink it
         # (the module constant stays the production default).
         self._heartbeat_interval_sec: float = HEARTBEAT_INTERVAL_SEC
+        # wallet -> what the current tick is doing right now (or a terminal state
+        # when no tick is running). Surfaced by the Settings tab's Status section.
+        self._tick_status: Dict['Abstract_Wallet', str] = {}
+        # Live log capture backing the GUI's Log tab. Created here (not per
+        # wallet) because Python logging is process-global: one bounded ring and
+        # one handler serve every wallet this plugin instance manages.
+        self.log_buffer = LogRingBuffer(
+            clamp_max_lines(getattr(config, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES",
+                                    DEFAULT_LOG_BUFFER_LINES)))
+        self.log_capture = LogCapture(self.log_buffer)
+        self.apply_log_capture_settings()
         util.register_callback(self._on_wallet_event, _TRIGGER_EVENTS)
 
     # --- lifecycle --------------------------------------------------------
@@ -721,6 +791,7 @@ class LiquidityPlugin(BasePlugin):
         self.wallets.setdefault(wallet, asyncio.Lock())
         self._started_at[wallet] = time.time()
         self._peer_seen_online.setdefault(wallet, set())
+        self._set_status(wallet, STATUS_SETTLING)
         self.logger.info(f"managing inbound liquidity for {wallet.basename()}")
         self._diag_event(wallet, category="lifecycle", kind="start",
                          reason="started managing wallet")
@@ -819,7 +890,7 @@ class LiquidityPlugin(BasePlugin):
     # heartbeat loop watches it to know when to exit.
     _PER_WALLET_STATE_ATTRS = (
         "_eval_pending", "_last_decline_sigs", "_last_offers", "_suggest_errors",
-        "_remediating_opens",
+        "_remediating_opens", "_tick_status",
         "_local_closes", "_wedged_faulted", "_close_capped_logged",
         "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
         "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
@@ -858,6 +929,93 @@ class LiquidityPlugin(BasePlugin):
             util.unregister_callback(self._on_wallet_event)
         except Exception as e:
             self.logger.info(f"could not unregister event callback: {e!r}")
+        # Remove our logging handler and undo any level override, so a disabled
+        # plugin stops capturing and hands the user's verbosity back. Done last:
+        # the lines above are worth capturing.
+        try:
+            self.log_capture.detach()
+        except Exception:
+            pass
+
+    # --- tick status ------------------------------------------------------
+    def tick_status(self, wallet: 'Abstract_Wallet') -> str:
+        """What this wallet's evaluation is doing right now, or a terminal state
+        when nothing is running. Read by the Settings tab's Status section."""
+        store = getattr(self, "_tick_status", None)
+        if not isinstance(store, dict):
+            return STATUS_NOT_STARTED
+        return store.get(wallet, STATUS_NOT_STARTED)
+
+    def _set_status(self, wallet: 'Abstract_Wallet', status: str) -> None:
+        """Record the current tick step and notify the GUI.
+
+        Also logged (at INFO) so the Log tab doubles as a tick trace: the status
+        line only ever shows the *current* step, but the log keeps the sequence
+        that led to it, which is what you actually need when a tick stalls.
+        Statuses are only stored for wallets we still manage, so a step that
+        lands after ``stop_wallet`` cannot resurrect state we just dropped.
+
+        Purely a display concern, so it is defensive on both ends: it tolerates a
+        partially-constructed plugin (the unit-test harnesses build one without
+        ``BasePlugin.__init__``) and swallows a failing GUI notification. A
+        status update must never be able to break the action it is describing.
+        """
+        store = getattr(self, "_tick_status", None)
+        if not isinstance(store, dict):
+            return  # not fully constructed; nothing is displaying a status
+        if store.get(wallet) == status:
+            return  # unchanged; don't re-log or re-notify
+        if wallet in getattr(self, "wallets", {}):
+            store[wallet] = status
+        self.logger.info(f"status: {status}")
+        try:
+            self.on_status_changed(wallet, status)
+        except Exception as e:
+            self.logger.info(f"status notification failed: {e!r}")
+
+    def on_status_changed(self, wallet: 'Abstract_Wallet', status: str) -> None:
+        """GUI hook: overridden in qt.py to push the status onto the GUI thread.
+        No-op in the base/headless plugin."""
+
+    def _terminal_status(self, wallet: 'Abstract_Wallet', config: Optional[LiquidityConfig],
+                         *, manual: bool) -> str:
+        """Which resting state to show now that a tick has finished.
+
+        Distinguishing these matters: "sleeping" on a plugin whose master switch
+        is off would be a lie, and "sleeping" during the startup grace would hide
+        the fact that automation is deliberately deferred for a couple of minutes.
+        """
+        if config is not None and not config.automation_enabled:
+            return STATUS_DISABLED
+        if not manual and self._manual_run_only():
+            return STATUS_MANUAL_ONLY
+        if not self._wallet_ready(wallet):
+            return STATUS_SETTLING
+        return STATUS_SLEEPING
+
+    # --- live log capture -------------------------------------------------
+    def log_buffer_lines(self) -> int:
+        """Configured Log-tab buffer size, clamped to the supported range."""
+        return clamp_max_lines(getattr(self.config, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES",
+                                       DEFAULT_LOG_BUFFER_LINES))
+
+    def apply_log_capture_settings(self) -> None:
+        """(Re)configure log capture from the current config. Idempotent, so the
+        Advanced tab can just call it after any of the three settings change."""
+        try:
+            self.log_buffer.resize(self.log_buffer_lines())
+            self.log_capture.configure(
+                capture_ln=bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_LN", False)),
+                force_debug=bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", False)),
+            )
+        except Exception as e:
+            # Capture is a diagnostic convenience; never let it break plugin load.
+            self.logger.info(f"could not configure log capture: {e!r}")
+
+    def get_log_lines(self, *, min_level: int = 0,
+                      text: Optional[str] = None) -> List[LogLine]:
+        """Captured log lines, oldest first, optionally filtered."""
+        return self.log_buffer.snapshot(min_level=min_level, text=text)
 
     def _install_close_hooks(self, wallet: 'Abstract_Wallet', lnworker) -> None:
         """Wrap the lnworker's local close entry points so that a close *we*
@@ -2431,6 +2589,12 @@ class LiquidityPlugin(BasePlugin):
         if lock.locked():
             return  # an evaluation / action is already in flight; the next event re-checks
         async with lock:
+            # Whatever happens below -- an early return through one of the gates,
+            # an exception, or a full run -- the status must end up on a terminal
+            # state, or the tab would sit forever on the step we died in. The
+            # config is captured as we read it so the terminal state can name the
+            # right reason (disabled / manual-only / settling / sleeping).
+            config: Optional[LiquidityConfig] = None
             try:
                 # Re-assert the channel-funding floor every tick so the user's
                 # min_onchain value always wins, even if some code path reset the
@@ -2462,6 +2626,7 @@ class LiquidityPlugin(BasePlugin):
                 # Resolve any reverse swaps we were watching (funded -> success,
                 # never funded -> stuck fault) before snapshotting, so the
                 # penalties folded into this tick's offers are up to date.
+                self._set_status(wallet, "reconciling pending swaps")
                 self._reconcile_pending_swaps(wallet)
                 # Pay out any dev fee that has accrued past the batch threshold
                 # (runs as a guarded background task; never blocks this tick).
@@ -2469,16 +2634,20 @@ class LiquidityPlugin(BasePlugin):
                 # Watchdog: fault/force-close force-closed or wedged-open channels
                 # so a bad peer can't wedge automation and is de-prioritised next
                 # time we pick a partner.
+                self._set_status(wallet, "checking channel health")
                 self._scan_channel_health(wallet)
                 # Watchdog: sample peer uptime and cooperatively-/force-close
                 # plugin-opened channels whose peer has gone offline for good.
+                self._set_status(wallet, "checking for offline peers")
                 self._scan_offline_autoclose(wallet)
                 # First pass with no provider data: cheap, and tells us whether a
                 # swap is even on the table. Only if one is do we pay to open a
                 # nostr session (connect relays + discover providers); channel
                 # opens and idle/frozen ticks need no provider at all.
+                self._set_status(wallet, "reading wallet state")
                 base = self.build_snapshot(wallet, None)
                 if self._swap_may_be_needed(base, config):
+                    self._set_status(wallet, "discovering swap providers")
                     async with self._swap_session(wallet) as transport:
                         snapshot = self.build_snapshot(wallet, transport)
                         await self._run_decision(wallet, snapshot, config, transport)
@@ -2492,6 +2661,8 @@ class LiquidityPlugin(BasePlugin):
                 self._diag_event(wallet, category="error", kind="evaluation",
                                  reason="evaluation failed",
                                  detail=f"{type(e).__name__}: {e}")
+            finally:
+                self._set_status(wallet, self._terminal_status(wallet, config, manual=manual))
 
     async def _run_decision(self, wallet: 'Abstract_Wallet', snapshot: LiquiditySnapshot,
                             config: LiquidityConfig,
@@ -2517,11 +2688,17 @@ class LiquidityPlugin(BasePlugin):
         executable: List[Tuple[Action, Optional[List[str]]]] = []
         for action in result.actions:
             if isinstance(action, OpenChannelAction):
-                candidates = await self._resolve_channel_partners(wallet)
-                if not candidates:
-                    declines.append(await self._no_partner_decline(wallet, action))
+                self._set_status(wallet, "resolving channel partners")
+                res = await self._resolve_partners_detailed(wallet)
+                # Always log the arithmetic, not only when it comes out empty:
+                # "3 candidates, 2 suggestions dropped by the guard" is exactly
+                # as useful as "0 candidates" when tuning the partner settings.
+                self.logger.info(f"channel partners: {len(res.candidates)} candidate(s) "
+                                 f"({self._partner_breakdown(wallet, res)})")
+                if not res.candidates:
+                    declines.append(await self._no_partner_decline(wallet, action, res))
                     continue
-                executable.append((action, candidates))
+                executable.append((action, list(res.candidates)))
             else:
                 executable.append((action, None))
         # Record declines (freeze events + near misses) first. Only those not
@@ -2633,7 +2810,11 @@ class LiquidityPlugin(BasePlugin):
             return
         password = self._get_password(wallet)
         last_error: Optional[Exception] = None
-        for connect_str in candidates:
+        total = len(candidates)
+        for index, connect_str in enumerate(candidates, start=1):
+            partner = self._abbrev(normalize_node_id(connect_str)) or connect_str[:16]
+            self._set_status(
+                wallet, f"connecting to partner {partner} ({index} of {total})")
             try:
                 peer = await lnworker.lnpeermgr.add_peer(connect_str)
             except Exception as e:
@@ -2659,6 +2840,8 @@ class LiquidityPlugin(BasePlugin):
                     f"min {MIN_FUNDING_SAT}); skipping")
                 return
             self.logger.info(f"opening channel: {funding_sat} sat -> {connect_str} ({action.reason})")
+            self._set_status(
+                wallet, f"opening channel with {partner} ({funding_sat:,} sat)")
             try:
                 chan, funding_tx = await lnworker.open_channel_with_peer(
                     peer, funding_sat, push_sat=0, password=password)
@@ -2771,6 +2954,10 @@ class LiquidityPlugin(BasePlugin):
             return
         self._swap_cooldown_until[action.channel_id] = now + SWAP_COOLDOWN_SEC
         self.logger.info(f"reverse swap via {provider_label[:20]}…: {action.reason}")
+        self._set_status(
+            wallet,
+            f"attempting swap with {self._abbrev(provider_label) or provider_label} "
+            f"({action.lightning_amount_sat:,} sat from channel {action.short_id})")
 
         # Reuse the evaluation's open session when present; otherwise open a
         # transient transport (e.g. URL mode without a prior session).
@@ -3045,6 +3232,64 @@ class LiquidityPlugin(BasePlugin):
         self._suggest_errors.pop(wallet, None)
         return suggestions
 
+    def _routing_mode(self, wallet: 'Abstract_Wallet') -> str:
+        """"trampoline" or "gossip" -- which of the two very different peer-
+        suggestion paths ``lnworker.suggest_peer()`` will take (a random hardcoded
+        trampoline node vs. an LNRater ranking of the gossip graph). Worth naming
+        in the diagnostics: on a network with no hardcoded trampoline nodes
+        (regtest) the first path returns nothing at all, while the second returns
+        nothing until the graph has been analysed."""
+        lnworker = getattr(wallet, "lnworker", None)
+        try:
+            return "trampoline" if lnworker.uses_trampoline() else "gossip"
+        except Exception:
+            return "unknown"
+
+    async def _resolve_partners_detailed(self, wallet: 'Abstract_Wallet',
+                                         *, apply_peer_guard: bool = True) -> PartnerResolution:
+        """:meth:`_resolve_channel_partners` plus the per-stage counts that
+        explain the result (see :class:`PartnerResolution`)."""
+        preferred = _parse_partner_list(self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
+        banned = _parse_banned_partners(self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        strict = bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT)
+        exclude: frozenset = frozenset()
+        if apply_peer_guard and bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
+            exclude = self._current_peer_node_ids(wallet)
+        suggested: List[str] = []
+        if not strict:
+            suggested = [node_id.hex() for node_id in await self._suggest_peers(wallet)]
+        # Sink flaky peers in the try-order (soft de-prioritisation); banned peers
+        # are already excluded above. Auto-banned serial offenders never get here.
+        penalties = self._peer_penalties(wallet)
+        return resolve_channel_partners(preferred, banned, suggested, strict=strict,
+                                        penalties=penalties, exclude=exclude)
+
+    def _partner_breakdown(self, wallet: 'Abstract_Wallet',
+                           res: PartnerResolution) -> str:
+        """One-line, human-readable arithmetic behind a partner resolution.
+
+        This is the text that turns "no reachable channel partner is available"
+        from a dead end into a diagnosis: it says how many partners you
+        configured, how many Electrum offered, and which rule ate them."""
+        parts = [
+            f"preferred {res.preferred_kept}/{res.preferred_total}",
+            (f"suggested {res.suggested_kept}/{res.suggested_total}"
+             if not res.strict else "suggested n/a (strict mode: preferred only)"),
+            f"routing {self._routing_mode(wallet)}",
+        ]
+        if res.banned_hits:
+            parts.append(f"{res.banned_hits} banned")
+        if res.guard_hits:
+            parts.append(f"{res.guard_hits} already have a channel with")
+        if res.duplicate_hits:
+            parts.append(f"{res.duplicate_hits} duplicate")
+        if res.malformed_hits:
+            parts.append(f"{res.malformed_hits} unparseable")
+        err = self._suggest_errors.get(wallet)
+        if err:
+            parts.append(f"suggestion lookup failed ({scrub_text(err)})")
+        return ", ".join(parts)
+
     async def _resolve_channel_partners(self, wallet: 'Abstract_Wallet',
                                         *, apply_peer_guard: bool = True) -> List[str]:
         """Ordered connect strings to attempt a channel open against: preferred
@@ -3061,28 +3306,22 @@ class LiquidityPlugin(BasePlugin):
         capacity across distinct nodes. Pass ``apply_peer_guard=False`` to get
         the pre-guard ordering (used to tell "no partner at all" apart from
         "only the guard blocked us" when reporting a decline)."""
-        preferred = _parse_partner_list(self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
-        banned = _parse_banned_partners(self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
-        strict = bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT)
-        exclude: frozenset = frozenset()
-        if apply_peer_guard and bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
-            exclude = self._current_peer_node_ids(wallet)
-        suggested: List[str] = []
-        if not strict:
-            suggested = [node_id.hex() for node_id in await self._suggest_peers(wallet)]
-        # Sink flaky peers in the try-order (soft de-prioritisation); banned peers
-        # are already excluded above. Auto-banned serial offenders never get here.
-        penalties = self._peer_penalties(wallet)
-        return order_channel_partners(preferred, banned, suggested, strict=strict,
-                                      penalties=penalties, exclude=exclude)
+        res = await self._resolve_partners_detailed(wallet, apply_peer_guard=apply_peer_guard)
+        return list(res.candidates)
 
     async def _no_partner_decline(self, wallet: 'Abstract_Wallet',
-                                  action: OpenChannelAction) -> DeclineRecord:
+                                  action: OpenChannelAction,
+                                  resolution: Optional[PartnerResolution] = None) -> DeclineRecord:
         """Why an engine-approved open could not proceed: the one-channel-per-peer
         guard eliminated every candidate, the suggestion lookup itself failed, or
         there is simply no reachable partner. Distinguished (by re-resolving
         without the guard, and by the remembered lookup error) so the decision log
-        is actionable rather than a dead end."""
+        is actionable rather than a dead end.
+
+        ``resolution`` is the (empty) result the caller already computed; pass it
+        so the per-stage counts can be appended to the reason without resolving a
+        third time. It is optional only for direct/test callers.
+        """
         guard_on = bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER)
         if guard_on and await self._resolve_channel_partners(wallet, apply_peer_guard=False):
             reason = ("have funds and room to open, but already hold a channel with "
@@ -3096,7 +3335,14 @@ class LiquidityPlugin(BasePlugin):
         else:
             reason = ("have funds and room to open, but no reachable channel partner "
                       "is available (no preferred/suggested peer); not opening")
-        return DeclineRecord(kind="open", reason=reason, amount_sat=action.funding_sat)
+        if resolution is None:
+            resolution = await self._resolve_partners_detailed(wallet)
+        # The arithmetic goes in `detail` rather than the reason so the decline's
+        # dedup signature (kind, channel_id, reason) is unchanged: a steady state
+        # still logs once, not on every tick.
+        detail = "partner resolution: " + self._partner_breakdown(wallet, resolution)
+        return DeclineRecord(kind="open", reason=reason, amount_sat=action.funding_sat,
+                             detail=detail)
 
     def _current_peer_node_ids(self, wallet: 'Abstract_Wallet') -> frozenset:
         """Normalized (lowercased) pubkeys of every peer we currently hold a
@@ -3314,7 +3560,7 @@ class LiquidityPlugin(BasePlugin):
             "source": self._abbrev(decline.short_id),
             "dest": None,
             "reason": decline.reason,
-            "detail": None,
+            "detail": decline.detail,
             "state": state or {},
         }
         self._append_log(wallet, entry)
