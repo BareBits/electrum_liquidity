@@ -60,15 +60,20 @@ class _FakeDB:
 
 
 class _FakeWallet:
-    def __init__(self, lnworker=None, *, connected: bool = True) -> None:
+    def __init__(self, lnworker=None, *, connected: bool = True,
+                 synced: bool = True) -> None:
         self.db = _FakeDB()
         self.saved = 0
         self.lnworker = lnworker
-        # ``connected`` is a mutable box so a test can flip it (shutdown) between
-        # scans without rebuilding the wallet.
+        # ``connected`` / ``synced`` are mutable boxes so a test can flip them
+        # (shutdown, mid-sync) between scans without rebuilding the wallet.
         self._connected = connected
+        self._synced = synced
         self.network = SimpleNamespace(
             asyncio_loop=None, is_connected=lambda: self._connected)
+
+    def is_up_to_date(self) -> bool:
+        return self._synced
 
     def basename(self) -> str:
         return "test-wallet"
@@ -152,17 +157,64 @@ def _mark_started(p, w, clock) -> None:
 
 
 # --- _wallet_ready --------------------------------------------------------
-def test_wallet_ready_requires_connection_and_grace(clock) -> None:
+def test_wallet_ready_requires_connection_sync_and_the_window(clock) -> None:
     ln, _ = _lnworker_with([])
     p, w = _plugin(clock), _FakeWallet(ln)
     # Not managed yet (no recorded load time) -> never ready.
     assert p._wallet_ready(w) is False
     _mark_started(p, w, clock)
-    assert p._wallet_ready(w) is False           # within grace
+    assert p._wallet_ready(w) is False            # inside the startup window
     clock.advance(GRACE + 1)
-    assert p._wallet_ready(w) is True            # settled
+    assert p._wallet_ready(w) is True             # window elapsed
     w._connected = False
-    assert p._wallet_ready(w) is False           # shutdown: connection gone
+    assert p._wallet_ready(w) is False            # shutdown: connection gone
+    w._connected, w._synced = True, False
+    assert p._wallet_ready(w) is False            # still catching up with server
+    w._synced = True
+    assert p._wallet_ready(w) is True
+
+
+def test_wallet_ready_manual_bypasses_the_window_only(clock) -> None:
+    """The reported bug. A manual run skips the startup window, but a
+    disconnected or still-syncing wallet is refused either way."""
+    ln, _ = _lnworker_with([_Chan(_open("OPEN"), active=False)])
+    p, w = _plugin(clock), _FakeWallet(ln)
+    _mark_started(p, w, clock)
+    assert p._wallet_ready(w) is False                    # automatic: defers
+    assert p._wallet_ready(w, manual=True) is True        # "Run now": proceeds
+    w._connected = False
+    assert p._wallet_ready(w, manual=True) is False
+    w._connected, w._synced = True, False
+    assert p._wallet_ready(w, manual=True) is False
+
+
+def test_readiness_block_names_the_reason(clock) -> None:
+    from electrum.plugins.inbound_liquidity import BLOCK_NOT_MANAGED  # type: ignore
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        BLOCK_NO_CONNECTION, BLOCK_STARTING_UP, BLOCK_SYNCING,
+    )
+
+    ln, _ = _lnworker_with([])
+    p, w = _plugin(clock), _FakeWallet(ln)
+    assert p._readiness_block(w) == BLOCK_NOT_MANAGED
+    _mark_started(p, w, clock)
+    assert p._readiness_block(w) == BLOCK_STARTING_UP
+    w._synced = False
+    assert p._readiness_block(w) == BLOCK_SYNCING
+    w._connected = False
+    assert p._readiness_block(w) == BLOCK_NO_CONNECTION
+
+
+def test_wallet_synced_defaults_true_when_wallet_cannot_answer(clock) -> None:
+    # A wallet with no is_up_to_date, or one that raises, must not stall the
+    # plugin forever -- the old behaviour never consulted sync state at all.
+    p = _plugin(clock)
+    assert p._wallet_synced(SimpleNamespace()) is True
+
+    def _boom() -> bool:
+        raise RuntimeError("nope")
+
+    assert p._wallet_synced(SimpleNamespace(is_up_to_date=_boom)) is True
 
 
 def test_evaluate_defers_all_automation_until_ready(clock) -> None:
@@ -181,12 +233,50 @@ def test_evaluate_defers_all_automation_until_ready(clock) -> None:
     p._run_decision = _run_decision
 
     _mark_started(p, w, clock)
-    asyncio.run(p._evaluate(w))                   # within grace -> deferred
+    asyncio.run(p._evaluate(w))                   # inside the window -> deferred
     assert called == []
 
-    clock.advance(GRACE + 1)                      # settled -> automation runs
+    clock.advance(GRACE + 1)                      # window elapsed -> runs
     asyncio.run(p._evaluate(w))
     assert "health" in called and "autoclose" in called
+
+
+def test_evaluate_manual_run_acts_inside_the_startup_window(clock) -> None:
+    """The reported bug: "Run now" during the startup window logged "waiting for
+    wallet to settle" and did nothing. A manual run must act."""
+    ln, _ = _lnworker_with([])
+    p, w = _plugin(clock), _FakeWallet(ln)
+    p.wallets = {w: asyncio.Lock()}
+    called: List[str] = []
+    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p._reconcile_pending_swaps = lambda wal: called.append("reconcile")
+    p._scan_channel_health = lambda wal: called.append("health")
+    p._scan_offline_autoclose = lambda wal: called.append("autoclose")
+    p.build_snapshot = lambda wal, t=None: SimpleNamespace()
+    p._swap_may_be_needed = lambda base, config: False
+    # Manual-run-only mode on, to prove both gates are bypassed together.
+    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    async def _run_decision(wal, snap, config, transport):
+        called.append("decision")
+    p._run_decision = _run_decision
+
+    _mark_started(p, w, clock)
+    asyncio.run(p._evaluate(w))                            # automatic: nothing
+    assert called == []
+    asyncio.run(p._evaluate(w, manual=True))               # "Run now": acts
+    assert "decision" in called
+
+
+def test_evaluate_manual_run_still_refused_when_disconnected(clock) -> None:
+    ln, _ = _lnworker_with([])
+    p, w = _plugin(clock), _FakeWallet(ln, connected=False)
+    p.wallets = {w: asyncio.Lock()}
+    called: List[str] = []
+    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p._scan_channel_health = lambda wal: called.append("health")
+    _mark_started(p, w, clock)
+    asyncio.run(p._evaluate(w, manual=True))
+    assert called == []
 
 
 # --- _observe_peer matrix -------------------------------------------------

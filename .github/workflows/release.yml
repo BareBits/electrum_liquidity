@@ -105,4 +105,4 @@ jobs:
             "${{ steps.meta.outputs.zip }}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. **Experimental — do not use with real funds.** Install by importing the attached zip into Electrum's plugin manager."
+            --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. Install by importing the attached zip into Electrum's plugin manager."

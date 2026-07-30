@@ -66,11 +66,11 @@ WEDGE_AGE_WAIT = 75.0
 # Closing/closed channel states as reported by `list_channels`.
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
-# The plugin defers ALL automation for STARTUP_GRACE_SEC (120s) after wallet
-# load -- the startup settle window in which a not-yet-connected peer would look
-# offline (see inbound_liquidity/__init__.py STARTUP_GRACE_SEC). Its first
-# evaluation therefore lands ~120s after load, so a first-open wait must
-# comfortably exceed that grace or it races the plugin's very first tick.
+# The plugin defers ALL automatic evaluation until the wallet is ready: server
+# connected, wallet synced, and STARTUP_GRACE_SEC (120s) elapsed since load (see
+# inbound_liquidity/__init__.py STARTUP_GRACE_SEC). Its first evaluation
+# therefore lands ~120s after load, so a first-open wait must comfortably exceed
+# that window or it races the plugin's very first tick.
 FIRST_OPEN_TIMEOUT = 200.0
 
 

@@ -369,6 +369,14 @@ def _client_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
         # Flip the ENABLED/DISABLED slider on (Liquidity tab -> Settings) to
         # exercise it. Disabled is also the shipped default now.
         ("plugins.inbound_liquidity.automation_enabled", "false"),
+        # The rig's baseline channels are opened by the rig over the CLI, so the
+        # plugin does not consider them its own. The shipped default of the scope
+        # switch is ON (only manage plugin-opened channels), which would make
+        # every rig channel off-limits to a reverse swap. Pin it OFF here so a
+        # test that wants to drive a swap against the baseline channels can, and
+        # let the tests that care about the switch itself
+        # (test_outbound_preservation_e2e) set it explicitly either way.
+        ("plugins.inbound_liquidity.manage_plugin_opened_only", "false"),
     ]
 
 

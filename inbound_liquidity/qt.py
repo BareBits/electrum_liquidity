@@ -28,7 +28,7 @@ import time
 from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
-    MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
+    DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
     PLUGIN_OPENED_CHANNELS_DB_KEY, TERMINAL_STATUSES,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
@@ -431,9 +431,9 @@ class Plugin(LiquidityPlugin):
         v.addWidget(_wrapped_label(_(
             "Everything this plugin logged since Electrum started, merged with "
             "this wallet's decision log. Held in memory only — nothing here is "
-            "written to disk. Use \"Save to file…\" to keep a copy; use the "
-            "Advanced tab to widen what is captured (Electrum's own Lightning "
-            "logs, debug level) or to change how many lines are kept.")))
+            "written to disk. Use \"Save to file…\" to keep a copy, and the "
+            "capture options below to widen what is recorded or change how many "
+            "lines are kept.")))
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel(_("Level")))
@@ -452,6 +452,69 @@ class Plugin(LiquidityPlugin):
                                "back through the log while it keeps growing."))
         controls.addWidget(follow_cb)
         v.addLayout(controls)
+
+        # --- capture options (moved here from the Advanced tab) --------------
+        # These govern what lands in the view directly above them, so they belong
+        # next to it rather than three tabs away. Applied immediately -- there is
+        # no Apply button on this tab, and each one only re-configures the live
+        # capture handler / ring buffer.
+        #
+        # The first two are separate switches on purpose: WHICH loggers to record,
+        # and WHETHER to force debug level, are independent questions -- and only
+        # the second has a side effect outside this plugin (see its tooltip).
+        c = self.config
+        capture_ln_cb = QCheckBox(_("Also capture Electrum Lightning logs"))
+        capture_ln_cb.setToolTip(_("Include Electrum's own Lightning and swap logging (peer "
+                                   "manager, node rater, channels, routing, submarine swaps) in "
+                                   "this view. Useful when the plugin reports that no channel "
+                                   "partner is available — that decision is made inside those "
+                                   "subsystems. Noisy; off by default."))
+        capture_ln_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN', False)))
+
+        capture_debug_cb = QCheckBox(_("Capture debug-level logs"))
+        capture_debug_cb.setToolTip(_("Force debug-level logging while this is on. Electrum "
+                                      "normally produces debug records already (they are just "
+                                      "hidden), so this matters only if you started Electrum with "
+                                      "a reduced verbosity — in which case it also makes those "
+                                      "records appear in Electrum's own log file. The previous "
+                                      "setting is restored when you turn it off."))
+        capture_debug_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG', False)))
+
+        buffer_edit = QLineEdit(str(getattr(c, 'INBOUND_LIQUIDITY_LOG_BUFFER_LINES',
+                                            DEFAULT_LOG_BUFFER_LINES)))
+        buffer_edit.setMaximumWidth(90)
+        buffer_edit.setToolTip(_("How many captured lines to keep in memory. Values outside "
+                                 "{}–{} are clamped. Applied when you finish editing.").format(
+            MIN_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES))
+
+        capture_row = QHBoxLayout()
+        capture_row.addWidget(capture_ln_cb)
+        capture_row.addWidget(capture_debug_cb)
+        capture_row.addStretch(1)
+        capture_row.addWidget(QLabel(_("Buffer (lines)")))
+        capture_row.addWidget(buffer_edit)
+        v.addLayout(capture_row)
+
+        def _apply_capture() -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN', capture_ln_cb.isChecked())
+            setattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG', capture_debug_cb.isChecked())
+            self.apply_log_capture_settings()
+
+        def _apply_buffer() -> None:
+            """Persist the buffer size, clamped. A non-numeric entry is rejected
+            by snapping the box back to what is actually in force, so the field
+            never shows a value the ring is not using."""
+            try:
+                setattr(c, 'INBOUND_LIQUIDITY_LOG_BUFFER_LINES',
+                        clamp_max_lines(int(buffer_edit.text().strip())))
+            except ValueError:
+                pass
+            self.apply_log_capture_settings()
+            buffer_edit.setText(str(self.log_buffer_lines()))
+
+        capture_ln_cb.toggled.connect(_apply_capture)
+        capture_debug_cb.toggled.connect(_apply_capture)
+        buffer_edit.editingFinished.connect(_apply_buffer)
 
         view = QPlainTextEdit()
         view.setReadOnly(True)
@@ -519,6 +582,18 @@ class Plugin(LiquidityPlugin):
         def _force_refresh() -> None:
             refresh(force=True)
 
+        def _refresh_all() -> None:
+            """The refresh the outer tab calls: re-read the capture options from
+            config (something else may have changed them) as well as the view."""
+            for cb, attr in ((capture_ln_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN'),
+                             (capture_debug_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG')):
+                cb.blockSignals(True)
+                cb.setChecked(bool(getattr(c, attr, False)))
+                cb.blockSignals(False)
+            if not buffer_edit.hasFocus():      # don't fight a half-typed value
+                buffer_edit.setText(str(self.log_buffer_lines()))
+            refresh(force=True)
+
         level_combo.currentIndexChanged.connect(_force_refresh)
         filter_edit.textChanged.connect(_force_refresh)
         follow_cb.toggled.connect(_force_refresh)
@@ -562,7 +637,7 @@ class Plugin(LiquidityPlugin):
         timer.start()
 
         refresh(force=True)
-        return tab, _force_refresh
+        return tab, _refresh_all
 
     # --- tab construction -------------------------------------------------
     def _build_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet'):
@@ -692,11 +767,33 @@ class Plugin(LiquidityPlugin):
         manual_only_cb.toggled.connect(on_manual_only)
         vbox.addWidget(manual_only_cb)
 
+        # --- scope switch: which channels the plugin may touch ---------------
+        # On the main tab (not Advanced) because it answers the first question a
+        # new user has -- "will this thing touch the channel I set up myself?" --
+        # and it defaults ON, so the answer is no until they say otherwise.
+        # Applied immediately, like the switches above: it changes what the very
+        # next tick is allowed to do, rather than being a tunable awaiting Apply.
+        plugin_only_cb = QCheckBox(_("Only manage channels the plugin opened"))
+        plugin_only_cb.setToolTip(_(
+            "When on (the default), the plugin only reverse-swaps channels it "
+            "opened itself; a channel you opened by hand is left entirely alone "
+            "and its outbound is never drained. Turn it off to let the plugin "
+            "manage every channel in this wallet."))
+        plugin_only_cb.setChecked(
+            bool(getattr(c, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY', True)))
+
+        def on_plugin_only(checked: bool) -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY', bool(checked))
+
+        plugin_only_cb.toggled.connect(on_plugin_only)
+        vbox.addWidget(plugin_only_cb)
+
         run_now_btn = QPushButton(_("Run now"))
         run_now_btn.setToolTip(_(
             "Evaluate once right now and take any warranted action, regardless of "
-            "the \"Manual run only\" setting. Requires the Automation switch to be "
-            "enabled."))
+            "the \"Manual run only\" setting, and without waiting for the startup "
+            "window that automatic runs observe. Requires the Automation switch to "
+            "be enabled, a server connection, and a fully synced wallet."))
 
         def on_run_now() -> None:
             self.request_evaluation(wallet, manual=True)
@@ -849,6 +946,10 @@ class Plugin(LiquidityPlugin):
             manual_only_cb.blockSignals(True)
             manual_only_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', False)))
             manual_only_cb.blockSignals(False)
+            plugin_only_cb.blockSignals(True)
+            plugin_only_cb.setChecked(
+                bool(getattr(c, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY', True)))
+            plugin_only_cb.blockSignals(False)
             _set_tick_status(self.tick_status(wallet))
             self._populate_log_tree(actions_tree, self.get_decision_log(wallet, "action"))
             self._populate_log_tree(declines_tree, self.get_decision_log(wallet, "decline"))
@@ -912,49 +1013,21 @@ class Plugin(LiquidityPlugin):
                                   "(broadcasts a tx and incurs a mining fee)."))
         v.addWidget(autoclose_cb)
 
-        plugin_only_cb = QCheckBox(_("Only drain channels the plugin opened"))
-        plugin_only_cb.setToolTip(_("When on, the plugin only reverse-swaps channels it opened "
-                                    "itself; channels you opened by hand are left entirely alone "
-                                    "(their outbound is never drained). When off, every channel is "
-                                    "managed."))
-        v.addWidget(plugin_only_cb)
-
         diag_log_cb = QCheckBox(_("Write diagnostic log files"))
         diag_log_cb.setToolTip(_("Append this plugin's decisions and errors to daily text files "
                                  "(one folder per wallet, kept 30 days) under the Electrum data "
                                  "directory. Contains no private keys or seeds. Off by default."))
         v.addWidget(diag_log_cb)
 
-        # --- Log-tab capture -----------------------------------------------
-        # Two separate switches on purpose: WHICH loggers to record, and WHETHER
-        # to force debug level, are independent questions — and only the second
-        # has a side effect outside this plugin (see its tooltip).
-        capture_ln_cb = QCheckBox(_("Log tab: also capture Electrum Lightning logs"))
-        capture_ln_cb.setToolTip(_("Include Electrum's own Lightning and swap logging (peer "
-                                   "manager, node rater, channels, routing, submarine swaps) in "
-                                   "the Log tab. Useful when the plugin reports that no channel "
-                                   "partner is available — that decision is made inside those "
-                                   "subsystems. Noisy; off by default."))
-        v.addWidget(capture_ln_cb)
-
-        capture_debug_cb = QCheckBox(_("Log tab: capture debug-level logs"))
-        capture_debug_cb.setToolTip(_("Force debug-level logging while this is on. Electrum "
-                                      "normally produces debug records already (they are just "
-                                      "hidden), so this matters only if you started Electrum with "
-                                      "a reduced verbosity — in which case it also makes those "
-                                      "records appear in Electrum's own log file. The previous "
-                                      "setting is restored when you turn it off."))
-        v.addWidget(capture_debug_cb)
-
+        # NB: the scope switch ("Only manage channels the plugin opened") lives on
+        # the main Settings tab, and the Log-tab capture switches live on the Log
+        # tab itself — each next to what it affects.
         checkboxes = [
             (reliability_cb, 'INBOUND_LIQUIDITY_RELIABILITY_ENABLED'),
             (peer_reliability_cb, 'INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
             (auto_remediate_cb, 'INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
             (autoclose_cb, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
-            (plugin_only_cb, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY'),
             (diag_log_cb, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
-            (capture_ln_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN'),
-            (capture_debug_cb, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG'),
         ]
 
         grid = QGridLayout()
@@ -1022,11 +1095,6 @@ class Plugin(LiquidityPlugin):
             (_("Offline auto-close: force-close after trying to close (days)"),
              'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', float,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, val))),
-            # Appended last on purpose: the ceiling fields above must stay at
-            # findChildren(QLineEdit) index 0/1 for the Advanced-tab tests.
-            (_("Log tab buffer (lines, {}–{})").format(MIN_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES),
-             'INBOUND_LIQUIDITY_LOG_BUFFER_LINES', int,
-             lambda val: setattr(c, 'INBOUND_LIQUIDITY_LOG_BUFFER_LINES', clamp_max_lines(val))),
         ]
         field_rows = []  # (edit, attr, parser, setter, label)
         for (label, attr, parser, setter) in fields:
@@ -1081,9 +1149,6 @@ class Plugin(LiquidityPlugin):
                 setattr(c, attr, cb.isChecked())
             for setter, value in parsed_fields:
                 setter(value)
-            # Log capture reads all three of its settings from config, so bring
-            # the live handler/buffer in line with what was just saved.
-            self.apply_log_capture_settings()
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))

@@ -355,28 +355,73 @@ def deadline_reached(marked_ts: Optional[float], now: float,
 # blame the peer for *our* transitional state -- an immediate hard fault or a
 # poisoned uptime ratio that can force-close a channel to a peer that was fine.
 #
-# These two PURE predicates (no clock, no Electrum) encode the guard. The glue
+# These PURE predicates (no clock, no Electrum) encode the guard. The glue
 # supplies the wall clock (as ``elapsed_sec`` since the wallet was loaded), the
-# network-connected flag, and -- for the per-peer gate -- whether we have already
-# seen *this* peer online at least once since load. Keeping them here keeps the
-# race logic unit-testable in isolation.
+# network-connected flag, whether the wallet has finished syncing, whether every
+# open channel's peer has yielded a trustworthy reading, and -- for the per-peer
+# gate -- whether we have already seen *this* peer online at least once since
+# load. Keeping them here keeps the race logic unit-testable in isolation.
 
-def is_wallet_ready(network_connected: bool, elapsed_sec: float,
-                    grace_sec: float) -> bool:
-    """Whether the wallet has settled enough for the plugin to take *any*
-    automated action.
+# Reasons a wallet is not yet ready. Returned by ``wallet_readiness_block`` and
+# used verbatim in the deferral log line, so the log names the limb that is
+# actually blocking instead of an opaque "not settled yet".
+BLOCK_NOT_MANAGED = "wallet is not being managed"
+BLOCK_NO_CONNECTION = "no server connection"
+BLOCK_SYNCING = "wallet is still syncing with the server"
+BLOCK_STARTING_UP = "still in the startup window"
 
-    Ready only when we have a live server connection AND a bounded startup grace
-    has elapsed since load, giving the Lightning layer a fair chance to connect
-    to its peers first. Before that, every automated action (open / swap / close)
-    is deferred -- the tick becomes a no-op and a later tick re-checks. A
-    non-positive ``grace_sec`` disables the time gate (ready as soon as
-    connected), which the tests use to exercise the connected/disconnected axis
-    on its own.
+
+def wallet_readiness_block(network_connected: bool, wallet_synced: bool,
+                           elapsed_sec: float, grace_sec: float, *,
+                           manual: bool = False) -> Optional[str]:
+    """Why the wallet cannot take automated action yet, or ``None`` if it can.
+
+    Three independent conditions, checked in the order the user would want them
+    reported:
+
+      * **server connection** -- without one we can neither read fresh chain
+        state nor broadcast, so nothing may proceed (manual runs included);
+      * **wallet sync** -- an address-synchronizer that is still catching up
+        reports a partial UTXO set, so a balance-driven decision (open / swap)
+        would be taken on incomplete state. Also blocks manual runs;
+      * **startup window** -- for ``grace_sec`` after load the plugin takes no
+        automated action at all. The Lightning layer is still (re)connecting: a
+        healthy peer reads as offline, and -- learned the hard way, see below --
+        a channel whose peer has just come up still cannot necessarily *route*.
+
+    Only the last is time-based, and only it is skipped for a user-initiated
+    "Run now" (``manual=True``): the user is present, watching, and can retry.
+
+    Why this stayed a plain stopwatch. An earlier version of this gate ended the
+    window as soon as every open channel's peer had been observed, which normally
+    happened within seconds. It was measurably worse: ``chan.is_active()`` only
+    means the peer connection is up, NOT that the channel can carry a large
+    payment yet, so reverse swaps fired in that window had their Lightning
+    payment fail fast (``NoPathFound``) and returned no funding txid. The rig's
+    reverse-swap e2e failed 2 runs in 3 that way. "Ready to observe a peer" is
+    not "ready to move money", and we had no trustworthy signal for the latter --
+    so automatic action waits out the full window, as it always has.
+
+    A non-positive ``grace_sec`` disables the time gate (ready as soon as
+    connected and synced), which the tests use to exercise the other axes on
+    their own.
     """
     if not network_connected:
-        return False
-    return elapsed_sec >= grace_sec
+        return BLOCK_NO_CONNECTION
+    if not wallet_synced:
+        return BLOCK_SYNCING
+    if manual or elapsed_sec >= grace_sec:
+        return None
+    return BLOCK_STARTING_UP
+
+
+def is_wallet_ready(network_connected: bool, wallet_synced: bool,
+                    elapsed_sec: float, grace_sec: float, *,
+                    manual: bool = False) -> bool:
+    """Whether the wallet has settled enough for the plugin to take *any*
+    automated action -- the boolean face of :func:`wallet_readiness_block`."""
+    return wallet_readiness_block(network_connected, wallet_synced, elapsed_sec,
+                                  grace_sec, manual=manual) is None
 
 
 def classify_peer_observation(is_active: bool, seen_online_before: bool,
@@ -837,9 +882,15 @@ class LiquidityConfig:
     # Scope switch. When True, the engine only ever reverse-swaps channels the
     # plugin itself opened (``ChannelSnapshot.is_plugin_opened``); channels the
     # user opened by hand are left entirely alone (their outbound is never
-    # drained). When False (the default), every channel is managed -- the original
-    # behaviour. The glue supplies the per-channel flag from its persisted
-    # plugin-opened tag; the engine stays pure.
+    # drained). When False, every channel is managed. The glue supplies the
+    # per-channel flag from its persisted plugin-opened tag; the engine stays
+    # pure.
+    #
+    # NB: this dataclass default is False, but the SHIPPED default is ON -- see
+    # ``INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY``. They differ on purpose:
+    # ``read_config`` always passes the user's value explicitly, so this default
+    # is only ever seen by pure tests and non-populating callers, where False
+    # keeps the older "manage every channel" behaviour they were written against.
     manage_plugin_opened_only: bool = False
     # Runaway guard: at most this many channel opens in any rolling 24h window
     # (0 = unlimited). Counted from the executed-open history the glue passes in

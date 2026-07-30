@@ -58,7 +58,7 @@ from rig.services import (  # noqa: E402
 # plugin; duplicated rather than imported because the plugin package is only
 # importable inside the client daemon's environment).
 TERMINAL = ("sleeping", "automation disabled", "idle (manual run only)",
-            "waiting for wallet to settle", "not started")
+            "warming up", "not started")
 
 
 def _setcfg(key: str, value: str) -> None:
@@ -156,8 +156,8 @@ def test_tick_status_walks_the_steps_and_comes_to_rest(rig):
     _quiet_config()
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
 
-    # The plugin defers everything during its startup grace, so the first
-    # statuses are "waiting for wallet to settle"; wait for a real tick.
+    # The plugin defers everything until the wallet is ready, so the first
+    # statuses are "warming up"; wait for a real tick.
     assert _wait_until(lambda: "reading wallet state" in _status_lines(),
                        rig=rig, timeout=240), \
         f"no tick ever ran; statuses seen: {_status_lines()!r}"
@@ -228,6 +228,35 @@ def test_no_partner_decline_carries_the_breakdown(rig):
     # The same arithmetic is logged, so it reaches the Log tab (and the diagnostic
     # files) as well as the decision-log row.
     assert "channel partners: 0 candidate(s)" in _client_log_text()
+
+
+def test_deferrals_name_the_blocking_limb(rig):
+    """The reported bug was half wording: every deferral logged "not settled
+    yet", which read as "your funds are unconfirmed" when readiness has nothing
+    to do with funds. A deferral must now name which limb is blocking.
+
+    The automatic startup window itself is deliberately unchanged (shortening it
+    broke reverse swaps -- see wallet_readiness_block), so what is asserted here
+    is the wording, not the timing.
+    """
+    _quiet_config()
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
+
+    assert _wait_until(lambda: "reading wallet state" in _status_lines(),
+                       rig=rig, timeout=240), \
+        f"no tick ever ran; statuses seen: {_status_lines()!r}"
+
+    log = _client_log_text()
+    assert "not settled yet" not in log, \
+        "the old funds-sounding deferral wording is back"
+    assert "waiting for wallet to settle" not in log, \
+        "the old funds-sounding status wording is back"
+    # Whatever it rested on before the first tick must be the new wording.
+    assert "warming up" in _status_lines(), _status_lines()
+    # Any deferral it logged (DEBUG, so only when running verbose) names a limb.
+    for line in log.splitlines():
+        if "deferring evaluation" in line:
+            assert "not ready (" in line, f"deferral gives no reason: {line!r}"
 
 
 def test_breakdown_names_the_one_channel_per_peer_guard(rig):

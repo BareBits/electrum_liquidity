@@ -1,37 +1,80 @@
 """Unit tests for the PURE startup/shutdown-readiness helpers in
-liquidity_manager: ``is_wallet_ready`` (the all-automation deferral gate) and
-``classify_peer_observation`` (the per-peer online/offline/not-observed gate that
-stops a not-yet-connected peer at startup -- or a torn-down connection at
-shutdown -- from being mistaken for a real outage). No Electrum, no clock."""
+liquidity_manager: ``wallet_readiness_block`` / ``is_wallet_ready`` (the
+all-automation deferral gate) and ``classify_peer_observation`` (the per-peer
+online/offline/not-observed gate that stops a not-yet-connected peer at startup
+-- or a torn-down connection at shutdown -- from being mistaken for a real
+outage). No Electrum, no clock."""
 from __future__ import annotations
 
 from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
+    BLOCK_NO_CONNECTION,
+    BLOCK_STARTING_UP,
+    BLOCK_SYNCING,
     classify_peer_observation,
     is_wallet_ready,
+    wallet_readiness_block,
 )
 
 GRACE = 120.0
 
-
-# --- is_wallet_ready ------------------------------------------------------
-def test_ready_only_when_connected_and_past_grace() -> None:
-    assert is_wallet_ready(True, GRACE + 1, GRACE) is True
-    assert is_wallet_ready(True, GRACE, GRACE) is True  # boundary is inclusive
+# Positional order: connected, synced, elapsed, grace.
 
 
-def test_not_ready_within_grace() -> None:
-    assert is_wallet_ready(True, 0.0, GRACE) is False
-    assert is_wallet_ready(True, GRACE - 0.001, GRACE) is False
+# --- is_wallet_ready: the startup window ----------------------------------
+def test_ready_once_the_startup_window_has_elapsed() -> None:
+    assert is_wallet_ready(True, True, GRACE + 1, GRACE) is True
+    assert is_wallet_ready(True, True, GRACE, GRACE) is True  # boundary inclusive
 
 
+def test_not_ready_inside_the_startup_window() -> None:
+    # Deliberately a plain stopwatch: ending this window early on a
+    # "peers are connected" signal made reverse swaps fail (their Lightning leg
+    # cannot route yet). See the note in wallet_readiness_block.
+    assert is_wallet_ready(True, True, 0.0, GRACE) is False
+    assert is_wallet_ready(True, True, GRACE - 0.001, GRACE) is False
+
+
+# --- is_wallet_ready: the connection and sync limbs -----------------------
 def test_not_ready_when_disconnected_regardless_of_time() -> None:
     # Covers both startup (server not connected yet) and shutdown (torn down).
-    assert is_wallet_ready(False, 10_000.0, GRACE) is False
+    assert is_wallet_ready(False, True, 10_000.0, GRACE) is False
 
 
-def test_zero_grace_ready_as_soon_as_connected() -> None:
-    assert is_wallet_ready(True, 0.0, 0.0) is True
-    assert is_wallet_ready(False, 0.0, 0.0) is False
+def test_not_ready_while_wallet_is_still_syncing() -> None:
+    # A partial UTXO set would make a balance-driven decision wrong, so this
+    # blocks even with the startup window long past.
+    assert is_wallet_ready(True, False, 10_000.0, GRACE) is False
+
+
+def test_zero_grace_ready_as_soon_as_connected_and_synced() -> None:
+    assert is_wallet_ready(True, True, 0.0, 0.0) is True
+    assert is_wallet_ready(False, True, 0.0, 0.0) is False
+    assert is_wallet_ready(True, False, 0.0, 0.0) is False
+
+
+# --- is_wallet_ready: the manual ("Run now") bypass ------------------------
+def test_manual_run_skips_the_startup_window() -> None:
+    # Freshly loaded: an automatic tick defers, a user-initiated run goes ahead.
+    assert is_wallet_ready(True, True, 0.0, GRACE) is False
+    assert is_wallet_ready(True, True, 0.0, GRACE, manual=True) is True
+
+
+def test_manual_run_still_requires_connection_and_sync() -> None:
+    assert is_wallet_ready(False, True, 10_000.0, GRACE, manual=True) is False
+    assert is_wallet_ready(True, False, 10_000.0, GRACE, manual=True) is False
+
+
+# --- wallet_readiness_block: the reported reason --------------------------
+def test_block_reason_names_the_failing_limb() -> None:
+    assert wallet_readiness_block(True, True, GRACE + 1, GRACE) is None
+    assert wallet_readiness_block(False, True, 0.0, GRACE) == BLOCK_NO_CONNECTION
+    assert wallet_readiness_block(True, False, 0.0, GRACE) == BLOCK_SYNCING
+    assert wallet_readiness_block(True, True, 0.0, GRACE) == BLOCK_STARTING_UP
+
+
+def test_block_reason_reports_connection_before_sync() -> None:
+    # Both broken -> report the one the user must fix first.
+    assert wallet_readiness_block(False, False, 0.0, GRACE) == BLOCK_NO_CONNECTION
 
 
 # --- classify_peer_observation --------------------------------------------

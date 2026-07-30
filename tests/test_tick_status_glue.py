@@ -84,7 +84,7 @@ def _wire_tick(p, *, automation: bool = True) -> None:
 
 
 def _ready(p, wallet) -> None:
-    p._wallet_ready = lambda w: True
+    p._wallet_ready = lambda w, **kw: True
     p._started_at[wallet] = 0.0
 
 
@@ -150,14 +150,46 @@ def test_manual_run_only_ends_manual_only() -> None:
     assert p.tick_status(w) == STATUS_SLEEPING
 
 
-def test_unsettled_wallet_ends_settling() -> None:
+def test_not_ready_wallet_ends_warming_up() -> None:
     p, w = _plugin(), _FakeWallet()
     p.wallets[w] = asyncio.Lock()
     _wire_tick(p)
-    p._wallet_ready = lambda wallet: False
+    p._wallet_ready = lambda wallet, **kw: False
 
     asyncio.run(p._evaluate(w))
     assert p.tick_status(w) == STATUS_SETTLING
+
+
+def test_manual_run_during_warm_up_does_not_end_warming_up() -> None:
+    """A "Run now" that was deliberately let past the peer/time limb must not
+    come to rest on the very state it skipped -- that read as "the button did
+    nothing"."""
+    p, w = _plugin(), _FakeWallet()
+    p.wallets[w] = asyncio.Lock()
+    _wire_tick(p)
+    p._started_at[w] = 0.0
+    ran: List[bool] = []
+    p._scan_channel_health = lambda wallet: ran.append(True)
+    # Still inside the startup window: only a manual run is let through. Both the
+    # gate _evaluate consults and the one _terminal_status re-checks are stubbed
+    # so they agree.
+    p._readiness_block = lambda wallet, *, manual=False: None if manual else "still connecting to Lightning peers"
+    p._wallet_ready = lambda wallet, *, manual=False: manual
+
+    asyncio.run(p._evaluate(w))
+    assert ran == []                                   # automatic tick deferred
+    assert p.tick_status(w) == STATUS_SETTLING
+    # ...but the manual run acts and rests on "sleeping".
+    asyncio.run(p._evaluate(w, manual=True))
+    assert ran == [True]
+    assert p.tick_status(w) == STATUS_SLEEPING
+
+
+def test_status_wording_is_not_about_funds_settling() -> None:
+    # The reported confusion: the old "waiting for wallet to settle" read as
+    # "your coins are unconfirmed". Readiness has nothing to do with funds.
+    assert "settle" not in STATUS_SETTLING.lower()
+    assert STATUS_SETTLING in TERMINAL_STATUSES
 
 
 def test_an_exception_mid_tick_still_ends_terminal() -> None:

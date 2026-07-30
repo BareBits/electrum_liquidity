@@ -74,7 +74,9 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = 25.0
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = 25_000
         self.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = 0
-        self.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = False
+        # Mirrors the shipped ConfigVar default (on: never touch a channel the
+        # user opened by hand unless they say so).
+        self.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = True
         self.INBOUND_LIQUIDITY_CHANNEL_PEER = ""
         self.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS = DEFAULT_LOG_RETENTION_DAYS
         self.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ""
@@ -451,6 +453,65 @@ def test_manual_run_only_checkbox_reflects_config_on_build(qapp):
     assert _manual_only_cb(p, wallet).isChecked() is True
 
 
+# --- "Only manage channels the plugin opened" scope switch ----------------
+# Moved to the Settings tab (it answers "will this touch the channel I opened
+# myself?", which is a main-tab question, not an Advanced one) and now defaults
+# ON, so an untouched install never drains a hand-opened channel.
+def _plugin_only_cb(p, wallet):
+    from PyQt6.QtWidgets import QCheckBox
+    return next(
+        cb for cb in _settings_tab(p, wallet).findChildren(QCheckBox)
+        if "Only manage channels the plugin opened" in cb.text())
+
+
+def test_scope_switch_ships_on_by_default(qapp):
+    # The shipped ConfigVar default, not just the test fake.
+    from electrum.simple_config import SimpleConfig
+    assert SimpleConfig.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY.get_default_value() is True
+
+
+def test_scope_switch_is_on_settings_tab_and_checked_by_default(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert _plugin_only_cb(p, wallet).isChecked() is True
+
+
+def test_scope_switch_no_longer_on_the_advanced_tab(qapp):
+    from PyQt6.QtWidgets import QCheckBox
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    texts = [cb.text() for cb in advanced_tab.findChildren(QCheckBox)]
+    assert not any("plugin opened" in t for t in texts), texts
+    # ...and the old wording is gone from the UI entirely.
+    settings_texts = [cb.text() for cb in
+                      _settings_tab(p, wallet).findChildren(QCheckBox)]
+    assert not any("Only drain" in t for t in texts + settings_texts)
+
+
+def test_scope_switch_persists_immediately(qapp):
+    # Like the master switch and manual-run-only: no Apply needed.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    cb = _plugin_only_cb(p, wallet)
+
+    cb.setChecked(False)
+    assert p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is False
+    cb.setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is True
+
+
+def test_scope_switch_reflects_config_on_build(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = False
+    p._add_liquidity_tab(window, wallet)
+    assert _plugin_only_cb(p, wallet).isChecked() is False
+
+
 def test_run_now_button_triggers_manual_evaluation(qapp):
     # "Run now" calls request_evaluation with manual=True (bypassing the guard),
     # even while manual-run-only is on.
@@ -682,7 +743,10 @@ def _level_combo(state) -> QComboBox:
 
 
 def _filter_edit(state) -> QLineEdit:
-    return state.log_tab.findChild(QLineEdit)
+    # Matched by placeholder, not position: the Log tab has a second QLineEdit
+    # (the capture buffer size) and findChild() order must not decide this.
+    return next(e for e in state.log_tab.findChildren(QLineEdit)
+                if "substring" in e.placeholderText())
 
 
 def _capture(p, level: int, message: str, ts: float, source: str = "plugin") -> None:
@@ -932,3 +996,98 @@ def test_status_section_still_updates_from_its_new_position(qapp):
     p._add_liquidity_tab(window, wallet)
     p._on_status_changed_ui(wallet, "discovering swap providers")
     assert "discovering swap providers" in _status_labels(p._tabs[wallet])
+
+
+# --- Log-tab capture options (moved here from the Advanced tab) -----------
+# They govern what lands in the view directly above them, so they live next to
+# it. No Apply button on this tab: each one applies immediately.
+def _capture_cb(state, needle: str):
+    from PyQt6.QtWidgets import QCheckBox
+    return next(cb for cb in state.log_tab.findChildren(QCheckBox)
+                if needle in cb.text())
+
+
+def _buffer_edit(state) -> QLineEdit:
+    return next(e for e in state.log_tab.findChildren(QLineEdit)
+                if "substring" not in e.placeholderText())
+
+
+def test_capture_options_moved_off_the_advanced_tab(qapp):
+    from PyQt6.QtWidgets import QCheckBox, QLabel
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    cb_texts = [cb.text() for cb in advanced_tab.findChildren(QCheckBox)]
+    assert not any("capture" in t.lower() for t in cb_texts), cb_texts
+    labels = [lbl.text() for lbl in advanced_tab.findChildren(QLabel)]
+    assert not any(t.startswith("Log tab buffer") for t in labels), labels
+
+
+def test_capture_options_present_on_the_log_tab(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    assert _capture_cb(state, "Lightning logs").isChecked() is False
+    assert _capture_cb(state, "debug-level").isChecked() is False
+    assert _buffer_edit(state).text() == str(DEFAULT_LOG_BUFFER_LINES)
+
+
+def test_capture_checkboxes_apply_immediately(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+
+    _capture_cb(state, "Lightning logs").setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_LN is True
+    assert p.log_capture.capture_ln is True          # live handler reconfigured
+
+    _capture_cb(state, "debug-level").setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG is True
+
+    _capture_cb(state, "Lightning logs").setChecked(False)
+    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_LN is False
+    assert p.log_capture.capture_ln is False
+
+
+def test_buffer_size_applies_and_clamps_on_edit(qapp):
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
+    )
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    edit = _buffer_edit(state)
+
+    edit.setText("2500")
+    edit.editingFinished.emit()
+    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == 2500
+    assert p.log_buffer.max_lines == 2500
+
+    edit.setText("1")                                 # below the floor
+    edit.editingFinished.emit()
+    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MIN_LOG_BUFFER_LINES
+    assert edit.text() == str(MIN_LOG_BUFFER_LINES)   # box snaps to what is in force
+
+    edit.setText("10" + "0" * 9)                      # above the ceiling
+    edit.editingFinished.emit()
+    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MAX_LOG_BUFFER_LINES
+    assert edit.text() == str(MAX_LOG_BUFFER_LINES)
+
+
+def test_buffer_size_rejects_a_non_numeric_entry(qapp):
+    # Garbage must not be persisted, and the box must snap back to the value the
+    # ring is actually using rather than keep showing the bad text.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    edit = _buffer_edit(state)
+
+    edit.setText("not a number")
+    edit.editingFinished.emit()
+    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == DEFAULT_LOG_BUFFER_LINES
+    assert edit.text() == str(DEFAULT_LOG_BUFFER_LINES)
