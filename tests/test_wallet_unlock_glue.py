@@ -227,6 +227,65 @@ def _wire_tick(p) -> None:
     p._run_decision = _run_decision
 
 
+def test_a_locked_tick_tells_the_gui_so_it_can_offer_to_unlock() -> None:
+    """The deferral the user can act on. Headless has nobody to ask (the base
+    hook is a no-op), but the Qt subclass turns this into a prompt."""
+    p, w = _plugin(), _FakeWallet(keystore_encrypted=True)
+    p.wallets[w] = asyncio.Lock()
+    p._started_at[w] = 0.0
+    _wire_tick(p)
+    asked: List[object] = []
+    p.on_wallet_locked = lambda wallet: asked.append(wallet)
+
+    asyncio.run(p._evaluate(w))
+    assert asked == [w]
+
+
+def test_the_hook_fires_on_every_locked_tick_not_just_the_first() -> None:
+    # Rate limiting is the GUI's business; latching here would mean a wallet
+    # locked again mid-session never prompts.
+    p, w = _plugin(), _FakeWallet(keystore_encrypted=True)
+    p.wallets[w] = asyncio.Lock()
+    p._started_at[w] = 0.0
+    _wire_tick(p)
+    asked: List[object] = []
+    p.on_wallet_locked = lambda wallet: asked.append(wallet)
+
+    asyncio.run(p._evaluate(w))
+    asyncio.run(p._evaluate(w))
+    assert asked == [w, w]
+
+
+def test_an_unlocked_wallet_never_triggers_the_hook() -> None:
+    p, w = _plugin(), _FakeWallet(keystore_encrypted=True,
+                                  unlocked_password=PASSWORD)
+    p.wallets[w] = asyncio.Lock()
+    p._started_at[w] = 0.0
+    _wire_tick(p)
+    asked: List[object] = []
+    p.on_wallet_locked = lambda wallet: asked.append(wallet)
+
+    asyncio.run(p._evaluate(w))
+    assert asked == []
+
+
+def test_other_readiness_blocks_do_not_trigger_the_hook() -> None:
+    # A disconnected wallet is not a locked one; prompting for a password would
+    # not help and would be baffling.
+    p, w = _plugin(), _FakeWallet(keystore_encrypted=True,
+                                  unlocked_password=PASSWORD,
+                                  connected=False)
+    p.wallets[w] = asyncio.Lock()
+    p._started_at[w] = 0.0
+    _wire_tick(p)
+    asked: List[object] = []
+    p.on_wallet_locked = lambda wallet: asked.append(wallet)
+
+    asyncio.run(p._evaluate(w))
+    assert p.ran == []
+    assert asked == []
+
+
 def test_tick_on_a_locked_wallet_does_no_work_and_logs_no_error(caplog) -> None:
     """The reported symptom: an error on every tick. A locked wallet should now
     defer quietly, before the expensive part of the tick."""

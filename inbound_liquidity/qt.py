@@ -41,6 +41,17 @@ if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
 
 
+# How long to leave a locked wallet alone after the user dismisses the unlock
+# prompt. Automation re-evaluates on the heartbeat (10 min) and on wallet
+# activity, and every one of those ticks re-reports "locked" -- so without a
+# cooldown, "not now" would be answered by another dialog minutes later. An hour
+# is long enough not to nag and short enough that a user who meant to unlock is
+# reminded the same day. The prompt is NOT suppressed permanently: automation
+# silently doing nothing is exactly the state this whole gate exists to make
+# visible.
+UNLOCK_PROMPT_COOLDOWN_SEC = 3600.0
+
+
 # --- Electrum "Channels" tab: a "Managed by" column ------------------------
 # The plugin drains outbound from channels; a user needs to see, on Electrum's
 # own Channels tab, which channels the plugin opened (and so will manage) versus
@@ -114,6 +125,7 @@ class _Signals(QObject):
     log_changed = pyqtSignal(object)          # (wallet,)
     providers_changed = pyqtSignal(object)    # (wallet,) -- discovered provider list refreshed
     status_changed = pyqtSignal(object, str)  # (wallet, tick status) -- from the asyncio thread
+    unlock_requested = pyqtSignal(object)     # (wallet,) -- a tick deferred on a locked wallet
 
 
 class _TabState:
@@ -136,6 +148,7 @@ class _TabState:
         self.repopulate_providers: Callable[[], None] = lambda: None
         self.repopulate_partners: Callable[[], None] = lambda: None
         self.set_status: Callable[[str], None] = lambda status: None
+        self.set_locked: Callable[[bool], None] = lambda locked: None
         for key, value in handles.items():
             setattr(self, key, value)
 
@@ -191,6 +204,16 @@ class Plugin(LiquidityPlugin):
         self.signals: Optional[_Signals] = None
         # One Liquidity tab per open wallet (Electrum opens one window/wallet).
         self._tabs: Dict['Abstract_Wallet', _TabState] = {}
+        # When we last asked about a locked wallet and were turned down, per
+        # wallet. Automation ticks every few minutes, so without this a
+        # dismissed prompt would come straight back; see UNLOCK_PROMPT_COOLDOWN_SEC.
+        self._unlock_declined_at: Dict['Abstract_Wallet', float] = {}
+        # Wallets with an unlock dialog on screen right now. The dialog is modal
+        # but Qt keeps delivering queued signals while it runs, so without this a
+        # second tick could stack a second dialog on top of the first.
+        self._unlock_prompting: set = set()
+        # Instance attribute so tests can shrink it.
+        self._unlock_prompt_cooldown_sec: float = UNLOCK_PROMPT_COOLDOWN_SEC
 
     @hook
     def load_wallet(self, wallet: 'Abstract_Wallet', window: 'ElectrumWindow') -> None:
@@ -199,6 +222,7 @@ class Plugin(LiquidityPlugin):
             self.signals.log_changed.connect(self._on_log_changed_ui)
             self.signals.providers_changed.connect(self._on_providers_changed_ui)
             self.signals.status_changed.connect(self._on_status_changed_ui)
+            self.signals.unlock_requested.connect(self._on_unlock_requested_ui)
         self._add_liquidity_tab(window, wallet)
         # Add the "Managed by" column to Electrum's Channels tab (once, globally),
         # then refresh this window's already-built list so the column appears now.
@@ -213,6 +237,10 @@ class Plugin(LiquidityPlugin):
     def close_wallet(self, wallet: 'Abstract_Wallet') -> None:
         self.stop_wallet(wallet)
         self._remove_liquidity_tab(wallet)
+        # Reopening a wallet is a fresh session: a decline made an hour ago
+        # should not silence the prompt for a wallet the user just opened.
+        self._unlock_declined_at.pop(wallet, None)
+        self._unlock_prompting.discard(wallet)
 
     def requires_settings(self) -> bool:
         # Settings now live in the Liquidity tab rather than a settings dialog.
@@ -255,6 +283,87 @@ class Plugin(LiquidityPlugin):
             # The tab's widgets were deleted between the emit and its delivery
             # (close_wallet races a queued signal). Nothing to update.
             pass
+
+    # --- locked wallet: offering to unlock ---------------------------------
+    def on_wallet_locked(self, wallet: 'Abstract_Wallet') -> None:
+        # Called from the asyncio thread by every tick that defers on a locked
+        # wallet; emit a queued signal so the dialog opens on the GUI thread.
+        # Rate limiting lives on the UI side, not here.
+        if self.signals is not None:
+            self.signals.unlock_requested.emit(wallet)
+
+    def _on_unlock_requested_ui(self, wallet: 'Abstract_Wallet') -> None:
+        """An automatic tick found the wallet locked. Ask -- unless we asked
+        recently and were turned down."""
+        if self._signing_unlocked(wallet):
+            # Unlocked between the tick and the delivery of this signal, or by
+            # another route (Wallet > Unlock) since we last asked. Checked ahead
+            # of the cooldown so a decline cannot outlive the lock it was about:
+            # otherwise unlocking by hand, then locking again, would sit out the
+            # remainder of a cooldown that no longer refers to anything.
+            self._unlock_declined_at.pop(wallet, None)
+            self._refresh_unlock_affordance(wallet)
+            return
+        declined_at = self._unlock_declined_at.get(wallet)
+        if declined_at is not None:
+            if time.time() - declined_at < self._unlock_prompt_cooldown_sec:
+                return
+            # Cooldown served; ask again from a clean slate.
+            self._unlock_declined_at.pop(wallet, None)
+        self._prompt_unlock(wallet)
+
+    def _prompt_unlock(self, wallet: 'Abstract_Wallet') -> None:
+        """Ask Electrum to unlock ``wallet``, saying who is asking and why.
+
+        Routed through the window's own ``unlock_wallet`` rather than
+        ``wallet.unlock``: that is what hands the password to the txbatcher,
+        refreshes the padlock icon and the Wallet menu's Lock/Unlock item, and
+        shows the standard confirmation. Doing it by hand would leave Electrum's
+        own UI out of step with the wallet.
+
+        Cancelling is a real answer -- it starts the cooldown and nothing else.
+        Automation stays armed and resumes the moment the wallet is unlocked by
+        any route (this prompt, the tab's button, or Wallet > Unlock)."""
+        state = self._tabs.get(wallet)
+        if state is None or state.window is None:
+            return          # no window for this wallet (closing, or headless)
+        if wallet in self._unlock_prompting:
+            return          # a dialog for this wallet is already up
+        if self._signing_unlocked(wallet):
+            # Unlocked between the tick and the delivery of this signal.
+            self._unlock_declined_at.pop(wallet, None)
+            return
+        self._unlock_prompting.add(wallet)
+        try:
+            state.window.unlock_wallet(message=' '.join([
+                _("The Inbound Liquidity plugin needs your wallet unlocked to "
+                  "open channels and sign swaps."),
+                _("Automation is paused until you unlock it."),
+                _("Enter your password to unlock your wallet:"),
+            ]))
+        except Exception:
+            # A prompt is a convenience; never let it break the tab or the tick.
+            self.logger.exception("could not show the unlock prompt")
+        finally:
+            self._unlock_prompting.discard(wallet)
+        if self._signing_unlocked(wallet):
+            self._unlock_declined_at.pop(wallet, None)
+            # Do not make the user wait out the heartbeat for the automation
+            # they just unlocked for.
+            self.request_evaluation(wallet)
+        else:
+            self._unlock_declined_at[wallet] = time.time()
+        self._refresh_unlock_affordance(wallet)
+
+    def _refresh_unlock_affordance(self, wallet: 'Abstract_Wallet') -> None:
+        """Show or hide the Settings tab's Unlock button to match the wallet."""
+        state = self._tabs.get(wallet)
+        if state is None:
+            return
+        try:
+            state.set_locked(not self._signing_unlocked(wallet))
+        except RuntimeError:
+            pass    # widgets deleted between the emit and its delivery
 
     # --- tab lifecycle ----------------------------------------------------
     def _add_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet') -> None:
@@ -733,6 +842,21 @@ class Plugin(LiquidityPlugin):
         tick_since_label = QLabel("")
         tick_since_label.setStyleSheet("color: gray;")
 
+        # Shown only while the wallet is locked. "wallet locked" is the one
+        # resting state the user can clear on the spot, and the control that
+        # clears it lives in Electrum's Wallet menu -- not somewhere you would
+        # look while reading this tab. So the remedy sits next to the diagnosis.
+        unlock_btn = QPushButton(_("Unlock wallet…"))
+        unlock_btn.setToolTip(_(
+            "Your wallet is password-protected and locked, so nothing can be "
+            "signed and automation is paused. Unlocking keeps the password in "
+            "memory for this session — the same thing Wallet > Unlock does."))
+        unlock_btn.setVisible(False)
+        unlock_btn.clicked.connect(lambda: self._prompt_unlock(wallet))
+
+        def _set_locked(locked: bool) -> None:
+            unlock_btn.setVisible(bool(locked))
+
         def _set_tick_status(status: str) -> None:
             """Render one tick status. Terminal states are muted, an in-flight
             step is emphasised, so a glance tells you whether anything is
@@ -743,6 +867,10 @@ class Plugin(LiquidityPlugin):
                 "color: gray;" if resting else "color: #2ea043; font-weight: bold;")
             tick_since_label.setText(
                 "" if resting else _("since {}").format(_fmt_time(time.time())))
+            # Every status change is also a chance for the lock state to have
+            # changed (unlocked elsewhere, or locked again mid-session), so the
+            # button tracks it here rather than needing its own timer.
+            _set_locked(not self._signing_unlocked(wallet))
 
         _set_tick_status(self.tick_status(wallet))
 
@@ -914,6 +1042,10 @@ class Plugin(LiquidityPlugin):
         vbox.addWidget(status_header)
         vbox.addWidget(tick_status_label)
         vbox.addWidget(tick_since_label)
+        unlock_row = QHBoxLayout()
+        unlock_row.addWidget(unlock_btn)
+        unlock_row.addStretch(1)
+        vbox.addLayout(unlock_row)
         tabs.addTab(settings_tab, _("Settings"))
 
         # --- Swap providers sub-tab ---------------------------------------
@@ -970,6 +1102,8 @@ class Plugin(LiquidityPlugin):
             "repopulate_providers": repopulate_providers,
             "repopulate_partners": repopulate_partners,
             "set_status": _set_tick_status,
+            "set_locked": _set_locked,
+            "unlock_button": unlock_btn,
         }
 
     # --- advanced sub-tab -------------------------------------------------
