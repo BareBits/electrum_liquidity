@@ -107,6 +107,11 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG = False
         self.INBOUND_LIQUIDITY_DEV_FEE_PCT = 0.1
         self.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = "electrum_liqhelper@getbarebits.com"
+        self.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = False
+        self.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = False
+        self.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0
+        self.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = ""
+        self.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ""
 
 
 class _FakeStatusBar:
@@ -944,6 +949,60 @@ def test_refresh_syncs_the_status_from_the_plugin(qapp):
     assert "discovering swap providers" in _status_labels(p._tabs[wallet])
 
 
+# --- the version / update line in the Status footer ------------------------
+def test_the_update_line_is_absent_until_the_check_is_switched_on(qapp):
+    # A user who declined the update check must not see the feature at all --
+    # not even a line telling them they are up to date.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert not [t for t in _status_labels(p._tabs[wallet]) if "version" in t.lower()]
+
+
+def test_the_update_line_reports_up_to_date(qapp):
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
+    p._plugin_version_cache = "0.1.14"
+    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.14"
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert any("0.1.14 (up to date)" in t for t in _status_labels(p._tabs[wallet]))
+
+
+def test_the_update_line_links_to_the_release_when_behind(qapp):
+    # The link is the whole remedy: nothing is downloaded or installed here, so
+    # a user who is behind needs somewhere to go.
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
+    p._plugin_version_cache = "0.1.14"
+    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.15"
+    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = "https://example.invalid/releases/tag/v0.1.15"
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+
+    line = next(t for t in _status_labels(p._tabs[wallet]) if "update available" in t)
+    assert "0.1.15" in line and "0.1.14" in line
+    assert 'href="https://example.invalid/releases/tag/v0.1.15"' in line
+
+
+def test_the_update_line_escapes_what_it_renders(qapp):
+    # The label renders rich text and both halves originate off-machine (a
+    # GitHub release payload). `extract_release` sanitises them at the boundary;
+    # this pins the second guard, so markup can never reach a QLabel that would
+    # render it -- an <img> here would fetch a remote URL from inside the wallet.
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
+    p._plugin_version_cache = "0.1.14"
+    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = '0.1.15'
+    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = 'https://x/"><img src="http://tracker.invalid/p">'
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+
+    line = next(t for t in _status_labels(p._tabs[wallet]) if "update available" in t)
+    assert "<img" not in line
+    assert "&lt;img" in line or "&quot;" in line
+
+
 def _settings_layout_order(state) -> List[str]:
     """Ordered markers for the Settings tab's top-level layout rows.
 
@@ -986,10 +1045,11 @@ def test_status_section_sits_at_the_bottom_of_the_settings_tab(qapp):
     stretch = next(i for i, m in enumerate(order) if m == "stretch")
 
     assert apply_row < stretch < header, order
-    # Status header, the status itself, the "since" line, and the Unlock button
-    # that appears with a "wallet locked" status (hidden otherwise).
-    assert order[-4:] == ["label:Status", f"label:{STATUS_NOT_STARTED}",
-                          "label:", "row:Unlock wallet…"], order
+    # Status header, the status itself, the "since" line, the version/update
+    # line (empty and hidden unless the update check is switched on), and the
+    # Unlock button that appears with a "wallet locked" status (hidden otherwise).
+    assert order[-5:] == ["label:Status", f"label:{STATUS_NOT_STARTED}",
+                          "label:", "label:", "row:Unlock wallet…"], order
     assert order[header - 1] == "separator", order
 
 

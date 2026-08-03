@@ -23,6 +23,7 @@ compatibility shim is ever removed. Skipped outside the Electrum venv.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -88,3 +89,41 @@ def test_plugin_loads_the_way_electrum_loads_an_external_zip(tmp_path) -> None:
         "external-zip load failed the way it would crash Electrum on install:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
     assert "EXTERNAL_ZIP_LOAD_OK" in proc.stdout, proc.stdout
+
+# The version the plugin reports about ITSELF has to come out of the same zip.
+# `manifest.json` is a data file inside the archive: a filesystem `open()` of it
+# fails under a real (zip) install, which would leave the update check comparing
+# against an unknown running version and silently doing nothing. So the read goes
+# through the loader, and this proves it does.
+_CHILD_VERSION = textwrap.dedent(
+    """
+    import importlib, importlib.util, json, logging, os, sys, zipimport
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    zip_path = sys.argv[1]
+    sys.path[:] = [p for p in sys.path
+                   if not os.path.isdir(os.path.join(p or '.', 'inbound_liquidity'))]
+
+    imp = zipimport.zipimporter(zip_path)
+    base = "electrum_external_plugins.inbound_liquidity"
+    init_spec = imp.find_spec("inbound_liquidity")
+    module = importlib.util.module_from_spec(init_spec)
+    sys.modules[base] = module
+    init_spec.loader.exec_module(module)
+
+    plugin = object.__new__(module.LiquidityPlugin)
+    plugin.logger = logging.getLogger("zip-version")
+    print("ZIP_VERSION:" + (plugin.plugin_version() or "<empty>"))
+    """
+)
+
+
+def test_the_plugin_reads_its_own_version_from_inside_the_zip(tmp_path) -> None:
+    zip_path = _build_zip(str(tmp_path))
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_VERSION, zip_path],
+        capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+    with open(os.path.join(_PKG_DIR, "manifest.json"), encoding="utf-8") as fh:
+        expected = json.load(fh)["version"]
+    assert f"ZIP_VERSION:{expected}" in proc.stdout, proc.stdout

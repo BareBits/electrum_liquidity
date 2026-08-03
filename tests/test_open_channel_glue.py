@@ -199,3 +199,85 @@ def test_tag_hiccup_does_not_abort_success() -> None:
     # ...yet the open still counts: success recorded, action logged, user notified.
     assert p.peer_successes == [PUB_A.hex()]
     assert p.action_events == ["open"] and len(p.actions_logged) == 1 and p.done
+
+
+# --- bookkeeping must never sink the action it is recording ---------------
+# The reason these exist: a peer-fault write raised out of `_record_peer_fault`
+# (a wallet-db deepcopy failure) and aborted the candidate loop mid-walk, so a
+# run with 10 partners tried 2 and gave up -- and the same throw, one branch
+# over, would have abandoned a channel that was already funded on-chain.
+def test_fault_recording_failure_does_not_abort_the_candidate_loop() -> None:
+    p = _plugin()
+    p._max_funding_minus_reserve = lambda wallet, node_id: 1_000_000
+
+    def _fault_boom(wallet, node_id, reason, *, hard):
+        raise TypeError("cannot pickle '_thread.RLock' object")
+    p._record_peer_fault = _fault_boom
+
+    peers = {"partnerA": PUB_A, "partnerB": PUB_B}
+
+    async def _add_peer(cs):
+        return SimpleNamespace(pubkey=peers[cs])
+
+    opened = []
+
+    async def _open(peer, funding_sat, *, push_sat=0, password=None):
+        if peer.pubkey == PUB_A:
+            raise RuntimeError("open negotiation rejected")
+        opened.append(peer.pubkey)
+        return _chan(), SimpleNamespace()
+    wallet = _wallet(add_peer=_add_peer, open_channel=_open)
+
+    _run(p, wallet, candidates=["partnerA", "partnerB"])
+
+    # A's fault could not be recorded -- and the walk still reached B and opened.
+    assert opened == [PUB_B]
+    assert p.peer_successes == [PUB_B.hex()] and p.done
+
+
+def test_connect_fault_recording_failure_does_not_abort_the_candidate_loop() -> None:
+    # Same guarantee on the connect-failure branch (a soft fault).
+    p = _plugin()
+    p._max_funding_minus_reserve = lambda wallet, node_id: 1_000_000
+
+    def _fault_boom(wallet, node_id, reason, *, hard):
+        raise TypeError("cannot pickle '_thread.RLock' object")
+    p._record_peer_fault = _fault_boom
+
+    async def _add_peer(cs):
+        if cs == "partnerA":
+            raise ConnectionError("unreachable")
+        return SimpleNamespace(pubkey=PUB_B)
+
+    async def _open(peer, funding_sat, *, push_sat=0, password=None):
+        return _chan(), SimpleNamespace()
+    wallet = _wallet(add_peer=_add_peer, open_channel=_open)
+
+    _run(p, wallet, candidates=["partnerA", "partnerB"])
+    assert p.peer_successes == [PUB_B.hex()] and p.done
+
+
+@pytest.mark.parametrize("attr", ["_record_peer_success", "_record_action_event",
+                                  "_log_action"])
+def test_post_open_bookkeeping_failure_does_not_lose_the_open(attr: str) -> None:
+    # The channel is funded before any of this runs; a throw here must not
+    # propagate out of the executor and leave the plugin with no record of it.
+    p = _plugin()
+    p._max_funding_minus_reserve = lambda wallet, node_id: 1_000_000
+
+    def _boom(*args, **kwargs):
+        raise TypeError("cannot pickle '_thread.RLock' object")
+    setattr(p, attr, _boom)
+
+    async def _add_peer(cs):
+        return SimpleNamespace(pubkey=PUB_A)
+
+    async def _open(peer, funding_sat, *, push_sat=0, password=None):
+        return _chan(), SimpleNamespace()
+    wallet = _wallet(add_peer=_add_peer, open_channel=_open)
+
+    _run(p, wallet, candidates=["partnerA"])       # must not raise
+
+    # The user is still told the channel opened, and the surviving recorders ran.
+    assert p.done
+    assert p.tagged == ["cc" * 32]

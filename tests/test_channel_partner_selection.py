@@ -140,6 +140,29 @@ def test_size_rejection_matches_peer_error_text_across_implementations():
         assert is_channel_size_rejection(text), text
 
 
+def test_size_rejection_matches_the_2026_07_31_run_verbatim():
+    # Both of these were relayed by real peers in one live run and were NOT
+    # classified as size rejections, so two healthy nodes took a hard fault (and,
+    # by reaching the fault recorder, tripped a persistence crash that aborted
+    # the candidate loop). Verbatim text, as it appeared in the log.
+    assert is_channel_size_rejection(
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: 'Funding satoshis "
+        "(60647) is less than the user specified limit (1000000)'")
+    assert is_channel_size_rejection(
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: 'We do not accept "
+        "channels smaller than 1M sats'")
+    # The same run's already-matching phrasings, kept alongside them so the whole
+    # observed set is pinned in one place.
+    assert is_channel_size_rejection(
+        "remote peer sent error [DO NOT TRUST THIS MESSAGE]: 'chan size of "
+        "0.00060647 BTC is below min chan size of 0.05000000 BTC'")
+
+
+def test_size_rejection_matches_custom_acceptor_upper_bounds():
+    # The mirror-image phrasing from a hand-written channel acceptor.
+    assert is_channel_size_rejection("we do not accept channels larger than 10M sats")
+
+
 def test_non_size_failures_are_not_size_rejections():
     # These stay faultable: they are real reliability signals.
     for text in (

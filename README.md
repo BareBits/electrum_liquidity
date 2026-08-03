@@ -52,9 +52,10 @@ ceilings, diagnostics, etc.).
 | `log_buffer_lines` | Log | How many recent log lines the **Log** sub-tab keeps in memory (100–100 000). Never written to disk | `2000` |
 | `log_capture_ln` | Log | Also capture Electrum's own Lightning/swap logging (peer manager, node rater, channels, routing, submarine swaps) in the **Log** sub-tab. Noisy, but it is where "no channel partner available" is actually decided | `false` |
 | `log_capture_debug` | Log | Force debug-level logging while on. Electrum normally produces debug records already (just hidden), so this matters only if you started Electrum with a reduced verbosity — in which case it also makes those records appear in Electrum's own log file. The previous level is restored when you turn it off | `false` |
-| `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 10 suggestions are tried in turn if one refuses the open) | `""` |
+| `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 50 suggestions are tried in turn if one refuses the open) | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
+| `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once, by dialog, the first time the plugin loads. Nothing is ever downloaded or installed | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
 (bounded by the channel's spendable balance, minus any `min_outbound_sat`
@@ -156,6 +157,30 @@ wallet.
 The plugin writes **nothing** into Electrum's own status bar (the area beside
 your balance). Everything it has to say lives inside the **Liquidity** tab: this
 footer for what a tick is doing now, and the log sub-tabs below for what it did.
+
+### Update check (opt-in)
+
+The Status footer can also tell you whether the plugin itself is out of date —
+`version 0.1.14 (up to date)`, or `update available: 0.1.15 (running 0.1.14)`
+next to a link to the release notes.
+
+It is **off until you say otherwise**. The first time the plugin loads it asks,
+once, with a dialog; whichever way you answer is remembered, and you can change
+it later from **Advanced → Check GitHub for plugin updates**. Declining is
+final — you are not asked again — and a headless (`cmdline`) install, where
+there is no dialog, never checks unless the setting is turned on explicitly.
+
+What it does when enabled: once a day, a single `GET` to GitHub's
+`releases/latest` endpoint for this repository, through Electrum's configured
+proxy (so a Tor setup stays a Tor setup), with a short timeout. A failed or
+rate-limited lookup is logged and retried tomorrow. The reason it is opt-in is
+that it discloses your IP and the fact that this wallet is running to a third
+party who otherwise has no part in operating it.
+
+What it never does is download or install anything. A plugin that can rewrite
+its own code turns a compromised GitHub account — or one intercepted response —
+into code execution against a wallet holding funds. You get a version number and
+a link; updating stays a step you take deliberately.
 
 ### Decision log
 

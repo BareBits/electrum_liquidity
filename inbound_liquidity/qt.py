@@ -21,6 +21,7 @@ from electrum.plugin import hook
 from electrum.gui.qt.util import read_QIcon
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -214,6 +215,10 @@ class Plugin(LiquidityPlugin):
         self._unlock_prompting: set = set()
         # Instance attribute so tests can shrink it.
         self._unlock_prompt_cooldown_sec: float = UNLOCK_PROMPT_COOLDOWN_SEC
+        # Whether the update-check opt-in has been put on screen in this session.
+        # The persisted flag records the *answer*; this guards against opening a
+        # second wallet stacking a second dialog before the first is answered.
+        self._update_opt_in_asked: bool = False
 
     @hook
     def load_wallet(self, wallet: 'Abstract_Wallet', window: 'ElectrumWindow') -> None:
@@ -232,6 +237,54 @@ class Plugin(LiquidityPlugin):
             except Exception:
                 self.logger.debug("could not refresh channels list after column patch")
         self.start_wallet(wallet)
+        self._maybe_prompt_update_opt_in(window, wallet)
+
+    def _maybe_prompt_update_opt_in(self, window: 'ElectrumWindow',
+                                    wallet: 'Abstract_Wallet') -> None:
+        """Ask ONCE whether the plugin may check GitHub for new releases.
+
+        Asked rather than assumed: the check is the plugin's only contact with a
+        server that has nothing to do with running the wallet, and a daily
+        request to github.com tells a third party this wallet's IP and that it
+        is running. So the question is put plainly, once, and both answers are
+        remembered -- "prompted" is stored separately from "enabled" so that
+        declining is final rather than being re-asked at every startup.
+
+        Never blocks or breaks wallet load: a failure to show the dialog leaves
+        the flag unset (it will be offered again next time) and nothing else.
+        """
+        c = self.config
+        if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED', False)):
+            return
+        if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED', False)):
+            return          # already switched on from Advanced; nothing to ask
+        if self._update_opt_in_asked:
+            return          # a second wallet opening in the same session
+        self._update_opt_in_asked = True
+        try:
+            enable = bool(window.question(
+                ' '.join([
+                    _("Should the Inbound Liquidity plugin check GitHub once a day "
+                      "for new versions of itself?"),
+                    _("This contacts github.com (through your proxy, if you have one "
+                      "configured), which tells GitHub that this wallet is running."),
+                    _("Nothing is ever downloaded or installed — if a newer version "
+                      "exists, the plugin only says so and links to the release."),
+                    _("You can change this later in the plugin's Advanced settings."),
+                ]),
+                title=_("Check for plugin updates?")))
+        except Exception:
+            # A prompt is a convenience; never let it break loading a wallet.
+            self.logger.exception("could not show the update-check opt-in prompt")
+            self._update_opt_in_asked = False
+            return
+        c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = True
+        c.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = enable
+        self.logger.info(
+            f"update check {'enabled' if enable else 'declined'} by the user")
+        if enable:
+            # Don't make the user wait for the next heartbeat to learn the answer.
+            self._request_update_check(wallet)
 
     @hook
     def close_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -857,6 +910,36 @@ class Plugin(LiquidityPlugin):
         def _set_locked(locked: bool) -> None:
             unlock_btn.setVisible(bool(locked))
 
+        # Version / update line. Sits with the status rather than in its own
+        # section: "am I running something current" is the same kind of question
+        # as "is anything happening", and both are read at a glance. Empty (and
+        # invisible) when the update check is switched off, so a user who
+        # declined it never sees the feature again.
+        update_label = _wrapped_label("")
+        update_label.setOpenExternalLinks(True)
+        update_label.setTextFormat(Qt.TextFormat.RichText)
+
+        def _refresh_update_label() -> None:
+            text = self.update_status()
+            update_label.setVisible(bool(text))
+            if not text:
+                update_label.setText("")
+                return
+            # Escaped even though both halves are already sanitised upstream
+            # (`extract_release` rebuilds the version from digits and accepts
+            # only https URLs): this label renders rich text, and the strings
+            # originate off-machine. Two independent guards, not one.
+            safe_text = html.escape(text)
+            if self.update_available():
+                url = html.escape(self.latest_release_url(), quote=True)
+                # The link goes to the release page and nothing is downloaded
+                # here: updating stays something the user does deliberately.
+                update_label.setText(
+                    f'<span style="color:#d29922;">{safe_text}</span> '
+                    f'&nbsp;<a href="{url}">{_("Release notes")}</a>')
+            else:
+                update_label.setText(f'<span style="color:gray;">{safe_text}</span>')
+
         def _set_tick_status(status: str) -> None:
             """Render one tick status. Terminal states are muted, an in-flight
             step is emphasised, so a glance tells you whether anything is
@@ -871,6 +954,9 @@ class Plugin(LiquidityPlugin):
             # changed (unlocked elsewhere, or locked again mid-session), so the
             # button tracks it here rather than needing its own timer.
             _set_locked(not self._signing_unlocked(wallet))
+            # The base plugin re-emits the current status when a check completes,
+            # so this is where a newly-found update reaches the tab.
+            _refresh_update_label()
 
         _set_tick_status(self.tick_status(wallet))
 
@@ -1042,6 +1128,7 @@ class Plugin(LiquidityPlugin):
         vbox.addWidget(status_header)
         vbox.addWidget(tick_status_label)
         vbox.addWidget(tick_since_label)
+        vbox.addWidget(update_label)
         unlock_row = QHBoxLayout()
         unlock_row.addWidget(unlock_btn)
         unlock_row.addStretch(1)
@@ -1083,6 +1170,7 @@ class Plugin(LiquidityPlugin):
                 bool(getattr(c, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY', True)))
             plugin_only_cb.blockSignals(False)
             _set_tick_status(self.tick_status(wallet))
+            _refresh_update_label()
             self._populate_log_tree(actions_tree, self.get_decision_log(wallet, "action"))
             self._populate_log_tree(declines_tree, self.get_decision_log(wallet, "decline"))
             self._populate_log_tree(faults_tree, self.get_decision_log(wallet, "fault"))
@@ -1153,6 +1241,15 @@ class Plugin(LiquidityPlugin):
                                  "directory. Contains no private keys or seeds. Off by default."))
         v.addWidget(diag_log_cb)
 
+        # The other side of the first-run opt-in dialog: where a user goes to
+        # change their mind either way.
+        update_check_cb = QCheckBox(_("Check GitHub for plugin updates"))
+        update_check_cb.setToolTip(_("Once a day, ask GitHub whether a newer release of this plugin "
+                                     "has been published, and show it in the Status footer. Contacts "
+                                     "github.com through your configured proxy, which tells GitHub "
+                                     "this wallet is running. Nothing is downloaded or installed."))
+        v.addWidget(update_check_cb)
+
         # NB: the scope switch ("Only manage channels the plugin opened") lives on
         # the main Settings tab, and the Log-tab capture switches live on the Log
         # tab itself — each next to what it affects.
@@ -1162,6 +1259,7 @@ class Plugin(LiquidityPlugin):
             (auto_remediate_cb, 'INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
             (autoclose_cb, 'INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
             (diag_log_cb, 'INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
+            (update_check_cb, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED'),
         ]
 
         grid = QGridLayout()
