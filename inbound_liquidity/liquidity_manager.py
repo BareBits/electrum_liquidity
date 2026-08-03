@@ -501,7 +501,16 @@ def normalize_node_id(connect_str: Optional[str]) -> str:
 # bounds both that polling and how many peers a single open walks through before
 # giving up. Preferred partners are NOT counted against it -- they are always all
 # tried first (see :func:`order_channel_partners`).
-MAX_SUGGESTED_PARTNERS: int = 10
+#
+# Raised from 10 to 50 because a wallet whose funding amount is below the common
+# minimum channel size can burn the whole list on size rejections without ever
+# reaching a peer that would take it -- a real run declined 10-for-10 that way.
+# The cost is wall-clock: the walk is serial and each candidate can hold it for
+# Electrum's LN_P2P_NETWORK_TIMEOUT (20s), so a tick where every partner fails
+# can now run for minutes rather than seconds. That is bounded work, not a hang
+# (the walk stops at the first success, and each attempt is individually
+# timed out), but it is why this number is not simply "all of them".
+MAX_SUGGESTED_PARTNERS: int = 50
 
 # Substrings identifying a channel-open failure caused purely by the CHANNEL SIZE
 # being unacceptable -- either our own funding amount tripping a local BOLT/config
@@ -533,6 +542,12 @@ _CHANNEL_SIZE_REJECTION_MARKERS: Tuple[str, ...] = (
     "below min chan size",
     "exceeds maximum channel size",
     "exceeds the maximum channel size",
+    # lnd's `--minchansize` gate, which reports the *limit* without ever saying
+    # "channel size": "Funding satoshis (60647) is less than the user specified
+    # limit (1000000)". Observed in a real run on 2026-07-31, where it (and the
+    # custom-acceptor phrasing below) were the only two size rejections that
+    # slipped through and hard-faulted healthy peers.
+    "less than the user specified limit",
     # Core Lightning
     "funding_satoshis is too small",
     "amount too small",
@@ -548,6 +563,11 @@ _CHANNEL_SIZE_REJECTION_MARKERS: Tuple[str, ...] = (
     "capacity too large",
     "channel size",
     "min_chan_size",
+    # Hand-written channel acceptors (lnd/CLN plugins, LSP front-ends) phrase
+    # their own minimum freely, e.g. "We do not accept channels smaller than
+    # 1M sats". The operator-facing shape is stable enough to match on.
+    "channels smaller than",
+    "channels larger than",
 )
 
 
@@ -1448,3 +1468,93 @@ def _decide_reverse_swaps(
             )
         )
     return actions, declines
+
+
+# --- release/version comparison -------------------------------------------
+# Pure half of the update check: the glue fetches the GitHub release payload
+# (network, proxy, config -- all I/O), and everything that decides what the
+# answer MEANS lives here, where it is testable without a network.
+#
+# Ordering is numeric-component-wise: "0.1.9" < "0.1.10" (a string compare would
+# get that backwards, which is the whole reason this is not a one-liner at the
+# call site). A tag's leading "v" is accepted because that is how the releases
+# are tagged, and a pre-release suffix ("0.2.0-rc1") is ignored for ordering --
+# GitHub's ``releases/latest`` already excludes pre-releases, and the glue
+# double-checks the flag, so a suffix reaching here is an oddity, not a version
+# we should nag the user about being "behind".
+_VERSION_RE = re.compile(r"^\s*v?(\d+(?:\.\d+)*)", re.IGNORECASE)
+
+
+def parse_version(text: Optional[object]) -> Optional[Tuple[int, ...]]:
+    """The numeric components of a version string: ``"v0.1.14"`` -> ``(0, 1, 14)``.
+
+    Returns None for anything that does not start with a dotted number, so a
+    surprise payload (an HTML error page, a renamed tag scheme) reads as "no
+    usable answer" rather than as a version to compare against.
+    """
+    if text is None:
+        return None
+    match = _VERSION_RE.match(str(text))
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def is_newer_version(latest: Optional[object], current: Optional[object]) -> bool:
+    """Whether ``latest`` is a strictly newer release than ``current``.
+
+    Components are compared left to right, shorter versions zero-padded, so
+    "0.2" == "0.2.0" and "0.1.10" > "0.1.9". Either side failing to parse is
+    False: an unreadable answer must never be reported as an available update.
+    """
+    latest_parts, current_parts = parse_version(latest), parse_version(current)
+    if latest_parts is None or current_parts is None:
+        return False
+    width = max(len(latest_parts), len(current_parts))
+    pad = lambda parts: parts + (0,) * (width - len(parts))  # noqa: E731
+    return pad(latest_parts) > pad(current_parts)
+
+
+@dataclass(frozen=True)
+class ReleaseInfo:
+    """One published release, as the update check understands it.
+
+    Both fields are SANITISED, not merely copied: they come from a remote
+    party's JSON and end up in the plugin's status line and in a clickable link,
+    so ``version`` is rebuilt from the parsed numbers ("0.1.15" -- digits and
+    dots, nothing else) and ``url`` is either an ``https://`` link from the
+    payload or empty. A tag of ``0.1.15<img src=http://tracker/x>`` would
+    otherwise render as markup in a Qt label and fetch a remote image from
+    inside the wallet.
+    """
+    version: str            # normalised numeric version ("0.1.15")
+    url: str                # the release page to send the user to, or ""
+
+
+def extract_release(payload: Optional[Mapping]) -> Optional[ReleaseInfo]:
+    """Read a GitHub ``releases/latest`` payload into a :class:`ReleaseInfo`.
+
+    Returns None when the payload is not a usable release: missing/garbage tag,
+    or explicitly a draft or pre-release. ``releases/latest`` is documented to
+    exclude both, but this is a remote party's JSON -- the plugin should not
+    start advertising an unreleased build because an endpoint changed its mind.
+    The URL is taken from the payload rather than constructed, and dropped
+    unless it is an ``https://`` link, so a doctored payload cannot put an
+    arbitrary scheme in front of the user.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("draft") or payload.get("prerelease"):
+        return None
+    tag = payload.get("tag_name") or payload.get("name")
+    parts = parse_version(tag)
+    if parts is None:
+        return None
+    # Rebuilt from the parsed components rather than trimmed: `parse_version`
+    # matches a PREFIX (so a suffix cannot break ordering), which means the raw
+    # tag can carry arbitrary trailing text. Anything not part of the number is
+    # dropped here, at the boundary, so nothing downstream has to wonder.
+    version = ".".join(str(part) for part in parts)
+    url = payload.get("html_url")
+    url = str(url) if isinstance(url, str) and url.startswith("https://") else ""
+    return ReleaseInfo(version=version, url=url)

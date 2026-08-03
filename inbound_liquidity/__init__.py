@@ -10,18 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import os
+import pkgutil
 import sys
 import time
 from concurrent import futures
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, AsyncIterator, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from electrum import util
 from electrum.i18n import _
 from electrum.plugin import BasePlugin
 from electrum.simple_config import ConfigVar, SimpleConfig
-from electrum.util import log_exceptions, ignore_exceptions
+from electrum.util import log_exceptions, ignore_exceptions, make_aiohttp_session
 from electrum.logging import get_logger
 
 # --- external-zip load compatibility --------------------------------------
@@ -60,6 +62,7 @@ from .liquidity_manager import (
     PartnerResolution,
     ProviderOffer,
     ProviderReliability,
+    ReleaseInfo,
     ReverseSwapAction,
     classify_peer_observation,
     clamp_dev_fee_pct,
@@ -71,7 +74,9 @@ from .liquidity_manager import (
     decide_dev_fee_payout,
     eligible_providers,
     evaluate,
+    extract_release,
     is_channel_size_rejection,
+    is_newer_version,
     normalize_node_id,
     order_channel_partners,
     record_uptime_sample,
@@ -248,6 +253,59 @@ HEARTBEAT_INTERVAL_SEC = 600.0
 # we have. Bounded so an evaluation never hangs on an unreachable network.
 OFFER_CONNECT_TIMEOUT_SEC = 10.0
 OFFER_DISCOVERY_TIMEOUT_SEC = 12.0
+
+# --- update check ---------------------------------------------------------
+# The published-release endpoint for this plugin. GitHub's ``releases/latest``
+# excludes drafts and pre-releases, needs no API token for a public repo (the
+# unauthenticated limit is 60 requests/hour per IP, against a once-a-day check),
+# and carries the release page URL we show the user. Everything about it is
+# opt-in; see INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED.
+UPDATE_CHECK_URL = (
+    "https://api.github.com/repos/BareBits/electrum_liquidity/releases/latest")
+UPDATE_RELEASES_URL = "https://github.com/BareBits/electrum_liquidity/releases"
+# At most one lookup a day, and a short timeout: this is a background courtesy,
+# never something an evaluation should wait on.
+UPDATE_CHECK_INTERVAL_SEC = 86_400.0
+UPDATE_CHECK_TIMEOUT_SEC = 15.0
+# Cap on the response we will read at all, so a hostile/broken endpoint cannot
+# make the wallet buffer an unbounded body.
+UPDATE_CHECK_MAX_BYTES = 512 * 1024
+
+
+def _plain_json_copy(value: Any) -> Any:
+    """Rebuild ``value`` out of plain dicts/lists, recursively.
+
+    Every ``_load_*`` helper below runs its wallet-db value through this, and
+    the reason is not tidiness -- it is the difference between the plugin
+    working and a mid-action crash.
+
+    Electrum's ``JsonDB`` does not hand back the data it was given. ``put``
+    stores into ``self.data``, a ``StoredDict`` whose ``__setitem__``
+    recursively re-wraps nested plain dicts as ``StoredDict``s, each carrying
+    ``_db`` (the ``JsonDB``, which owns a ``threading.RLock``), ``_lock`` and
+    ``_parent`` back-references. So a store read back with a *shallow* copy
+    (``dict(raw)``) looks like data but its values are live db objects, and
+    handing one back to ``put`` -- which does ``copy.deepcopy(value)`` -- makes
+    deepcopy walk ``StoredDict.__dict__ -> _db -> lock`` and raise
+    ``TypeError: cannot pickle '_thread.RLock' object``.
+
+    That is not a storage-layer inconvenience: the exception surfaces at the
+    *call site*, so a routine "remember this peer faulted" write aborted the
+    channel-open loop mid-candidate and took the whole evaluation down with it
+    (observed 2026-07-31: opens stopped after 2 of 10 candidates). It hit only
+    the second and later writes -- the first write of a fresh store passes,
+    because until then there is nothing db-backed to read back.
+
+    Values are JSON-plain by construction (these stores hold numbers, strings
+    and nested dicts/lists of them), so a rebuild is faithful; tuples become
+    lists, exactly as a save/load round-trip through the wallet file would.
+    """
+    if isinstance(value, dict):
+        return {k: _plain_json_copy(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json_copy(v) for v in value]
+    return value
+
 
 # Wallet-storage key under which the per-wallet decision log is persisted (a
 # JSON-plain list of entry dicts; see `_log_entry`).
@@ -698,6 +756,44 @@ SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS = ConfigVar(
                         "days without success (the peer never agreed / stayed offline), it force-closes "
                         "the channel. This broadcasts a transaction, incurs a mining fee, and timelocks "
                         "your funds. Counts against the daily channel-close ceiling."))
+# --- update check ---------------------------------------------------------
+# Off until the user says otherwise. This is the plugin's only contact with a
+# server that is not part of running the wallet, and a periodic request to
+# github.com discloses this wallet's IP and a usage pattern to a third party --
+# so it is opt-in, asked once via a dialog on first run (see qt.py), and the
+# request goes through Electrum's configured proxy like every other HTTP call
+# the wallet makes. A user who never answers, or who runs headless where there
+# is no dialog, simply never checks.
+SimpleConfig.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = ConfigVar(
+    'plugins.inbound_liquidity.update_check_enabled',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Check GitHub for plugin updates"),
+    long_desc=lambda: _("Once a day, ask GitHub whether a newer release of this plugin has been "
+                        "published, and show it in the plugin's status. This contacts github.com "
+                        "(through your configured proxy, if any) and therefore reveals to GitHub "
+                        "that this wallet is running. Nothing is ever downloaded or installed: "
+                        "updating stays a manual step you take yourself."))
+# Whether the opt-in question has been put to the user yet. Separate from the
+# setting itself so "declined" and "not asked" stay distinguishable -- otherwise
+# the dialog would reappear for a user who has already said no.
+SimpleConfig.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = ConfigVar(
+    'plugins.inbound_liquidity.update_check_prompted',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Update-check opt-in has been offered"))
+# Cache of the last successful lookup, so the answer survives a restart and the
+# check runs at most once a day rather than once a tick.
+SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = ConfigVar(
+    'plugins.inbound_liquidity.update_last_check_ts',
+    default=0.0, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Last update check (epoch seconds)"))
+SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = ConfigVar(
+    'plugins.inbound_liquidity.update_latest_version',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Latest release seen on GitHub"))
+SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
+    'plugins.inbound_liquidity.update_latest_url',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Release page for the latest release seen"))
 
 
 class LiquidityPlugin(BasePlugin):
@@ -833,6 +929,10 @@ class LiquidityPlugin(BasePlugin):
         # Periodic heartbeat so time-based watchdogs advance without depending on
         # wallet events (see HEARTBEAT_INTERVAL_SEC).
         self._start_heartbeat(wallet)
+        # Opt-in update check. Deliberately outside the automation/readiness
+        # gates: whether a newer plugin exists has nothing to do with whether
+        # this wallet is armed, synced, or funded. A no-op unless enabled.
+        self._request_update_check(wallet)
 
     def _start_heartbeat(self, wallet: 'Abstract_Wallet') -> None:
         """Launch the per-wallet heartbeat loop on the network's asyncio loop, if
@@ -854,6 +954,14 @@ class LiquidityPlugin(BasePlugin):
                     return  # cancelled by stop_wallet / on_close
                 if wallet not in self.wallets:
                     return
+                # Self-throttled to once a day; this is just the clock that gets
+                # it re-tried on a long-running wallet.
+                try:
+                    await self._maybe_check_for_update(wallet)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    self.logger.info(f"update check tick error: {e!r}")
                 try:
                     await self._evaluate(wallet)
                 except asyncio.CancelledError:
@@ -1030,6 +1138,151 @@ class LiquidityPlugin(BasePlugin):
         if block is not None:
             return STATUS_SETTLING
         return STATUS_SLEEPING
+
+    # --- version + update check -------------------------------------------
+    # Opt-in, once a day, read-only: ask GitHub for the latest published release
+    # and say so if this install is behind. Nothing is downloaded and nothing is
+    # installed -- a plugin that can rewrite its own code turns a compromised
+    # GitHub account or a MITM into code execution against a wallet holding
+    # funds, so the result is a version string and a link the user acts on.
+    def plugin_version(self) -> str:
+        """The running plugin's version, read from ``manifest.json``.
+
+        ``pkgutil.get_data`` rather than ``open()``: under an external ZIP
+        install this package lives inside the archive, where a filesystem read
+        of ``manifest.json`` fails. Cached because it cannot change while the
+        process runs, and "" when it cannot be read at all -- an unknown running
+        version simply disables the comparison instead of guessing.
+        """
+        cached = getattr(self, "_plugin_version_cache", None)
+        if cached is not None:
+            return cached
+        version = ""
+        try:
+            raw = pkgutil.get_data(__package__ or __name__, "manifest.json")
+            if raw:
+                version = str(json.loads(raw.decode("utf-8")).get("version") or "")
+        except Exception as e:
+            self.logger.info(f"could not read the plugin version from manifest: {e!r}")
+        self._plugin_version_cache = version
+        return version
+
+    def latest_known_version(self) -> str:
+        """The newest release seen by the last successful check (cached in the
+        config, so it survives a restart and is available before the first
+        check of a session completes). "" if we have never looked."""
+        return str(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "") or "")
+
+    def latest_release_url(self) -> str:
+        return (str(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", "") or "")
+                or UPDATE_RELEASES_URL)
+
+    def update_available(self) -> bool:
+        return is_newer_version(self.latest_known_version(), self.plugin_version())
+
+    def update_status(self) -> str:
+        """One line for the Status footer / headless caller: what version is
+        running, and whether something newer is published. "" when the check is
+        switched off, so an opted-out user sees nothing about it anywhere."""
+        if not bool(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", False)):
+            return ""
+        running = self.plugin_version() or "unknown"
+        if self.update_available():
+            return (f"update available: {self.latest_known_version()} "
+                    f"(running {running})")
+        return f"version {running} (up to date)"
+
+    def _request_update_check(self, wallet: 'Abstract_Wallet') -> None:
+        """Fire the (self-throttling) update check on the network's asyncio loop.
+
+        Fire-and-forget on purpose: this is a courtesy lookup against a third
+        party, and neither wallet startup nor a heartbeat tick may wait on it or
+        fail because of it."""
+        loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._maybe_check_for_update(wallet), loop)
+        except Exception as e:
+            self.logger.info(f"could not schedule the update check: {e!r}")
+
+    async def _maybe_check_for_update(self, wallet: 'Abstract_Wallet') -> None:
+        """Check for a newer release, at most once per UPDATE_CHECK_INTERVAL_SEC.
+
+        The timestamp is stamped BEFORE the request, so an endpoint that is down
+        (or rate-limiting us) is retried tomorrow rather than on every heartbeat.
+        """
+        if not bool(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", False)):
+            return
+        now = time.time()
+        last = float(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS", 0.0) or 0.0)
+        if 0.0 <= now - last < UPDATE_CHECK_INTERVAL_SEC:
+            return
+        self.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = now
+        release = await self._fetch_latest_release(wallet)
+        if release is None:
+            return
+        self.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = release.version
+        self.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = release.url or UPDATE_RELEASES_URL
+        running = self.plugin_version()
+        if not is_newer_version(release.version, running):
+            self.logger.info(
+                f"plugin update check: running {running or 'unknown'}, "
+                f"latest published {release.version} -- up to date")
+            return
+        # Log the availability once per version per session: the Status footer
+        # keeps showing it, so repeating it every day would only be noise.
+        seen = getattr(self, "_update_logged", None)
+        if not isinstance(seen, set):
+            seen = set()
+            self._update_logged = seen
+        message = (f"a newer version of this plugin is available: {release.version} "
+                   f"(running {running or 'unknown'}) -- {self.latest_release_url()}")
+        if release.version not in seen:
+            seen.add(release.version)
+            self.logger.warning(message)
+            self._diag_event(wallet, category="lifecycle", kind="update",
+                             reason="plugin update available",
+                             detail=message)
+        # Nudge the Status footer to re-read (the update line lives there).
+        # Guarded like `_set_status`: a GUI notification must never be able to
+        # break the thing it is notifying about.
+        try:
+            self.on_status_changed(wallet, self.tick_status(wallet))
+        except Exception as e:
+            self.logger.info(f"status notification failed: {e!r}")
+
+    async def _fetch_latest_release(self, wallet: 'Abstract_Wallet') -> Optional[ReleaseInfo]:
+        """GET the latest published release, or None on any failure.
+
+        Routed through ``make_aiohttp_session`` so it honours the wallet's proxy
+        (a Tor user's update check must not be the one request that leaks their
+        IP), bounded by a short timeout and a read cap, and non-raising: a failed
+        courtesy lookup is logged at INFO and forgotten."""
+        proxy = getattr(getattr(wallet, "network", None), "proxy", None)
+        headers = {"User-Agent": "Electrum-inbound-liquidity",
+                   "Accept": "application/vnd.github+json"}
+        try:
+            async with make_aiohttp_session(proxy, headers=headers,
+                                            timeout=UPDATE_CHECK_TIMEOUT_SEC) as session:
+                async with session.get(UPDATE_CHECK_URL) as response:
+                    if response.status != 200:
+                        self.logger.info(
+                            f"update check: GitHub replied {response.status}; skipping")
+                        return None
+                    raw = await response.content.read(UPDATE_CHECK_MAX_BYTES + 1)
+            if len(raw) > UPDATE_CHECK_MAX_BYTES:
+                self.logger.info("update check: response too large; skipping")
+                return None
+            release = extract_release(json.loads(raw.decode("utf-8")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.info(f"update check failed: {e!r}")
+            return None
+        if release is None:
+            self.logger.info("update check: no usable release in the reply; skipping")
+        return release
 
     # --- live log capture -------------------------------------------------
     def log_buffer_lines(self) -> int:
@@ -1232,11 +1485,11 @@ class LiquidityPlugin(BasePlugin):
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(ACTION_TIMESTAMPS_DB_KEY, data)
         try:
+            db.put(ACTION_TIMESTAMPS_DB_KEY, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist action timestamps: {e!r}")
+            self.logger.error(f"could not persist action timestamps: {e!r}", exc_info=True)
 
     def _count_actions_last_24h(self, wallet: 'Abstract_Wallet', kind: str,
                                 now: Optional[float] = None) -> int:
@@ -1301,11 +1554,11 @@ class LiquidityPlugin(BasePlugin):
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(DEV_FEE_OWED_DB_KEY, max(0, int(owed_sat)))
         try:
+            db.put(DEV_FEE_OWED_DB_KEY, max(0, int(owed_sat)))
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist dev-fee ledger: {e!r}")
+            self.logger.error(f"could not persist dev-fee ledger: {e!r}", exc_info=True)
 
     def _accrue_dev_fee(self, wallet: 'Abstract_Wallet', basis_sat: int,
                         source: str = "") -> int:
@@ -1341,11 +1594,11 @@ class LiquidityPlugin(BasePlugin):
         db = getattr(wallet, "db", None)
         if db is None:
             return
-        db.put(DEV_FEE_PAYMENTS_DB_KEY, data)
         try:
+            db.put(DEV_FEE_PAYMENTS_DB_KEY, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist dev-fee payment history: {e!r}")
+            self.logger.error(f"could not persist dev-fee payment history: {e!r}", exc_info=True)
 
     def _dev_fee_paid_last_24h(self, wallet: 'Abstract_Wallet',
                                now: Optional[float] = None) -> int:
@@ -1534,17 +1787,17 @@ class LiquidityPlugin(BasePlugin):
     def _load_reliability(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
         db = getattr(wallet, "db", None)
         raw = db.get(RELIABILITY_DB_KEY, {}) if db is not None else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
     def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(RELIABILITY_DB_KEY, data)
         try:
+            db.put(RELIABILITY_DB_KEY, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist provider reliability: {e!r}")
+            self.logger.error(f"could not persist provider reliability: {e!r}", exc_info=True)
 
     def _provider_penalty(self, wallet: 'Abstract_Wallet', npub: str,
                           stats: Optional[Dict], params: Dict[str, float],
@@ -1683,17 +1936,22 @@ class LiquidityPlugin(BasePlugin):
     def _load_peer_reliability(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
         db = getattr(wallet, "db", None)
         raw = db.get(PEER_RELIABILITY_DB_KEY, {}) if db is not None else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
     def _save_peer_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(PEER_RELIABILITY_DB_KEY, data)
+        # Guarded like every other store: `JsonDB.put` deep-copies what it is
+        # given and raises on anything it cannot copy, and an exception here
+        # escapes into whatever action was mid-flight (this one aborted the
+        # channel-open candidate loop). Bookkeeping failing must never sink the
+        # action it is bookkeeping for -- log it and carry on.
         try:
+            db.put(PEER_RELIABILITY_DB_KEY, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist peer reliability: {e!r}")
+            self.logger.error(f"could not persist peer reliability: {e!r}", exc_info=True)
 
     def _peer_penalty(self, node_id: str, stats: Optional[Dict],
                       params: Dict[str, float], now: float) -> float:
@@ -1708,6 +1966,23 @@ class LiquidityPlugin(BasePlugin):
             faults, max(0.0, now - last_fault_ts),
             base_pct=params["base_pct"], halflife_sec=params["halflife_sec"],
             cap_pct=params["cap_pct"])
+
+    def _bookkeep(self, what: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        """Run a bookkeeping side effect that must never sink the action it is
+        recording, swallowing (and loudly logging) anything it raises.
+
+        The save helpers each guard their own write, which covers the storage
+        layer -- but the recorders around them do more than write: they log,
+        rank, auto-ban and notify the GUI. This is the second half of that belt:
+        applied at the call sites in the executor, where the action has either
+        already happened (a channel is open) or the loop still has candidates
+        left to try, and neither outcome may be lost to a failure in the
+        record-keeping about it. It is deliberately NOT applied to the watchdog's
+        recorders, where a fault *is* the action."""
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            self.logger.error(f"could not record {what}: {e!r}", exc_info=True)
 
     def _record_peer_fault(self, wallet: 'Abstract_Wallet', node_id: str, reason: str,
                            *, hard: bool = False, rate_key: Optional[str] = None,
@@ -1830,7 +2105,7 @@ class LiquidityPlugin(BasePlugin):
     def _load_pending_swaps(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
         db = getattr(wallet, "db", None)
         raw = db.get(PENDING_SWAPS_DB_KEY, {}) if db is not None else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
     def _save_pending_swaps(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
         """Persist the pending-swap tracking map.
@@ -2098,17 +2373,17 @@ class LiquidityPlugin(BasePlugin):
     def _load_json_dict(self, wallet: 'Abstract_Wallet', key: str) -> Dict:
         db = getattr(wallet, "db", None)
         raw = db.get(key, {}) if db is not None else {}
-        return dict(raw) if isinstance(raw, dict) else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
     def _save_json(self, wallet: 'Abstract_Wallet', key: str, data) -> None:
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
-        db.put(key, data)
         try:
+            db.put(key, data)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist {key}: {e!r}")
+            self.logger.error(f"could not persist {key}: {e!r}", exc_info=True)
 
     def _plugin_opened_channels(self, wallet: 'Abstract_Wallet') -> set:
         db = getattr(wallet, "db", None)
@@ -2921,7 +3196,8 @@ class LiquidityPlugin(BasePlugin):
                     f"could not connect to partner {connect_str[:24]}…: {e!r}; trying next")
                 # Couldn't even reach the peer: a *soft* fault (transient
                 # unreachability) -- de-prioritise, but don't count toward auto-ban.
-                self._record_peer_fault(
+                self._bookkeep(
+                    "peer fault", self._record_peer_fault,
                     wallet, normalize_node_id(connect_str),
                     f"connect failed: {type(e).__name__}", hard=False)
                 last_error = e
@@ -2961,7 +3237,8 @@ class LiquidityPlugin(BasePlugin):
                 # blanket hard fault would auto-ban swathes of the graph over a
                 # few ticks for something that was never their fault.
                 if not size_rejection:
-                    self._record_peer_fault(
+                    self._bookkeep(
+                        "peer fault", self._record_peer_fault,
                         wallet, peer.pubkey.hex(),
                         f"channel open failed: {type(e).__name__}", hard=True)
                 self._diag_event(wallet, category="error", kind="open",
@@ -2979,11 +3256,19 @@ class LiquidityPlugin(BasePlugin):
                 self._tag_plugin_opened_channel(wallet, chan.channel_id.hex())
             except Exception as e:
                 self.logger.info(f"could not tag plugin-opened channel: {e!r}")
+            # The channel now EXISTS -- funds are committed on-chain. Everything
+            # below is record-keeping about it, and none of it may be allowed to
+            # raise past here: an exception would abort the executor after the
+            # open, leaving the plugin with no record of a channel it just paid
+            # for (and, in the loop's older shape, moving on to open another).
             # A clean open clears the peer's penalty at its source.
-            self._record_peer_success(wallet, peer.pubkey.hex())
+            self._bookkeep("peer success", self._record_peer_success,
+                           wallet, peer.pubkey.hex())
             # Count this open toward the rolling-24h open ceiling.
-            self._record_action_event(wallet, "open")
-            self._log_action(
+            self._bookkeep("open against the daily ceiling",
+                           self._record_action_event, wallet, "open")
+            self._bookkeep(
+                "open in the decision log", self._log_action,
                 wallet, kind="open", amount_sat=funding_sat,
                 source="on-chain", dest=peer.pubkey.hex(),
                 reason=action.reason,
@@ -3718,7 +4003,12 @@ class LiquidityPlugin(BasePlugin):
 
     def _load_log(self, wallet: 'Abstract_Wallet') -> List[Dict]:
         raw = wallet.db.get(LOG_DB_KEY, [])
-        return list(raw) if isinstance(raw, list) else []
+        # `_plain_json_copy`, not `list(raw)`: entries must come back as plain
+        # dicts before they are appended to and written back (see the helper).
+        # This store survives a shallow copy today only by accident -- Electrum's
+        # `StoredList` happens not to re-wrap its children the way `StoredDict`
+        # does -- and that is not a property worth depending on.
+        return _plain_json_copy(raw) if isinstance(raw, list) else []
 
     def _prune(self, entries: List[Dict]) -> List[Dict]:
         cutoff = time.time() - self._retention_days() * 86400
@@ -3731,11 +4021,11 @@ class LiquidityPlugin(BasePlugin):
         entries = self._load_log(wallet)
         entries.append(entry)
         entries = self._prune(entries)
-        wallet.db.put(LOG_DB_KEY, entries)
         try:
+            wallet.db.put(LOG_DB_KEY, entries)
             wallet.save_db()
         except Exception as e:
-            self.logger.info(f"could not persist decision log: {e!r}")
+            self.logger.error(f"could not persist decision log: {e!r}", exc_info=True)
         # Mirror the same already-scrubbed entry to the on-disk diagnostic log
         # (a no-op unless the operator has enabled it).
         self._diag_write(wallet, entry)
