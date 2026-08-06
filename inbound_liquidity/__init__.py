@@ -488,7 +488,7 @@ SimpleConfig.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = ConfigVar(
                         "a way to use the plugin without trusting full automation. The master "
                         "Automation switch must still be enabled for a manual run to move funds."))
 SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
-    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=50_000, type_=int, plugin=_PLUGIN_NAME,
+    'plugins.inbound_liquidity.min_onchain_to_open_sat', default=60_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Min on-chain to open a channel (sat)"),
     long_desc=lambda: _("Never open a Lightning channel while on-chain spendable funds are below this. "
                         "When this is below Electrum's stock channel-funding floor (MIN_FUNDING_SAT), "
@@ -520,7 +520,7 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = ConfigVar(
                         "open got wedged; once the ceiling is reached, a wedged open is not "
                         "auto-freed until the window rolls over. 0 = unlimited."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
-    'plugins.inbound_liquidity.max_swap_fee_pct', default=0.6, type_=float, plugin=_PLUGIN_NAME,
+    'plugins.inbound_liquidity.max_swap_fee_pct', default=0.9, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
     long_desc=lambda: _("Do not swap Lightning -> on-chain if the effective all-in cost "
                         "(percentage fee + provider mining fee + on-chain claim fee, as a "
