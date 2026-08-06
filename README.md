@@ -39,9 +39,9 @@ ceilings, diagnostics, etc.).
 | Setting | Tab | Meaning | Default |
 |---|---|---|---|
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
-| `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `50_000` |
+| `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
-| `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.6` |
+| `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on the on-chain amount received from plugin-initiated reverse swaps (0 = off). Paid automatically to a fixed payout address | `0.1` |
@@ -284,7 +284,7 @@ sub-tab to arm it (it applies immediately, no **Apply** needed).
 Note: on the rig's small (0.02 BTC) channels a reverse swap's **effective all-in
 cost** (provider percentage + provider mining fee + on-chain claim fee, as a
 share of the amount) is several percent, because the fixed provider/mining fees
-dominate at small amounts. With the default `max_swap_fee_pct = 0.6` the plugin
+dominate at small amounts. With the default `max_swap_fee_pct = 0.9` the plugin
 will correctly **decline** those as uneconomical; raise **"Max fee to move LN →
 on-chain"** on the **Liquidity → Settings** tab (e.g. to 10, then **Apply**) to
 watch swaps actually execute against the rig provider.

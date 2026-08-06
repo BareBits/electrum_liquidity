@@ -902,7 +902,7 @@ class LiquidityConfig:
     min_onchain_to_open_sat: int   # never open a channel with less than this on-chain (rule: X)
     onchain_reserve_sat: int       # always leave this much on-chain when opening (rule: 10_000)
     max_channels: int              # never hold more than this many channels (rule: 2)
-    max_swap_fee_pct: float        # skip reverse swaps whose effective all-in cost % exceeds this (rule: 0.6)
+    max_swap_fee_pct: float        # skip reverse swaps whose effective all-in cost % exceeds this (rule: 0.9)
     swap_trigger_pct: float        # reverse-swap a channel at/over this % of capacity local (rule: 25)
     swap_trigger_sat: int          # ...OR once local balance exceeds this many sats (rule: 25_000)
     # Outbound-preservation floor (sat), per channel. A reverse swap never drains a

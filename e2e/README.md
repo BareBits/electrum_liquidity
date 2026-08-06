@@ -70,7 +70,7 @@ RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q -s
 
 > On the rig's small (0.02 BTC) channels a reverse swap's effective all-in cost
 > is several percent (a fixed ~45k-sat prepayment dominates), so at the default
-> `max_swap_fee_pct = 0.6` the plugin correctly declines. `test_reverse_swap_e2e`
+> `max_swap_fee_pct = 0.9` the plugin correctly declines. `test_reverse_swap_e2e`
 > raises the ceiling so a swap actually executes.
 
 ## CI note
