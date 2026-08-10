@@ -102,7 +102,7 @@ from .log_buffer import (
 
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
-    from electrum.submarine_swaps import SwapServerTransport
+    from electrum.submarine_swaps import SwapOffer, SwapServerTransport
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -2157,9 +2157,21 @@ class LiquidityPlugin(BasePlugin):
     def _ln_payment_failed(self, wallet: 'Abstract_Wallet', payment_hash_hex: str) -> bool:
         """Whether our outgoing Lightning payment for this swap has definitively
         failed (every route attempt exhausted) -- the signal that the fault is our
-        channel peer's, not the swap provider's."""
+        channel peer's, not the swap provider's.
+
+        ``PR_FAILED`` is never *stored* on a sent payment: ``get_payment_status``
+        returns the persisted ``PaymentInfo.status``, and nothing in lnworker ever
+        writes PR_FAILED there. Electrum only *derives* it, in
+        ``lnworker.get_invoice_status``: a sent payment is failed when it is
+        PR_UNPAID, is not in ``inflight_payments``, and has route-attempt logs in
+        ``lnworker.logs`` (i.e. we tried and gave up). Comparing the raw status to
+        PR_FAILED -- what this did before -- was therefore dead code: every swap
+        that did not fund fell through to the stuck-swap timeout and was charged
+        to the provider, even when the real cause was our own payment failing.
+        So replicate that derivation instead.
+        """
         from electrum.lnutil import Direction
-        from electrum.invoices import PR_FAILED
+        from electrum.invoices import PR_UNPAID, PR_FAILED
         lnworker = getattr(wallet, "lnworker", None)
         if lnworker is None:
             return False
@@ -2168,7 +2180,16 @@ class LiquidityPlugin(BasePlugin):
                 bytes.fromhex(payment_hash_hex), direction=Direction.SENT)
         except Exception:
             return False
-        return status == PR_FAILED
+        # A future Electrum that does persist PR_FAILED keeps working unchanged.
+        if status == PR_FAILED:
+            return True
+        if status != PR_UNPAID:
+            return False
+        # Still being retried -> not (yet) a failure.
+        if payment_hash_hex in getattr(lnworker, "inflight_payments", ()):
+            return False
+        # Route attempts were logged and none is in flight: we gave up.
+        return bool(getattr(lnworker, "logs", {}).get(payment_hash_hex))
 
     def _reconcile_pending_swaps(self, wallet: 'Abstract_Wallet') -> None:
         """Resolve tracked reverse swaps against the swap manager's state:
@@ -2793,6 +2814,44 @@ class LiquidityPlugin(BasePlugin):
                     f"{int(timeout // 60)} min; no longer freezing automation")
         return count
 
+    @staticmethod
+    def _channel_sendable_sat(lnworker, chan) -> int:
+        """How much of ``chan``'s local balance Electrum can actually *send*.
+
+        ``available_to_spend(LOCAL)`` is the raw ceiling: the balance minus the
+        channel reserve and the commitment/fee-spike buffer. It is NOT what
+        Electrum will let you send, because a Lightning payment also needs a
+        routing-fee budget on top of the amount, and that budget is paid from the
+        same balance. Electrum's own "max sendable" (``lnworker.num_sats_can_send``)
+        therefore subtracts ``estimate_fee_reserve_for_total_amount()`` from the
+        raw ceiling -- whose docstring names this exact use case ("reliably allow
+        doing a 'Max' amount lightning send (e.g. for submarine swaps)").
+
+        We must mirror that, and per channel rather than wallet-wide, because a
+        reverse swap's Lightning leg is pinned to one channel (see
+        ``_reverse_swap``). Sizing a swap at the raw ceiling asks Electrum to send
+        strictly more than it believes it can: the provider splits our
+        ``lightning_amount_sat`` into a main hold invoice plus a mining-fee
+        prepayment invoice, so two HTLCs must fit in that one channel, and the
+        provider only creates the on-chain funding output once BOTH arrive. If
+        either leg cannot be routed the swap is never funded and never fails --
+        it just hangs until the stuck-swap timeout blames the provider.
+
+        Degrades to the raw ceiling if the estimator is unavailable (older
+        Electrum / a stubbed lnworker in tests) rather than blocking swaps.
+        """
+        from electrum.lnutil import LOCAL
+        raw_sat = int(chan.available_to_spend(LOCAL)) // 1000
+        estimate = getattr(lnworker, "estimate_fee_reserve_for_total_amount", None)
+        if not callable(estimate):
+            return max(0, raw_sat)
+        try:
+            reserve_sat = int(estimate(raw_sat))
+        except Exception as e:  # noqa: BLE001
+            _logger.info(f"could not estimate LN fee reserve for channel: {e!r}")
+            return max(0, raw_sat)
+        return max(0, raw_sat - max(0, reserve_sat))
+
     def build_snapshot(self, wallet: 'Abstract_Wallet',
                        transport: Optional['SwapServerTransport'] = None) -> LiquiditySnapshot:
         from electrum.lnutil import LOCAL, REMOTE
@@ -2851,7 +2910,7 @@ class LiquidityPlugin(BasePlugin):
                 capacity_sat=int(capacity),
                 local_sat=chan.balance(LOCAL) // 1000,
                 remote_sat=chan.balance(REMOTE) // 1000,
-                spendable_local_sat=chan.available_to_spend(LOCAL) // 1000,
+                spendable_local_sat=self._channel_sendable_sat(lnworker, chan),
                 is_active=chan.is_active(),
                 has_unsettled_htlcs=has_unsettled,
                 unsettled_is_swap=unsettled_is_swap,
@@ -3320,6 +3379,7 @@ class LiquidityPlugin(BasePlugin):
         # nostr) points the swap math + RPC at that specific provider; an empty
         # npub keeps the legacy single-provider behaviour (config.SWAPSERVER_*).
         target_pubkey: Optional[str] = None
+        chosen_offer: Optional['SwapOffer'] = None
         provider_label = "configured provider"
         if action.provider_npub:
             offer = transport.get_offer(action.provider_npub) if transport is not None else None
@@ -3328,9 +3388,11 @@ class LiquidityPlugin(BasePlugin):
                     f"chosen provider {action.provider_npub[:12]}… no longer "
                     f"advertising; skipping swap on {action.short_id}")
                 return
-            # Make sm.get_recv_amount / sanity checks use the chosen provider's
-            # terms, and address the swap RPC to it.
-            sm.update_pairs(offer.pairs)
+            # Applied below, once the transport knows which provider it is
+            # talking to: sm.update_pairs() wakes the transport's relay-following
+            # loop, which must be able to resolve the chosen provider (see
+            # TargetedNostrTransport.update_relays).
+            chosen_offer = offer
             target_pubkey = offer.server_pubkey
             provider_label = action.provider_npub
         elif not (self.config.SWAPSERVER_NPUB or self.config.SWAPSERVER_URL):
@@ -3351,6 +3413,15 @@ class LiquidityPlugin(BasePlugin):
         async with session as tr:
             if target_pubkey is not None and hasattr(tr, "target_pubkey"):
                 tr.target_pubkey = target_pubkey
+                # Let the transport resolve the chosen provider before we trigger
+                # its relay-following loop via update_pairs() just below.
+                if hasattr(tr, "target_npub"):
+                    tr.target_npub = npub or None
+            if chosen_offer is not None:
+                # Make sm.get_recv_amount / the cost sanity checks use the chosen
+                # provider's advertised terms. This also sets sm.is_initialized,
+                # which the wait below depends on.
+                sm.update_pairs(chosen_offer.pairs)
             try:
                 await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
             except asyncio.TimeoutError:

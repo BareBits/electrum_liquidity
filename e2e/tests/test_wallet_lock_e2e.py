@@ -148,8 +148,17 @@ def test_locked_wallet_rests_on_locked_then_resumes_when_unlocked(rig):
     #    locks the wallet on the way out, so the daemon is now holding an
     #    encrypted wallet with no password in memory -- exactly the reported
     #    condition.
-    electrum_cli("password", "--new_password", PASSWORD, "--encrypt_file", "false",
-                 inst=CLIENT)
+    #    ``--password ""`` states the CURRENT password (there is none yet).
+    #    Electrum's init_cmdline demands a password value for the `password` and
+    #    `unlock` commands *unconditionally* -- not only when the wallet is
+    #    already encrypted -- so omitting it makes the CLI fall back to an
+    #    interactive getpass. Under pytest there is no tty, so that surfaced as
+    #    `termios.error: Inappropriate ioctl for device` followed by `EOFError`,
+    #    and the test could only ever pass when run from a terminal. The empty
+    #    string is normalised straight back to None by init_cmdline, so this is
+    #    exactly "no current password" -- it does not weaken what is set below.
+    electrum_cli("password", "--password", "", "--new_password", PASSWORD,
+                 "--encrypt_file", "false", inst=CLIENT)
 
     assert _wait_until(lambda: _last_status() == STATUS_LOCKED, rig=rig, timeout=180), \
         f"locked wallet did not come to rest on {STATUS_LOCKED!r}: {_status_lines()[-5:]!r}"

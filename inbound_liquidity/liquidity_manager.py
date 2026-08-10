@@ -739,7 +739,12 @@ class ChannelSnapshot:
     capacity_sat: int
     local_sat: int             # our outbound balance
     remote_sat: int            # inbound liquidity (what we can still receive)
-    spendable_local_sat: int   # available_to_spend(LOCAL), i.e. sendable after reserves
+    # What Electrum will actually let us SEND over this channel: its
+    # available_to_spend(LOCAL) minus the routing-fee budget Electrum reserves for
+    # a max-amount send (see LiquidityPlugin._channel_sendable_sat). Not the raw
+    # balance, and not the raw available_to_spend either -- a swap sized at the
+    # latter cannot have both of its Lightning legs routed.
+    spendable_local_sat: int
     is_active: bool            # OPEN and usable right now (can route an HTLC)
     # Whether the channel currently has HTLCs that have not yet settled in either
     # direction. A reverse swap pays an LN HTLC through this channel, so swapping

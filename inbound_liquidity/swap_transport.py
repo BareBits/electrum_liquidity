@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Optional
 
 import electrum_aionostr as aionostr
@@ -40,9 +41,74 @@ class TargetedNostrTransport(NostrTransport):
     # a class attribute so tests can shrink it.
     RPC_REPLY_TIMEOUT_SEC: float = 60.0
 
+    # Yield this long on the "no provider to follow" path of update_relays; see
+    # the comment there. A class attribute so tests can shrink it.
+    NO_PROVIDER_BACKOFF_SEC: float = 0.05
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.target_pubkey: Optional[str] = None
+        # npub form of the same provider, used to follow its announced relays.
+        self.target_npub: Optional[str] = None
+
+    def get_relay_manager(self):
+        """As stock, but honour the Log tab's "capture debug-level logs" switch.
+
+        ``NostrTransport.get_relay_manager`` pins its ``aionostr`` child logger to
+        INFO every time a transport is built ("DEBUG is very verbose"). Those are
+        precisely the records that show whether a swap provider ever answered our
+        DM, and because the pin is re-applied per transport, lifting it once when
+        the operator ticks the switch would be undone on the next evaluation. So
+        re-lift it here, after super() has pinned it.
+        """
+        manager = super().get_relay_manager()
+        if bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", False)):
+            try:
+                self.logger.getChild("aionostr").setLevel(logging.DEBUG)
+            except Exception:  # noqa: BLE001  (diagnostics must never break swaps)
+                pass
+        return manager
+
+    async def update_relays(self) -> None:
+        """Follow the *chosen* provider's announced relays.
+
+        The stock loop resolves the provider as ``config.SWAPSERVER_NPUB`` only.
+        In multi-provider mode we leave that config unset, so every time the
+        plugin points the swap math at a provider (``sm.update_pairs``) the stock
+        loop woke up, looked up ``self._offers[None]``, found nothing, and logged
+        ``pairs updated but no pair for self.config.SWAPSERVER_NPUB=None
+        available`` with a stack trace -- once per swap evaluation. That was the
+        visible symptom; the real cost was silent: ``_last_swapserver_relays``
+        never got updated, so unlike stock Electrum we never joined the relays
+        the chosen provider announced. A provider whose reply DMs go out on
+        relays we are not subscribed to looks, from our side, exactly like a swap
+        that was accepted and then never funded.
+
+        So resolve the provider as "the one we chose, else the configured one",
+        and when neither is known just wait for the next tick instead of logging.
+        Everything else mirrors the stock loop.
+        """
+        while True:
+            previous_relays = self._last_swapserver_relays
+            await self.sm.pairs_updated.wait()
+            npub = self.target_npub or self.config.SWAPSERVER_NPUB
+            offer = self._offers.get(npub) if npub else None
+            if offer is None:
+                # No provider chosen yet (or its offer has aged out of _offers):
+                # there is nothing to follow. Not an error -- normal in
+                # multi-provider mode before the first swap. Yield briefly before
+                # looping: `pairs_updated` is set and cleared synchronously by
+                # SwapManager, so wait() returns once per trigger and this cannot
+                # spin -- but a future caller that leaves the event set would
+                # otherwise starve the asyncio thread the whole wallet runs on.
+                await asyncio.sleep(self.NO_PROVIDER_BACKOFF_SEC)
+                continue
+            latest_known_relays = offer.relays
+            if latest_known_relays != previous_relays:
+                self.logger.debug(
+                    "swap provider relays changed, updating relay list.")
+                self._store_last_swapserver_relays(latest_known_relays)
+                await self.relay_manager.update_relays(self.relays)
 
     async def send_request_to_server(self, method: str, request_data: dict) -> dict:
         # Address the chosen provider when one is set, else the single configured

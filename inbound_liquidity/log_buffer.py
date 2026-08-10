@@ -78,6 +78,15 @@ LN_LOGGER_MARKERS: Tuple[str, ...] = (
     "lnchannel",
     "lnrouter",
     "submarine_swaps",
+    # A stuck reverse swap is decided in these three, not in the ones above: the
+    # provider's funding output is spotted by the lnwatcher, the tx that funds
+    # (server side) or claims (our side) is built by the txbatcher, and lnsweep
+    # constructs the claim/refund. Without them, ticking "capture Electrum
+    # Lightning logs" while diagnosing "no on-chain funding" showed peer and
+    # channel chatter but nothing about why the funding was never seen.
+    "lnwatcher",
+    "txbatcher",
+    "lnsweep",
 )
 
 # Logger tree Electrum puts everything under (electrum.logging.electrum_logger).
@@ -300,6 +309,9 @@ class LogCapture:
         # Level we found on the root logger before force-DEBUG overrode it, so
         # unticking (or unloading the plugin) puts the user's verbosity back.
         self._saved_level: Optional[int] = None
+        # Same, for individual child loggers inside the captured tree that carry
+        # an explicit level of their own (see _lift_child_levels).
+        self._saved_child_levels: Dict[str, int] = {}
         self._capture_ln = False
         self._force_debug = False
 
@@ -340,22 +352,82 @@ class LogCapture:
         self._capture_ln = capture_ln
         self._apply_force_debug(logger, force_debug)
 
+    @staticmethod
+    def already_emits_debug(root_logger_name: str = ELECTRUM_LOGGER_NAME) -> bool:
+        """Whether DEBUG records are already being created for the captured tree.
+
+        Electrum pins its ``electrum`` logger to DEBUG and filters at the
+        *handlers*, so this is normally True and forcing DEBUG changes nothing --
+        which is exactly why the toggle looks broken. The GUI uses this to say so
+        instead of leaving the user to guess.
+        """
+        try:
+            return logging.getLogger(root_logger_name).isEnabledFor(logging.DEBUG)
+        except Exception:
+            return False
+
+    def _lift_child_levels(self, root_logger_name: str) -> Dict[str, int]:
+        """Drop to DEBUG every *child* logger in the tree that pins itself higher.
+
+        Raising the tree root alone is not enough: a level set on a child wins
+        over its ancestors, so a single pinned child stays quiet. Two real cases
+        inside Electrum:
+
+          * ``-v warning,network=error``-style verbosity, which
+            ``logging._process_verbosity_log_levels`` applies to *individual*
+            child loggers;
+          * ``submarine_swaps`` pinning its ``aionostr`` child to INFO because
+            DEBUG is verbose -- the very records that show whether a swap
+            provider ever answered us over nostr.
+
+        Returns the levels replaced, so unticking restores them exactly.
+        """
+        saved: Dict[str, int] = {}
+        prefix = root_logger_name + "."
+        try:
+            existing = list(logging.Logger.manager.loggerDict.items())
+        except Exception:
+            return saved
+        for name, obj in existing:
+            # loggerDict also holds PlaceHolder objects for unrealised parents.
+            if not isinstance(obj, logging.Logger) or not name.startswith(prefix):
+                continue
+            level = obj.level
+            if level == logging.NOTSET or level <= logging.DEBUG:
+                continue
+            try:
+                obj.setLevel(logging.DEBUG)
+            except Exception:
+                continue
+            saved[name] = level
+        return saved
+
+    def _restore_child_levels(self) -> None:
+        for name, level in self._saved_child_levels.items():
+            try:
+                logging.getLogger(name).setLevel(level)
+            except Exception:
+                pass
+        self._saved_child_levels = {}
+
     def _apply_force_debug(self, logger: logging.Logger, force_debug: bool) -> None:
         """Raise (or restore) the captured tree's level.
 
         Electrum leaves its ``electrum`` logger at DEBUG by default and filters
-        at the *handler*, so DEBUG records normally reach us untouched and this
-        is a no-op. It matters only when the user launched with an explicit
-        ``-v`` that raised the level, which would stop the interesting records
-        from ever being created.
+        at the *handler*, so for the tree root this is usually a no-op -- see
+        :meth:`already_emits_debug`. The part that does bite is the child loggers
+        (:meth:`_lift_child_levels`), which is where a reduced verbosity and
+        Electrum's own INFO pins actually suppress records.
         """
         if force_debug and not self._force_debug:
             self._saved_level = logger.level
             logger.setLevel(logging.DEBUG)
+            self._saved_child_levels = self._lift_child_levels(logger.name)
         elif not force_debug and self._force_debug:
             if self._saved_level is not None:
                 logger.setLevel(self._saved_level)
             self._saved_level = None
+            self._restore_child_levels()
         self._force_debug = force_debug
 
     def detach(self) -> None:
@@ -373,6 +445,7 @@ class LogCapture:
                 logger.setLevel(self._saved_level)
             except Exception:
                 pass
+        self._restore_child_levels()
         self._saved_level = None
         self._force_debug = False
         self._capture_ln = False
