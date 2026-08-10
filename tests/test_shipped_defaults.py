@@ -45,6 +45,44 @@ def test_default_open_floor_is_below_electrums_stock_funding_floor() -> None:
     assert EXPECTED_MIN_ONCHAIN_TO_OPEN_SAT < MIN_FUNDING_SAT
 
 
+# The gates on force-closing a wedged channel open. These are funds-affecting in
+# the same way as the two above: together they decide how long an untouched
+# install waits before spending a mining fee on an irreversible force-close.
+EXPECTED_STUCK_OPEN_CLOSE_TIMEOUT_MIN: int = 360      # 6 hours
+EXPECTED_WEDGE_REQUIRED_CHECKS: int = 5
+EXPECTED_WEDGE_CHECK_SPREAD_MIN: int = 60
+EXPECTED_COOP_BEFORE_FORCE_MIN: int = 10
+EXPECTED_CONFIRMING_FREEZE_DAYS: float = 3.0
+
+
+def test_wedged_open_close_gate_defaults() -> None:
+    for attr, expected in (
+        ("INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN",
+         EXPECTED_STUCK_OPEN_CLOSE_TIMEOUT_MIN),
+        ("INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS", EXPECTED_WEDGE_REQUIRED_CHECKS),
+        ("INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN", EXPECTED_WEDGE_CHECK_SPREAD_MIN),
+        ("INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN", EXPECTED_COOP_BEFORE_FORCE_MIN),
+    ):
+        default = getattr(SimpleConfig, attr).get_default_value()
+        assert default == expected, attr
+        assert isinstance(default, int), attr
+
+
+def test_confirming_freeze_days_default() -> None:
+    default = SimpleConfig.INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS.get_default_value()
+    assert default == pytest.approx(EXPECTED_CONFIRMING_FREEZE_DAYS)
+    assert isinstance(default, float)
+
+
+def test_force_close_timeout_is_well_above_the_freeze_escape() -> None:
+    """The two clocks were once a single setting, which is what made raising the
+    safety margin on the irreversible action also stall the plugin for hours.
+    Un-freezing must stay fast while force-closing stays slow."""
+    freeze = SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN.get_default_value()
+    close = SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN.get_default_value()
+    assert close >= 4 * freeze, (freeze, close)
+
+
 def test_readme_documents_the_shipped_defaults() -> None:
     """The README settings table is the user-facing contract for these two; keep
     it from drifting away from the code."""

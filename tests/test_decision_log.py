@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from types import SimpleNamespace
 from typing import Dict, List
 
 import pytest
@@ -218,8 +219,14 @@ def test_prune_caps_total_entries() -> None:
 
 # --- build_snapshot wiring (exercises the real ChannelState / swap manager) --
 class _FakeChan:
+    """``confs``/``min_depth`` model funding-tx confirmation progress. A pre-OPEN
+    channel with ``confs < min_depth`` is still legitimately confirming, which
+    freezes only further opens; one that has confirmed but has not reached OPEN
+    is waiting on its peer and freezes everything."""
+
     def __init__(self, *, cid: bytes, short, capacity, local_msat, remote_msat,
-                 spendable_msat, state, active) -> None:
+                 spendable_msat, state, active, confs=6, min_depth=3,
+                 init_ts=None) -> None:
         self.channel_id = cid
         self.short_channel_id = short
         self._capacity = capacity
@@ -228,6 +235,12 @@ class _FakeChan:
         self._spendable = spendable_msat
         self._state = state
         self._active = active
+        self.confs = confs
+        self.min_depth = min_depth
+        self.funding_outpoint = SimpleNamespace(txid=cid.hex())
+        self.lnworker = None            # set by _FakeLnworker
+        store = {"init_timestamp": init_ts} if init_ts is not None else {}
+        self.storage = SimpleNamespace(get=lambda k, d=None: store.get(k, d))
 
     def get_capacity(self):
         return self._capacity
@@ -237,6 +250,9 @@ class _FakeChan:
 
     def is_active(self):
         return self._active
+
+    def funding_txn_minimum_depth(self):
+        return self.min_depth
 
     def balance(self, direction):
         from electrum.lnutil import LOCAL
@@ -280,6 +296,12 @@ class _FakeLnworker:
     def __init__(self, channels, swap_manager) -> None:
         self._channels = {c.channel_id: c for c in channels}
         self.swap_manager = swap_manager
+        by_txid = {c.funding_outpoint.txid: c for c in channels}
+        self.lnwatcher = SimpleNamespace(adb=SimpleNamespace(
+            get_tx_height=lambda txid: SimpleNamespace(
+                conf=by_txid[txid].confs if txid in by_txid else 0)))
+        for c in channels:
+            c.lnworker = self
 
     @property
     def channels(self):
@@ -302,10 +324,14 @@ def test_build_snapshot_counts_pending_channels_and_inflight_swaps() -> None:
         cid=b"\xaa" * 32, short="117x1x0", capacity=2_000_000,
         local_msat=1_000_000_000, remote_msat=1_000_000_000,
         spendable_msat=900_000_000, state=ChannelState.OPEN, active=True)
+    # OPENING with 1 of 3 confirmations: still legitimately confirming, so it
+    # blocks only a further open.
     opening_chan = _FakeChan(
         cid=b"\xbb" * 32, short=None, capacity=2_000_000,
         local_msat=0, remote_msat=2_000_000_000,
-        spendable_msat=0, state=ChannelState.OPENING, active=False)
+        spendable_msat=0, state=ChannelState.OPENING, active=False,
+        confs=1, min_depth=3)
+    # FUNDED: fully confirmed, waiting on the peer -- freezes everything.
     funded_chan = _FakeChan(
         cid=b"\xcc" * 32, short=None, capacity=2_000_000,
         local_msat=0, remote_msat=2_000_000_000,
@@ -318,7 +344,8 @@ def test_build_snapshot_counts_pending_channels_and_inflight_swaps() -> None:
     snap = p.build_snapshot(wallet)
     assert snap.onchain_spendable_sat == 5_000_000
     assert len(snap.channels) == 3
-    assert snap.pending_channel_count == 2          # OPENING + FUNDED
+    assert snap.pending_channel_count == 1          # FUNDED (waiting on peer)
+    assert snap.pending_open_freeze_count == 1      # OPENING (still confirming)
     # Two fresh (just-seen) pending swaps still freeze; neither has aged past the
     # stuck-swap timeout yet.
     assert snap.inflight_swap_count == 2
@@ -330,15 +357,15 @@ def test_build_snapshot_counts_pending_channels_and_inflight_swaps() -> None:
 
 
 def test_build_snapshot_freeze_then_clear_end_to_end() -> None:
-    # An OPENING channel + on-chain funds -> evaluate() freezes (no second open).
-    # Once it reaches OPEN, the same state is no longer frozen.
+    # A confirmed-but-not-OPEN channel + on-chain funds -> evaluate() freezes
+    # (no second open). Once it reaches OPEN, the same state is no longer frozen.
     from electrum.lnchannel import ChannelState
     from liquidity_manager import evaluate  # type: ignore
     p = _make_plugin()
     chan = _FakeChan(
         cid=b"\xbb" * 32, short=None, capacity=2_000_000, local_msat=0,
         remote_msat=2_000_000_000, spendable_msat=0,
-        state=ChannelState.OPENING, active=False)
+        state=ChannelState.FUNDED, active=False)
     sm = _FakeSwapManager(pending_swaps=[])
     wallet = _FakeSnapWallet(_FakeLnworker([chan], sm), onchain_sat=5_000_000)
     cfg = _config()
@@ -353,6 +380,36 @@ def test_build_snapshot_freeze_then_clear_end_to_end() -> None:
     open_snap = p.build_snapshot(wallet)
     assert open_snap.pending_channel_count == 0
     assert evaluate(open_snap, cfg).frozen is None
+
+
+def test_confirming_open_blocks_opens_but_not_swaps() -> None:
+    """A funding tx that is merely slow to confirm must not stall reverse swaps
+    on unrelated, already-open channels -- confirmation can take days in a high-
+    fee environment. It does still block a second open."""
+    from electrum.lnchannel import ChannelState
+    from liquidity_manager import evaluate  # type: ignore
+    p = _make_plugin()
+    # An open channel well over the swap trigger, so a swap is genuinely wanted.
+    rich = _FakeChan(
+        cid=b"\xaa" * 32, short="117x1x0", capacity=2_000_000,
+        local_msat=1_900_000_000, remote_msat=100_000_000,
+        spendable_msat=1_900_000_000, state=ChannelState.OPEN, active=True)
+    confirming = _FakeChan(
+        cid=b"\xbb" * 32, short=None, capacity=2_000_000, local_msat=0,
+        remote_msat=2_000_000_000, spendable_msat=0,
+        state=ChannelState.OPENING, active=False, confs=1, min_depth=3)
+    sm = _FakeSwapManager(pending_swaps=[])
+    wallet = _FakeSnapWallet(_FakeLnworker([rich, confirming], sm),
+                             onchain_sat=5_000_000)
+    snap = p.build_snapshot(wallet)
+    assert snap.pending_channel_count == 0          # nothing freezes globally
+    assert snap.pending_open_freeze_count == 1
+
+    result = evaluate(snap, _config())
+    assert result.frozen is None                    # the tick is NOT frozen
+    assert not any(a.__class__.__name__ == "OpenChannelAction" for a in result.actions)
+    assert any(d.kind == "open" and "still confirming" in d.reason
+               for d in result.declines)
 
 
 if __name__ == "__main__":

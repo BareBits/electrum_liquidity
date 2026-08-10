@@ -64,9 +64,16 @@ from .liquidity_manager import (
     ProviderReliability,
     ReleaseInfo,
     ReverseSwapAction,
+    COOP_BEFORE_FORCE_WINDOW_SEC,
+    COOP_MAX_ATTEMPTS,
+    WEDGE_ABSOLUTE_CAP_SEC,
+    WEDGE_MIN_SPREAD_SEC,
+    WEDGE_REQUIRED_STRIKES,
     classify_peer_observation,
+    classify_pending_freeze,
     clamp_dev_fee_pct,
     compute_dev_fee,
+    coop_before_force_ready,
     count_within_window,
     daily_cap_reached,
     deadline_reached,
@@ -80,11 +87,13 @@ from .liquidity_manager import (
     normalize_node_id,
     order_channel_partners,
     record_uptime_sample,
+    record_wedge_strike,
     reliability_penalty_pct,
     resolve_channel_partners,
     scrub_text,
     should_auto_ban,
     should_commit_offline_close,
+    should_remediate_wedged_open,
     uptime_ratio,
     validate_offer,
     wallet_readiness_block,
@@ -449,6 +458,18 @@ CHANNEL_UPTIME_DB_KEY = "inbound_liquidity_channel_uptime"
 # {"marked_ts": float, "reason": str}. The "trying to close since T" clock the
 # force-close deadline is measured from; survives restarts.
 CLOSE_INTENT_DB_KEY = "inbound_liquidity_close_intent"
+# Per-channel wedged-open strike accumulators (see
+# liquidity_manager.record_wedge_strike): channel_id(hex) ->
+# {"strikes": int, "first_ts": float, "last_ts": float}. Persisted so the strike
+# count and the wedge clock survive a restart -- otherwise every restart would
+# reset the evidence and a genuinely wedged channel would never be remediated.
+WEDGE_STRIKES_DB_KEY = "inbound_liquidity_wedge_strikes"
+# Per-channel record of the plugin's attempts to close: channel_id(hex) ->
+# {"first_ts": float, "coop_attempts": int, "last_coop_ts": float|None}.
+# Drives the "cooperative close always precedes a force-close" invariant (see
+# liquidity_manager.coop_before_force_ready) for EVERY close path, so the rule
+# cannot be bypassed by adding a new caller.
+CLOSE_ATTEMPT_DB_KEY = "inbound_liquidity_close_attempts"
 
 # Offline auto-close defaults (all editable from the Settings tab). Times are in
 # DAYS and stored as floats so tests can set sub-minute values.
@@ -466,6 +487,24 @@ DEFAULT_OFFLINE_FORCE_CLOSE_DAYS = 7.0
 # (a cooperative close is async and can take minutes; each tick would otherwise
 # pile on another attempt).
 COOP_CLOSE_COOLDOWN_SEC = 300.0
+
+# --- wedged channel-open remediation defaults -----------------------------
+# How long a channel may look wedged before it is force-closed, measured from
+# the FIRST observation that it is wedged -- not from channel creation. A
+# funding tx that takes hours to confirm is not wedged and does not start this
+# clock (see _wedge_eligible), so the whole budget is available for the part
+# that is actually the peer's fault.
+#
+# Deliberately much larger than DEFAULT_STUCK_OPEN_TIMEOUT_MIN below: un-
+# freezing automation is cheap and reversible, while force-closing costs a
+# mining fee and locks funds behind a CSV timelock. The two clocks were once a
+# single setting, which meant raising the safety margin on the irreversible
+# action also stalled the plugin for hours. They are now independent.
+DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN = 360  # 6 hours
+# How long a channel whose funding tx is still confirming may block a *further*
+# channel open. Generous, because confirmation time is set by the fee market,
+# not by us: a fee spike can legitimately delay a low-fee funding tx for days.
+DEFAULT_CONFIRMING_FREEZE_DAYS = 3.0
 
 
 # --- User-configurable settings -------------------------------------------
@@ -706,8 +745,48 @@ SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN = ConfigVar(
     'plugins.inbound_liquidity.stuck_open_timeout_min', default=60, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Stuck channel-open timeout (minutes)"),
     long_desc=lambda: _("A channel that has been opening (not yet usable) for longer than this is "
-                        "treated as wedged by an unresponsive peer: it stops freezing automation and "
-                        "is counted as a hard fault against the peer."))
+                        "treated as wedged by an unresponsive peer and stops freezing automation. "
+                        "This only un-freezes the plugin; force-closing such a channel is governed "
+                        "separately (and much more conservatively) by the setting below."))
+SimpleConfig.INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN = ConfigVar(
+    'plugins.inbound_liquidity.stuck_open_close_timeout_min',
+    default=DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN, type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Force-close a wedged open after (minutes)"),
+    long_desc=lambda: _("How long a channel open must look wedged before it is force-closed, timed "
+                        "from the first moment it looked wedged rather than from when it was "
+                        "created. Time spent waiting for the funding transaction to confirm does "
+                        "not count. The channel must also look wedged on several separate checks "
+                        "spread over time, and a cooperative close is always attempted first."))
+SimpleConfig.INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS = ConfigVar(
+    'plugins.inbound_liquidity.wedge_required_checks',
+    default=WEDGE_REQUIRED_STRIKES, type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Wedged-open confirmations required"),
+    long_desc=lambda: _("How many separate checks must all find a channel open wedged before it is "
+                        "closed. Evaluation runs can happen in quick bursts, so these checks must "
+                        "also be spread over the interval below."))
+SimpleConfig.INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN = ConfigVar(
+    'plugins.inbound_liquidity.wedge_check_spread_min',
+    default=int(WEDGE_MIN_SPREAD_SEC // 60), type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Wedged-open checks must span (minutes)"),
+    long_desc=lambda: _("Minimum time between the first and last check that found a channel open "
+                        "wedged. Stops a burst of evaluations in quick succession from counting as "
+                        "independent evidence."))
+SimpleConfig.INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN = ConfigVar(
+    'plugins.inbound_liquidity.coop_before_force_min',
+    default=int(COOP_BEFORE_FORCE_WINDOW_SEC // 60), type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Wait for a cooperative close (minutes)"),
+    long_desc=lambda: _("How long a cooperative close gets to complete before the plugin escalates "
+                        "to a force-close, and how long an unreachable peer is given to come back "
+                        "before we accept that cooperating with it is impossible. The plugin never "
+                        "force-closes without first trying, or ruling out, a cooperative close."))
+SimpleConfig.INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS = ConfigVar(
+    'plugins.inbound_liquidity.confirming_freeze_days',
+    default=DEFAULT_CONFIRMING_FREEZE_DAYS, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Confirming open blocks new opens for (days)"),
+    long_desc=lambda: _("While a channel's funding transaction is still confirming, the plugin will "
+                        "not open another channel, for up to this long. Reverse swaps on other "
+                        "channels are never blocked by a confirming open. Generous by default, "
+                        "because a fee spike can delay confirmation for days."))
 SimpleConfig.INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN = ConfigVar(
     'plugins.inbound_liquidity.stuck_swap_timeout_min', default=180, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Stuck reverse-swap timeout (minutes)"),
@@ -2248,12 +2327,107 @@ class LiquidityPlugin(BasePlugin):
     @staticmethod
     def _open_age_exceeded(chan, timeout_sec: float, now: float) -> bool:
         """True if a not-yet-open channel has been opening longer than
-        ``timeout_sec`` (by its persisted ``init_timestamp``)."""
+        ``timeout_sec`` (by its persisted ``init_timestamp``).
+
+        This is the FREEZE-ESCAPE clock only -- "has this been in flight long
+        enough that it should stop blocking the plugin". It is deliberately
+        plain wall-clock age from channel creation, with no confirmation-
+        progress exemption, so that a channel ALWAYS un-freezes automation
+        eventually. The separate, much more conservative force-close clock is
+        the strike accumulator (see ``_wedge_eligible``).
+        """
         try:
             init_ts = float(chan.storage.get("init_timestamp", 0) or 0)
         except Exception:
             return False
-        return init_ts > 0 and (now - init_ts) > timeout_sec
+        if init_ts <= 0:
+            return False
+        # A creation timestamp in the future means the wall clock moved
+        # backwards (NTP correction, wrong-clock boot). Treat it as brand new
+        # rather than letting a skewed comparison declare it ancient.
+        if init_ts > now:
+            return False
+        return (now - init_ts) > timeout_sec
+
+    def _wedge_params(self) -> Dict[str, float]:
+        """Wedged-open gate tuning, read fresh so edits take effect at once. The
+        getattr defaults keep partial (unit-test) configs sane."""
+        c = self.config
+        return {
+            "close_timeout_sec": max(1, int(getattr(
+                c, "INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN",
+                DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN))) * 60.0,
+            "required_strikes": max(1, int(getattr(
+                c, "INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS",
+                WEDGE_REQUIRED_STRIKES))),
+            "min_spread_sec": max(0.0, float(getattr(
+                c, "INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN",
+                WEDGE_MIN_SPREAD_SEC / 60.0)) * 60.0),
+            "coop_window_sec": max(0.0, float(getattr(
+                c, "INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN",
+                COOP_BEFORE_FORCE_WINDOW_SEC / 60.0)) * 60.0),
+        }
+
+    def _funding_confirmations(self, chan) -> Optional[Tuple[int, int]]:
+        """``(confirmations, required_depth)`` for the channel's funding tx, or
+        ``None`` if either is unknowable. Read through the lnwatcher's address
+        db, which is what Electrum itself uses to decide the channel has
+        confirmed (``is_funding_tx_mined``)."""
+        try:
+            txid = chan.funding_outpoint.txid
+            adb = chan.lnworker.lnwatcher.adb
+            conf = int(adb.get_tx_height(txid).conf)
+            depth = int(chan.funding_txn_minimum_depth())
+        except Exception:
+            return None
+        return (conf, max(1, depth))
+
+    def _is_confirming(self, chan) -> bool:
+        """Whether a pre-OPEN channel is making legitimate confirmation
+        progress -- i.e. nothing is wrong with it, it just needs more blocks.
+
+        A channel that has reached FUNDED has all the confirmations it needs;
+        anything keeping it from OPEN from there is the peer failing to complete
+        the ``channel_ready`` exchange, which is exactly what remediation is
+        for. Below FUNDED, it is confirming as long as its funding tx has not
+        yet reached the depth the peer requires.
+        """
+        from electrum.lnchannel import ChannelState
+        try:
+            if chan.get_state() >= ChannelState.FUNDED:
+                return False
+        except Exception:
+            return False
+        confs = self._funding_confirmations(chan)
+        if confs is None:
+            # Can't tell. Treat as confirming: the cost of guessing wrong this
+            # way is a delayed force-close, the cost of guessing wrong the other
+            # way is force-closing a healthy channel. ``_wedge_eligible``'s
+            # absolute cap still backstops a channel that never resolves.
+            return True
+        conf, depth = confs
+        return conf < depth
+
+    def _wedge_eligible(self, chan, now: float) -> bool:
+        """Whether this channel currently looks WEDGED, as opposed to merely
+        slow -- the first of the three gates on force-closing a stuck open.
+
+        Eligible when the channel is pre-OPEN and is *not* making confirmation
+        progress. The absolute cap overrides the confirmation exemption: a
+        funding tx that never confirms would otherwise stay exempt forever,
+        leaving the funds locked with nothing able to free them.
+        """
+        from electrum.lnchannel import ChannelState
+        pending_states = (
+            ChannelState.PREOPENING, ChannelState.OPENING, ChannelState.FUNDED)
+        try:
+            if chan.get_state() not in pending_states:
+                return False
+        except Exception:
+            return False
+        if self._open_age_exceeded(chan, WEDGE_ABSOLUTE_CAP_SEC, now):
+            return True
+        return not self._is_confirming(chan)
 
     def _scan_channel_health(self, wallet: 'Abstract_Wallet') -> None:
         """Watchdog over the wallet's channels, run each tick before snapshotting.
@@ -2264,8 +2438,10 @@ class LiquidityPlugin(BasePlugin):
             observe the transition (rising edge), excluding closes *we* triggered;
           * a channel whose **peer is offline** (OPEN but not connected), at most
             once per 24h per peer (rate-limited so a long outage isn't double-counted);
-          * a channel **wedged opening** past the stuck-open timeout, which is also
-            force-closed when auto-remediation is on so its funds are freed.
+          * a channel **wedged opening** -- not merely confirming -- on several
+            separate checks spread over time, past the force-close timeout.
+            Such a channel is also closed when auto-remediation is on, so its
+            funds are freed; cooperatively if the peer can be reached at all.
 
         Channels already closed before we started managing (present on the very
         first scan) are seeded, not retroactively blamed on the peer.
@@ -2276,10 +2452,11 @@ class LiquidityPlugin(BasePlugin):
             return
         auto_remediate = bool(getattr(
             self.config, "INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN", True))
-        timeout_sec = max(1, int(getattr(
-            self.config, "INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN", 60))) * 60.0
-        pending_states = (
-            ChannelState.PREOPENING, ChannelState.OPENING, ChannelState.FUNDED)
+        # The force-close gates, independent of the freeze-escape timeout: un-
+        # freezing is cheap and reversible, force-closing is neither, so they get
+        # very different budgets.
+        wedge = self._wedge_params()
+        close_timeout_sec = wedge["close_timeout_sec"]
         closing_states = (
             ChannelState.SHUTDOWN, ChannelState.CLOSING, ChannelState.FORCE_CLOSING,
             ChannelState.REQUESTED_FCLOSE, ChannelState.CLOSED)
@@ -2289,6 +2466,8 @@ class LiquidityPlugin(BasePlugin):
         local_closes = self._local_closes.setdefault(wallet, set())
         wedged_faulted = self._wedged_faulted.setdefault(wallet, set())
         close_capped_logged = self._close_capped_logged.setdefault(wallet, set())
+        strikes = self._load_json_dict(wallet, WEDGE_STRIKES_DB_KEY)
+        strikes_changed = False
         first_scan = wallet not in self._known_chan_states
         known = self._known_chan_states.setdefault(wallet, {})
         try:
@@ -2333,47 +2512,47 @@ class LiquidityPlugin(BasePlugin):
                     self._record_peer_fault(
                         wallet, node_id, "peer offline", hard=True,
                         rate_key="last_offline_fault_ts", rate_limit_sec=86400.0)
-            # Stuck-open watchdog.
-            if (state in pending_states and cid not in remediating
-                    and self._open_age_exceeded(chan, timeout_sec, now)):
+            # Stuck-open watchdog. Three independent gates before we will close
+            # anything (see liquidity_manager's "wedged channel-open
+            # remediation" notes): eligibility (is it actually wedged, or just
+            # confirming?), the wedge clock, and the strike count/spread. Every
+            # tick folds one observation in -- including the negative ones,
+            # which wipe the record when a channel recovers.
+            eligible = self._wedge_eligible(chan, now)
+            updated = record_wedge_strike(strikes.get(cid), now, eligible)
+            if updated != strikes.get(cid):
+                if updated is None:
+                    strikes.pop(cid, None)
+                    # The channel recovered: drop any close attempt history too,
+                    # so a later, unrelated wedge starts its cooperative-close
+                    # window from scratch rather than inheriting an expired one
+                    # and escalating straight past cooperation.
+                    self._clear_close_attempt(wallet, cid)
+                    wedged_faulted.discard(cid)
+                else:
+                    strikes[cid] = updated
+                strikes_changed = True
+            if eligible and cid not in remediating and should_remediate_wedged_open(
+                    updated, now, timeout_sec=close_timeout_sec,
+                    required_strikes=int(wedge["required_strikes"]),
+                    min_spread_sec=wedge["min_spread_sec"]):
                 # Fault the peer exactly once for the wedged open (decoupled from
                 # remediation, which may be deferred by the close ceiling below).
                 if cid not in wedged_faulted:
                     wedged_faulted.add(cid)
                     self._record_peer_fault(
                         wallet, node_id,
-                        f"channel open wedged > {int(timeout_sec // 60)} min", hard=True)
-                # Remediate by force-closing -- but only if the rolling-24h close
-                # ceiling still allows it. When the ceiling is reached we defer
-                # (the snapshot already stops freezing on a wedged open), and a
-                # later tick retries once the window rolls over.
+                        f"channel open wedged > {int(close_timeout_sec // 60)} min",
+                        hard=True)
                 if auto_remediate:
-                    if not self._within_close_cap(wallet, now):
-                        if cid not in close_capped_logged:
-                            close_capped_logged.add(cid)
-                            self.logger.warning(
-                                f"daily close ceiling ({self._max_closes_per_day()}/24h) "
-                                f"reached; deferring force-close of wedged open "
-                                f"{cid[:12]}… to peer {node_id[:12]}…")
-                    else:
-                        close_capped_logged.discard(cid)
-                        remediating.add(cid)
-                        try:
-                            lnworker.schedule_force_closing(chan.channel_id)
-                            self._record_action_event(wallet, "close")
-                            self.logger.warning(
-                                f"force-closing wedged channel open {cid[:12]}… "
-                                f"to peer {node_id[:12]}…")
-                            self._log_action(
-                                wallet, kind="close", amount_sat=None,
-                                source=self._abbrev(node_id) or node_id or None,
-                                dest=None, reason="force-closed wedged channel open",
-                                detail=f"channel {cid[:12]}… wedged "
-                                       f"> {int(timeout_sec // 60)} min", state=None)
-                        except Exception as e:
-                            remediating.discard(cid)  # scheduling failed; allow retry
-                            self.logger.warning(
-                                f"could not force-close wedged open {cid[:12]}…: {e!r}")
+                    self._request_close(
+                        wallet, chan, cid, node_id, now,
+                        reason="wedged channel open",
+                        detail=(f"channel {cid[:12]}… wedged > "
+                                f"{int(close_timeout_sec // 60)} min "
+                                f"({updated['strikes']} checks over "
+                                f"{int((updated['last_ts'] - updated['first_ts']) // 60)} min)"),
+                        on_force_closed=lambda: remediating.add(cid))
         # Forget bookkeeping for channels that are gone (redeemed/removed), so a
         # later reused channel_id starts fresh.
         remediating &= live_ids
@@ -2382,6 +2561,11 @@ class LiquidityPlugin(BasePlugin):
         close_capped_logged &= live_ids
         for gone in [c for c in known if c not in live_ids]:
             del known[gone]
+        for gone in [c for c in strikes if c not in live_ids]:
+            del strikes[gone]
+            strikes_changed = True
+        if strikes_changed:
+            self._save_json(wallet, WEDGE_STRIKES_DB_KEY, strikes)
 
     # --- offline-channel auto-close --------------------------------------
     # Applies ONLY to channels the plugin opened (see PLUGIN_OPENED_CHANNELS_DB_KEY).
@@ -2557,6 +2741,12 @@ class LiquidityPlugin(BasePlugin):
                 # Peer recovered above the floor before we closed -> cancel.
                 intents.pop(cid, None)
                 intents_changed = True
+                # Drop the close-attempt record with it. Otherwise, if the peer
+                # goes offline again later and we re-commit, the stale
+                # ``first_ts`` would already be past the cooperative window and
+                # the very first tick would force-close without ever trying to
+                # cooperate -- exactly the invariant this record exists to hold.
+                self._clear_close_attempt(wallet, cid)
                 self.logger.info(
                     f"cancelling pending close of {cid[:12]}…: peer recovered")
 
@@ -2566,31 +2756,14 @@ class LiquidityPlugin(BasePlugin):
                 continue
             marked_ts = float(intent.get("marked_ts", now) or now)
             if deadline_reached(marked_ts, now, params["force_close_sec"]):
-                # Escalate to a force-close (offline-safe, idempotent), gated by
-                # the rolling-24h close ceiling shared with the wedged-open remedy.
-                if state in (ChannelState.FORCE_CLOSING, ChannelState.REQUESTED_FCLOSE):
-                    continue  # already force-closing
-                if not self._within_close_cap(wallet, now):
-                    self.logger.warning(
-                        f"daily close ceiling reached; deferring force-close of "
-                        f"offline channel {cid[:12]}…")
-                    continue
-                try:
-                    lnworker.schedule_force_closing(chan.channel_id)
-                    self._record_action_event(wallet, "close")
-                    self.logger.warning(
-                        f"force-closing offline channel {cid[:12]}… to peer "
-                        f"{node_id[:12]}… after {params['force_close_sec'] / 86400.0:.2f}d")
-                    self._log_action(
-                        wallet, kind="close", amount_sat=None,
-                        source=self._abbrev(node_id) or node_id or None, dest=None,
-                        reason="auto-close: force-closed offline channel",
-                        detail=f"peer never agreed within "
-                               f"{params['force_close_sec'] / 86400.0:.2f}d of trying to close",
-                        state=None)
-                except Exception as e:
-                    self.logger.warning(
-                        f"could not force-close offline channel {cid[:12]}…: {e!r}")
+                # Past the deadline: hand over to the single close path, which
+                # still tries cooperation first if the peer has become
+                # reachable, and only force-closes once that has had its chance.
+                self._request_close(
+                    wallet, chan, cid, node_id, now,
+                    reason="offline channel (auto-close)",
+                    detail=f"peer never agreed within "
+                           f"{params['force_close_sec'] / 86400.0:.2f}d of trying to close")
             elif state == ChannelState.OPEN:
                 # Not yet at the deadline: attempt the cheaper cooperative close
                 # whenever the peer is reachable (it requires the peer online).
@@ -2599,10 +2772,19 @@ class LiquidityPlugin(BasePlugin):
                 except Exception:
                     peer_online = False
                 if peer_online:
-                    self._maybe_cooperative_close(wallet, chan, cid, node_id, now)
+                    self._maybe_cooperative_close(wallet, chan, cid, node_id, now,
+                                                  reason="offline channel (auto-close)")
 
         if uptime_changed:
             self._save_json(wallet, CHANNEL_UPTIME_DB_KEY, uptime)
+        # Forget close-attempt records for channels that no longer exist, so the
+        # store stays bounded and a reused channel id never inherits one.
+        attempts = self._load_json_dict(wallet, CLOSE_ATTEMPT_DB_KEY)
+        stale_attempts = [c for c in attempts if c not in channels]
+        if stale_attempts:
+            for c in stale_attempts:
+                attempts.pop(c, None)
+            self._save_json(wallet, CLOSE_ATTEMPT_DB_KEY, attempts)
         # Cleanup: forget uptime/intent for channels that are gone (redeemed/
         # removed) or no longer tagged, so a reused id starts fresh.
         for store, key in ((uptime, CHANNEL_UPTIME_DB_KEY),
@@ -2616,44 +2798,207 @@ class LiquidityPlugin(BasePlugin):
                 self._save_json(wallet, key, store)
         coop_inflight &= set(channels)
 
-    def _maybe_cooperative_close(self, wallet: 'Abstract_Wallet', chan, cid: str,
-                                 node_id: str, now: float) -> None:
-        """Launch a cooperative close on a committed channel whose peer is online,
-        unless one is already in flight or we attempted one recently (cooldown).
-        The close is async and can take minutes, so it runs as a background task;
-        the force-close escalation remains the backstop if it never completes."""
-        if not self._within_close_cap(wallet, now):
+    # --- the single close path -------------------------------------------
+    # INVARIANT: every close the plugin initiates goes through _request_close,
+    # and _request_close never force-closes without first having tried -- or
+    # established the impossibility of -- a cooperative close. A force-close
+    # costs a mining fee, locks the funds behind a CSV timelock, and cannot be
+    # undone; cooperation is cheap and immediate. Funnelling both watchdogs
+    # through one function is what makes the rule impossible to bypass by
+    # adding a caller.
+    def _coop_close_possible(self, chan) -> bool:
+        """Whether a cooperative close can even be attempted right now: we need a
+        live, good-state connection to the peer.
+
+        ``chan.is_active()`` is deliberately NOT used here -- it is hardcoded to
+        ``state == OPEN`` (lnchannel.is_active), so it is False for every
+        channel the wedged-open path deals with, which would make cooperation
+        look permanently impossible on exactly the channels this matters for.
+        Electrum permits a cooperative close from any state >= OPENING
+        (``lnpeer.can_send_shutdown``), so the real precondition is just a peer
+        we can talk to.
+        """
+        from electrum.lnchannel import ChannelState, PeerState
+        try:
+            if not (ChannelState.OPENING <= chan.get_state() < ChannelState.CLOSING):
+                return False
+            if chan.peer_state != PeerState.GOOD:
+                return False
+            return chan.lnworker.lnpeermgr.get_peer_by_pubkey(chan.node_id) is not None
+        except Exception:
+            return False
+
+    def _load_close_attempt(self, wallet: 'Abstract_Wallet', cid: str) -> Optional[Dict]:
+        rec = self._load_json_dict(wallet, CLOSE_ATTEMPT_DB_KEY).get(cid)
+        return rec if isinstance(rec, dict) else None
+
+    def _save_close_attempt(self, wallet: 'Abstract_Wallet', cid: str,
+                            rec: Dict) -> None:
+        attempts = self._load_json_dict(wallet, CLOSE_ATTEMPT_DB_KEY)
+        attempts[cid] = rec
+        self._save_json(wallet, CLOSE_ATTEMPT_DB_KEY, attempts)
+
+    def _clear_close_attempt(self, wallet: 'Abstract_Wallet', cid: str) -> bool:
+        """Forget a channel's close-attempt history. Returns whether anything was
+        dropped. Called when a channel recovers, so a later unrelated close
+        request starts its cooperative window fresh instead of inheriting a
+        stale one and escalating straight to a force-close."""
+        attempts = self._load_json_dict(wallet, CLOSE_ATTEMPT_DB_KEY)
+        if cid not in attempts:
+            return False
+        attempts.pop(cid, None)
+        self._save_json(wallet, CLOSE_ATTEMPT_DB_KEY, attempts)
+        return True
+
+    def _request_close(self, wallet: 'Abstract_Wallet', chan, cid: str,
+                       node_id: str, now: float, *, reason: str, detail: str,
+                       on_force_closed: Optional[Callable[[], None]] = None) -> None:
+        """Ask for ``chan`` to be closed, cooperatively if at all possible.
+
+        Called repeatedly (once per tick) by the watchdogs for as long as they
+        still want the channel closed. Each call does the most cooperative thing
+        available and returns; escalation to a force-close happens on a LATER
+        call, once ``coop_before_force_ready`` agrees cooperation has had its
+        chance. This staging is required because a cooperative close is an async
+        negotiation taking minutes, while the watchdogs are synchronous scans --
+        there is no way to await one inline.
+
+        ``on_force_closed`` fires only on the force-close branch, so a caller can
+        record that it has spent its one remediation.
+        """
+        from electrum.lnchannel import ChannelState
+        try:
+            state = chan.get_state()
+        except Exception:
             return
+        # Electrum is explicit that force-closing a WE_ARE_TOXIC channel is
+        # unsafe -- we have lost state and the remote has proved it, so our
+        # commitment tx is revoked and publishing it forfeits the balance. The
+        # remote must close this one; we must not touch it. Checked explicitly
+        # (the >= SHUTDOWN return below also covers it today, since WE_ARE_TOXIC
+        # sorts above SHUTDOWN) so the guarantee does not rest on that ordering.
+        if state == ChannelState.WE_ARE_TOXIC:
+            self.logger.info(
+                f"not closing {cid[:12]}…: channel is WE_ARE_TOXIC, only the "
+                f"remote may close it safely")
+            return
+        # Already closing (by us, by the peer, or cooperatively in progress):
+        # nothing left to ask for.
+        if state >= ChannelState.SHUTDOWN:
+            return
+        # Stamp "we have wanted this closed since T" BEFORE the ceiling check, so
+        # a close deferred by the daily ceiling does not also restart the
+        # cooperative-close window once the ceiling clears.
+        rec = self._load_close_attempt(wallet, cid)
+        if rec is None:
+            rec = {"first_ts": now, "coop_attempts": 0, "last_coop_ts": None}
+            self._save_close_attempt(wallet, cid, rec)
+
+        if not self._within_close_cap(wallet, now):
+            if cid not in self._close_capped_logged.setdefault(wallet, set()):
+                self._close_capped_logged[wallet].add(cid)
+                self.logger.warning(
+                    f"daily close ceiling ({self._max_closes_per_day()}/24h) "
+                    f"reached; deferring close of {cid[:12]}… to peer "
+                    f"{node_id[:12]}… ({reason})")
+            return
+        self._close_capped_logged.setdefault(wallet, set()).discard(cid)
+
+        # A cooperative close is negotiating right now: never interrupt it.
+        if cid in self._coop_closing.get(wallet, set()):
+            return
+        attempts = int(rec.get("coop_attempts", 0) or 0)
+        coop_window_sec = self._wedge_params()["coop_window_sec"]
+
+        def _try_coop() -> bool:
+            if not self._coop_close_possible(chan):
+                return False
+            if not self._maybe_cooperative_close(wallet, chan, cid, node_id, now,
+                                                 reason=reason):
+                return False
+            rec["coop_attempts"] = attempts + 1
+            rec["last_coop_ts"] = now
+            self._save_close_attempt(wallet, cid, rec)
+            return True
+
+        # 1) Still inside the current attempt's window. Launch the FIRST attempt
+        #    here (nothing has been tried yet); otherwise just wait it out.
+        if not coop_before_force_ready(rec, now, window_sec=coop_window_sec):
+            if attempts == 0:
+                _try_coop()
+            return
+
+        # 2) The window has elapsed without the channel closing. Retry
+        #    cooperation while we still have attempts left and a peer to talk
+        #    to; each retry gets its own window. The attempt cap is what makes
+        #    this terminate -- a reachable peer that simply refuses to cooperate
+        #    would otherwise renew the window forever and never be force-closed.
+        if attempts < COOP_MAX_ATTEMPTS and _try_coop():
+            return
+        try:
+            wallet.lnworker.schedule_force_closing(chan.channel_id)
+        except Exception as e:
+            self.logger.warning(
+                f"could not force-close {cid[:12]}… ({reason}): {e!r}")
+            return
+        if on_force_closed is not None:
+            on_force_closed()
+        self._record_action_event(wallet, "close")
+        attempted = int(rec.get("coop_attempts", 0) or 0)
+        why = (f"after {attempted} cooperative close attempt(s)" if attempted
+               else "peer was never reachable to close cooperatively")
+        self.logger.warning(
+            f"force-closing {cid[:12]}… to peer {node_id[:12]}… ({reason}); {why}")
+        self._log_action(
+            wallet, kind="close", amount_sat=None,
+            source=self._abbrev(node_id) or node_id or None, dest=None,
+            reason=f"force-closed {reason}",
+            detail=f"{detail}; {why}", state=None)
+
+    def _maybe_cooperative_close(self, wallet: 'Abstract_Wallet', chan, cid: str,
+                                 node_id: str, now: float, *,
+                                 reason: str = "offline channel") -> bool:
+        """Launch a cooperative close on a channel whose peer is reachable, unless
+        one is already in flight or we attempted one recently (cooldown).
+        Returns whether an attempt was actually launched. The close is async and
+        can take minutes, so it runs as a background task; the force-close
+        escalation remains the backstop if it never completes."""
+        if not self._within_close_cap(wallet, now):
+            return False
         coop_inflight = self._coop_closing.setdefault(wallet, set())
         if cid in coop_inflight:
-            return
+            return False
         mono = time.monotonic()
         if mono < self._coop_close_cooldown_until.get(cid, 0.0):
-            return
+            return False
         self._coop_close_cooldown_until[cid] = mono + COOP_CLOSE_COOLDOWN_SEC
         coop_inflight.add(cid)
         loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
-        coro = self._do_cooperative_close(wallet, chan.channel_id, cid, node_id)
+        coro = self._do_cooperative_close(wallet, chan.channel_id, cid, node_id,
+                                          reason=reason)
         if loop is not None:
             asyncio.run_coroutine_threadsafe(coro, loop)
         else:
             asyncio.ensure_future(coro)
+        return True
 
     async def _do_cooperative_close(self, wallet: 'Abstract_Wallet', chan_id: bytes,
-                                    cid: str, node_id: str) -> None:
+                                    cid: str, node_id: str, *,
+                                    reason: str = "offline channel") -> None:
         lnworker = getattr(wallet, "lnworker", None)
         try:
             self.logger.info(
-                f"attempting cooperative close of offline channel {cid[:12]}… "
-                f"to peer {node_id[:12]}… (peer is currently reachable)")
+                f"attempting cooperative close of {cid[:12]}… to peer "
+                f"{node_id[:12]}… ({reason}; peer is currently reachable)")
             await lnworker.close_channel(chan_id)
             self._record_action_event(wallet, "close")
             self.logger.info(f"cooperatively closed channel {cid[:12]}…")
             self._log_action(
                 wallet, kind="close", amount_sat=None,
                 source=self._abbrev(node_id) or node_id or None, dest=None,
-                reason="auto-close: cooperatively closed offline channel",
-                detail=f"channel {cid[:12]}… closed with a now-reachable peer",
+                reason=f"cooperatively closed {reason}",
+                detail=f"channel {cid[:12]}… closed with a reachable peer, "
+                       f"avoiding a force-close",
                 state=None)
         except Exception as e:
             # Peer went away mid-close, or refused: leave the intent in place so
@@ -2870,8 +3215,15 @@ class LiquidityPlugin(BasePlugin):
         # what stops one flaky peer from wedging the plugin forever.
         stuck_open_sec = max(1, int(getattr(
             self.config, "INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN", 60))) * 60.0
+        # A channel that is merely CONFIRMING is not wedged at all, and gets a
+        # far longer -- but opens-only -- freeze: it must not stall reverse swaps
+        # on unrelated channels while the fee market does its thing.
+        confirming_freeze_sec = max(0.0, float(getattr(
+            self.config, "INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS",
+            DEFAULT_CONFIRMING_FREEZE_DAYS))) * 86400.0
         now = time.time()
         pending_channel_count = 0
+        pending_open_freeze_count = 0
         # Set of channel ids (hex) the plugin opened itself, for the
         # manage-plugin-opened-only scope switch. Read once per snapshot.
         plugin_opened = self._plugin_opened_channels(wallet)
@@ -2890,9 +3242,25 @@ class LiquidityPlugin(BasePlugin):
             except Exception:  # noqa: BLE001
                 pass
             capacity = chan.get_capacity() or 0
-            if chan.get_state() in pending_states and not self._open_age_exceeded(
-                    chan, stuck_open_sec, now):
-                pending_channel_count += 1
+            if chan.get_state() in pending_states:
+                # Age is from channel creation for BOTH horizons: this is the
+                # freeze-escape clock, and it must always run so a pre-OPEN
+                # channel un-freezes the plugin eventually no matter what.
+                try:
+                    init_ts = float(chan.storage.get("init_timestamp", 0) or 0)
+                except Exception:
+                    init_ts = 0.0
+                age_sec = max(0.0, now - init_ts) if 0 < init_ts <= now else 0.0
+                freezes_opens, freezes_swaps = classify_pending_freeze(
+                    self._is_confirming(chan), age_sec,
+                    stuck_sec=stuck_open_sec,
+                    confirming_freeze_sec=confirming_freeze_sec)
+                if freezes_swaps:
+                    # Blocks everything (the engine's global freeze).
+                    pending_channel_count += 1
+                elif freezes_opens:
+                    # Blocks only a further open; swaps proceed.
+                    pending_open_freeze_count += 1
             try:
                 has_unsettled = bool(chan.has_unsettled_htlcs())
             except Exception:
@@ -2974,6 +3342,7 @@ class LiquidityPlugin(BasePlugin):
             swap_claim_fee_sat=claim_fee,
             provider_offers=tuple(offers),
             pending_channel_count=pending_channel_count,
+            pending_open_freeze_count=pending_open_freeze_count,
             inflight_swap_count=inflight_swap_count,
             opens_last_24h=self._count_actions_last_24h(wallet, "open", now),
         )
@@ -3986,6 +4355,7 @@ class LiquidityPlugin(BasePlugin):
             "num_channels": len(snapshot.channels),
             "active_channels": sum(1 for c in snapshot.channels if c.is_active),
             "pending_channel_count": snapshot.pending_channel_count,
+            "pending_open_freeze_count": snapshot.pending_open_freeze_count,
             "inflight_swap_count": snapshot.inflight_swap_count,
             "swap_percentage_fee": snapshot.swap_percentage_fee,
             "provider_min_amount_sat": snapshot.provider_min_amount_sat,

@@ -346,6 +346,222 @@ def deadline_reached(marked_ts: Optional[float], now: float,
     return (now - marked_ts) >= deadline_sec
 
 
+# --- wedged channel-open remediation --------------------------------------
+# A channel stuck in a pre-OPEN state (PREOPENING/OPENING/FUNDED) may simply be
+# waiting for its funding tx to confirm, or its peer may have vanished mid-
+# handshake. Only the latter deserves remediation, and remediation is a
+# force-close -- irreversible and it costs an on-chain fee -- so the bar is
+# deliberately high and made of three independent gates:
+#
+#   1. ELIGIBILITY: the channel is not making legitimate confirmation progress
+#      (see the glue's ``_wedge_eligible``). While the funding tx is still
+#      accruing confirmations toward the peer's required depth, nothing is
+#      wrong and the wedge clock does not even start.
+#   2. AGE: the wedge clock -- measured from the FIRST eligible observation,
+#      not from channel creation -- has run past the close timeout. Starting it
+#      at first-eligible is what stops a slow-confirming funding tx from
+#      consuming the entire budget before the peer is even involved.
+#   3. STRIKES: we have seen the channel wedged on several separate
+#      observations, spread over real time. Evaluation ticks are event-driven
+#      and can fire in bursts (several within a second), so a bare count is
+#      nearly free to satisfy; requiring a minimum spread between the first and
+#      last strike means only a genuinely persistent wedge qualifies.
+#
+# Any single non-wedged observation resets the accumulator to nothing, so a peer
+# that reconnects and completes the handshake wipes its record entirely.
+#
+# These helpers are PURE (no clock, no I/O): the glue reads the wall clock,
+# passes ``now`` in, and persists the returned accumulator as JSON in wallet.db.
+
+# Number of separate eligible observations required before remediating.
+WEDGE_REQUIRED_STRIKES: int = 5
+# Minimum wall-clock spread between the first and last strike. Defeats tick
+# bursts: five observations one second apart do not clear this.
+WEDGE_MIN_SPREAD_SEC: float = 3600.0
+# Absolute backstop measured from channel creation. A funding tx that never
+# confirms would otherwise stay "legitimately confirming" -- and therefore
+# exempt -- forever, leaving the funds locked with nothing to free them.
+WEDGE_ABSOLUTE_CAP_SEC: float = 7 * 86400.0
+
+
+def record_wedge_strike(acc: Optional[Mapping], now: float,
+                        eligible: bool) -> Optional[dict]:
+    """Fold one wedge observation into the strike accumulator.
+
+    ``eligible`` is the glue's verdict that this channel currently looks wedged
+    (pre-OPEN and not making confirmation progress). A False observation clears
+    the record entirely by returning ``None`` -- the channel recovered, so its
+    history is worthless and must not carry over to a later, unrelated wedge.
+
+    Returns a NEW accumulator (the input is never mutated), shaped
+    ``{"strikes": int, "first_ts": float, "last_ts": float}``. ``first_ts`` is
+    the wedge clock's origin; ``last_ts`` is only advanced by this call, so the
+    spread grows with real time rather than with tick frequency.
+    """
+    if not eligible:
+        return None
+    strikes = 0
+    first_ts = now
+    if acc:
+        try:
+            strikes = max(0, int(acc.get("strikes", 0) or 0))
+        except (TypeError, ValueError):
+            strikes = 0
+        try:
+            raw_first = acc.get("first_ts")
+            if raw_first is not None:
+                first_ts = float(raw_first)
+        except (TypeError, ValueError):
+            first_ts = now
+        # A stored first_ts in the future means the wall clock moved backwards
+        # (NTP correction, a wrong-clock boot). Trusting it would make the
+        # channel look arbitrarily young or old; re-anchor on now instead.
+        if first_ts > now:
+            first_ts = now
+    return {"strikes": strikes + 1, "first_ts": first_ts, "last_ts": now}
+
+
+def wedge_strikes_satisfied(acc: Optional[Mapping], *,
+                            required_strikes: int = WEDGE_REQUIRED_STRIKES,
+                            min_spread_sec: float = WEDGE_MIN_SPREAD_SEC) -> bool:
+    """Whether the strike gate (count AND spread) is cleared. Both conditions
+    must hold: enough separate observations, and enough real time between the
+    first and the last of them."""
+    if not acc:
+        return False
+    try:
+        strikes = int(acc.get("strikes", 0) or 0)
+        first_ts = float(acc.get("first_ts", 0.0) or 0.0)
+        last_ts = float(acc.get("last_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if strikes < required_strikes:
+        return False
+    return (last_ts - first_ts) >= min_spread_sec
+
+
+def wedge_clock_expired(acc: Optional[Mapping], now: float,
+                        timeout_sec: float) -> bool:
+    """Whether the wedge clock -- running from the first eligible observation --
+    has passed ``timeout_sec``. Never true without an accumulator (the channel
+    has not been seen wedged even once)."""
+    if not acc:
+        return False
+    try:
+        first_ts = float(acc.get("first_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if first_ts <= 0:
+        return False
+    return (now - first_ts) >= timeout_sec
+
+
+def should_remediate_wedged_open(acc: Optional[Mapping], now: float, *,
+                                 timeout_sec: float,
+                                 required_strikes: int = WEDGE_REQUIRED_STRIKES,
+                                 min_spread_sec: float = WEDGE_MIN_SPREAD_SEC
+                                 ) -> bool:
+    """The full remediation verdict: the wedge clock has expired AND the strike
+    gate is cleared. Eligibility (gate 1) is the caller's job -- it is what
+    decides whether an observation is folded in at all."""
+    return (wedge_clock_expired(acc, now, timeout_sec)
+            and wedge_strikes_satisfied(acc, required_strikes=required_strikes,
+                                        min_spread_sec=min_spread_sec))
+
+
+# --- cooperative-close-before-force-close ---------------------------------
+# INVARIANT: the plugin never force-closes a channel without first giving a
+# cooperative close a genuine chance. A force-close is expensive (a mining fee),
+# slow to redeem (CSV timelocks) and irreversible, whereas a cooperative close
+# is cheap and immediate -- so a force-close is only ever correct when
+# cooperation was tried and did not work, or was impossible because the peer
+# could not be reached at all.
+#
+# The glue cannot simply await a cooperative close inline: it is an async
+# negotiation that can take minutes, while the watchdogs are synchronous scans.
+# So the attempt is launched, recorded, and the force-close escalation is
+# deferred to a later tick -- gated on this predicate.
+
+# How long cooperation gets before a force-close may escalate. Also the window a
+# never-reachable peer gets to come back before we accept that cooperation is
+# impossible.
+COOP_BEFORE_FORCE_WINDOW_SEC: float = 600.0
+# How many cooperative closes to attempt before accepting that the peer will not
+# cooperate. Each attempt gets its own full window, so this bounds the total
+# cooperation phase at roughly COOP_MAX_ATTEMPTS * COOP_BEFORE_FORCE_WINDOW_SEC.
+# A bound is essential: without one, a peer that stays reachable but refuses to
+# cooperate would earn a fresh attempt (and a fresh window) on every tick, and
+# the force-close backstop would never fire at all.
+COOP_MAX_ATTEMPTS: int = 3
+
+
+def coop_before_force_ready(attempt: Optional[Mapping], now: float, *,
+                            window_sec: float = COOP_BEFORE_FORCE_WINDOW_SEC
+                            ) -> bool:
+    """Whether a cooperative close has had its fair chance, so a force-close may
+    now proceed. Two ways to qualify, both requiring ``window_sec`` to elapse:
+
+      * we attempted a cooperative close and the channel still has not closed
+        (``last_coop_ts`` set) -- the peer refused, stalled, or vanished mid-
+        negotiation; or
+      * we have wanted to close since ``first_ts`` and never once found the peer
+        reachable enough to even attempt cooperation -- there is nobody to
+        cooperate with.
+
+    Returns False without a record: no close has been requested yet, so nothing
+    has earned an escalation.
+    """
+    if not attempt:
+        return False
+    try:
+        raw_last = attempt.get("last_coop_ts")
+        if raw_last is not None:
+            return (now - float(raw_last)) >= window_sec
+    except (TypeError, ValueError):
+        return False
+    try:
+        first_ts = float(attempt.get("first_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if first_ts <= 0:
+        return False
+    return (now - first_ts) >= window_sec
+
+
+# --- pending-channel freeze classification --------------------------------
+# A channel open that has not reached OPEN yet freezes plugin automation, so the
+# plugin does not re-fire while it settles. But "not yet OPEN" covers two very
+# different situations, and they deserve different treatment:
+#
+#   * still CONFIRMING -- the funding tx is accruing confirmations normally.
+#     Nothing is wrong; it just needs blocks. In a high-fee environment this can
+#     legitimately take days. Such a channel must not block reverse swaps on
+#     OTHER, already-open channels -- those are unrelated operations and
+#     stalling them for days is pure lost value. It does still block a second
+#     channel open, so on-chain funds are not committed twice over, but even
+#     that gives up after ``confirming_freeze_sec``.
+#   * WEDGED -- confirmed (or not progressing) and waiting on a peer that is not
+#     responding. This freezes everything, as before, until it ages out at
+#     ``stuck_sec`` and the watchdog takes over.
+
+
+def classify_pending_freeze(is_confirming: bool, age_sec: float, *,
+                            stuck_sec: float,
+                            confirming_freeze_sec: float) -> Tuple[bool, bool]:
+    """``(freezes_opens, freezes_swaps)`` for one pre-OPEN channel.
+
+    ``age_sec`` is measured from channel creation for both horizons -- this is
+    the freeze-escape clock, deliberately kept on plain wall-clock age so a
+    channel ALWAYS un-freezes automation eventually, whatever its confirmation
+    state. (The force-close clock is the one that starts later; see
+    ``record_wedge_strike``. Conflating the two would let a slow-confirming
+    channel freeze the plugin indefinitely.)
+    """
+    if is_confirming:
+        return (age_sec < confirming_freeze_sec, False)
+    return (age_sec < stuck_sec, age_sec < stuck_sec)
+
+
 # --- startup / shutdown readiness -----------------------------------------
 # The watchdogs read a peer's live reachability (``chan.is_active()``) to decide
 # it is offline -- faulting the peer and/or feeding an "it's gone" uptime metric.
@@ -972,6 +1188,13 @@ class LiquiditySnapshot:
     #   * reverse swaps whose funding tx is broadcast but not yet swept.
     pending_channel_count: int = 0
     inflight_swap_count: int = 0
+    # Pre-OPEN channels that are still legitimately CONFIRMING (funding tx
+    # accruing confirmations). Counted separately because they block only a
+    # further channel open -- never reverse swaps on other channels, which have
+    # nothing to do with this funding tx confirming. See
+    # ``classify_pending_freeze``. Channels counted here are NOT in
+    # ``pending_channel_count``; the two are disjoint.
+    pending_open_freeze_count: int = 0
     # Number of channel opens the glue has executed within the trailing 24h
     # (rolling window), for the ``max_opens_per_day`` ceiling. The glue counts
     # these from its persisted action-timestamp store; 0 in the pure tests unless
@@ -1189,11 +1412,17 @@ def evaluate(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> DecisionRe
 
     Order of reasoning:
       1. If automation is off, do nothing (and record nothing).
-      2. GLOBAL FREEZE: if any plugin-relevant transaction is still in flight
-         (a channel open not yet OPEN, or a reverse swap not yet swept), take
-         *no* action this tick -- neither opens nor swaps. This stops the plugin
-         re-firing every tick while, e.g., a channel open is still confirming.
-      3. Otherwise consider a channel open first (so a cold wallet builds
+      2. GLOBAL FREEZE: if a plugin-relevant transaction is in flight in a way
+         that blocks everything (a channel open that is NOT simply confirming,
+         or a reverse swap not yet swept), take *no* action this tick -- neither
+         opens nor swaps.
+      3. PARTIAL FREEZE: a channel open that is merely waiting for
+         confirmations blocks only a further open (so on-chain funds are not
+         committed twice), while reverse swaps on other, already-open channels
+         proceed normally. Confirmation can legitimately take days in a high-fee
+         environment, and stalling unrelated channels for that long is pure lost
+         value.
+      4. Otherwise consider a channel open first (so a cold wallet builds
          capacity before draining it), then reverse swaps. A freshly opened
          channel is not yet ``is_active`` and so is never reverse-swapped in the
          same cycle that opens it.
@@ -1217,11 +1446,24 @@ def evaluate(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> DecisionRe
     actions: List[Action] = []
     declines: List[DeclineRecord] = []
 
-    open_action, open_decline = _decide_channel_open(snapshot, config)
-    if open_action is not None:
-        actions.append(open_action)
-    if open_decline is not None:
-        declines.append(open_decline)
+    confirming = snapshot.pending_open_freeze_count
+    if confirming > 0:
+        # Partial freeze: opens only. Recorded as an "open" decline rather than
+        # a "freeze" one, because the tick is not frozen -- swaps below still
+        # run, and labelling it a freeze would misreport that in the log.
+        declines.append(DeclineRecord(
+            kind="open",
+            reason=(
+                f"{confirming} channel open(s) still confirming on-chain; not "
+                f"opening another until they confirm (reverse swaps unaffected)"
+            ),
+        ))
+    else:
+        open_action, open_decline = _decide_channel_open(snapshot, config)
+        if open_action is not None:
+            actions.append(open_action)
+        if open_decline is not None:
+            declines.append(open_decline)
 
     swap_actions, swap_declines = _decide_reverse_swaps(snapshot, config)
     actions.extend(swap_actions)
