@@ -84,17 +84,40 @@ class _FakeWallet:
 
 
 class _Chan:
-    def __init__(self, state, *, node_id=NODE_A, cid=CID, active=False) -> None:
+    """Fake channel.
+
+    ``active`` (``is_active()``) drives the UPTIME metric, while ``reachable``
+    (``peer_state`` / the peer manager) drives whether a cooperative close can
+    be attempted. They usually coincide and ``reachable`` defaults to ``active``,
+    but they are genuinely separate signals in Electrum -- ``is_active()`` is
+    hardcoded to ``state == OPEN``, so it cannot express reachability for the
+    pre-OPEN channels the wedged-open path closes. Tests that need to make the
+    peer talkable without also feeding the uptime metric set them apart.
+    """
+
+    def __init__(self, state, *, node_id=NODE_A, cid=CID, active=False,
+                 reachable=None) -> None:
         self.channel_id = bytes.fromhex(cid)
         self.node_id = bytes.fromhex(node_id)
         self.state = state
         self.active = active
+        self.reachable = active if reachable is None else reachable
+        self.funding_outpoint = SimpleNamespace(txid=cid)
+        self.lnworker = None            # set by _lnworker_with
 
     def get_state(self):
         return self.state
 
     def is_active(self):
         return self.active
+
+    def funding_txn_minimum_depth(self):
+        return 3
+
+    @property
+    def peer_state(self):
+        from electrum.lnchannel import PeerState
+        return PeerState.GOOD if self.reachable else PeerState.DISCONNECTED
 
 
 def _lnworker_with(channels):
@@ -105,11 +128,19 @@ def _lnworker_with(channels):
         coop.append(cid)
         return "coop-txid"
 
+    adb = SimpleNamespace(get_tx_height=lambda txid: SimpleNamespace(conf=6))
     ln = SimpleNamespace(
         channels={c.channel_id: c for c in channels},
         schedule_force_closing=lambda cid: forced.append(cid),
         close_channel=_close,
+        lnwatcher=SimpleNamespace(adb=adb),
+        lnpeermgr=SimpleNamespace(
+            get_peer_by_pubkey=lambda pk: next(
+                (object() for c in channels
+                 if c.node_id == pk and c.reachable), None)),
     )
+    for c in channels:
+        c.lnworker = ln
     return ln, forced, coop
 
 
@@ -119,6 +150,7 @@ def _plugin(**overrides) -> LiquidityPlugin:
     p.logger = logging.getLogger("test.inbound_liquidity.autoclose")
     p._coop_closing = {}
     p._coop_close_cooldown_until = {}
+    p._close_capped_logged = {}
     p._last_decline_sigs = {}
     # Startup-race guard state: grace=0.0 means the wallet is treated as fully
     # settled, so a not-connected peer is a genuine offline (these tests predate
@@ -227,6 +259,12 @@ def test_recovered_peer_cancels_pending_close(clock) -> None:
 
 
 # --- force-close escalation ----------------------------------------------
+# Reaching the deadline no longer force-closes on the spot: the close is handed
+# to the single close path, which force-closes only once a cooperative close has
+# been attempted or shown to be impossible (COOP_BEFORE_FORCE_WINDOW_SEC).
+COOP_WINDOW = pkg.COOP_BEFORE_FORCE_WINDOW_SEC
+
+
 def test_force_close_after_deadline(clock) -> None:
     chan = _Chan(_state("OPEN"), active=False)
     ln, forced, _ = _lnworker_with([chan])
@@ -236,11 +274,18 @@ def test_force_close_after_deadline(clock) -> None:
     assert CID in w.db.get(CLOSE_INTENT_DB_KEY, {})
     clock.advance(FORCE_SEC + 1)                          # past the deadline
     p._scan_offline_autoclose(w)
+    # The peer is unreachable, so cooperation is impossible -- but it still gets
+    # its window to come back before we spend a force-close.
+    assert forced == []
+    clock.advance(COOP_WINDOW + 1)
+    p._scan_offline_autoclose(w)
     assert forced == [bytes.fromhex(CID)]
     # It counted against the daily close ceiling and logged a close action.
     assert p._count_actions_last_24h(w, "close") == 1
     closes = [e for e in p.get_decision_log(w, "action") if e.get("kind") == "close"]
     assert any("force-closed offline" in (e.get("reason") or "") for e in closes)
+    # The log says why a force-close was justified rather than a cooperative one.
+    assert any("never reachable" in (e.get("detail") or "") for e in closes)
 
 
 def test_force_close_deferred_when_ceiling_reached(clock) -> None:
@@ -252,6 +297,8 @@ def test_force_close_deferred_when_ceiling_reached(clock) -> None:
     p._record_action_event(w, "close")                   # ceiling (1) already used
     assert _drive_to_commit(p, w, chan, clock=clock)
     clock.advance(FORCE_SEC + 1)
+    p._scan_offline_autoclose(w)
+    clock.advance(COOP_WINDOW + 1)
     p._scan_offline_autoclose(w)
     assert forced == []                                  # deferred by the cap
     # Raising the ceiling releases it.
@@ -266,7 +313,7 @@ def test_cooperative_close_attempted_when_peer_reachable(clock) -> None:
     ln, forced, _ = _lnworker_with([chan])
     p, w = _plugin(), _FakeWallet(ln)
     calls: List[str] = []
-    p._maybe_cooperative_close = lambda wal, ch, cid, nid, now: calls.append(cid)
+    p._maybe_cooperative_close = lambda wal, ch, cid, nid, now, **kw: calls.append(cid) or True
     _tag(p, w, CID)
     assert _drive_to_commit(p, w, chan, clock=clock)     # commit (ratio ~0%)
     assert CID in w.db.get(CLOSE_INTENT_DB_KEY, {})
@@ -275,6 +322,70 @@ def test_cooperative_close_attempted_when_peer_reachable(clock) -> None:
     p._scan_offline_autoclose(w)
     assert calls == [CID]                                # cooperative close attempted
     assert forced == []
+
+
+def test_reachable_peer_gets_coop_close_before_force_at_deadline(clock) -> None:
+    """The invariant: even past the force-close deadline, a peer we can talk to
+    gets a cooperative close attempt first -- a force-close is never the plugin's
+    opening move."""
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS=FORCE_SEC / DAY), _FakeWallet(ln)
+    calls: List[str] = []
+    p._maybe_cooperative_close = lambda wal, ch, cid, nid, now, **kw: calls.append(cid) or True
+    _tag(p, w, CID)
+    assert _drive_to_commit(p, w, chan, clock=clock)
+    clock.advance(FORCE_SEC + 1)                         # deadline reached
+    # The peer is talkable again (so cooperation is possible) but the channel is
+    # still not usable, so uptime stays low and the close intent holds.
+    chan.reachable = True
+    p._scan_offline_autoclose(w)
+    assert calls == [CID] and forced == []               # cooperated, did not force
+    # Only after cooperation has had its window does a force-close follow.
+    chan.reachable = False
+    clock.advance(COOP_WINDOW + 1)
+    p._scan_offline_autoclose(w)
+    assert forced == [bytes.fromhex(CID)]
+    closes = [e for e in p.get_decision_log(w, "action") if e.get("kind") == "close"]
+    assert any("cooperative close attempt" in (e.get("detail") or "") for e in closes)
+
+
+def test_recovered_peer_clears_the_close_attempt_record(clock) -> None:
+    """A cancelled close must drop its attempt record. Otherwise a re-commit
+    later would find a long-expired ``first_ts``, decide cooperation had already
+    had its chance, and force-close on the very first tick."""
+    from electrum.plugins.inbound_liquidity import CLOSE_ATTEMPT_DB_KEY
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS=FORCE_SEC / DAY), _FakeWallet(ln)
+    _tag(p, w, CID)
+    assert _drive_to_commit(p, w, chan, clock=clock)
+    clock.advance(FORCE_SEC + 1)
+    p._scan_offline_autoclose(w)                     # stamps the attempt record
+    assert CID in w.db.get(CLOSE_ATTEMPT_DB_KEY, {})
+
+    # Peer comes back for good: uptime recovers, the close intent is cancelled.
+    chan.active = True
+    for _ in range(40):
+        clock.advance(WINDOW_SEC / 20)
+        p._scan_offline_autoclose(w)
+    assert CID not in w.db.get(CLOSE_INTENT_DB_KEY, {}), "intent should be cancelled"
+    assert CID not in w.db.get(CLOSE_ATTEMPT_DB_KEY, {}), \
+        "the close-attempt record must be cleared with the intent"
+    assert forced == []
+
+
+def test_close_attempts_are_forgotten_for_vanished_channels(clock) -> None:
+    """The attempt store must not grow without bound as channels are redeemed
+    and removed."""
+    from electrum.plugins.inbound_liquidity import CLOSE_ATTEMPT_DB_KEY
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, _forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    _tag(p, w, CID)
+    w.db.put(CLOSE_ATTEMPT_DB_KEY, {"dead" * 16: {"first_ts": 1.0}})
+    p._scan_offline_autoclose(w)
+    assert "dead" * 16 not in w.db.get(CLOSE_ATTEMPT_DB_KEY, {})
 
 
 def test_do_cooperative_close_calls_lnworker_and_logs(clock) -> None:

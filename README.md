@@ -91,16 +91,60 @@ ops regardless of who started them:
 This stops the plugin from, e.g., opening a second channel every tick while the
 first open is still confirming.
 
-Two exceptions keep one wedged operation from freezing automation forever:
+A channel that is merely **still confirming** (its funding tx has not yet reached
+the depth the peer requires) is treated differently: it blocks only a further
+channel *open* — for up to the **confirming-open freeze** (Advanced tab, default
+3 days) — and never blocks reverse swaps on other, already-open channels. In a
+high-fee environment a funding tx can legitimately take days to confirm, and
+stalling unrelated channels for that long is pure lost value.
+
+Two exceptions keep one genuinely wedged operation from freezing automation
+forever:
 
 - a channel stuck *opening* past the **stuck channel-open timeout** (Advanced
-  tab) is treated as wedged by an unresponsive peer — it no longer counts toward
-  the freeze, so automation can resume (and, if "Force-close wedged channel
-  opens" is enabled, the wedged open is force-closed to free the funds), and
+  tab, default 60 min) is treated as wedged by an unresponsive peer — it no
+  longer counts toward the freeze, so automation can resume, and
 - a reverse swap whose funding is broadcast but still unswept past the **stuck
   reverse-swap timeout** (Advanced tab, default 3 h) likewise stops counting
   toward the freeze. The swap is still tracked and its provider still faulted
   separately — this only releases the freeze so other opens/swaps can proceed.
+
+### Closing a wedged channel open
+
+Releasing the freeze (above) is cheap and reversible. *Closing* the channel is
+neither — a force-close costs a mining fee and locks the funds behind a CSV
+timelock — so it is governed by its own, far more conservative set of gates, all
+of which must pass:
+
+1. **Not merely confirming.** While the funding tx is still accruing
+   confirmations, nothing is wrong and the clock does not even start.
+2. **The wedge clock**, timed from the first moment the channel looked wedged —
+   *not* from when it was created, so time spent waiting for confirmations never
+   counts against it. Default 6 h (Advanced tab).
+3. **Repeated, spread-out evidence**: the channel must look wedged on several
+   separate checks (default 5) spanning at least a minimum interval (default
+   60 min). Evaluation ticks are event-driven and can fire in bursts, so a count
+   alone would be nearly free to satisfy.
+
+An absolute 7-day backstop from channel creation overrides gate 1, so a funding
+tx that never confirms cannot keep the funds locked indefinitely.
+
+### Cooperative close always comes first
+
+**The plugin never force-closes a channel without first attempting — or ruling
+out — a cooperative close.** Both watchdogs (wedged opens and offline
+auto-close) funnel through a single close path that:
+
+- attempts a cooperative close whenever the peer can be reached at all, retrying
+  up to 3 times, each with its own window;
+- force-closes only once cooperation has had that window (default 10 min) and
+  either failed or was impossible because no peer connection existed;
+- never touches a `WE_ARE_TOXIC` channel, where Electrum states that
+  force-closing by us is unsafe.
+
+The close action logged in the Actions view records which of these applied
+("after N cooperative close attempt(s)" vs "peer was never reachable to close
+cooperatively").
 
 ### Heartbeat
 

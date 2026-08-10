@@ -1246,10 +1246,13 @@ class Plugin(LiquidityPlugin):
                                          "force-close, and auto-ban serial offenders."))
         v.addWidget(peer_reliability_cb)
 
-        auto_remediate_cb = QCheckBox(_("Force-close wedged channel opens"))
-        auto_remediate_cb.setToolTip(_("When a channel open is wedged past the timeout, force-close "
-                                       "it to free the funds and resume automation (broadcasts a tx "
-                                       "and incurs a mining fee)."))
+        auto_remediate_cb = QCheckBox(_("Close wedged channel opens"))
+        auto_remediate_cb.setToolTip(_("When a channel open stays wedged, close it to free the funds. "
+                                       "Time spent waiting for the funding transaction to confirm "
+                                       "does not count, the channel must look wedged on several "
+                                       "checks spread over time, and a cooperative close is always "
+                                       "attempted first; a force-close (which broadcasts a tx and "
+                                       "incurs a mining fee) is the last resort."))
         v.addWidget(auto_remediate_cb)
 
         autoclose_cb = QCheckBox(_("Auto-close channels whose peer stays offline"))
@@ -1339,6 +1342,22 @@ class Plugin(LiquidityPlugin):
             (_("Stuck channel-open timeout (minutes)"),
              'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN', max(1, int(val)))),
+            (_("Force-close a wedged channel open after (minutes)"),
+             'INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN',
+                                 max(1, int(val)))),
+            (_("Wedged-open: checks required before closing"),
+             'INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS', max(1, int(val)))),
+            (_("Wedged-open: those checks must span (minutes)"),
+             'INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN', max(0, int(val)))),
+            (_("Wait for a cooperative close before forcing (minutes)"),
+             'INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN', max(0, int(val)))),
+            (_("Confirming open blocks new opens for (days)"),
+             'INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS', max(0.0, val))),
             (_("Stuck reverse-swap timeout (minutes)"),
              'INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN', max(1, int(val)))),
