@@ -34,7 +34,7 @@ from . import (
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
 from .liquidity_manager import normalize_node_id
-from .log_buffer import LEVEL_CHOICES, clamp_max_lines
+from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
 from .qt_widgets import ToggleSwitch
 
 if TYPE_CHECKING:
@@ -489,7 +489,10 @@ class Plugin(LiquidityPlugin):
                     cfg.get("max_opens_per_day"), state.get("opens_last_24h", "?"),
                     cfg.get("max_closes_per_day")))
         for ch in state.get("channels", []):
-            lines.append(_("chan {}: cap {} local {} remote {} spendable {} active={}").format(
+            # "sendable" (not "spendable"): the figure is what Electrum will let
+            # us send over this channel, i.e. after its routing-fee reserve, so it
+            # reads lower than the channel's local balance by design.
+            lines.append(_("chan {}: cap {} local {} remote {} sendable {} active={}").format(
                 ch.get("short_id"), _fmt_sat(ch.get("capacity_sat")),
                 _fmt_sat(ch.get("local_sat")), _fmt_sat(ch.get("remote_sat")),
                 _fmt_sat(ch.get("spendable_local_sat")), ch.get("is_active")))
@@ -634,13 +637,26 @@ class Plugin(LiquidityPlugin):
         capture_ln_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN', False)))
 
         capture_debug_cb = QCheckBox(_("Capture debug-level logs"))
-        capture_debug_cb.setToolTip(_("Force debug-level logging while this is on. Electrum "
-                                      "normally produces debug records already (they are just "
-                                      "hidden), so this matters only if you started Electrum with "
-                                      "a reduced verbosity — in which case it also makes those "
-                                      "records appear in Electrum's own log file. The previous "
-                                      "setting is restored when you turn it off."))
+        capture_debug_cb.setToolTip(_("Force debug-level logging while this is on, including for "
+                                      "subsystems that quieten themselves (Electrum pins its "
+                                      "nostr client to info level, which hides whether a swap "
+                                      "provider ever replied). Electrum's main logger is normally "
+                                      "at debug already, so if the hint beside this box says so, "
+                                      "ticking it only affects those pinned subsystems. The "
+                                      "previous levels are restored when you turn it off."))
         capture_debug_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG', False)))
+
+        # Say out loud that Electrum is already emitting debug records, so the
+        # checkbox above does not read as broken when ticking it adds nothing.
+        capture_hint = QLabel("")
+        capture_hint.setStyleSheet("color: gray;")
+
+        def _refresh_capture_hint() -> None:
+            if LogCapture.already_emits_debug():
+                capture_hint.setText(_("(Electrum already logs at debug level; the filter above "
+                                       "controls what you see)"))
+            else:
+                capture_hint.setText("")
 
         buffer_edit = QLineEdit(str(getattr(c, 'INBOUND_LIQUIDITY_LOG_BUFFER_LINES',
                                             DEFAULT_LOG_BUFFER_LINES)))
@@ -652,15 +668,22 @@ class Plugin(LiquidityPlugin):
         capture_row = QHBoxLayout()
         capture_row.addWidget(capture_ln_cb)
         capture_row.addWidget(capture_debug_cb)
+        capture_row.addWidget(capture_hint)
         capture_row.addStretch(1)
         capture_row.addWidget(QLabel(_("Buffer (lines)")))
         capture_row.addWidget(buffer_edit)
         v.addLayout(capture_row)
+        _refresh_capture_hint()
 
         def _apply_capture() -> None:
             setattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_LN', capture_ln_cb.isChecked())
             setattr(c, 'INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG', capture_debug_cb.isChecked())
             self.apply_log_capture_settings()
+            _refresh_capture_hint()
+            # Re-render now. Without this the view only changes on the next timer
+            # tick, and then only if the ring happened to move -- so a toggle that
+            # did take effect still looked like it had done nothing.
+            _force_refresh()
 
         def _apply_buffer() -> None:
             """Persist the buffer size, clamped. A non-numeric entry is rejected
@@ -754,6 +777,7 @@ class Plugin(LiquidityPlugin):
                 cb.blockSignals(False)
             if not buffer_edit.hasFocus():      # don't fight a half-typed value
                 buffer_edit.setText(str(self.log_buffer_lines()))
+            _refresh_capture_hint()
             refresh(force=True)
 
         level_combo.currentIndexChanged.connect(_force_refresh)

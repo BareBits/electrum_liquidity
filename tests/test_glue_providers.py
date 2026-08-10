@@ -247,6 +247,92 @@ def test_reverse_swap_targets_chosen_provider() -> None:
     assert "npubCHOSEN" in logged["detail"]
 
 
+def test_reverse_swap_tells_the_transport_which_npub_it_chose() -> None:
+    """The transport needs the chosen provider in *npub* form, not just its
+    pubkey, to follow that provider's announced relays (see
+    TargetedNostrTransport.update_relays). It must be set BEFORE update_pairs(),
+    because update_pairs is what wakes the relay-following loop."""
+    p = _plugin()
+    p.config = SimpleNamespace(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
+
+    order = []
+    sm = SimpleNamespace(
+        mining_fee=1_000,
+        is_initialized=asyncio.Event(),
+        get_recv_amount=lambda amt, *, is_reverse: amt - 500,
+        _swaps={},
+    )
+    sm.is_initialized.set()
+
+    offer = SimpleNamespace(server_pubkey="ab" * 32, pairs=SimpleNamespace())
+    transport = SimpleNamespace(
+        target_pubkey=None, target_npub=None,
+        get_offer=lambda npub: offer if npub == "npubCHOSEN" else None)
+
+    def _update_pairs(pairs):
+        # Snapshot what the transport already knows at this moment.
+        order.append(("update_pairs", transport.target_npub))
+    sm.update_pairs = _update_pairs
+
+    async def _rs(**kw):
+        order.append(("reverse_swap", transport.target_npub))
+        return "txid"
+    sm.reverse_swap = _rs
+
+    wallet = SimpleNamespace(lnworker=SimpleNamespace(swap_manager=sm))
+    p._log_action = lambda wallet, **kw: None
+    p.on_action_done = lambda wallet, msg: None
+    p._record_provider_success = lambda *a, **k: None
+    p._accrue_dev_fee = lambda *a, **k: None
+
+    action = ReverseSwapAction(channel_id="aa" * 32, short_id="1x1x1",
+                               lightning_amount_sat=400_000, reason="drain",
+                               provider_npub="npubCHOSEN")
+    asyncio.run(p._reverse_swap(wallet, action, state={}, transport=transport))
+
+    assert transport.target_npub == "npubCHOSEN"
+    assert transport.target_pubkey == "ab" * 32
+    # npub was already in place when the relay-following loop was woken.
+    assert order == [("update_pairs", "npubCHOSEN"), ("reverse_swap", "npubCHOSEN")]
+
+
+def test_reverse_swap_tolerates_a_transport_without_target_npub() -> None:
+    """URL-mode / stock transports have no such attribute; must not crash."""
+    p = _plugin()
+    p.config = SimpleNamespace(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
+    sm = SimpleNamespace(
+        mining_fee=1_000,
+        is_initialized=asyncio.Event(),
+        update_pairs=lambda pairs: None,
+        get_recv_amount=lambda amt, *, is_reverse: amt - 500,
+        _swaps={},
+    )
+    sm.is_initialized.set()
+    calls = []
+
+    async def _rs(**kw):
+        calls.append(kw)
+        return "txid"
+    sm.reverse_swap = _rs
+
+    offer = SimpleNamespace(server_pubkey="cd" * 32, pairs=SimpleNamespace())
+    transport = SimpleNamespace(       # note: no target_npub attribute
+        target_pubkey=None,
+        get_offer=lambda npub: offer if npub == "npubCHOSEN" else None)
+    wallet = SimpleNamespace(lnworker=SimpleNamespace(swap_manager=sm))
+    p._log_action = lambda wallet, **kw: None
+    p.on_action_done = lambda wallet, msg: None
+    p._record_provider_success = lambda *a, **k: None
+    p._accrue_dev_fee = lambda *a, **k: None
+
+    action = ReverseSwapAction(channel_id="aa" * 32, short_id="1x1x1",
+                               lightning_amount_sat=400_000, reason="drain",
+                               provider_npub="npubCHOSEN")
+    asyncio.run(p._reverse_swap(wallet, action, state={}, transport=transport))
+    assert len(calls) == 1
+    assert not hasattr(transport, "target_npub")
+
+
 def test_reverse_swap_skips_when_offer_gone() -> None:
     p = _plugin()
     p.config = SimpleNamespace(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)

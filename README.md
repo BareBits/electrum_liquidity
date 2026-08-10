@@ -58,9 +58,14 @@ ceilings, diagnostics, etc.).
 | `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once, by dialog, the first time the plugin loads. Nothing is ever downloaded or installed | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
-(bounded by the channel's spendable balance, minus any `min_outbound_sat`
-floor). Opening a channel funds with the **maximum minus the on-chain reserve**,
-with the mining fee deducted so the transaction is feasible.
+(bounded by what Electrum can actually *send* over the channel, minus any
+`min_outbound_sat` floor). That send ceiling is the channel's spendable balance
+less the routing-fee budget Electrum reserves for a max-amount payment — the
+same figure Electrum's own "Max" button uses — because a reverse swap's
+Lightning side is two payments (the swap invoice and the provider's mining-fee
+prepayment) and both have to fit. Opening a channel funds with the **maximum
+minus the on-chain reserve**, with the mining fee deducted so the transaction is
+feasible.
 
 By default the plugin manages **only the channels it opened itself**
 (`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a
