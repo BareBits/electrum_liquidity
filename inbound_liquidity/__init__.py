@@ -52,6 +52,7 @@ from .liquidity_manager import (
     Action,
     ChannelSnapshot,
     clean_npub,
+    CloseChannelAction,
     DAILY_WINDOW_SEC,
     DeclineRecord,
     LiquidityConfig,
@@ -59,6 +60,7 @@ from .liquidity_manager import (
     MAX_SUGGESTED_PARTNERS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
+    over_swap_trigger,
     PartnerResolution,
     ProviderOffer,
     ProviderReliability,
@@ -400,6 +402,14 @@ MAX_ACTION_TIMESTAMPS = 1000
 # closes (the watchdog's wedged-open force-close) are gated in the glue.
 DEFAULT_MAX_OPENS_PER_DAY = 5
 DEFAULT_MAX_CLOSES_PER_DAY = 5
+# Shipped default for the liquidity goal (sat): the channel size the plugin aims
+# for. A plugin-opened channel smaller than this is replaced once it is blocking
+# a bigger one -- see `_decide_undersized_closes` in the engine for the full gate
+# list. Ships ACTIVE (not 0/off), so the rule applies to existing wallets on
+# upgrade; the guards that make that safe are the channel-ceiling condition (the
+# rule only fires when a small channel is actually in the way) and the swap
+# trigger (a channel is only replaceable once the plugin has drained it).
+DEFAULT_LIQUIDITY_GOAL_SAT = 100_000
 
 # --- channel-funding floor override ---------------------------------------
 # Electrum's stock MIN_FUNDING_SAT (lnutil, 200_000) is a hard floor on new-
@@ -558,6 +568,12 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = ConfigVar(
                         "window. This includes the emergency force-close of a channel whose "
                         "open got wedged; once the ceiling is reached, a wedged open is not "
                         "auto-freed until the window rolls over. 0 = unlimited."))
+SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT = ConfigVar(
+    'plugins.inbound_liquidity.liquidity_goal_sat', default=DEFAULT_LIQUIDITY_GOAL_SAT,
+    type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Liquidity goal"),
+    long_desc=lambda: _("Automatically close small channels and re-open bigger channels "
+                        "if we have sufficient funds to reach this goal"))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.max_swap_fee_pct', default=0.9, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
@@ -1521,6 +1537,7 @@ class LiquidityPlugin(BasePlugin):
             min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(),
+            liquidity_goal_sat=self._liquidity_goal_sat(),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
         )
@@ -1533,6 +1550,17 @@ class LiquidityPlugin(BasePlugin):
         this flag, so a manual run still flows through the engine and acts
         normally."""
         return bool(getattr(self.config, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", False))
+
+    def _liquidity_goal_sat(self) -> int:
+        """The configured liquidity goal in sat, clamped non-negative. A garbage
+        or missing value reads as the shipped default rather than raising: this
+        is read on every tick, and a hand-edited config must not be able to abort
+        the whole evaluation."""
+        try:
+            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_GOAL_SAT",
+                                      DEFAULT_LIQUIDITY_GOAL_SAT)))
+        except (TypeError, ValueError):
+            return DEFAULT_LIQUIDITY_GOAL_SAT
 
     # --- daily action ceilings (rolling 24h) ------------------------------
     # A runaway guard: at most N opens / N closes in any trailing 24h window.
@@ -2914,7 +2942,7 @@ class LiquidityPlugin(BasePlugin):
             if not self._coop_close_possible(chan):
                 return False
             if not self._maybe_cooperative_close(wallet, chan, cid, node_id, now,
-                                                 reason=reason):
+                                                 reason=reason, detail=detail):
                 return False
             rec["coop_attempts"] = attempts + 1
             rec["last_coop_ts"] = now
@@ -2957,7 +2985,8 @@ class LiquidityPlugin(BasePlugin):
 
     def _maybe_cooperative_close(self, wallet: 'Abstract_Wallet', chan, cid: str,
                                  node_id: str, now: float, *,
-                                 reason: str = "offline channel") -> bool:
+                                 reason: str = "offline channel",
+                                 detail: Optional[str] = None) -> bool:
         """Launch a cooperative close on a channel whose peer is reachable, unless
         one is already in flight or we attempted one recently (cooldown).
         Returns whether an attempt was actually launched. The close is async and
@@ -2975,7 +3004,7 @@ class LiquidityPlugin(BasePlugin):
         coop_inflight.add(cid)
         loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
         coro = self._do_cooperative_close(wallet, chan.channel_id, cid, node_id,
-                                          reason=reason)
+                                          reason=reason, detail=detail)
         if loop is not None:
             asyncio.run_coroutine_threadsafe(coro, loop)
         else:
@@ -2984,7 +3013,8 @@ class LiquidityPlugin(BasePlugin):
 
     async def _do_cooperative_close(self, wallet: 'Abstract_Wallet', chan_id: bytes,
                                     cid: str, node_id: str, *,
-                                    reason: str = "offline channel") -> None:
+                                    reason: str = "offline channel",
+                                    detail: Optional[str] = None) -> None:
         lnworker = getattr(wallet, "lnworker", None)
         try:
             self.logger.info(
@@ -2997,8 +3027,13 @@ class LiquidityPlugin(BasePlugin):
                 wallet, kind="close", amount_sat=None,
                 source=self._abbrev(node_id) or node_id or None, dest=None,
                 reason=f"cooperatively closed {reason}",
-                detail=f"channel {cid[:12]}… closed with a reachable peer, "
-                       f"avoiding a force-close",
+                # The caller's own justification (e.g. the liquidity-goal
+                # arithmetic) leads, so the entry explains WHY this channel was
+                # closed and not merely how.
+                detail="; ".join(filter(None, [
+                    detail,
+                    f"channel {cid[:12]}… closed with a reachable peer, "
+                    f"avoiding a force-close"])),
                 state=None)
         except Exception as e:
             # Peer went away mid-close, or refused: leave the intent in place so
@@ -3007,6 +3042,52 @@ class LiquidityPlugin(BasePlugin):
                 f"cooperative close of {cid[:12]}… did not complete: {e!r}")
         finally:
             self._coop_closing.get(wallet, set()).discard(cid)
+
+    def _close_undersized_channel(self, wallet: 'Abstract_Wallet',
+                                  action: CloseChannelAction,
+                                  state: Optional[Dict] = None) -> None:
+        """Execute an engine-decided undersized-channel replacement.
+
+        Deliberately thin: everything that makes a close safe -- cooperation
+        first, the daily close ceiling, the force-close backstop, the
+        WE_ARE_TOXIC refusal -- already lives in ``_request_close``, and routing
+        through it is what keeps the "never force-close without first trying to
+        cooperate" invariant true by construction rather than by review. The
+        engine has already established that the peer is reachable, so the very
+        first call here normally completes cooperatively; the escalation path
+        only matters if the peer vanishes mid-negotiation.
+        """
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return
+        cid = action.channel_id
+        try:
+            chan = lnworker.channels.get(bytes.fromhex(cid))
+        except (ValueError, AttributeError):
+            chan = None
+        if chan is None:
+            # Closed or forgotten between snapshot and execution. Nothing to do;
+            # the next tick re-reads the world.
+            self.logger.info(
+                f"undersized channel {cid[:12]}… is no longer present; skipping close")
+            return
+        node_id = self._channel_peer_node_id(wallet, cid)
+        goal = self._liquidity_goal_sat()
+        self.logger.info(
+            f"replacing undersized channel {cid[:12]}… ({action.capacity_sat} sat "
+            f"capacity, below the {goal} sat liquidity goal)")
+        # No decision-log entry is written here on purpose. _request_close may
+        # legitimately do nothing this tick -- the daily close ceiling can defer
+        # it, or a cooperative close may already be negotiating -- and an entry
+        # written before the attempt would claim a close that never happened.
+        # The close paths themselves log the real event (cooperative on success,
+        # force-close on escalation), so the arithmetic is handed to them as
+        # `detail` and appears on whichever one actually fires.
+        self._request_close(
+            wallet, chan, cid, node_id, time.time(),
+            reason="undersized channel (liquidity goal)",
+            detail=f"capacity {action.capacity_sat} sat is below the {goal} sat "
+                   f"liquidity goal and was blocking a bigger channel")
 
     def _offers_from_transport(self, wallet: Optional['Abstract_Wallet'],
                                transport: Optional['SwapServerTransport']
@@ -3224,6 +3305,13 @@ class LiquidityPlugin(BasePlugin):
         now = time.time()
         pending_channel_count = 0
         pending_open_freeze_count = 0
+        # Closes under way but not yet mined. WE_ARE_TOXIC is excluded on
+        # purpose: it is not a close in progress (only the remote may close such
+        # a channel) and it can persist indefinitely, so counting it would wedge
+        # the undersized-replacement rule for good.
+        closing_states = (ChannelState.SHUTDOWN, ChannelState.CLOSING,
+                          ChannelState.FORCE_CLOSING, ChannelState.REQUESTED_FCLOSE)
+        closing_channel_count = 0
         # Set of channel ids (hex) the plugin opened itself, for the
         # manage-plugin-opened-only scope switch. Read once per snapshot.
         plugin_opened = self._plugin_opened_channels(wallet)
@@ -3242,6 +3330,12 @@ class LiquidityPlugin(BasePlugin):
             except Exception:  # noqa: BLE001
                 pass
             capacity = chan.get_capacity() or 0
+            # Unguarded: the dead-channel filter above has already called
+            # get_state() successfully for this channel, so a try/except here
+            # would only defer the same failure to the `pending_states` check on
+            # the next line.
+            if chan.get_state() in closing_states:
+                closing_channel_count += 1
             if chan.get_state() in pending_states:
                 # Age is from channel creation for BOTH horizons: this is the
                 # freeze-escape clock, and it must always run so a pre-OPEN
@@ -3345,6 +3439,7 @@ class LiquidityPlugin(BasePlugin):
             pending_open_freeze_count=pending_open_freeze_count,
             inflight_swap_count=inflight_swap_count,
             opens_last_24h=self._count_actions_last_24h(wallet, "open", now),
+            closing_channel_count=closing_channel_count,
         )
 
     # --- event handling ---------------------------------------------------
@@ -3501,6 +3596,36 @@ class LiquidityPlugin(BasePlugin):
                     declines.append(await self._no_partner_decline(wallet, action, res))
                     continue
                 executable.append((action, list(res.candidates)))
+            elif isinstance(action, CloseChannelAction):
+                # Closing a channel is irreversible and costs a mining fee, and
+                # the ONLY reason to do it here is to reopen bigger. So verify a
+                # partner would actually be there to reopen to -- otherwise the
+                # close destroys inbound liquidity and buys nothing. The closing
+                # channel's own peer is exempted from the one-channel-per-peer
+                # guard: it is about to be freed by this very close, and leaving
+                # it excluded would let the guard veto every replacement on a
+                # small peer set.
+                self._set_status(wallet, "resolving channel partners")
+                peer = normalize_node_id(
+                    self._channel_peer_node_id(wallet, action.channel_id))
+                res = await self._resolve_partners_detailed(
+                    wallet, ignore_peers=frozenset([peer]) if peer else frozenset())
+                self.logger.info(
+                    f"replacement partners for {action.short_id}: "
+                    f"{len(res.candidates)} candidate(s) "
+                    f"({self._partner_breakdown(wallet, res)})")
+                if not res.candidates:
+                    declines.append(DeclineRecord(
+                        kind="close", channel_id=action.channel_id,
+                        short_id=action.short_id, amount_sat=action.capacity_sat,
+                        reason=(f"channel {action.short_id} is below the liquidity "
+                                f"goal and blocking a bigger one, but no channel "
+                                f"partner is available to reopen to; leaving it "
+                                f"alone rather than losing its inbound for nothing"),
+                        detail="partner resolution: "
+                               + self._partner_breakdown(wallet, res)))
+                    continue
+                executable.append((action, None))
             else:
                 executable.append((action, None))
         # Record declines (freeze events + near misses) first. Only those not
@@ -3517,17 +3642,16 @@ class LiquidityPlugin(BasePlugin):
     def _swap_may_be_needed(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> bool:
         """True if some active channel is over a swap trigger (so it's worth
         opening a provider session). Opens, idle channels, and frozen ticks need
-        no provider, so we skip the network round-trip for them."""
+        no provider, so we skip the network round-trip for them.
+
+        Shares the engine's ``over_swap_trigger`` rather than re-deriving the
+        comparison: this pre-pass decides whether to pay for provider discovery
+        at all, so if it disagreed with the engine about what "over a trigger"
+        means, a channel the engine would swap could never get a provider."""
         if snapshot.pending_channel_count or snapshot.inflight_swap_count:
             return False
-        for ch in snapshot.channels:
-            if not ch.is_active:
-                continue
-            over_pct = ch.local_sat >= (config.swap_trigger_pct / 100.0) * ch.capacity_sat
-            over_sat = ch.local_sat > config.swap_trigger_sat
-            if over_pct or over_sat:
-                return True
-        return False
+        return any(ch.is_active and over_swap_trigger(ch, config) is not None
+                   for ch in snapshot.channels)
 
     @asynccontextmanager
     async def _swap_session(self, wallet: 'Abstract_Wallet') -> AsyncIterator[Optional['SwapServerTransport']]:
@@ -3591,6 +3715,8 @@ class LiquidityPlugin(BasePlugin):
             await self._open_channel(wallet, action, state, candidates)
         elif isinstance(action, ReverseSwapAction):
             await self._reverse_swap(wallet, action, state, transport)
+        elif isinstance(action, CloseChannelAction):
+            self._close_undersized_channel(wallet, action, state)
 
     # --- actions ----------------------------------------------------------
     async def _open_channel(self, wallet: 'Abstract_Wallet', action: OpenChannelAction,
@@ -4070,15 +4196,27 @@ class LiquidityPlugin(BasePlugin):
             return "unknown"
 
     async def _resolve_partners_detailed(self, wallet: 'Abstract_Wallet',
-                                         *, apply_peer_guard: bool = True) -> PartnerResolution:
+                                         *, apply_peer_guard: bool = True,
+                                         ignore_peers: frozenset = frozenset()
+                                         ) -> PartnerResolution:
         """:meth:`_resolve_channel_partners` plus the per-stage counts that
-        explain the result (see :class:`PartnerResolution`)."""
+        explain the result (see :class:`PartnerResolution`).
+
+        ``ignore_peers`` (normalized pubkeys) are dropped from the
+        one-channel-per-peer exclusion set, i.e. treated as peers we do NOT have
+        a channel with. Used by the undersized-channel replacement pre-check,
+        which must ask "will a partner be available AFTER this close?" -- the
+        channel being closed still exists while we decide, so its own peer would
+        otherwise be excluded by the guard and could veto the very close that is
+        about to free it. Only that peer is exempted; every other held peer stays
+        excluded, so the guard is relaxed exactly as far as the close justifies.
+        """
         preferred = _parse_partner_list(self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
         banned = _parse_banned_partners(self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
         strict = bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT)
         exclude: frozenset = frozenset()
         if apply_peer_guard and bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
-            exclude = self._current_peer_node_ids(wallet)
+            exclude = self._current_peer_node_ids(wallet) - frozenset(ignore_peers)
         suggested: List[str] = []
         if not strict:
             suggested = [node_id.hex() for node_id in await self._suggest_peers(wallet)]
@@ -4373,6 +4511,7 @@ class LiquidityPlugin(BasePlugin):
                 "swap_trigger_pct": config.swap_trigger_pct,
                 "swap_trigger_sat": config.swap_trigger_sat,
                 "min_outbound_sat": config.min_outbound_sat,
+                "liquidity_goal_sat": config.liquidity_goal_sat,
                 "manage_plugin_opened_only": config.manage_plugin_opened_only,
                 "max_opens_per_day": config.max_opens_per_day,
                 "max_closes_per_day": self._max_closes_per_day(),

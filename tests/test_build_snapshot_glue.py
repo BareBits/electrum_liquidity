@@ -291,3 +291,52 @@ def test_outbound_floor_end_to_end() -> None:
     swaps = [act for act in result.actions if isinstance(act, ReverseSwapAction)]
     assert len(swaps) == 1
     assert swaps[0].lightning_amount_sat == 600_000       # 900k spendable - 300k floor
+
+
+# --- closes under way are counted separately ------------------------------
+# A channel being closed stays in ``lnworker.channels`` until its closing tx is
+# mined, and from the engine's side reads only as ``is_active == False`` -- the
+# same as an unreachable peer. The undersized-replacement rule needs to tell
+# those apart, so build_snapshot counts them.
+@pytest.mark.parametrize("state", [
+    ChannelState.SHUTDOWN,
+    ChannelState.CLOSING,
+    ChannelState.FORCE_CLOSING,
+    ChannelState.REQUESTED_FCLOSE,
+])
+def test_build_snapshot_counts_channels_being_closed(state) -> None:
+    closing = _StateChan(state=state, cid=b"\x0a" * 32, short="closing",
+                         capacity=2_000_000, local_msat=0, spendable=0)
+    p, w = _plugin(), _wallet([closing], _swap_manager())
+    snap = p.build_snapshot(w, transport=None)
+    assert snap.closing_channel_count == 1
+    # It is still a channel (it holds funds and occupies a slot until mined).
+    assert [c.short_id for c in snap.channels] == ["closing"]
+
+
+def test_build_snapshot_does_not_count_open_channels_as_closing() -> None:
+    live = _FakeChan(cid=b"\x0b" * 32, short="201x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000)
+    p, w = _plugin(), _wallet([live], _swap_manager())
+    assert p.build_snapshot(w, transport=None).closing_channel_count == 0
+
+
+def test_build_snapshot_does_not_count_we_are_toxic_as_closing() -> None:
+    """WE_ARE_TOXIC is not a close in progress -- only the remote may close such
+    a channel, and it can sit there indefinitely. Counting it would wedge the
+    undersized-replacement rule permanently."""
+    toxic = _StateChan(state=ChannelState.WE_ARE_TOXIC, cid=b"\x0c" * 32,
+                       short="toxic", capacity=2_000_000, local_msat=0, spendable=0)
+    p, w = _plugin(), _wallet([toxic], _swap_manager())
+    assert p.build_snapshot(w, transport=None).closing_channel_count == 0
+
+
+def test_build_snapshot_does_not_count_mined_closes() -> None:
+    # CLOSED/REDEEMED are done, not settling -- and are filtered out entirely.
+    done = [_StateChan(state=s, cid=bytes([i]) * 32, short=f"done{i}",
+                       capacity=2_000_000, local_msat=0, spendable=0)
+            for i, s in ((13, ChannelState.CLOSED), (14, ChannelState.REDEEMED))]
+    p, w = _plugin(), _wallet(done, _swap_manager())
+    snap = p.build_snapshot(w, transport=None)
+    assert snap.closing_channel_count == 0
+    assert snap.channels == ()

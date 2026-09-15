@@ -19,6 +19,7 @@ from electrum.i18n import _
 from electrum.plugin import hook
 
 from electrum.gui.qt.util import read_QIcon
+from electrum.gui.qt.amountedit import AmountEdit, BTCAmountEdit
 
 import asyncio
 import html
@@ -1079,6 +1080,67 @@ class Plugin(LiquidityPlugin):
             edit = QLineEdit(value)
             grid.addWidget(edit, row, 1)
             edits.append((edit, parser, setter, label))
+
+        # --- liquidity goal ------------------------------------------------
+        # The one amount on this tab that is entered as MONEY rather than as a
+        # bare sat count, so it gets Electrum's own amount widget: it renders and
+        # parses in whichever base unit the user has selected (BTC / mBTC / bits
+        # / sat), with an optional fiat companion wired through the main window's
+        # connect_fields -- exactly the pairing the Send and Receive tabs use.
+        # The stored ConfigVar is always sats regardless of what is displayed.
+        goal_label_text = _("Liquidity goal")
+        goal_tooltip = _("Automatically close small channels and re-open bigger "
+                         "channels if we have sufficient funds to reach this goal")
+        goal_row = len(fields)
+        goal_label = QLabel(goal_label_text)
+        goal_label.setToolTip(goal_tooltip)
+        grid.addWidget(goal_label, goal_row, 0)
+        # Fall back to BTC if the window predates get_decimal_point: a settings
+        # tab that fails to build is far worse than one showing the wrong unit.
+        get_decimal_point = getattr(window, "get_decimal_point", None) or (lambda: 8)
+        goal_e = BTCAmountEdit(get_decimal_point)
+        goal_e.setToolTip(goal_tooltip)
+        goal_e.setAmount(self._liquidity_goal_sat())
+        grid.addWidget(goal_e, goal_row, 1)
+        fx = getattr(window, "fx", None)
+        goal_fiat_e = None
+        if fx is not None and hasattr(window, "connect_fields"):
+            goal_fiat_e = AmountEdit(fx.get_currency)
+            goal_fiat_e.setToolTip(goal_tooltip)
+            goal_fiat_e.setVisible(bool(fx.is_enabled()))
+            grid.addWidget(goal_fiat_e, goal_row, 2)
+            window.connect_fields(goal_e, goal_fiat_e)
+
+        def _reload_goal() -> None:
+            """Re-render the goal field from the PERSISTED sat value.
+
+            Deliberately not Electrum's ``refresh_amount_edits`` behaviour, which
+            re-reads the widget's own text and so *reinterprets* the typed number
+            under the new unit (1 BTC becomes 1 sat). That is defensible for a
+            transient send amount, but this field mirrors a stored setting: the
+            amount does not change because the user changed how amounts are
+            displayed, so it is re-rendered from config instead. (This also has to
+            be wired up by hand -- ``refresh_amount_edits`` only knows about the
+            Send and Receive tabs' own fields.)
+
+            Guarded because this is also a signal slot on the long-lived QApplication
+            while the widgets belong to one wallet's tab. The slot is a plain
+            closure, not a QObject, so Qt cannot auto-disconnect it when the tab
+            goes away -- and touching a deleted widget raises RuntimeError. Closing
+            a wallet and then changing the base unit must not put a traceback in the
+            user's log."""
+            try:
+                goal_e.setAmount(self._liquidity_goal_sat())
+                if goal_fiat_e is not None:
+                    goal_fiat_e.setVisible(bool(fx.is_enabled()))
+            except RuntimeError:
+                return      # the tab (and its widgets) are gone
+
+        app = getattr(window, "app", None)
+        for _signal_name in ("refresh_amount_edits_signal", "update_fiat_signal"):
+            _signal = getattr(app, _signal_name, None)
+            if _signal is not None:
+                _signal.connect(_reload_goal)
         vbox.addLayout(grid)
 
         # Live read-out of the dev-fee ledger: sats owed (accrued, not yet paid)
@@ -1120,6 +1182,18 @@ class Plugin(LiquidityPlugin):
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_("Invalid value for: {}").format(label))
                     return
+            # The goal comes from the amount widget (already in sat). An empty or
+            # unparseable field is an error rather than "0": silently reading a
+            # cleared box as 0 would DISABLE the feature, which is not something a
+            # user should be able to do by accident. Typing an explicit 0 still
+            # turns it off.
+            goal_amount = goal_e.get_amount()
+            if goal_amount is None or int(goal_amount) < 0:
+                status_label.setStyleSheet("color: red;")
+                status_label.setText(_("Invalid value for: {}").format(goal_label_text))
+                return
+            parsed.append((lambda v: setattr(c, 'INBOUND_LIQUIDITY_GOAL_SAT', v),
+                           int(goal_amount)))
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
@@ -1129,6 +1203,7 @@ class Plugin(LiquidityPlugin):
             # a lowered floor keeps matching the (new) configured value at once.
             self._enforce_min_funding_floor()
             self._reload_settings_fields(edits, _sync_toggle_from_config)
+            _reload_goal()
             _refresh_dev_fee_label()
             status_label.setStyleSheet("color: green;")
             status_label.setText(_("Settings saved."))

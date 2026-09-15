@@ -41,6 +41,7 @@ ceilings, diagnostics, etc.).
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
 | `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
+| `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) | `100_000` |
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
@@ -75,6 +76,63 @@ adds to Electrum's own **Channels** tab (`Plugin` vs `Manual`).
 
 To preserve some outbound (send) capacity within the channels it *does* manage,
 `min_outbound_sat` holds back a per-channel floor.
+
+### Replacing undersized channels (the liquidity goal)
+
+Without this rule a wallet gets permanently capped by the size of the channels it
+happened to open first: the plugin opens its `max_channels`, later accumulates
+enough on-chain to fund something far bigger, and refuses to — because it is
+already at the ceiling. The **liquidity goal** lets a channel be *replaced*
+rather than merely counted.
+
+A channel is closed to make room for a bigger one only when **all** of these
+hold:
+
+1. a goal is configured (`liquidity_goal_sat`, `0` = off);
+2. we are **at** `max_channels` — below it a bigger channel can simply be opened
+   alongside, so closing anything would be gratuitous;
+3. on-chain spendable minus `onchain_reserve_sat` could fund a channel that
+   actually **reaches** the goal (and clears the funding floor);
+4. the channel was **opened by the plugin** — a channel you opened by hand is
+   never closed by this rule, whatever `manage_plugin_opened_only` is set to;
+5. its **capacity** is below the goal;
+6. it is **not over a swap trigger** — it holds no outbound the plugin is about
+   to convert into inbound;
+7. no other close is already **settling** — see below;
+8. it has no unsettled HTLCs; and
+9. its peer is reachable, so the close can be **cooperative**. A channel whose
+   peer has gone is left to the offline auto-close watchdog, which has uptime
+   evidence to justify the cost of a force-close — this rule will never pay a
+   force-close fee and a CSV timelock merely to resize.
+
+Before closing, the plugin also checks that a channel partner would actually be
+available to reopen to; if none is, it logs a decline and leaves the channel
+alone rather than losing its inbound for nothing. (The closing channel's own peer
+is exempted from the one-channel-per-peer guard for that check — it is about to
+be freed by this very close.)
+
+Condition 6 is what stops the rule churning: the plugin funds its channels with
+no push, so a freshly opened channel has local == capacity and is over the
+percentage trigger by construction. It cannot be opened and immediately closed
+again — it only becomes replaceable once the plugin has genuinely drained it into
+inbound liquidity.
+
+At most **one** channel is replaced per evaluation (the smallest qualifier) —
+and, via condition 7, one at a time *across* evaluations too. That second half
+matters: a channel being closed stays in the wallet until its closing tx is mined,
+and by then it just reads as "not active", so without it the next tick would find
+the next undersized channel eligible and close that as well, on the strength of
+the same on-chain balance. One funding amount buys exactly one replacement.
+
+The close goes through the same path as every other close the plugin makes:
+cooperative first, force-close only as a documented backstop, and counted against
+`max_closes_per_day`.
+
+> **Upgrading:** unlike most of the plugin's rules this one ships **active**
+> (`100_000` sat), so it applies to existing wallets on upgrade. A plugin-opened
+> channel smaller than the goal that has already been drained will be replaced
+> the first time you are at your channel ceiling with the funds to do better. Set
+> `liquidity_goal_sat` to `0` on the Settings tab to turn it off.
 
 ### In-flight freeze
 
