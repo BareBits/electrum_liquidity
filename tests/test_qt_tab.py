@@ -74,6 +74,7 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = 25.0
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = 25_000
         self.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = 0
+        self.INBOUND_LIQUIDITY_GOAL_SAT = 100_000
         # Mirrors the shipped ConfigVar default (on: never touch a channel the
         # user opened by hand unless they say so).
         self.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = True
@@ -134,6 +135,22 @@ class _FakeWindow:
 
     def statusBar(self) -> _FakeStatusBar:
         return self._sb
+
+    def get_decimal_point(self) -> int:
+        """Base unit the amount widgets render in, as ElectrumWindow exposes it.
+        Default 8 = BTC, matching Electrum's own default; tests that care set it."""
+        return getattr(self, "decimal_point", 8)
+
+
+def _plain_line_edits(widget):
+    """The tab's plain QLineEdit fields, in layout order.
+
+    Filtered by EXACT type on purpose: Electrum's BTCAmountEdit/AmountEdit are
+    QLineEdit subclasses, so a bare findChildren(QLineEdit) also picks up the
+    liquidity-goal amount widget (and any future one) and silently shifts the
+    positional indices these tests address fields by."""
+    from PyQt6.QtWidgets import QLineEdit
+    return [w for w in widget.findChildren(QLineEdit) if type(w) is QLineEdit]
 
 
 @pytest.fixture(scope="module")
@@ -261,8 +278,8 @@ def test_apply_persists_and_clamps(qapp):
     state = p._tabs[wallet]
     sub = state.container.findChild(QTabWidget)
     settings_tab = sub.widget(0)
-    from PyQt6.QtWidgets import QLineEdit, QPushButton
-    line_edits = settings_tab.findChildren(QLineEdit)
+    from PyQt6.QtWidgets import QPushButton
+    line_edits = _plain_line_edits(settings_tab)
     apply_btn = next(b for b in settings_tab.findChildren(QPushButton)
                      if b.text() == "Apply")
 
@@ -289,8 +306,8 @@ def test_apply_rejects_invalid_without_persisting(qapp):
     state = p._tabs[wallet]
     sub = state.container.findChild(QTabWidget)
     settings_tab = sub.widget(0)
-    from PyQt6.QtWidgets import QLineEdit, QPushButton
-    line_edits = settings_tab.findChildren(QLineEdit)
+    from PyQt6.QtWidgets import QPushButton
+    line_edits = _plain_line_edits(settings_tab)
     before = p.config.INBOUND_LIQUIDITY_MAX_CHANNELS
     line_edits[1].setText("not-a-number")   # max-channels is index 1 post-reorg
     apply_btn = next(b for b in settings_tab.findChildren(QPushButton)

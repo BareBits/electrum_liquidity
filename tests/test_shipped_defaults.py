@@ -36,6 +36,33 @@ def test_max_swap_fee_pct_default() -> None:
     assert isinstance(default, float)
 
 
+# The liquidity goal ships ACTIVE rather than at 0/off, so it is funds-affecting
+# on upgrade as well as on a fresh install: an existing wallet that is at its
+# channel ceiling with a drained, sub-goal, plugin-opened channel will have that
+# channel replaced. Pinned here so changing it has to be deliberate.
+EXPECTED_LIQUIDITY_GOAL_SAT: int = 100_000
+
+
+def test_liquidity_goal_default() -> None:
+    default = SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value()
+    assert default == EXPECTED_LIQUIDITY_GOAL_SAT
+    assert isinstance(default, int)
+
+
+def test_liquidity_goal_ships_enabled() -> None:
+    # 0 would disable the rule entirely; the shipped value must not be that.
+    assert SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value() > 0
+
+
+def test_liquidity_goal_is_reachable_from_the_default_open_floor() -> None:
+    """A goal the plugin could never fund would silently do nothing. The
+    replacement rule needs on-chain funds of at least max(goal, funding floor)
+    plus the reserve, so pin that the shipped goal is above the shipped open
+    floor -- i.e. replacing a channel really does aim at a BIGGER one."""
+    goal = SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value()
+    assert goal > EXPECTED_MIN_ONCHAIN_TO_OPEN_SAT
+
+
 def test_default_open_floor_is_below_electrums_stock_funding_floor() -> None:
     """The default is only useful if it actually engages the floor override --
     at or above Electrum's stock MIN_FUNDING_SAT the plugin would leave the

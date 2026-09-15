@@ -57,6 +57,14 @@ FUND_CAP_SAT = 1_000_000
 #   window ~130s, force-close ~60s after commit.
 UPTIME_WINDOW_DAYS = 130.0 / 86400.0
 FORCE_CLOSE_DAYS = 60.0 / 86400.0
+# The plugin never force-closes without first giving a cooperative close its
+# chance -- and when the peer is unreachable (exactly this scenario) that means
+# waiting out the whole window before accepting cooperation is impossible. The
+# shipped default is 10 minutes, which no sane test budget can absorb, so turn it
+# down to 1 (the same thing test_wedged_open_e2e does; the window itself is
+# tested there). Without this the watchdog commits to the close and then simply
+# waits, and this test fails with "watchdog never force-closed".
+COOP_BEFORE_FORCE_MIN = 1
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
 
@@ -177,6 +185,8 @@ def test_offline_plugin_channel_is_force_closed(rig):
     _setcfg_float("plugins.inbound_liquidity.offline_uptime_window_days", UPTIME_WINDOW_DAYS)
     _setcfg("plugins.inbound_liquidity.offline_min_uptime_pct", "10")
     _setcfg_float("plugins.inbound_liquidity.offline_force_close_days", FORCE_CLOSE_DAYS)
+    _setcfg("plugins.inbound_liquidity.coop_before_force_min",
+            str(COOP_BEFORE_FORCE_MIN))
 
     # The plugin opens its own channel...
     assert _wait_until(lambda: _live_channels() >= 3, rig=rig, timeout=150), \
@@ -196,7 +206,7 @@ def test_offline_plugin_channel_is_force_closed(rig):
     # The watchdog commits (uptime below the floor) then force-closes the plugin
     # channel after the deadline. Force-close is offline-safe, so it proceeds
     # without the peer.
-    assert _wait_until(lambda: _is_closing(plugin_cid), rig=rig, timeout=240), \
+    assert _wait_until(lambda: _is_closing(plugin_cid), rig=rig, timeout=330), \
         "watchdog never force-closed the offline plugin channel"
 
     # It was logged as a force-close of an offline channel.

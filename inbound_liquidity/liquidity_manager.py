@@ -1158,6 +1158,20 @@ class LiquidityConfig:
     # Empty preferred set means "use whichever discovered provider is cheapest".
     preferred_npubs: FrozenSet[str] = field(default_factory=frozenset)
     banned_npubs: FrozenSet[str] = field(default_factory=frozenset)
+    # Target size (sat) for a channel. Drives the undersized-channel replacement
+    # rule (see :func:`_decide_undersized_closes`): a plugin-opened channel whose
+    # CAPACITY is below this is closed -- freeing its slot -- once we are at the
+    # channel ceiling and hold enough on-chain to fund a replacement that would
+    # actually reach the goal. 0 (this dataclass's default) disables the rule
+    # entirely.
+    #
+    # NB: as with ``manage_plugin_opened_only``, the dataclass default and the
+    # SHIPPED default differ on purpose -- the ConfigVar ships at
+    # ``DEFAULT_LIQUIDITY_GOAL_SAT``. ``read_config`` always passes the user's
+    # value explicitly, so 0 here only affects pure tests and non-populating
+    # callers, for which "off" preserves the pre-feature behaviour they were
+    # written against.
+    liquidity_goal_sat: int = 0
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1214,21 @@ class LiquiditySnapshot:
     # these from its persisted action-timestamp store; 0 in the pure tests unless
     # set explicitly.
     opens_last_24h: int = 0
+    # Channels whose close is under way but not yet mined (ChannelState SHUTDOWN
+    # / CLOSING / FORCE_CLOSING / REQUESTED_FCLOSE). Such a channel is still in
+    # ``channels`` -- it only drops out at CLOSED -- so without counting it
+    # separately the engine cannot tell "already being closed" from "peer is
+    # unreachable"; both merely read as ``is_active == False``.
+    #
+    # This is what makes the undersized-replacement rule one-at-a-time ACROSS
+    # ticks and not just within one: the tick after a replacement close is
+    # requested, that channel is excluded (not active) while any OTHER undersized
+    # channel still qualifies -- and would be closed on the strength of the same
+    # on-chain balance that justified the first. See
+    # ``_decide_undersized_closes``. WE_ARE_TOXIC is deliberately NOT counted: it
+    # is not a close in progress and can persist indefinitely, so counting it
+    # would wedge the rule forever.
+    closing_channel_count: int = 0
 
 
 def swap_cost_sat(percentage_fee: float, mining_fee_sat: int, claim_fee_sat: int,
@@ -1373,7 +1402,23 @@ class ReverseSwapAction:
     provider_npub: str = ""
 
 
-Action = Union[OpenChannelAction, ReverseSwapAction]
+@dataclass(frozen=True)
+class CloseChannelAction:
+    """Close an undersized channel so its slot can be reused by a bigger one.
+
+    Emitted only by :func:`_decide_undersized_closes`, and executed by the glue
+    through its ONE close path (``_request_close``), which tries a cooperative
+    close first and respects the daily close ceiling. ``capacity_sat`` is carried
+    for the log line -- "closing a 150k channel to reopen at >=500k" is the whole
+    justification for the action, so it should not require a second lookup.
+    """
+    channel_id: str
+    short_id: str
+    capacity_sat: int
+    reason: str
+
+
+Action = Union[OpenChannelAction, ReverseSwapAction, CloseChannelAction]
 
 
 @dataclass(frozen=True)
@@ -1382,7 +1427,10 @@ class DeclineRecord:
     "Declines" view. ``kind`` is one of:
       * "freeze" -- the whole tick was skipped because something is in flight,
       * "open"   -- a channel open was considered but a rule blocked it,
-      * "swap"   -- a reverse swap was considered but a rule blocked it.
+      * "swap"   -- a reverse swap was considered but a rule blocked it,
+      * "close"  -- an undersized channel could have been replaced to make room
+                    for a bigger one, but a rule blocked it (see
+                    ``_decide_undersized_closes``).
     Only *near-miss* declines are recorded (a candidate that was on the verge of
     acting but got blocked) -- idle "nothing to do" ticks produce no records.
     """
@@ -1407,6 +1455,25 @@ class DecisionResult:
     frozen: Optional[str] = None   # non-None reason if the tick was frozen
 
 
+def over_swap_trigger(chan: ChannelSnapshot,
+                      config: LiquidityConfig) -> Optional[str]:
+    """Which swap-out trigger this channel is over -- ``"pct"``, ``"sat"``, or
+    ``None`` if neither.
+
+    Single source of truth for "this channel holds outbound the plugin intends
+    to drain into inbound". Used both by :func:`_decide_reverse_swaps` (to decide
+    whether to plan a swap) and by :func:`_decide_undersized_closes` (where being
+    over a trigger PROTECTS the channel: closing it would throw away value the
+    plugin is about to convert). "pct" wins the label when both are over, matching
+    the order the rules were specified in.
+    """
+    if chan.local_sat >= (config.swap_trigger_pct / 100.0) * chan.capacity_sat:
+        return "pct"
+    if chan.local_sat > config.swap_trigger_sat:
+        return "sat"
+    return None
+
+
 def evaluate(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> DecisionResult:
     """Map (state, thresholds) -> a DecisionResult.
 
@@ -1423,9 +1490,11 @@ def evaluate(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> DecisionRe
          environment, and stalling unrelated channels for that long is pure lost
          value.
       4. Otherwise consider a channel open first (so a cold wallet builds
-         capacity before draining it), then reverse swaps. A freshly opened
-         channel is not yet ``is_active`` and so is never reverse-swapped in the
-         same cycle that opens it.
+         capacity before draining it), then the undersized-channel replacement
+         rule (which can only fire when an open was blocked by the channel
+         ceiling), then reverse swaps. A freshly opened channel is not yet
+         ``is_active`` and so is never reverse-swapped in the same cycle that
+         opens it.
     """
     if not config.automation_enabled:
         return DecisionResult()
@@ -1460,10 +1529,24 @@ def evaluate(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> DecisionRe
         ))
     else:
         open_action, open_decline = _decide_channel_open(snapshot, config)
+        # Undersized-channel replacement. Sits in this branch (not outside it) on
+        # purpose: a channel open that is still confirming has already committed
+        # the on-chain funds this rule's "we can afford a replacement" test is
+        # counting, so closing on the strength of them would be double-spending
+        # the same balance across two decisions.
+        close_action, close_declines = _decide_undersized_closes(snapshot, config)
         if open_action is not None:
             actions.append(open_action)
+        if close_action is not None:
+            actions.append(close_action)
         if open_decline is not None:
-            declines.append(open_decline)
+            # When we are closing a channel *because* we are at the ceiling, the
+            # open's "at max channels; not opening" decline is the very thing the
+            # close resolves. Logging both would read as the plugin contradicting
+            # itself, so the close action speaks for the pair.
+            if close_action is None:
+                declines.append(open_decline)
+        declines.extend(close_declines)
 
     swap_actions, swap_declines = _decide_reverse_swaps(snapshot, config)
     actions.extend(swap_actions)
@@ -1538,6 +1621,164 @@ def _decide_channel_open(
     )
 
 
+# --- undersized-channel replacement (the "liquidity goal") ----------------
+# The problem this solves: the plugin opens channels for inbound liquidity, but
+# once it is holding ``max_channels`` of them it will not open another -- even
+# when it has since accumulated enough on-chain to fund a channel several times
+# bigger than the small ones it started with. The wallet ends up capped by the
+# size of its earliest channels with no way to grow.
+#
+# The fix is to let a channel be REPLACED rather than merely counted: a
+# plugin-opened channel whose capacity is below the user's liquidity goal is
+# closed, freeing its slot, but ONLY when closing it actually unblocks something
+# -- i.e. we are at the ceiling and already hold enough on-chain to fund a
+# replacement that would genuinely reach the goal.
+#
+# A close is irreversible and costs a mining fee, so the rule is deliberately
+# hedged about with conditions; see the gate list in the function below. Two of
+# them deserve highlighting because they are what make the rule safe rather than
+# merely cautious:
+#
+#   * OVER A SWAP TRIGGER PROTECTS THE CHANNEL. The plugin funds its channels
+#     with no push, so a freshly opened channel has local == capacity and is over
+#     the percentage trigger by construction. It therefore CANNOT be opened and
+#     immediately re-closed: it only becomes replaceable once the plugin has
+#     actually drained it into inbound liquidity. This is the churn guard, and it
+#     costs nothing because the condition was already required for a different
+#     reason (never throw away outbound we are about to convert).
+#   * ONE PER EVALUATION. Several undersized channels may qualify at once, but
+#     the funds test is a test for ONE replacement -- closing three channels on
+#     the strength of a single funding amount would destroy more inbound than can
+#     be rebuilt. The smallest qualifier goes first and the rest wait for a later
+#     evaluation, by which time the state has been re-read.
+def _decide_undersized_closes(
+    snapshot: LiquiditySnapshot, config: LiquidityConfig
+) -> Tuple[Optional[CloseChannelAction], List[DeclineRecord]]:
+    """Decide whether to close ONE undersized channel to make room for a bigger
+    one. Returns ``(action_or_None, declines)``.
+
+    Every one of these must hold, and each is here for its own reason:
+
+      1. a liquidity goal is configured (0 = rule disabled);
+      2. we are AT the channel ceiling -- below it, a bigger channel can simply
+         be opened alongside, so closing anything would be gratuitous;
+      3. on-chain spendable minus the reserve can fund a channel that reaches the
+         goal (and clears the funding floor) -- so the replacement is real, not
+         hypothetical;
+      4. the channel was opened by the plugin -- a channel the user opened by
+         hand is never closed by this rule, whatever the scope switch says;
+      5. its capacity is below the goal -- it is the thing holding us back;
+      6. it is NOT over a swap trigger -- it holds no outbound we are about to
+         convert into inbound (and, per the note above, it is not brand new);
+      7. no OTHER close is already settling -- one replacement at a time, or the
+         same on-chain balance would justify closing several channels over
+         consecutive ticks (see ``LiquiditySnapshot.closing_channel_count``);
+      8. it has no unsettled HTLCs -- never close over an in-flight payment;
+      9. its peer is reachable (``is_active``) -- so the close can be
+         COOPERATIVE. A channel whose peer is gone would have to be force-closed,
+         paying a mining fee and a CSV timelock purely to resize; that case
+         belongs to the offline auto-close watchdog, which has uptime evidence to
+         justify the expense.
+
+    Declines are recorded only for a genuine near miss: gates 1-3 passed (we are
+    blocked, with the funds to fix it) and at least one channel is undersized,
+    but nothing cleared the remaining gates.
+    """
+    if config.liquidity_goal_sat <= 0:
+        return None, []
+    if len(snapshot.channels) < config.max_channels:
+        return None, []
+    # What a replacement channel would actually be funded with -- mirrors
+    # _decide_channel_open, so "we could fund it" here means the same arithmetic
+    # that will run when the open is decided.
+    funding_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    # The replacement must both REACH THE GOAL (else the close buys nothing) and
+    # clear Electrum's funding floor (else it cannot be opened at all). The floor
+    # is the module global, which the glue lowers to the user's
+    # min_onchain_to_open_sat at startup -- so this tracks the effective floor.
+    required_sat = max(config.liquidity_goal_sat, MIN_FUNDING_SAT)
+    if funding_sat < required_sat:
+        # Simply waiting for funds; not a near miss, so nothing is logged (the
+        # same treatment _decide_channel_open gives its min-on-chain gate).
+        return None, []
+
+    undersized = [c for c in snapshot.channels
+                  if c.is_plugin_opened and c.capacity_sat < config.liquidity_goal_sat]
+    if not undersized:
+        return None, []
+
+    # One replacement at a time, across ticks as well as within one. A channel we
+    # asked to close stays in ``channels`` until its closing tx is mined, and by
+    # then it reads as merely not-active -- so without this gate the very next
+    # tick would find the NEXT undersized channel still eligible and close it
+    # too, on the strength of the same on-chain balance that justified the first.
+    # Waiting for the close to settle also means the next decision is made
+    # against the funds that close actually returned.
+    #
+    # Failure mode, accepted deliberately: a cooperative close that stalls after
+    # shutdown was sent (peer vanished mid-negotiation) leaves the channel in
+    # SHUTDOWN, and this gate then pauses the rule until Electrum completes the
+    # close on reconnect. That is a visible pause with a decline explaining it --
+    # no funds at risk -- and the alternative (re-driving the close until it
+    # escalates to a force-close) would spend a mining fee and a CSV timelock to
+    # resize a channel, which is exactly what gate 9 exists to prevent. A close
+    # that fails BEFORE shutdown is sent leaves the channel OPEN and is retried
+    # normally, so only the half-closed case pauses anything.
+    if snapshot.closing_channel_count > 0:
+        return None, [DeclineRecord(
+            kind="close",
+            reason=(f"a channel close is already settling; not replacing another "
+                    f"undersized channel until it completes"),
+            detail=f"{snapshot.closing_channel_count} channel(s) closing; "
+                   f"{len(undersized)} undersized channel(s) waiting",
+        )]
+
+    candidates: List[ChannelSnapshot] = []
+    blocked: List[str] = []
+    for chan in undersized:
+        trigger = over_swap_trigger(chan, config)
+        if trigger is not None:
+            blocked.append(f"{chan.short_id} still holds {chan.local_sat} sat of "
+                           f"outbound to swap out first (over the {trigger} trigger)")
+        elif chan.has_unsettled_htlcs:
+            blocked.append(f"{chan.short_id} has unsettled HTLCs")
+        elif not chan.is_active:
+            blocked.append(f"{chan.short_id} peer is offline, so it could only be "
+                           f"force-closed")
+        else:
+            candidates.append(chan)
+
+    if not candidates:
+        # The reason deliberately carries only STABLE facts (channel count, the
+        # configured goal): it is the decline's dedup key, so folding in the
+        # funding amount -- which drifts with every block -- would re-log this
+        # steady state on every tick. The varying arithmetic goes in `detail`,
+        # which is excluded from the signature by design.
+        return None, [DeclineRecord(
+            kind="close",
+            amount_sat=funding_sat,
+            reason=(f"at max channels ({len(snapshot.channels)}) with funds to "
+                    f"reach the {config.liquidity_goal_sat} sat liquidity goal, "
+                    f"but no undersized channel can be replaced right now"),
+            detail="; ".join([f"{funding_sat} sat available to fund a replacement"]
+                             + blocked),
+        )]
+
+    # Smallest first -- it is the one furthest from the goal, so replacing it
+    # buys the most. channel_id breaks ties so the choice is deterministic (the
+    # same tick re-run picks the same channel).
+    chan = min(candidates, key=lambda c: (c.capacity_sat, c.channel_id))
+    return CloseChannelAction(
+        channel_id=chan.channel_id,
+        short_id=chan.short_id,
+        capacity_sat=chan.capacity_sat,
+        reason=(f"channel {chan.short_id} capacity {chan.capacity_sat} is below the "
+                f"{config.liquidity_goal_sat} sat liquidity goal, and at "
+                f"{len(snapshot.channels)}/{config.max_channels} channels it is "
+                f"blocking a bigger one; closing it to reopen with {funding_sat} sat"),
+    ), []
+
+
 def _decide_reverse_swaps(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
 ) -> Tuple[List[ReverseSwapAction], List[DeclineRecord]]:
@@ -1553,12 +1794,10 @@ def _decide_reverse_swaps(
     # single provider uses "" as its key.
     consumed: Dict[str, int] = {}
     for chan in snapshot.channels:
-        over_pct = chan.local_sat >= (config.swap_trigger_pct / 100.0) * chan.capacity_sat
-        over_sat = chan.local_sat > config.swap_trigger_sat
-        if not (over_pct or over_sat):
+        trigger = over_swap_trigger(chan, config)
+        if trigger is None:
             # Below both triggers: nothing to do, and not a near miss.
             continue
-        trigger = "pct" if over_pct else "sat"
         # The channel wants to be drained; from here on, anything that blocks it
         # is a near miss worth logging.
         # Scope switch: in plugin-opened-only mode, a channel the user opened by

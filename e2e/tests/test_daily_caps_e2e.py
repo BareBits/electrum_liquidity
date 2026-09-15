@@ -62,7 +62,28 @@ WEDGE_FUND_BTC = 0.003
 # The plugin's stuck-open timeout clamps to a 1-minute floor; a wedged open is
 # only remediated once it is older than that. Wait comfortably past it.
 STUCK_MIN = 1
-WEDGE_AGE_WAIT = 75.0
+# Remediating a wedged open has to clear three further gates, all of which ship
+# at operator-friendly (hours-long) defaults. This test is about the daily CLOSE
+# CEILING, not about those gates, so they are turned right down -- the same thing
+# test_wedged_open_e2e does, which is where the gates themselves are tested.
+# Without this the force-close simply cannot happen inside any sane test budget:
+# the shipped defaults demand a 6-hour wedge clock, a 60-minute spread between
+# checks, and a 10-minute cooperative-close window before escalating.
+CLOSE_TIMEOUT_MIN = 1
+REQUIRED_CHECKS = 3
+CHECK_SPREAD_MIN = 1
+COOP_BEFORE_FORCE_MIN = 1
+# Budget for the wedge lifecycle: the wedge clock (CLOSE_TIMEOUT_MIN) and the
+# check spread (CHECK_SPREAD_MIN) run concurrently, then the cooperative window
+# (COOP_BEFORE_FORCE_MIN) runs after them -- so ~2 minutes minimum. Aging waits
+# out the first part; the force-close waits below cover the rest, with margin for
+# tick granularity on a loaded machine.
+WEDGE_AGE_WAIT = 150.0
+FORCE_CLOSE_TIMEOUT = 180.0
+# Once the ceiling is raised the deferred channel escalates promptly: its
+# close-attempt record was stamped on the very first deferred call (before the
+# ceiling check, deliberately), so its cooperative window has already elapsed.
+DEFERRED_CLOSE_TIMEOUT = 120.0
 # Closing/closed channel states as reported by `list_channels`.
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
@@ -214,6 +235,14 @@ def test_close_ceiling_enforced_end_to_end(rig):
     _setcfg("plugins.inbound_liquidity.stuck_open_timeout_min", str(STUCK_MIN))
     _setcfg("plugins.inbound_liquidity.auto_remediate_stuck_open", "true")
     _setcfg("plugins.inbound_liquidity.max_closes_per_day", "1")
+    # Wedge gates turned down so the remediation this test depends on can
+    # actually fire (see the constants above).
+    _setcfg("plugins.inbound_liquidity.stuck_open_close_timeout_min",
+            str(CLOSE_TIMEOUT_MIN))
+    _setcfg("plugins.inbound_liquidity.wedge_required_checks", str(REQUIRED_CHECKS))
+    _setcfg("plugins.inbound_liquidity.wedge_check_spread_min", str(CHECK_SPREAD_MIN))
+    _setcfg("plugins.inbound_liquidity.coop_before_force_min",
+            str(COOP_BEFORE_FORCE_MIN))
 
     # Induce two wedged opens. Open W1, mine one block (advances the height so
     # W2's funding key differs, but W1 is still below the 3-conf min-depth so it
@@ -242,7 +271,8 @@ def test_close_ceiling_enforced_end_to_end(rig):
 
     # With the close ceiling at 1, the watchdog force-closes exactly ONE of the
     # two wedged opens and defers the other.
-    assert _wait_until(lambda: _closing_among(wedged) >= 1, rig=rig, timeout=60), \
+    assert _wait_until(lambda: _closing_among(wedged) >= 1, rig=rig,
+                       timeout=FORCE_CLOSE_TIMEOUT), \
         "watchdog never force-closed a wedged open"
     # Hold: several more ticks must NOT close the second one (the cap blocks it).
     for _ in range(6):
@@ -254,7 +284,8 @@ def test_close_ceiling_enforced_end_to_end(rig):
 
     # Raise the ceiling -- the deferred wedged open is now force-closed too.
     _setcfg("plugins.inbound_liquidity.max_closes_per_day", "5")
-    assert _wait_until(lambda: _closing_among(wedged) >= 2, rig=rig, timeout=90), \
+    assert _wait_until(lambda: _closing_among(wedged) >= 2, rig=rig,
+                       timeout=DEFERRED_CLOSE_TIMEOUT), \
         "raising the ceiling did not release the deferred force-close"
     assert len(_log_entries("action", "close")) >= 2, \
         "expected a second 'close' action after raising the ceiling"
