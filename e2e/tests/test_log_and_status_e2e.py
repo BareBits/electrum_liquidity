@@ -56,9 +56,19 @@ from rig.services import (  # noqa: E402
 
 # Terminal statuses the plugin comes to rest on (mirrors TERMINAL_STATUSES in the
 # plugin; duplicated rather than imported because the plugin package is only
-# importable inside the client daemon's environment).
+# importable inside the client daemon's environment). Matched by PREFIX, not
+# equality: the sleeping state carries a "(next check in ~Xm)" suffix naming when
+# the evaluation rate limit will next let an automatic tick run.
 TERMINAL = ("sleeping", "automation disabled", "idle (manual run only)",
             "warming up", "wallet locked", "not started")
+
+
+def _is_terminal(status: str) -> bool:
+    return status.startswith(TERMINAL)
+
+
+def _is_sleeping(status: str) -> bool:
+    return status.startswith("sleeping")
 
 
 def _setcfg(key: str, value: str) -> None:
@@ -174,16 +184,16 @@ def test_tick_status_walks_the_steps_and_comes_to_rest(rig):
     assert order == sorted(order), f"steps out of order: {seen!r}"
 
     # And it comes to rest -- the property that keeps the Settings tab honest.
-    assert _wait_until(lambda: _last_status() in TERMINAL, rig=rig, timeout=120), \
+    assert _wait_until(lambda: _is_terminal(_last_status()), rig=rig, timeout=120), \
         f"tick never reached a terminal status; last was {_last_status()!r}"
-    assert "sleeping" in _status_lines()
+    assert any(_is_sleeping(s) for s in _status_lines())
 
 
 def test_disabling_automation_rests_on_disabled_not_sleeping(rig):
     """A switched-off plugin must not claim it is merely sleeping."""
     _quiet_config()
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
-    assert _wait_until(lambda: "sleeping" in _status_lines(), rig=rig, timeout=240), \
+    assert _wait_until(lambda: any(_is_sleeping(s) for s in _status_lines()), rig=rig, timeout=240), \
         f"plugin never reached the armed resting state: {_status_lines()!r}"
 
     _setcfg("plugins.inbound_liquidity.automation_enabled", "false")

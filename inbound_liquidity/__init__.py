@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import json
+import math
 import os
 import pkgutil
 import sys
@@ -189,6 +191,20 @@ _TRIGGER_EVENTS = [
     "adb_added_verified_tx",   # a new on-chain tx affecting our addresses confirmed
     "adb_set_up_to_date",      # address sync settled (catches on-chain receives)
     "payment_succeeded",       # a Lightning payment settled
+]
+
+# Handled separately from _TRIGGER_EVENTS because this is the one trigger the
+# plugin can fire at *itself*. Every evaluation that might swap opens a nostr
+# session (``_swap_session``), and Electrum's nostr offer handler raises
+# ``swap_offers_changed`` once per provider announcement it receives
+# (submarine_swaps.py). So our own discovery re-entered this handler, which
+# scheduled another evaluation, which opened another session -- a closed loop
+# that re-connected every relay every few seconds for as long as a swap looked
+# possible, with nothing in the wallet actually changing. Those events are
+# suppressed while we hold a session of our own (see ``_on_offers_event``); the
+# event stays subscribed so a provider discovered by Electrum's *own* swap
+# machinery (the user opening the Swap dialog, say) still wakes us.
+_OFFER_TRIGGER_EVENTS = [
     "swap_offers_changed",     # the swap provider / its fees became known
 ]
 
@@ -258,6 +274,53 @@ STARTUP_GRACE_SEC = 120.0
 # startup-readiness), so a heartbeat tick is safe and idempotent. Referenced via
 # ``self._heartbeat_interval_sec`` so tests can shrink it.
 HEARTBEAT_INTERVAL_SEC = 600.0
+
+# --- automatic-evaluation rate limit --------------------------------------
+# Floor on how often *automatic* (event-driven) evaluation may run, and the
+# ceiling it backs off to when nothing is happening.
+#
+# The plugin is event-driven, and events are not paced: a settling wallet, a
+# swap's own updates, or a burst of relay traffic can all fire many times a
+# second. The 1s debounce coalesces a burst, but it does not bound the *rate* --
+# so any steady trickle of events produced back-to-back evaluations, each of
+# which opened and tore down a nostr session against nine public relays. With
+# nothing in the wallet changing between them, that is pure waste and a good way
+# to get rate-limited by a relay.
+#
+# So: an automatic trigger inside the window does not run. It is not dropped
+# either -- a single trailing evaluation is queued for the end of the window
+# (``_schedule_trailing_evaluation``), so the trigger is honoured, just later.
+# Two deliberate exemptions keep this from costing responsiveness:
+#
+#   * A *material* change in the wallet (see ``_material_state_sig``) bypasses
+#     the window entirely and evaluates at once. Receiving a Lightning payment
+#     moves balance from remote to local -- exactly the thing that consumes
+#     inbound liquidity -- so the case this plugin exists for is never delayed.
+#   * The heartbeat, a manual "Run now", and the post-grace one-shot call
+#     ``_evaluate`` directly and are not rate-limited at all. The heartbeat in
+#     particular guarantees the time-based watchdogs keep their cadence no
+#     matter how deep the backoff has grown.
+#
+# The backoff itself only ever applies to a tick that changed nothing: identical
+# state, no action taken. Each such tick doubles the interval up to
+# MAX_AUTO_EVAL_INTERVAL_SEC; any change, any action, or a manual run resets it
+# to the floor. Capped at the heartbeat because beyond that the heartbeat is
+# running anyway, so a larger value would buy nothing.
+# Referenced via ``self._min_auto_eval_interval_sec`` /
+# ``self._max_auto_eval_interval_sec`` so tests can shrink them.
+MIN_AUTO_EVAL_INTERVAL_SEC = 60.0
+MAX_AUTO_EVAL_INTERVAL_SEC = HEARTBEAT_INTERVAL_SEC
+AUTO_EVAL_BACKOFF_FACTOR = 2.0
+
+# How long a deferred evaluation waits before looking again when it wakes up to
+# find an evaluation already in flight. ``_evaluate`` early-returns on the
+# per-wallet lock, so calling it then would silently discard the trigger the
+# deferred run is carrying -- and that trigger may be a change the running tick
+# snapshotted too early to see. Re-arming instead costs only a timer (no network,
+# no wallet read), so a long-running tick just gets looked at again once it lets
+# go of the lock. Referenced via ``self._trailing_retry_sec`` so tests can shrink
+# it.
+TRAILING_EVAL_RETRY_SEC = 5.0
 
 # When opening a nostr swap session, how long to wait for relays to connect, and
 # then for the first provider offers to arrive, before proceeding with whatever
@@ -382,6 +445,45 @@ TERMINAL_STATUSES = frozenset({
     STATUS_NOT_STARTED, STATUS_SLEEPING, STATUS_DISABLED,
     STATUS_MANUAL_ONLY, STATUS_SETTLING, STATUS_LOCKED,
 })
+
+
+def format_duration(seconds: float) -> str:
+    """A short, human "1m" / "10m" / "2h" for a wait, rounded up.
+
+    Rounded *up* on purpose: this labels "the next check is no sooner than
+    this", and a display that said "0m" while the plugin still had 40 seconds to
+    wait would read as a stall.
+    """
+    secs = max(0, int(math.ceil(seconds)))
+    if secs < 60:
+        return f"{secs}s"
+    minutes = int(math.ceil(secs / 60))
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{int(math.ceil(minutes / 60))}h"
+
+
+def sleeping_status(next_check_in_sec: Optional[float]) -> str:
+    """The resting status, annotated with when the next automatic check is due.
+
+    "sleeping" alone cannot distinguish "armed and waiting for the next tick"
+    from "wedged": both show the same word forever. Naming the wait makes the
+    rate limit's backoff visible -- the operator can see the plugin is
+    deliberately taking a break, and for how long.
+    """
+    if next_check_in_sec is None or next_check_in_sec <= 0:
+        return STATUS_SLEEPING
+    return f"{STATUS_SLEEPING} (next check in ~{format_duration(next_check_in_sec)})"
+
+
+def is_terminal_status(status: str) -> bool:
+    """Whether ``status`` means "the tick is over, nothing is in flight".
+
+    Prefer this over ``status in TERMINAL_STATUSES``: the sleeping state carries
+    a variable "next check in ~Xm" suffix (see ``sleeping_status``), so exact
+    membership would classify a resting plugin as busy.
+    """
+    return status in TERMINAL_STATUSES or status.startswith(STATUS_SLEEPING)
 
 # On-disk diagnostic log (opt-in; see INBOUND_LIQUIDITY_DIAG_LOG_ENABLED). Files
 # live in this subdirectory of the Electrum data dir, one folder per wallet, one
@@ -983,6 +1085,34 @@ class LiquidityPlugin(BasePlugin):
         # Fixed heartbeat cadence, as an instance attribute so tests can shrink it
         # (the module constant stays the production default).
         self._heartbeat_interval_sec: float = HEARTBEAT_INTERVAL_SEC
+        # --- automatic-evaluation rate limit (see MIN_AUTO_EVAL_INTERVAL_SEC) ---
+        # wallet -> monotonic time of the last evaluation that actually ran past
+        # the gates. The rate limit is measured from here, so a run triggered by
+        # any path (event, heartbeat, manual) delays the next automatic one.
+        self._last_eval_at: Dict['Abstract_Wallet', float] = {}
+        # wallet -> the current minimum spacing between automatic evaluations.
+        # Starts at the floor and doubles for every tick that changed nothing.
+        self._auto_eval_interval: Dict['Abstract_Wallet', float] = {}
+        # wallet -> the material state signature (see _material_state_sig) as of
+        # the last evaluation, so the next one can tell "something happened" from
+        # "identical to last time" and bypass / apply the rate limit accordingly.
+        self._last_state_sig: Dict['Abstract_Wallet', tuple] = {}
+        # wallet -> the queued trailing evaluation (an asyncio.Task), i.e. the one
+        # run that an in-window trigger is deferred to. At most one per wallet:
+        # further triggers inside the same window coalesce onto it.
+        self._trailing_eval_tasks: Dict['Abstract_Wallet', "asyncio.Task"] = {}
+        # Rate-limit bounds as instance attributes so tests can shrink them (the
+        # module constants stay the production defaults).
+        self._min_auto_eval_interval_sec: float = MIN_AUTO_EVAL_INTERVAL_SEC
+        self._max_auto_eval_interval_sec: float = MAX_AUTO_EVAL_INTERVAL_SEC
+        self._trailing_retry_sec: float = TRAILING_EVAL_RETRY_SEC
+        # How many nostr swap sessions this plugin currently has open. Nonzero
+        # means any `swap_offers_changed` we see is almost certainly our own
+        # discovery echoing back, so it must not schedule an evaluation (see
+        # _OFFER_TRIGGER_EVENTS). A counter rather than a flag because sessions
+        # can overlap across wallets, and a plain flag would be cleared by
+        # whichever session closed first.
+        self._open_swap_sessions: int = 0
         # wallet -> what the current tick is doing right now (or a terminal state
         # when no tick is running). Surfaced by the Settings tab's Status section.
         self._tick_status: Dict['Abstract_Wallet', str] = {}
@@ -995,6 +1125,7 @@ class LiquidityPlugin(BasePlugin):
         self.log_capture = LogCapture(self.log_buffer)
         self.apply_log_capture_settings()
         util.register_callback(self._on_wallet_event, _TRIGGER_EVENTS)
+        util.register_callback(self._on_offers_event, _OFFER_TRIGGER_EVENTS)
 
     # --- lifecycle --------------------------------------------------------
     def start_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -1127,6 +1258,8 @@ class LiquidityPlugin(BasePlugin):
         "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
         "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
         "_heartbeat_tasks",
+        "_last_eval_at", "_auto_eval_interval", "_last_state_sig",
+        "_trailing_eval_tasks",
     )
 
     def _forget_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -1145,7 +1278,28 @@ class LiquidityPlugin(BasePlugin):
         hb = self._heartbeat_tasks.get(wallet)
         if hb is not None:
             hb.cancel()
+        # Same for a deferred evaluation still waiting out the rate-limit window:
+        # it would otherwise wake up and evaluate a wallet we no longer manage.
+        # (It re-checks `self.wallets` on waking too -- belt and braces, because
+        # this cancel may have to cross threads. See _cancel_trailing_evaluation.)
+        self._cancel_trailing_evaluation(wallet)
         self._forget_wallet(wallet)
+
+    def _per_wallet_store(self, name: str) -> dict:
+        """The named per-wallet dict, created on first use if it is missing.
+
+        Mirrors the tolerance ``_set_status`` / ``tick_status`` already have, and
+        for the same reason: the glue test harnesses build a plugin via
+        ``object.__new__`` without ``BasePlugin.__init__``, so bookkeeping that
+        assumed its dict exists would ``AttributeError`` into the middle of an
+        evaluation. Used by the rate-limit bookkeeping, which is an optimisation
+        and must never be the thing that breaks a tick.
+        """
+        store = getattr(self, name, None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self, name, store)
+        return store
 
     def on_close(self) -> None:
         """Plugin teardown (Electrum calls BasePlugin.close -> on_close on disable/
@@ -1157,10 +1311,18 @@ class LiquidityPlugin(BasePlugin):
             except Exception:
                 pass
         self._heartbeat_tasks.clear()
-        try:
-            util.unregister_callback(self._on_wallet_event)
-        except Exception as e:
-            self.logger.info(f"could not unregister event callback: {e!r}")
+        trailing_tasks = self._per_wallet_store("_trailing_eval_tasks")
+        for trailing in list(trailing_tasks.values()):
+            try:
+                trailing.cancel()
+            except Exception:
+                pass
+        trailing_tasks.clear()
+        for callback in (self._on_wallet_event, self._on_offers_event):
+            try:
+                util.unregister_callback(callback)
+            except Exception as e:
+                self.logger.info(f"could not unregister event callback: {e!r}")
         # Remove our logging handler and undo any level override, so a disabled
         # plugin stops capturing and hands the user's verbosity back. Done last:
         # the lines above are worth capturing.
@@ -1232,7 +1394,10 @@ class LiquidityPlugin(BasePlugin):
             return STATUS_LOCKED
         if block is not None:
             return STATUS_SETTLING
-        return STATUS_SLEEPING
+        # Armed, ready, nothing in flight -- so say when we will next look. The
+        # wait can be zero (the window has already elapsed, or this is the first
+        # tick), in which case this reads as the plain "sleeping" as before.
+        return sleeping_status(self._auto_eval_wait_sec(wallet))
 
     # --- version + update check -------------------------------------------
     # Opt-in, once a day, read-only: ask GitHub for the latest published release
@@ -3456,10 +3621,294 @@ class LiquidityPlugin(BasePlugin):
             self._eval_pending[wallet] = True
             asyncio.ensure_future(self._debounced_evaluate(wallet))
 
+    @ignore_exceptions
+    @log_exceptions
+    async def _on_offers_event(self, *args) -> None:
+        """``swap_offers_changed`` handler -- ignored while we are discovering.
+
+        Split out of ``_on_wallet_event`` for one reason: this is the only
+        trigger the plugin can raise at itself. Our own ``_swap_session`` makes
+        Electrum emit one of these per provider announcement, so treating them
+        as news meant every evaluation scheduled the next one and the plugin
+        never rested (re-connecting nine relays every few seconds indefinitely).
+        Events arriving while any of our sessions is open are therefore dropped;
+        anything else is a genuine outside discovery and is handled as normal.
+        """
+        if self._open_session_count() > 0:
+            return
+        await self._on_wallet_event(*args)
+
     async def _debounced_evaluate(self, wallet: 'Abstract_Wallet') -> None:
         await asyncio.sleep(1.0)  # collect a burst of events before acting
         self._eval_pending[wallet] = False
+        await self._evaluate_rate_limited(wallet)
+
+    # --- automatic-evaluation rate limit ----------------------------------
+    def _auto_eval_wait_sec(self, wallet: 'Abstract_Wallet') -> float:
+        """Seconds until an automatic evaluation of ``wallet`` may next run.
+
+        Purely the *time* limb of the rate limit: 0.0 means "the window has
+        elapsed". A material state change bypasses a nonzero wait -- that is
+        decided in ``_evaluate_rate_limited``, not here, so this stays a cheap
+        clock read usable from the status display.
+        """
+        last = self._per_wallet_store("_last_eval_at").get(wallet)
+        if last is None:
+            return 0.0  # never evaluated; nothing to wait for
+        interval = self._per_wallet_store("_auto_eval_interval").get(
+            wallet, self._min_interval_sec())
+        return max(0.0, (last + interval) - time.monotonic())
+
+    def _min_interval_sec(self) -> float:
+        return float(getattr(self, "_min_auto_eval_interval_sec",
+                             MIN_AUTO_EVAL_INTERVAL_SEC))
+
+    def _max_interval_sec(self) -> float:
+        return float(getattr(self, "_max_auto_eval_interval_sec",
+                             MAX_AUTO_EVAL_INTERVAL_SEC))
+
+    def _retry_sec(self) -> float:
+        return float(getattr(self, "_trailing_retry_sec", TRAILING_EVAL_RETRY_SEC))
+
+    async def _evaluate_rate_limited(self, wallet: 'Abstract_Wallet') -> None:
+        """Run an event-driven evaluation now, or defer it to the window's end.
+
+        The deferral is a *delay*, never a drop: the trigger is honoured by a
+        single trailing run, and further triggers inside the same window
+        coalesce onto that one. Only event-driven triggers come through here --
+        the heartbeat, a manual run, and the post-grace one-shot call
+        ``_evaluate`` directly.
+        """
+        wait = self._auto_eval_wait_sec(wallet)
+        if wait > 0 and not self._material_state_changed(wallet):
+            self._schedule_trailing_evaluation(wallet, wait)
+            return
+        if self._evaluation_in_flight(wallet):
+            # ``_evaluate`` early-returns when the per-wallet lock is held, so
+            # calling it now would consume this trigger and do nothing with it --
+            # and the running tick may have snapshotted before whatever we are
+            # reacting to. Queue it instead, and leave any already-queued run be.
+            self._schedule_trailing_evaluation(wallet, max(wait, self._retry_sec()))
+            return
+        # Running now supersedes anything queued: cancel it rather than letting
+        # it fire a redundant second evaluation moments later.
+        self._cancel_trailing_evaluation(wallet)
         await self._evaluate(wallet)
+
+    def _evaluation_in_flight(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether an evaluation currently holds this wallet's lock."""
+        lock = self.wallets.get(wallet)
+        return lock is not None and hasattr(lock, "locked") and lock.locked()
+
+    def _material_state_changed(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether the wallet's position differs from the last evaluation's.
+
+        This is what keeps the rate limit from costing inbound liquidity: a
+        received Lightning payment shifts a channel's balance from remote to
+        local, which lands in the signature, so it evaluates immediately however
+        long the backoff had grown. Only a tick that is *provably* a repeat gets
+        deferred.
+
+        Defensive on purpose -- it is consulted on every event burst and must
+        never be the thing that stops the plugin evaluating. Any failure reads
+        as "changed", which errs toward running.
+        """
+        sig = self._current_state_sig(wallet)
+        return sig is None or sig != self._per_wallet_store("_last_state_sig").get(wallet)
+
+    def _current_state_sig(self, wallet: 'Abstract_Wallet') -> Optional[tuple]:
+        """This wallet's signature right now, or ``None`` if it cannot be read.
+
+        Builds the snapshot *inside* the guard: reading wallet state can fail
+        transiently (a db mid-write, a wallet being torn down), and a failure
+        here must read as "assume it changed" rather than propagate into the
+        caller and abort the evaluation it was only meant to schedule.
+        """
+        try:
+            return self._safe_material_state_sig(self.build_snapshot(wallet, None),
+                                                 self.read_config())
+        except Exception as e:
+            self.logger.debug(f"could not read state for the signature: {e!r}")
+            return None
+
+    def _safe_material_state_sig(self, snapshot, config) -> Optional[tuple]:
+        """``_material_state_sig``, or ``None`` if it cannot be computed.
+
+        The signature is an optimisation -- it decides whether a tick may be
+        deferred -- so it must never be the thing that breaks a tick. Anything
+        unexpected (a snapshot shape this version does not know, a config that
+        is not a dataclass) reads as ``None``, which every caller treats as
+        "assume it changed" and therefore evaluates.
+        """
+        try:
+            return self._material_state_sig(snapshot, config)
+        except Exception as e:
+            self.logger.debug(f"could not compute state signature: {e!r}")
+            return None
+
+    def _safe_watchdogs_pending(self, snapshot) -> bool:
+        """``_watchdogs_pending``, defaulting to True if it cannot be read.
+
+        Errs toward keeping the check rate up: a snapshot we cannot interpret is
+        a poor reason to start skipping ticks that watchdogs depend on.
+        """
+        try:
+            return self._watchdogs_pending(snapshot)
+        except Exception as e:
+            self.logger.debug(f"could not read watchdog state: {e!r}")
+            return True
+
+    @staticmethod
+    def _watchdogs_pending(snapshot: LiquiditySnapshot) -> bool:
+        """Whether some time-based watchdog is currently counting down.
+
+        Each of these is a state the plugin is actively waiting out, and each is
+        advanced only by an evaluation running (see ``_note_evaluation_outcome``
+        for why that matters):
+
+          * a channel still opening -- the stuck/wedged-open watchdog, which
+            needs several checks spread over time before it will remediate;
+          * a channel closing -- tracked to completion;
+          * a swap in flight -- the stuck-swap reconciliation and freeze escape;
+          * a channel that is not active -- its peer may be gone, and the
+            offline auto-close watchdog samples peer uptime once per tick, so
+            starving ticks directly corrupts the uptime metric it decides on.
+
+        Derived from the no-transport snapshot the tick already built, so this
+        costs nothing extra.
+        """
+        if (snapshot.pending_channel_count or snapshot.pending_open_freeze_count
+                or snapshot.closing_channel_count or snapshot.inflight_swap_count):
+            return True
+        return any(not ch.is_active for ch in snapshot.channels)
+
+    @staticmethod
+    def _material_state_sig(snapshot: LiquiditySnapshot,
+                            config: LiquidityConfig) -> tuple:
+        """A signature of everything that means "there may be something to do".
+
+        Deliberately narrower than the whole snapshot. The fee-ish fields
+        (``swap_percentage_fee``, ``swap_mining_fee_sat``, ``swap_claim_fee_sat``
+        and the provider offers) are excluded because they drift on their own --
+        the claim fee tracks live on-chain fee estimates and moves with the
+        mempool -- so including them would mean "changed" on nearly every tick
+        and the backoff would never engage. That is safe: a fee movement alone
+        cannot create liquidity work, and the heartbeat re-prices everything on
+        its own cadence regardless.
+
+        The config *is* included, so editing a threshold in the settings dialog
+        takes effect on the next tick instead of waiting out a backoff.
+        """
+        return (
+            snapshot.onchain_spendable_sat,
+            tuple((ch.channel_id, ch.capacity_sat, ch.local_sat, ch.remote_sat,
+                   ch.spendable_local_sat, ch.is_active, ch.has_unsettled_htlcs,
+                   ch.unsettled_is_swap, ch.is_plugin_opened)
+                  for ch in snapshot.channels),
+            snapshot.pending_channel_count,
+            snapshot.pending_open_freeze_count,
+            snapshot.inflight_swap_count,
+            snapshot.closing_channel_count,
+            snapshot.opens_last_24h,
+            dataclasses.astuple(config),
+        )
+
+    def _schedule_trailing_evaluation(self, wallet: 'Abstract_Wallet',
+                                      delay: float) -> None:
+        """Queue the one evaluation a deferred trigger is honoured by.
+
+        At most one per wallet: if a run is already queued, this trigger simply
+        joins it (it would evaluate the same state at the same moment anyway).
+        """
+        tasks = self._per_wallet_store("_trailing_eval_tasks")
+        existing = tasks.get(wallet)
+        if existing is not None and not existing.done():
+            return
+        async def _wait_then_evaluate() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            # Clear our own slot *before* evaluating, so the run we are about to
+            # start does not see itself as "a trailing run to cancel".
+            self._per_wallet_store("_trailing_eval_tasks").pop(wallet, None)
+            if wallet not in self.wallets:
+                return  # stopped while we waited
+            if self._evaluation_in_flight(wallet):
+                # Still busy. Re-arm rather than call ``_evaluate``, which would
+                # bounce off the lock and drop the trigger we are carrying.
+                self._schedule_trailing_evaluation(wallet, self._retry_sec())
+                return
+            await self._evaluate(wallet)
+        tasks[wallet] = asyncio.ensure_future(_wait_then_evaluate())
+
+    def _cancel_trailing_evaluation(self, wallet: 'Abstract_Wallet') -> None:
+        """Drop the queued trailing run, from whichever thread we are on.
+
+        The heartbeat is a ``concurrent.futures.Future`` (from
+        ``run_coroutine_threadsafe``) and can be cancelled from anywhere, but
+        this is a plain ``asyncio.Task`` and ``Task.cancel()`` is NOT
+        thread-safe. ``stop_wallet`` reaches here from the GUI thread via the
+        ``close_wallet`` hook, so hop onto the loop that owns the task when we
+        are not already running on it.
+        """
+        task = self._per_wallet_store("_trailing_eval_tasks").pop(wallet, None)
+        if task is None or task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+            on_loop = True
+        except RuntimeError:
+            on_loop = False       # no running loop here => another thread
+        if not on_loop:
+            loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                    return
+                except RuntimeError:
+                    pass          # loop already closed; fall through
+        task.cancel()
+
+    def _note_evaluation_outcome(self, wallet: 'Abstract_Wallet', *,
+                                 changed: bool, acted: bool,
+                                 manual: bool, watchdogs_pending: bool = False) -> None:
+        """Fold this tick's outcome into the rate limit.
+
+        A tick that found a changed wallet, took an action, or was asked for by
+        hand resets the spacing to the floor -- the user is engaged, or the
+        situation is moving, and either way the next check should be prompt. A
+        tick that found the same state it found last time and did nothing about
+        it doubles the spacing (capped), because repeating it sooner would
+        produce the same nothing at the cost of another round of relay
+        connections.
+
+        ``watchdogs_pending`` pins the spacing to the floor even on an inert
+        tick, and it is load-bearing. Every time-based watchdog -- the wedged /
+        stuck open, the offline-peer uptime sampling, the stuck-swap
+        reconciliation -- only advances *when a tick runs*, and several need
+        several ticks spread over time before they will act. Those watchdogs
+        also run against a wallet that is, by definition, quiet: a dead peer
+        stops producing events, and a wedged open sits at identical balances
+        tick after tick. That is precisely the state this backoff would read as
+        "nothing is happening" and stretch toward the cap -- starving the
+        watchdog exactly when it matters. So while one is counting down, we keep
+        checking at the floor. The storm this rate limit exists to stop had no
+        watchdog pending at all (healthy channels, no pending open, no swap in
+        flight), so nothing about that case regresses.
+        """
+        intervals = self._per_wallet_store("_auto_eval_interval")
+        floor = self._min_interval_sec()
+        if changed or acted or manual or watchdogs_pending:
+            intervals[wallet] = floor
+            return
+        current = intervals.get(wallet, floor)
+        grown = min(current * AUTO_EVAL_BACKOFF_FACTOR, self._max_interval_sec())
+        intervals[wallet] = grown
+        if grown != current:
+            self.logger.info(
+                f"{wallet.basename()}: nothing changed and nothing to do; "
+                f"next automatic check in ~{format_duration(grown)}")
 
     async def _evaluate(self, wallet: 'Abstract_Wallet', *, manual: bool = False) -> None:
         """Evaluate `wallet` and take any warranted action.
@@ -3543,13 +3992,29 @@ class LiquidityPlugin(BasePlugin):
                 # opens and idle/frozen ticks need no provider at all.
                 self._set_status(wallet, "reading wallet state")
                 base = self.build_snapshot(wallet, None)
+                # Record that this tick ran, and against which state, so the rate
+                # limit has something to measure from. Done here rather than at
+                # the end because the work below can take minutes (a swap, a
+                # channel open), and the spacing we care about is between
+                # evaluations *starting*, not between one finishing and the next
+                # starting -- the latter would let a slow tick be followed
+                # immediately by another.
+                sig = self._safe_material_state_sig(base, config)
+                sigs = self._per_wallet_store("_last_state_sig")
+                changed = sig is None or sig != sigs.get(wallet)
+                if sig is not None:
+                    sigs[wallet] = sig
+                self._per_wallet_store("_last_eval_at")[wallet] = time.monotonic()
                 if self._swap_may_be_needed(base, config):
                     self._set_status(wallet, "discovering swap providers")
                     async with self._swap_session(wallet) as transport:
                         snapshot = self.build_snapshot(wallet, transport)
-                        await self._run_decision(wallet, snapshot, config, transport)
+                        acted = await self._run_decision(wallet, snapshot, config, transport)
                 else:
-                    await self._run_decision(wallet, base, config, None)
+                    acted = await self._run_decision(wallet, base, config, None)
+                self._note_evaluation_outcome(
+                    wallet, changed=changed, acted=acted, manual=manual,
+                    watchdogs_pending=self._safe_watchdogs_pending(base))
             except Exception as e:
                 # Never let an evaluation error escape (it would surface as an
                 # unhandled asyncio task exception); just log and wait for the
@@ -3563,8 +4028,14 @@ class LiquidityPlugin(BasePlugin):
 
     async def _run_decision(self, wallet: 'Abstract_Wallet', snapshot: LiquiditySnapshot,
                             config: LiquidityConfig,
-                            transport: Optional['SwapServerTransport']) -> None:
-        """Run the rules engine on a snapshot, log declines, and execute actions."""
+                            transport: Optional['SwapServerTransport']) -> bool:
+        """Run the rules engine on a snapshot, log declines, and execute actions.
+
+        Returns whether anything was actually executed. The rate limit uses that
+        to tell a productive tick from an inert one: a tick that acted is
+        followed promptly (its action changes state, which is worth re-reading),
+        while one that did nothing feeds the idle backoff.
+        """
         result = evaluate(snapshot, config)
         self.logger.info(
             f"{wallet.basename()}: onchain={snapshot.onchain_spendable_sat} "
@@ -3637,6 +4108,7 @@ class LiquidityPlugin(BasePlugin):
         # (enriched with the concrete peer / txid) inside _execute.
         for action, candidates in executable:
             await self._execute(wallet, action, state, transport, candidates)
+        return bool(executable)
 
     @staticmethod
     def _swap_may_be_needed(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> bool:
@@ -3665,24 +4137,41 @@ class LiquidityPlugin(BasePlugin):
         from .swap_transport import TargetedNostrTransport
         from electrum.lnutil import generate_random_keypair
         sm = wallet.lnworker.swap_manager
-        if self.config.SWAPSERVER_URL:
-            # Single HTTP provider; provider selection does not apply.
-            async with sm.create_transport() as transport:
+        # Mute `swap_offers_changed` for the lifetime of this session. Discovery
+        # here makes Electrum emit one of those per provider announcement, and
+        # treating our own echo as news is what made the plugin evaluate
+        # continuously (see _on_offers_event). Incremented around BOTH transport
+        # kinds and released in `finally`, so an exception mid-session cannot
+        # leave the plugin permanently deaf to real offer events.
+        self._open_swap_sessions = self._open_session_count() + 1
+        try:
+            if self.config.SWAPSERVER_URL:
+                # Single HTTP provider; provider selection does not apply.
+                async with sm.create_transport() as transport:
+                    try:
+                        await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+                    except asyncio.TimeoutError:
+                        self.logger.info("swap provider (URL) not reachable yet")
+                    yield transport
+                return
+            transport = TargetedNostrTransport(self.config, sm, generate_random_keypair())
+            async with transport:
                 try:
-                    await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+                    await asyncio.wait_for(transport.is_connected.wait(),
+                                           timeout=OFFER_CONNECT_TIMEOUT_SEC)
                 except asyncio.TimeoutError:
-                    self.logger.info("swap provider (URL) not reachable yet")
+                    self.logger.info("nostr relays did not connect; proceeding with no offers")
+                await self._await_offers(transport)
                 yield transport
-            return
-        transport = TargetedNostrTransport(self.config, sm, generate_random_keypair())
-        async with transport:
-            try:
-                await asyncio.wait_for(transport.is_connected.wait(),
-                                       timeout=OFFER_CONNECT_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                self.logger.info("nostr relays did not connect; proceeding with no offers")
-            await self._await_offers(transport)
-            yield transport
+        finally:
+            self._open_swap_sessions = max(0, self._open_session_count() - 1)
+
+    def _open_session_count(self) -> int:
+        """How many nostr swap sessions we currently hold open. Read through
+        ``getattr`` for the same reason as ``_per_wallet_store``: a harness-built
+        plugin has no ``__init__``, and muting an event must never be able to
+        break the session it is muting for."""
+        return int(getattr(self, "_open_swap_sessions", 0) or 0)
 
     @staticmethod
     async def _await_offers(transport: 'SwapServerTransport',

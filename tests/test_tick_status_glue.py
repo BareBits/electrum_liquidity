@@ -32,6 +32,7 @@ from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     STATUS_SETTLING,
     STATUS_SLEEPING,
     TERMINAL_STATUSES,
+    is_terminal_status,
 )
 from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore  # noqa: E402
     OpenChannelAction,
@@ -88,6 +89,13 @@ def _ready(p, wallet) -> None:
     p._started_at[wallet] = 0.0
 
 
+def _sleeping(status: str) -> bool:
+    """Whether ``status`` is the resting state. Not an equality test: once a tick
+    has run, the resting status carries the rate limit's "(next check in ~Xm)"
+    suffix (see ``sleeping_status``)."""
+    return status.startswith(STATUS_SLEEPING) and is_terminal_status(status)
+
+
 # --- initial state --------------------------------------------------------
 def test_status_starts_as_not_started() -> None:
     p, w = _plugin(), _FakeWallet()
@@ -116,14 +124,16 @@ def test_full_tick_walks_the_steps_and_ends_sleeping() -> None:
 
     asyncio.run(p._evaluate(w))
 
-    assert p.seen == [
+    assert p.seen[:-1] == [
         "reconciling pending swaps",
         "checking channel health",
         "checking for offline peers",
         "reading wallet state",
-        STATUS_SLEEPING,
     ]
-    assert p.tick_status(w) == STATUS_SLEEPING
+    # A completed tick rests on "sleeping", now annotated with when the next
+    # automatic check is due (the rate limit's window has just started).
+    assert _sleeping(p.seen[-1])
+    assert p.tick_status(w) == f"{STATUS_SLEEPING} (next check in ~1m)"
 
 
 def test_disabled_automation_ends_disabled_not_sleeping() -> None:
@@ -147,7 +157,7 @@ def test_manual_run_only_ends_manual_only() -> None:
 
     # An explicit "Run now" bypasses the gate, so it runs and ends sleeping.
     asyncio.run(p._evaluate(w, manual=True))
-    assert p.tick_status(w) == STATUS_SLEEPING
+    assert _sleeping(p.tick_status(w))
 
 
 def test_not_ready_wallet_ends_warming_up() -> None:
@@ -182,7 +192,7 @@ def test_manual_run_during_warm_up_does_not_end_warming_up() -> None:
     # ...but the manual run acts and rests on "sleeping".
     asyncio.run(p._evaluate(w, manual=True))
     assert ran == [True]
-    assert p.tick_status(w) == STATUS_SLEEPING
+    assert _sleeping(p.tick_status(w))
 
 
 def test_status_wording_is_not_about_funds_settling() -> None:
@@ -204,7 +214,7 @@ def test_an_exception_mid_tick_still_ends_terminal() -> None:
     p._diag_event = lambda wallet, **kw: None
 
     asyncio.run(p._evaluate(w))                  # _evaluate swallows the error
-    assert p.tick_status(w) == STATUS_SLEEPING
+    assert _sleeping(p.tick_status(w))
     assert p.seen[-1] in TERMINAL_STATUSES
 
 
@@ -237,7 +247,7 @@ def test_a_failing_gui_notification_does_not_break_the_tick() -> None:
     p.on_status_changed = _explode
 
     asyncio.run(p._evaluate(w))                  # must complete regardless
-    assert p.tick_status(w) == STATUS_SLEEPING
+    assert _sleeping(p.tick_status(w))
 
 
 def test_repeated_identical_status_is_not_re_notified() -> None:

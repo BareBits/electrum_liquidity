@@ -148,17 +148,22 @@ def test_start_heartbeat_noop_without_loop() -> None:
 def test_stop_wallet_forgets_all_per_wallet_state() -> None:
     p = _bare_plugin()
     wallet = _FakeWallet()
-    # Populate every per-wallet dict + the managed set + a (fake) heartbeat.
+    # Populate every per-wallet dict + the managed set. The two task maps get a
+    # cancellable stand-in rather than a marker dict: stop_wallet cancels what it
+    # finds there, which is the behaviour under test for them.
+    task_attrs = ("_heartbeat_tasks", "_trailing_eval_tasks")
     for attr in LiquidityPlugin._PER_WALLET_STATE_ATTRS:
-        getattr(p, attr)[wallet] = {"marker": True}
+        getattr(p, attr)[wallet] = (_FakeFuture() if attr in task_attrs
+                                    else {"marker": True})
     p.wallets[wallet] = "lock"
-    fut = _FakeFuture()
-    p._heartbeat_tasks[wallet] = fut
+    fut = p._heartbeat_tasks[wallet]
+    trailing = p._trailing_eval_tasks[wallet]
 
     p.stop_wallet(wallet)
 
     assert wallet not in p.wallets
     assert fut.cancel_called, "heartbeat future should be cancelled"
+    assert trailing.cancel_called, "deferred evaluation should be cancelled"
     for attr in LiquidityPlugin._PER_WALLET_STATE_ATTRS:
         assert wallet not in getattr(p, attr), f"{attr} still holds the wallet"
 
@@ -185,16 +190,24 @@ def test_on_close_cancels_heartbeats_and_unregisters(monkeypatch) -> None:
     recorded: list = []
     monkeypatch.setattr(util, "unregister_callback", lambda cb: recorded.append(cb))
     p._on_wallet_event = "SENTINEL_CB"      # type: ignore[assignment]
+    p._on_offers_event = "SENTINEL_OFFERS_CB"   # type: ignore[assignment]
     w1, w2 = _FakeWallet(), _FakeWallet()
     f1, f2 = _FakeFuture(), _FakeFuture()
     p._heartbeat_tasks[w1] = f1
     p._heartbeat_tasks[w2] = f2
+    trailing = _FakeFuture()
+    p._trailing_eval_tasks[w1] = trailing
 
     p.on_close()
 
     assert f1.cancel_called and f2.cancel_called
     assert p._heartbeat_tasks == {}
-    assert recorded == ["SENTINEL_CB"]
+    assert trailing.cancel_called, "a queued deferred evaluation must be cancelled"
+    assert p._trailing_eval_tasks == {}
+    # BOTH callbacks come off: the offer-event handler is registered separately
+    # (see _OFFER_TRIGGER_EVENTS), and leaving it behind would keep a disabled
+    # plugin reacting to nostr traffic.
+    assert recorded == ["SENTINEL_CB", "SENTINEL_OFFERS_CB"]
 
 
 # --- #4 stuck-swap freeze escape ------------------------------------------
