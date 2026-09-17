@@ -1512,6 +1512,34 @@ class LiquidityPlugin(BasePlugin):
         except Exception as e:
             self.logger.info(f"status notification failed: {e!r}")
 
+    @staticmethod
+    async def _read_capped(stream, limit: int) -> bytes:
+        """Read up to ``limit`` bytes from ``stream``, to EOF.
+
+        NOT the same as ``await stream.read(limit)``, and the difference was a
+        real bug: aiohttp's ``StreamReader.read(n)`` returns up to n bytes --
+        whatever happens to be buffered -- so on a chunked response it hands
+        back the FIRST CHUNK, not the body. The update check then fed a
+        truncated document to ``json.loads`` and failed with a
+        JSONDecodeError whose position was simply wherever the chunk ended.
+        Intermittent by nature: it depended entirely on how the response was
+        framed on the wire.
+
+        Looping to EOF fixes that while keeping the read cap, which exists so a
+        hostile or broken endpoint cannot make the wallet buffer an unbounded
+        body. Returning ``limit`` bytes is the caller's signal that the cap was
+        hit (it asks for one more than it will accept).
+        """
+        chunks: List[bytes] = []
+        remaining = limit
+        while remaining > 0:
+            chunk = await stream.read(min(remaining, 64 * 1024))
+            if not chunk:
+                break          # EOF: the whole body is in hand
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
     async def _fetch_latest_release(self, wallet: 'Abstract_Wallet') -> Optional[ReleaseInfo]:
         """GET the latest published release, or None on any failure.
 
@@ -1530,7 +1558,8 @@ class LiquidityPlugin(BasePlugin):
                         self.logger.info(
                             f"update check: GitHub replied {response.status}; skipping")
                         return None
-                    raw = await response.content.read(UPDATE_CHECK_MAX_BYTES + 1)
+                    raw = await self._read_capped(response.content,
+                                                  UPDATE_CHECK_MAX_BYTES + 1)
             if len(raw) > UPDATE_CHECK_MAX_BYTES:
                 self.logger.info("update check: response too large; skipping")
                 return None

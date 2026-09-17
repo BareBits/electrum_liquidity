@@ -65,6 +65,16 @@ PASSWORD = "rig-test-password"
 STATUS_LOCKED = "wallet locked"      # mirrors STATUS_LOCKED in the plugin
 
 
+def _is_sleeping(status: str) -> bool:
+    """Whether ``status`` is the armed resting state.
+
+    A prefix test, not equality: once a tick has run the plugin annotates the
+    resting status with when the evaluation rate limit will next let an
+    automatic tick run ("sleeping (next check in ~2m)").
+    """
+    return status.startswith("sleeping")
+
+
 def _setcfg(key: str, value: str) -> None:
     electrum_cli("setconfig", key, value, inst=CLIENT)
 
@@ -140,7 +150,7 @@ def test_locked_wallet_rests_on_locked_then_resumes_when_unlocked(rig):
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
 
     # 1. Baseline: the plugin is armed and ticking on the unencrypted wallet.
-    assert _wait_until(lambda: "sleeping" in _status_lines(), rig=rig, timeout=240), \
+    assert _wait_until(lambda: any(_is_sleeping(s) for s in _status_lines()), rig=rig, timeout=240), \
         f"plugin never reached the armed resting state: {_status_lines()!r}"
     log_before = len(_client_log_text())
 
@@ -174,7 +184,7 @@ def test_locked_wallet_rests_on_locked_then_resumes_when_unlocked(rig):
     #    GUI's Unlock button fills. No restart, no plugin-specific prompt.
     electrum_cli("unlock", "--password", PASSWORD, inst=CLIENT)
 
-    assert _wait_until(lambda: _last_status() == "sleeping", rig=rig, timeout=240), \
+    assert _wait_until(lambda: _is_sleeping(_last_status()), rig=rig, timeout=240), \
         f"plugin did not resume after unlocking: {_status_lines()[-5:]!r}"
     # It really ran a tick rather than just relabelling: the steps are back.
     assert "reading wallet state" in _status_lines()[-12:], \
