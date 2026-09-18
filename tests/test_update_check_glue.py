@@ -206,19 +206,52 @@ def test_an_available_update_is_logged_once_per_version(caplog) -> None:
 
 # --- what goes over the wire ----------------------------------------------
 class _FakeResponse:
+    """A response whose body is consumed like a real stream.
+
+    Position-tracking matters: a stream that returned the whole body on every
+    call would never signal EOF, so a reader looping to EOF could not terminate
+    -- and the fake would be testing something no wire ever does. ``_read``
+    returns b"" once exhausted, exactly like ``StreamReader``.
+    """
+
+    #: Bytes handed back per read; the default is "everything at once", which is
+    #: the friendly case. See _ChunkedResponse for the realistic one.
+    _chunk: Optional[int] = None
+
     def __init__(self, status: int, body: bytes) -> None:
         self.status = status
         self._body = body
+        self._pos = 0
         self.content = SimpleNamespace(read=self._read)
 
     async def _read(self, limit: int) -> bytes:
-        return self._body[:limit]
+        take = min(limit, len(self._body) - self._pos)
+        if self._chunk is not None:
+            take = min(take, self._chunk)
+        out = self._body[self._pos:self._pos + take]
+        self._pos += take
+        return out
 
     async def __aenter__(self) -> "_FakeResponse":
         return self
 
     async def __aexit__(self, *exc) -> None:
         return None
+
+
+class _ChunkedResponse(_FakeResponse):
+    """A response that hands back its body a chunk at a time, like the real one.
+
+    This is what aiohttp's ``StreamReader.read(n)`` actually does: it returns up
+    to n bytes -- whatever is buffered -- not n bytes. ``_FakeResponse`` above
+    returns the whole body on the first call, which is why the truncation bug
+    lived happily under the unit tests while failing intermittently against the
+    real GitHub endpoint. Reading has to continue to EOF.
+    """
+
+    def __init__(self, status: int, body: bytes, chunk: int = 16) -> None:
+        super().__init__(status, body)
+        self._chunk = chunk
 
 
 class _FakeSession:
@@ -298,6 +331,66 @@ def test_an_oversized_body_is_refused(monkeypatch) -> None:
     p = _plugin()
     _patch_session(monkeypatch, body=b"x" * (UPDATE_CHECK_MAX_BYTES + 10))
     assert asyncio.run(p._fetch_latest_release(_wallet())) is None
+
+
+# --- a body that arrives in chunks (the real wire behaviour) --------------
+def test_a_chunked_body_is_read_to_the_end(monkeypatch) -> None:
+    """The regression: a response delivered in chunks was parsed from its FIRST
+    CHUNK only, so the update check died on a JSONDecodeError at whatever byte
+    the chunk happened to end on. Against real GitHub it failed intermittently;
+    under the old single-shot fake it never failed at all."""
+    p = _plugin()
+    body = json.dumps({
+        "tag_name": "v9.9.9", "draft": False, "prerelease": False,
+        "html_url": "https://github.com/BareBits/electrum_liquidity/releases/tag/v9.9.9",
+        # Padding so the document is comfortably longer than one chunk.
+        "body": "release notes " * 200,
+    }).encode("utf-8")
+    record: Dict[str, Any] = {}
+    response = _ChunkedResponse(200, body, chunk=16)
+
+    def _make(proxy, headers=None, timeout=None):
+        return _FakeSession(response, record)
+    monkeypatch.setattr(pkg, "make_aiohttp_session", _make)
+
+    release = asyncio.run(p._fetch_latest_release(_wallet()))
+    assert release is not None, "a chunked body must be read to EOF, not truncated"
+    assert release.version == "9.9.9"
+
+
+def test_the_read_cap_still_holds_for_a_chunked_body(monkeypatch) -> None:
+    """Reading to EOF must not cost the bound that stops a hostile endpoint
+    making the wallet buffer an unbounded body."""
+    p = _plugin()
+    record: Dict[str, Any] = {}
+    response = _ChunkedResponse(200, b"x" * (UPDATE_CHECK_MAX_BYTES + 5000),
+                                chunk=4096)
+
+    def _make(proxy, headers=None, timeout=None):
+        return _FakeSession(response, record)
+    monkeypatch.setattr(pkg, "make_aiohttp_session", _make)
+    assert asyncio.run(p._fetch_latest_release(_wallet())) is None
+
+
+def test_read_capped_stops_at_eof_and_at_the_limit() -> None:
+    p = _plugin()
+
+    class _Stream:
+        def __init__(self, data: bytes, chunk: int) -> None:
+            self.data, self.chunk, self.pos = data, chunk, 0
+
+        async def read(self, n: int) -> bytes:
+            take = min(n, self.chunk, len(self.data) - self.pos)
+            out = self.data[self.pos:self.pos + take]
+            self.pos += take
+            return out
+
+    # Short body: every byte, then EOF ends the loop (it must not hang).
+    assert asyncio.run(p._read_capped(_Stream(b"abcdef", 2), 1000)) == b"abcdef"
+    # Empty body: EOF immediately.
+    assert asyncio.run(p._read_capped(_Stream(b"", 2), 1000)) == b""
+    # Long body: stops at exactly the limit, so the caller can detect the cap.
+    assert asyncio.run(p._read_capped(_Stream(b"y" * 100, 7), 10)) == b"y" * 10
 
 
 def test_a_network_error_is_swallowed(monkeypatch) -> None:

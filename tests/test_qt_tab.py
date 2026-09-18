@@ -940,6 +940,24 @@ def test_status_section_updates_from_the_plugin_signal(qapp):
     assert not any(t.startswith("since ") for t in labels)
 
 
+def test_the_annotated_sleeping_status_still_reads_as_resting(qapp):
+    """The status the plugin actually publishes once a tick has run carries the
+    rate limit's "(next check in ~Xm)" suffix. The tab decides "resting" by
+    prefix for exactly this reason -- an equality check against the terminal set
+    would paint a deliberately-waiting plugin as busy, in bold green and stamped
+    with a "since" time that never advances."""
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+
+    annotated = f"{STATUS_SLEEPING} (next check in ~10m)"
+    p._on_status_changed_ui(wallet, annotated)
+    labels = _status_labels(p._tabs[wallet])
+    assert annotated in labels, "the wait must be shown, not swallowed"
+    assert not any(t.startswith("since ") for t in labels), \
+        "a resting plugin must not be stamped with a start time"
+
+
 def test_status_update_for_an_unknown_wallet_is_a_no_op(qapp):
     p = _make_plugin()
     p._on_status_changed_ui(_FakeWallet(), STATUS_SLEEPING)      # must not raise

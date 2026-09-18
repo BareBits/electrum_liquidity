@@ -31,7 +31,7 @@ from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
-    PLUGIN_OPENED_CHANNELS_DB_KEY, TERMINAL_STATUSES,
+    PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
 from .liquidity_manager import normalize_node_id
@@ -970,7 +970,10 @@ class Plugin(LiquidityPlugin):
             step is emphasised, so a glance tells you whether anything is
             happening without reading the words."""
             tick_status_label.setText(status)
-            resting = status in TERMINAL_STATUSES
+            # Not a plain TERMINAL_STATUSES membership test: the sleeping state
+            # carries a "(next check in ~Xm)" suffix, and exact matching would
+            # paint a resting plugin as busy (and stamp it with a "since" time).
+            resting = is_terminal_status(status)
             tick_status_label.setStyleSheet(
                 "color: gray;" if resting else "color: #2ea043; font-weight: bold;")
             tick_since_label.setText(

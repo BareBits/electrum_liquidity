@@ -28,10 +28,18 @@ from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     STATUS_LOCKED,
     STATUS_SLEEPING,
     TERMINAL_STATUSES,
+    is_terminal_status,
 )
 from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore  # noqa: E402
     BLOCK_LOCKED,
 )
+
+
+def _sleeping(status: str) -> bool:
+    """Whether ``status`` is the resting state. Not an equality test: once a tick
+    has run, the resting status carries the rate limit's "(next check in ~Xm)"
+    suffix (see ``sleeping_status``)."""
+    return status.startswith(STATUS_SLEEPING) and is_terminal_status(status)
 
 PASSWORD = "hunter2"
 
@@ -314,7 +322,7 @@ def test_tick_runs_normally_once_the_wallet_is_unlocked() -> None:
     w.unlock(PASSWORD)
     asyncio.run(p._evaluate(w))
     assert "decision" in p.ran
-    assert p.tick_status(w) == STATUS_SLEEPING
+    assert _sleeping(p.tick_status(w))
 
 
 def test_locking_again_re_blocks_the_next_tick() -> None:
