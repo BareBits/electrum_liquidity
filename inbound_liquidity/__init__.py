@@ -322,6 +322,20 @@ AUTO_EVAL_BACKOFF_FACTOR = 2.0
 # it.
 TRAILING_EVAL_RETRY_SEC = 5.0
 
+# --- reverse-swap sizing headroom -----------------------------------------
+# Slack kept back when sizing a max reverse swap, over and above the routing-fee
+# reserve Electrum already accounts for. See ``_channel_sendable_sat`` for the
+# full reasoning; in short, a reverse swap is two concurrent payments down one
+# channel and Electrum's reserve covers one, leaving a max-sized swap about a
+# satoshi short of what it needs. 1% is far larger than the shortfall ever
+# observed (single-digit sats plus one HTLC's commitment cost) while costing a
+# user with a 0.02 BTC channel roughly 8,000 sat of swap size -- and a swap that
+# is 1% smaller is strictly better than one that hangs and faults an innocent
+# provider. The floor keeps the slack meaningful on small channels, where a
+# percentage would round down to noise.
+SWAP_SIZING_HEADROOM_PCT = 1.0
+SWAP_SIZING_HEADROOM_MIN_SAT = 1_000
+
 # When opening a nostr swap session, how long to wait for relays to connect, and
 # then for the first provider offers to arrive, before proceeding with whatever
 # we have. Bounded so an evaluation never hangs on an unreachable network.
@@ -3457,6 +3471,31 @@ class LiquidityPlugin(BasePlugin):
         either leg cannot be routed the swap is never funded and never fails --
         it just hangs until the stuck-swap timeout blames the provider.
 
+        Electrum's reserve alone is NOT enough here, which is the bug this extra
+        headroom fixes. That reserve is sized for ONE max-amount payment, and it
+        is very nearly exact: on a 804,515 sat channel it left a swap of 796,549
+        sat, against a requirement of 804,514 -- a margin of ONE satoshi. The
+        swap is two payments, and they are issued CONCURRENTLY by Electrum
+        (``submarine_swaps.reverse_swap`` fires the prepayment with
+        ``ensure_future`` and, unlike the main payment, does not pin it to our
+        chosen channel). So whether the main leg routes depends on whether the
+        prepayment's HTLC has already been committed against the same channel --
+        and once it has, the extra in-flight HTLC also enlarges the commitment
+        transaction, eating what little slack was left. Measured on the regtest
+        rig, a max-sized swap failed about three runs in four, identically with
+        and without the evaluation rate limit.
+
+        The failure is quiet and it blames the wrong party: the swap is accepted,
+        never funded, and reconciliation later records a stuck-swap fault against
+        a provider that did nothing wrong (repeat faults de-prioritise, then ban
+        it).
+
+        Rather than try to re-derive Electrum's per-HTLC commitment cost -- which
+        is version-specific and would silently drift -- we simply stop sizing
+        swaps at the ceiling, and keep SWAP_SIZING_HEADROOM_PCT of the channel
+        back. A swap ~1% smaller costs the user nothing that matters; being one
+        satoshi short costs the whole swap.
+
         Degrades to the raw ceiling if the estimator is unavailable (older
         Electrum / a stubbed lnworker in tests) rather than blocking swaps.
         """
@@ -3470,7 +3509,66 @@ class LiquidityPlugin(BasePlugin):
         except Exception as e:  # noqa: BLE001
             _logger.info(f"could not estimate LN fee reserve for channel: {e!r}")
             return max(0, raw_sat)
-        return max(0, raw_sat - max(0, reserve_sat))
+        headroom_sat = LiquidityPlugin._swap_sizing_headroom_sat(
+            raw_sat, LiquidityPlugin._second_htlc_overhead_sat(chan))
+        return max(0, raw_sat - max(0, reserve_sat) - headroom_sat)
+
+    @staticmethod
+    def _second_htlc_overhead_sat(chan) -> int:
+        """What a SECOND concurrent in-flight HTLC costs this channel, on top of
+        its own value. This is the whole gap being corrected.
+
+        ``available_to_spend`` already prices in ONE added HTLC -- it adds
+        ``fee_for_htlc_output`` and sizes its fee-spike buffer at
+        ``num_htlcs + 1`` at double the feerate (see ``lnchannel.py``). A reverse
+        swap puts TWO HTLCs through the channel at once (main invoice +
+        mining-fee prepayment, issued concurrently by ``reverse_swap``), so the
+        second one's cost is unaccounted for -- and it is charged twice over:
+        once as another commitment output, and once as the matching growth of
+        that 2x-feerate buffer.
+
+        Hence ``1x + 2x = 3x`` the per-HTLC output fee. Computed from the
+        channel's live feerate with Electrum's own helper and the BOLT-defined
+        ``HTLC_OUTPUT_WEIGHT``, rather than a guessed constant: it scales with
+        the mempool (it was ~19,000 sat at regtest feerates and will be far
+        smaller on a quiet mainnet), so any fixed number would be wrong almost
+        everywhere. Returns 0 if the channel cannot answer, leaving the
+        proportional part of the headroom to carry it.
+        """
+        try:
+            from electrum.lnutil import LOCAL, fee_for_htlc_output
+            feerate = int(chan.get_feerate(LOCAL, ctn=chan.get_next_ctn(LOCAL)))
+            # The extra commitment output, plus the fee-spike buffer's matching
+            # growth (which available_to_spend reserves at 2x feerate).
+            overhead_msat = (fee_for_htlc_output(feerate=feerate)
+                             + fee_for_htlc_output(feerate=2 * feerate))
+            return max(0, int(math.ceil(overhead_msat / 1000)))
+        except Exception as e:  # noqa: BLE001  (sizing must never raise)
+            _logger.info(f"could not price a second HTLC for this channel: {e!r}")
+            return 0
+
+    @staticmethod
+    def _swap_sizing_headroom_sat(raw_sat: int, htlc_overhead_sat: int = 0) -> int:
+        """Slack held back from a max-sized swap, on top of Electrum's reserve.
+
+        ``htlc_overhead_sat`` is the real cost of the swap's second concurrent
+        HTLC (see ``_second_htlc_overhead_sat``) -- the quantity Electrum's
+        one-payment reserve misses.
+
+        An earlier attempt reserved the prepayment's full principal as a proxy
+        for this. It worked on ordinary channels but was ruinous on small ones:
+        the principal does not shrink with the channel, so on a 0.005 BTC channel
+        it swallowed 46,000 of 69,515 spendable sat and cut the swap to 22,826
+        -- small enough that the provider's fixed mining fee made it a 197%
+        all-in cost, which the engine then (correctly) declined. Pricing the
+        actual overhead instead keeps small channels swappable.
+
+        The proportional part remains as plain safety margin, with a floor so a
+        small channel still gets real (not rounding-sized) slack.
+        """
+        proportional = max(SWAP_SIZING_HEADROOM_MIN_SAT,
+                           int(math.ceil(raw_sat * SWAP_SIZING_HEADROOM_PCT / 100.0)))
+        return proportional + max(0, htlc_overhead_sat)
 
     def build_snapshot(self, wallet: 'Abstract_Wallet',
                        transport: Optional['SwapServerTransport'] = None) -> LiquiditySnapshot:
