@@ -16,6 +16,12 @@ the mocked unit tests in [`../tests/`](../tests) cannot prove.
   swaps at 0.5% over nostr).
 - Two 0.02 BTC channels client→partner (50/50), and a local **LNURL-pay stub** so
   the dev-fee payout path can be exercised with real invoices minted by the partner.
+- Optionally (`--second-provider`) a **second** headless swapserver, advertising at
+  0.1% so it always outranks the first, plus one more 0.02 BTC channel to it. Off
+  by default — every other suite asserts the one-partner topology. It exists so
+  provider *failover* can be tested: kill the cheap provider and the plugin must
+  still complete the swap via the survivor (see
+  `tests/test_swap_provider_failover_e2e.py`).
 
 The plugin is loaded as an **internal** Electrum plugin (auto-authorized) by
 symlinking `../inbound_liquidity` into the Electrum checkout — see
@@ -45,6 +51,7 @@ shared build).
 python run.py                     # brings the stack up, opens the Qt client GUI
 python run.py --no-gui            # headless (both daemons; no GUI)
 python run.py --exit-when-ready   # smoke: bring up, confirm readiness, tear down
+python run.py --no-gui --second-provider   # two competing swap providers
 ```
 
 Endpoints/nodeids/channels/swap-npub are written to `.run/ready.json`.

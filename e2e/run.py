@@ -43,6 +43,9 @@ from rig.procman import ProcessManager
 from rig.services import (
     CLIENT,
     PARTNER,
+    PARTNER2,
+    PARTNER_FEE_MILLIONTHS,
+    PARTNER2_FEE_MILLIONTHS,
     Endpoints,
     bitcoin_cli,
     discover_swap_provider,
@@ -92,8 +95,10 @@ class Rig:
         self.miner_address: Optional[str] = None
         self.client_address: Optional[str] = None
         self.partner_address: Optional[str] = None
+        self.partner2_address: Optional[str] = None
         self.client_nodeid: Optional[str] = None
         self.partner_nodeid: Optional[str] = None
+        self.partner2_nodeid: Optional[str] = None
         self.swap_npub: Optional[str] = None
         self.swap_offer: Optional[dict] = None
         self.channels: list[dict] = []
@@ -114,17 +119,21 @@ class Rig:
 
     def allocate(self) -> None:
         (btc_rpc, btc_p2p, fulcrum_tcp, fulcrum_admin, nostr,
-         ln_client, ln_partner, swapserver) = ports.free_ports(8)
+         ln_client, ln_partner, swapserver,
+         ln_partner2, swapserver2) = ports.free_ports(10)
         self.ep = Endpoints(
             btc_rpc=btc_rpc, btc_p2p=btc_p2p,
             fulcrum_tcp=fulcrum_tcp, fulcrum_admin=fulcrum_admin,
             nostr=nostr, ln_listen_client=ln_client,
             ln_listen_partner=ln_partner, swapserver_port=swapserver,
+            ln_listen_partner2=ln_partner2, swapserver_port2=swapserver2,
         )
         log(f"ports: bitcoind-rpc={btc_rpc} p2p={btc_p2p}  "
             f"fulcrum-tcp={fulcrum_tcp} admin={fulcrum_admin}")
         log(f"ports: nostr={nostr}  ln-client={ln_client} ln-partner={ln_partner}  "
             f"swapserver={swapserver}")
+        if self.args.second_provider:
+            log(f"ports: ln-partner2={ln_partner2} swapserver2={swapserver2}")
         # A separate free port for the local LNURL-pay stub (dev-fee payout target).
         self.lnurl_stub_port = ports.free_port()
         log(f"ports: lnurl-stub={self.lnurl_stub_port}")
@@ -156,9 +165,17 @@ class Rig:
         self.partner_address = setup_wallet(ep, PARTNER)
         log(f"  partner funding address: {self.partner_address}")
 
+        if self.args.second_provider:
+            log("creating SECOND swap-provider wallet "
+                "(electrum_liqtest_swap_partner2) + config ...")
+            self.partner2_address = setup_wallet(ep, PARTNER2)
+            log(f"  partner2 funding address: {self.partner2_address}")
+
         log(f"funding each wallet with {self.args.funding} BTC ...")
         self._fund_wallet(self.client_address)
         self._fund_wallet(self.partner_address)
+        if self.args.second_provider:
+            self._fund_wallet(self.partner2_address)
         mine(ep, self.miner_address, 6)   # confirm funding
 
         log("starting Fulcrum ...")
@@ -175,6 +192,8 @@ class Rig:
         # channels to the swap provider (= partner), so we must know the
         # partner's LN node id before the client comes up.
         self._bring_up_partner()
+        if self.args.second_provider:
+            self._bring_up_partner2()
         peer = self.partner_nodeid
         log(f"pointing liquidity plugin preferred partner at partner: {peer[:24]}...")
         set_client_channel_peer(peer)
@@ -198,6 +217,10 @@ class Rig:
         pbal = wait_onchain_funds(PARTNER, min_btc=self.args.funding * 0.9,
                                   mine_cb=mine_cb, log=log)
         log(f"  client {cbal} BTC, partner {pbal} BTC confirmed")
+        if self.args.second_provider:
+            p2bal = wait_onchain_funds(PARTNER2, min_btc=self.args.funding * 0.9,
+                                       mine_cb=mine_cb, log=log)
+            log(f"  partner2 {p2bal} BTC confirmed")
 
         log("opening Lightning channels (client -> partner) ...")
         self.channels = open_channels(
@@ -214,10 +237,33 @@ class Rig:
             log(f"    {c['short_channel_id']}  local={c['local_balance']} "
                 f"remote={c['remote_balance']} sat")
 
+        if self.args.second_provider:
+            # The second provider needs a channel from the client for two
+            # reasons: its swapserver advertises max_forward from
+            # num_sats_can_receive(), so with no channel it would advertise a
+            # zero cap and the plugin would never rank it; and a reverse swap's
+            # Lightning leg is pinned to one channel, which (with gossip off)
+            # can only reach the peer it is open to.
+            log("opening Lightning channel (client -> partner2) ...")
+            self.channels = open_channels(
+                ep,
+                opener=CLIENT, peer=PARTNER2,
+                peer_listen_port=ep.ln_listen_partner2,
+                num_channels=1,
+                capacity_btc=self.args.channel_btc,
+                mine_cb=lambda n: mine(ep, self.miner_address, n),
+                log=log,
+                already_open=len(self.channels),
+            )
+            log(f"  {len(self.channels)} channel(s) OPEN in total")
+
         log("discovering swap provider over nostr ...")
         try:
             self.swap_npub, self.swap_offer = discover_swap_provider(
-                CLIENT, expected_fee_fraction=SWAP_FEE_FRACTION, log=log)
+                CLIENT, expected_fee_fraction=SWAP_FEE_FRACTION, log=log,
+                # Both swapservers must be on the relay before a failover test
+                # can rely on which one the plugin ranks first.
+                min_providers=2 if self.args.second_provider else 1)
         except TimeoutError as exc:
             # Non-fatal: the core rig (chain, server, relay, channels) is up; the
             # client can still be pointed at the partner manually. Surface it.
@@ -272,7 +318,21 @@ class Rig:
         self.partner_nodeid = wait_lightning_ready(PARTNER)
         bal = wallet_balance(PARTNER)
         log(f"swap-partner online (nodeid {self.partner_nodeid[:16]}..., "
-            f"balance {bal}); swapserver advertising at 0.5%")
+            f"balance {bal}); swapserver advertising at "
+            f"{PARTNER_FEE_MILLIONTHS / 10000:.2f}%")
+
+    def _bring_up_partner2(self) -> None:
+        """Second swap provider. It undercuts PARTNER on fee, so the plugin's
+        cheapest-first ranking always tries it FIRST -- which is what lets a test
+        control which provider fails and which one the cascade falls back to."""
+        log("starting headless SECOND swap-provider Electrum daemon ...")
+        start_electrum_daemon_ready(self.pm, PARTNER2, log=log)
+        wait_electrum_ready(PARTNER2)
+        self.partner2_nodeid = wait_lightning_ready(PARTNER2)
+        bal = wallet_balance(PARTNER2)
+        log(f"swap-provider 2 online (nodeid {self.partner2_nodeid[:16]}..., "
+            f"balance {bal}); swapserver advertising at "
+            f"{PARTNER2_FEE_MILLIONTHS / 10000:.2f}% (undercuts partner)")
 
     def _summary(self) -> None:
         assert self.ep is not None
@@ -285,6 +345,8 @@ class Rig:
         log(f"  nostr relay       : {ep.nostr_relay_url}")
         log(f"  client wallet     : {paths.CLIENT_WALLET_NAME}  (dir {CLIENT.datadir})")
         log(f"  partner wallet    : {paths.PARTNER_WALLET_NAME}  (dir {PARTNER.datadir})")
+        if self.args.second_provider:
+            log(f"  partner2 wallet   : {paths.PARTNER2_WALLET_NAME}  (dir {PARTNER2.datadir})")
         log(f"  channels open     : {len(self.channels)} x {self.args.channel_btc} BTC (50/50)")
         log(f"  swap provider npub: {self.swap_npub}")
         log(f"  swap offer        : {json.dumps(self.swap_offer)}")
@@ -320,6 +382,8 @@ class Rig:
             self.lnurl_stub.stop()
         stop_daemon(CLIENT)
         stop_daemon(PARTNER)
+        if self.args.second_provider:
+            stop_daemon(PARTNER2)
         self.pm.shutdown()
         log("all rig processes stopped")
 
@@ -341,6 +405,11 @@ class Rig:
             "partner_datadir": str(PARTNER.datadir),
             "partner_address": self.partner_address,
             "partner_nodeid": self.partner_nodeid,
+            "partner2_wallet": (paths.PARTNER2_WALLET_NAME
+                                if self.args.second_provider else None),
+            "partner2_datadir": (str(PARTNER2.datadir)
+                                 if self.args.second_provider else None),
+            "partner2_nodeid": self.partner2_nodeid,
             "channels": self.channels,
             "swap_provider_npub": self.swap_npub,
             "swap_offer": self.swap_offer,
@@ -368,6 +437,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="number of channels between the two wallets")
     parser.add_argument("--channel-btc", type=float, default=DEFAULT_CHANNEL_BTC,
                         help="capacity of each channel (BTC)")
+    parser.add_argument("--second-provider", action="store_true",
+                        help="bring up a SECOND swap provider (undercuts the "
+                             "first on fee) so provider failover can be tested; "
+                             "off by default -- the other e2e suites assume the "
+                             "one-partner topology")
     parser.add_argument("--no-gui", dest="gui", action="store_false",
                         help="run the client wallet headless too (no Qt GUI)")
     parser.add_argument("--display", default=None,

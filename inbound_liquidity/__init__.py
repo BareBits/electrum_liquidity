@@ -19,6 +19,7 @@ import sys
 import time
 from concurrent import futures
 from contextlib import asynccontextmanager
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from electrum import util
@@ -60,10 +61,12 @@ from .liquidity_manager import (
     LiquidityConfig,
     LiquiditySnapshot,
     MAX_SUGGESTED_PARTNERS,
+    MAX_SWAP_PROVIDER_ATTEMPTS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
     over_swap_trigger,
     PartnerResolution,
+    ProviderAttempt,
     ProviderOffer,
     ProviderReliability,
     ReleaseInfo,
@@ -226,6 +229,16 @@ SWAP_COOLDOWN_SEC = 180.0
 # ``self._reverse_swap_timeout_sec`` so tests can shrink it.
 REVERSE_SWAP_TIMEOUT_SEC = 300.0
 
+# Wall-clock ceiling on one channel's whole provider cascade (chosen provider
+# plus failovers). Checked BEFORE starting each attempt, never mid-attempt: once
+# an attempt is under way it runs to its own REVERSE_SWAP_TIMEOUT_SEC backstop,
+# because aborting a swap whose Lightning payment may already be in flight is
+# exactly what we must not do. Any providers left untried are simply retried on
+# the next evaluation cycle, by which time the failed ones have sunk in the
+# ranking. Sized above one worst-case backstop (300s) so a single slow provider
+# can never consume the budget before a second is even tried.
+SWAP_CASCADE_DEADLINE_SEC = 500.0
+
 # Substrings that identify an UNAMBIGUOUS provider cheat among the bare
 # ``Exception``s Electrum's ``reverse_swap`` raises from its pre-payment sanity
 # checks (submarine_swaps.py): a short-changed on-chain amount, an invoice whose
@@ -244,6 +257,38 @@ _REVERSE_SWAP_CHEAT_MARKERS = (
     "inconsistent RHASH",          # invoice payment hash != our RHASH
     "invoice_amount",              # invoice amount != what we requested
 )
+
+# Bare ``Exception``s from ``reverse_swap``'s pre-payment checks that are OUR
+# condition, not the provider's, and that every other provider would hit
+# identically -- so failing over would just burn the cascade budget on a
+# guaranteed-identical failure. These abort the cascade outright.
+#
+# Note what is deliberately NOT here: "locktime too close" -- see
+# _REVERSE_SWAP_RETRYABLE_MARKERS below.
+_REVERSE_SWAP_OUR_SIDE_MARKERS = (
+    "blockchain tip is stale",     # our local tip is behind; provider-independent
+)
+
+# The converse: bare ``Exception``s from those same pre-payment checks that are
+# worth trying a DIFFERENT provider for. A too-close locktime is checked against
+# OUR height, so it never proves provider misbehaviour (no fault is recorded) --
+# but the locktime itself is the provider's choice (``timeoutBlockHeight`` in its
+# createswap reply), so a provider with a tighter policy fails exactly where a
+# more generous one succeeds. Like every marker here it fires before any payment.
+#
+# Anything matching NEITHER tuple is an unrecognised failure: we cannot show it
+# left no funds committed, so the cascade stops rather than guessing.
+_REVERSE_SWAP_RETRYABLE_MARKERS = (
+    "locktime too close",          # provider-chosen timeoutBlockHeight vs our height
+)
+
+
+# What one provider attempt concluded, and hence what the cascade does next.
+class _SwapAttempt(Enum):
+    COMMITTED = auto()   # funds committed (funded, accepted, or possibly in flight): STOP
+    NEXT = auto()        # failed with nothing committed: safe to try the next provider
+    ABORT = auto()       # our-side condition or unknown bug: stop trying providers
+
 
 # Startup window. For this long after a wallet is loaded, the plugin takes NO
 # *automatic* action (open / swap / close) and does not judge any peer offline:
@@ -4474,212 +4519,338 @@ class LiquidityPlugin(BasePlugin):
         cap = int(self.config.LIGHTNING_MAX_FUNDING_SAT)
         return min(funding_sat, cap)
 
+    def _resolve_swap_attempts(self, action: ReverseSwapAction,
+                               transport: Optional['SwapServerTransport'],
+                               ) -> List[Tuple[ProviderAttempt, Optional['SwapOffer']]]:
+        """The ordered providers to try for one swap: the engine's chosen provider
+        followed by its ranked failovers, each paired with the live offer that
+        addresses it.
+
+        Providers that have stopped advertising since the decision was made are
+        dropped here rather than wasting an attempt slot. An empty result means
+        there is nobody left to try -- the caller then returns WITHOUT arming the
+        cooldown, so a re-evaluation can pick this channel up as soon as offers
+        come back, exactly as the single-provider path always did.
+
+        In legacy/URL mode (empty npub) there is one attempt with no offer: the
+        swap manager already points at the configured provider.
+        """
+        planned = [ProviderAttempt(npub=action.provider_npub,
+                                   amount_sat=action.lightning_amount_sat)]
+        planned.extend(action.alternates)
+        out: List[Tuple[ProviderAttempt, Optional['SwapOffer']]] = []
+        for attempt in planned:
+            if not attempt.npub:
+                # Legacy / URL mode: the single configured provider, no offer to
+                # resolve. It has no failovers, so this is always the only entry.
+                if not (self.config.SWAPSERVER_NPUB or self.config.SWAPSERVER_URL):
+                    self.logger.warning("no swap provider configured; skipping reverse swap")
+                    continue
+                out.append((attempt, None))
+                continue
+            offer = transport.get_offer(attempt.npub) if transport is not None else None
+            if offer is None:
+                self.logger.warning(
+                    f"provider {attempt.npub[:12]}… no longer advertising; "
+                    f"skipping it for the swap on {action.short_id}")
+                continue
+            out.append((attempt, offer))
+        return out
+
     async def _reverse_swap(self, wallet: 'Abstract_Wallet', action: ReverseSwapAction,
                             state: Optional[Dict] = None,
                             transport: Optional['SwapServerTransport'] = None) -> None:
+        """Drain one channel via a reverse swap, failing over between providers.
+
+        The engine ranks every provider that passes the cost gate; we try them in
+        that order until one commits. "Commits" is the safety-critical line: an
+        attempt that fails BEFORE Electrum's ``add_reverse_swap`` has moved no
+        funds and can be safely retried elsewhere, while an attempt that may have
+        started its Lightning payment must never be retried on this channel --
+        that would drain it twice. See ``_attempt_reverse_swap`` for how each
+        failure is classified.
+        """
         from contextlib import nullcontext
-        from electrum.util import UserFacingException
-        from electrum.submarine_swaps import SwapServerError
         sm = wallet.lnworker.swap_manager
         # Cooldown: don't re-attempt a channel we just acted on.
         now = time.monotonic()
         until = self._swap_cooldown_until.get(action.channel_id, 0.0)
         if now < until:
             return
-        # Resolve which provider to swap with. A chosen npub (multi-provider /
-        # nostr) points the swap math + RPC at that specific provider; an empty
-        # npub keeps the legacy single-provider behaviour (config.SWAPSERVER_*).
-        target_pubkey: Optional[str] = None
-        chosen_offer: Optional['SwapOffer'] = None
-        provider_label = "configured provider"
-        if action.provider_npub:
-            offer = transport.get_offer(action.provider_npub) if transport is not None else None
-            if offer is None:
-                self.logger.warning(
-                    f"chosen provider {action.provider_npub[:12]}… no longer "
-                    f"advertising; skipping swap on {action.short_id}")
-                return
-            # Applied below, once the transport knows which provider it is
-            # talking to: sm.update_pairs() wakes the transport's relay-following
-            # loop, which must be able to resolve the chosen provider (see
-            # TargetedNostrTransport.update_relays).
-            chosen_offer = offer
-            target_pubkey = offer.server_pubkey
-            provider_label = action.provider_npub
-        elif not (self.config.SWAPSERVER_NPUB or self.config.SWAPSERVER_URL):
-            self.logger.warning("no swap provider configured; skipping reverse swap")
+        attempts = self._resolve_swap_attempts(action, transport)
+        if not attempts:
+            # Every candidate vanished (or none configured): nothing was tried, so
+            # leave the channel free to be re-evaluated immediately.
             return
         self._swap_cooldown_until[action.channel_id] = now + SWAP_COOLDOWN_SEC
-        self.logger.info(f"reverse swap via {provider_label[:20]}…: {action.reason}")
-        self._set_status(
-            wallet,
-            f"attempting swap with {self._abbrev(provider_label) or provider_label} "
-            f"({action.lightning_amount_sat:,} sat from channel {action.short_id})")
+        self.logger.info(
+            f"reverse swap for {action.short_id}: {len(attempts)} provider(s) to try "
+            f"(cap {MAX_SWAP_PROVIDER_ATTEMPTS}): {action.reason}")
 
         # Reuse the evaluation's open session when present; otherwise open a
         # transient transport (e.g. URL mode without a prior session).
         own_transport = transport is None
         session = sm.create_transport() if own_transport else nullcontext(transport)
-        npub = action.provider_npub
+        # Wall-clock budget for the whole cascade, checked between attempts only.
+        deadline = now + SWAP_CASCADE_DEADLINE_SEC
+        total = len(attempts)
         async with session as tr:
-            if target_pubkey is not None and hasattr(tr, "target_pubkey"):
-                tr.target_pubkey = target_pubkey
+            for index, (attempt, offer) in enumerate(attempts, start=1):
+                if time.monotonic() >= deadline:
+                    remaining = total - index + 1
+                    self.logger.warning(
+                        f"swap cascade for {action.short_id} hit its "
+                        f"{SWAP_CASCADE_DEADLINE_SEC:.0f}s deadline with {remaining} "
+                        f"provider(s) untried; waiting for the next cycle")
+                    self._diag_event(
+                        wallet, category="error", kind="swap",
+                        reason="swap provider cascade deadline reached",
+                        source=attempt.npub,
+                        detail=f"{remaining} provider(s) untried after {index - 1} attempt(s)")
+                    break
+                outcome = await self._attempt_reverse_swap(
+                    wallet, action, attempt, offer, sm, tr, state,
+                    index=index, total=total)
+                if outcome is not _SwapAttempt.NEXT:
+                    break
+                if index < total:
+                    self.logger.info(
+                        f"failing over to the next provider for {action.short_id} "
+                        f"({index + 1} of {total})")
+
+    async def _attempt_reverse_swap(self, wallet: 'Abstract_Wallet',
+                                    action: ReverseSwapAction,
+                                    attempt: ProviderAttempt,
+                                    offer: Optional['SwapOffer'],
+                                    sm: Any, tr: Any, state: Optional[Dict],
+                                    *, index: int, total: int) -> '_SwapAttempt':
+        """One provider's attempt at the swap. Returns what the cascade should do
+        next -- see :class:`_SwapAttempt`.
+
+        Every failure arm below fires BEFORE Electrum's ``add_reverse_swap``
+        (submarine_swaps.py), i.e. before any Lightning payment exists, so
+        returning NEXT from them risks no funds. The one ambiguous arm is the
+        coarse timeout backstop, which can fire either side of that line; it is
+        resolved by asking whether a swap object actually appeared.
+        """
+        from electrum.util import UserFacingException
+        from electrum.submarine_swaps import SwapServerError
+        npub = attempt.npub
+        provider_label = npub or "configured provider"
+        of_n = f" ({index} of {total})" if total > 1 else ""
+        cost_note = ("" if attempt.all_in_cost_pct is None
+                     else f", all-in cost {attempt.all_in_cost_pct:.3f}%")
+        self.logger.info(
+            f"reverse swap via {provider_label[:20]}…{of_n}: "
+            f"{attempt.amount_sat} sat{cost_note}")
+        self._set_status(
+            wallet,
+            f"attempting swap with {self._abbrev(provider_label) or provider_label}"
+            f"{of_n} ({attempt.amount_sat:,} sat from channel {action.short_id})")
+        if offer is not None:
+            if hasattr(tr, "target_pubkey"):
+                tr.target_pubkey = offer.server_pubkey
                 # Let the transport resolve the chosen provider before we trigger
                 # its relay-following loop via update_pairs() just below.
                 if hasattr(tr, "target_npub"):
                     tr.target_npub = npub or None
-            if chosen_offer is not None:
-                # Make sm.get_recv_amount / the cost sanity checks use the chosen
-                # provider's advertised terms. This also sets sm.is_initialized,
-                # which the wait below depends on.
-                sm.update_pairs(chosen_offer.pairs)
-            try:
-                await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
-            except asyncio.TimeoutError:
-                # Unreachable provider is a reliability fault (timeout signal).
-                self.logger.warning("swap provider not reachable; skipping reverse swap")
-                self._record_provider_fault(wallet, npub, "not reachable (init timeout)")
-                return
-            lightning_amount_sat = action.lightning_amount_sat
-            expected_onchain_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
-            # get_recv_amount() returns None when this amount isn't swappable with
-            # the chosen provider (outside its min/max bounds, or it nets below
-            # dust after fees). The max_forward cap fix above should keep the
-            # planner from picking such an amount, but guard regardless: feeding
-            # None into reverse_swap() crashes its cost sanity-check (int - None).
-            # This is "wait for the channel to grow / retry", NOT a provider fault.
-            if expected_onchain_sat is None or sm.mining_fee is None:
-                self.logger.info(
-                    f"skipping reverse swap of {lightning_amount_sat} sat: provider "
-                    f"cannot host this amount right now (no receivable amount)")
-                self._diag_event(wallet, category="error", kind="swap",
-                                 reason="amount not swappable with provider", source=npub,
-                                 detail=f"{lightning_amount_sat} sat")
-                return
-            prepayment_sat = 2 * sm.mining_fee
-            # Pin the reverse swap's Lightning payment to the channel the engine
-            # chose to drain. Without this, lnworker routes the payment over ANY
-            # channel with enough outbound -- so when several channels share a
-            # peer, a swap planned to drain channel X can instead drain channel Y,
-            # leaving X permanently over its trigger while we keep re-issuing (and
-            # mis-attributing) swaps for it. Resolve defensively: if the channel
-            # can't be looked up, fall back to unpinned routing (old behaviour)
-            # rather than abort the swap.
-            target_channels = None
-            try:
-                if action.channel_id:
-                    chan = wallet.lnworker.get_channel_by_id(
-                        bytes.fromhex(action.channel_id))
-                    if chan is not None:
-                        target_channels = [chan]
-            except Exception as e:  # noqa: BLE001
-                self.logger.info(
-                    f"could not resolve channel {action.short_id} to pin the swap "
-                    f"payment ({e!r}); routing unpinned")
-            reverse_swap_kwargs = dict(
-                transport=tr,
-                lightning_amount_sat=lightning_amount_sat,
-                expected_onchain_amount_sat=expected_onchain_sat,
-                prepayment_sat=prepayment_sat,
+            # Make sm.get_recv_amount / the cost sanity checks use THIS provider's
+            # advertised terms. Re-applied on every attempt, so a failover never
+            # inherits the previous provider's economics. Also sets
+            # sm.is_initialized, which the wait below depends on.
+            sm.update_pairs(offer.pairs)
+        try:
+            await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            # Unreachable provider is a reliability fault (timeout signal).
+            self.logger.warning(
+                f"swap provider {provider_label[:20]}… not reachable; skipping it")
+            self._record_provider_fault(wallet, npub, "not reachable (init timeout)")
+            return _SwapAttempt.NEXT
+        lightning_amount_sat = attempt.amount_sat
+        expected_onchain_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
+        # get_recv_amount() returns None when this amount isn't swappable with
+        # the chosen provider (outside its min/max bounds, or it nets below
+        # dust after fees). The max_forward cap fix above should keep the
+        # planner from picking such an amount, but guard regardless: feeding
+        # None into reverse_swap() crashes its cost sanity-check (int - None).
+        # This is "wait for the channel to grow / retry", NOT a provider fault.
+        # It IS provider-specific, though -- another provider's bounds may well
+        # host this amount -- so the cascade moves on rather than giving up.
+        if expected_onchain_sat is None or sm.mining_fee is None:
+            self.logger.info(
+                f"skipping reverse swap of {lightning_amount_sat} sat: provider "
+                f"{provider_label[:20]}… cannot host this amount right now "
+                f"(no receivable amount)")
+            self._diag_event(wallet, category="error", kind="swap",
+                             reason="amount not swappable with provider", source=npub,
+                             detail=f"{lightning_amount_sat} sat")
+            return _SwapAttempt.NEXT
+        prepayment_sat = 2 * sm.mining_fee
+        # Pin the reverse swap's Lightning payment to the channel the engine
+        # chose to drain. Without this, lnworker routes the payment over ANY
+        # channel with enough outbound -- so when several channels share a
+        # peer, a swap planned to drain channel X can instead drain channel Y,
+        # leaving X permanently over its trigger while we keep re-issuing (and
+        # mis-attributing) swaps for it. Resolve defensively: if the channel
+        # can't be looked up, fall back to unpinned routing (old behaviour)
+        # rather than abort the swap.
+        target_channels = None
+        try:
+            if action.channel_id:
+                chan = wallet.lnworker.get_channel_by_id(
+                    bytes.fromhex(action.channel_id))
+                if chan is not None:
+                    target_channels = [chan]
+        except Exception as e:  # noqa: BLE001
+            self.logger.info(
+                f"could not resolve channel {action.short_id} to pin the swap "
+                f"payment ({e!r}); routing unpinned")
+        reverse_swap_kwargs = dict(
+            transport=tr,
+            lightning_amount_sat=lightning_amount_sat,
+            expected_onchain_amount_sat=expected_onchain_sat,
+            prepayment_sat=prepayment_sat,
+        )
+        if target_channels is not None:
+            reverse_swap_kwargs["channels"] = target_channels
+        # Snapshot the swap set so we can identify the swap we are about to
+        # create and, if it never funds, attribute the stall to this provider.
+        # This also decides the ONE ambiguous failover question: a swap object
+        # here means Electrum reached add_reverse_swap and fired the payment.
+        swaps_before = set(getattr(sm, "_swaps", {}).keys())
+        try:
+            # Bounded so no single swap can hold the per-wallet evaluation
+            # lock indefinitely. The precise hang (a provider that never
+            # answers the createswap RPC) is already bounded inside the
+            # transport; this coarse backstop covers anything else that could
+            # stall (see REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as
+            # asyncio.TimeoutError, handled below like any unresponsive
+            # provider.
+            funding_txid = await asyncio.wait_for(
+                sm.reverse_swap(**reverse_swap_kwargs),
+                timeout=self._reverse_swap_timeout_sec,
             )
-            if target_channels is not None:
-                reverse_swap_kwargs["channels"] = target_channels
-            # Snapshot the swap set so we can identify the swap we are about to
-            # create and, if it never funds, attribute the stall to this provider.
-            swaps_before = set(getattr(sm, "_swaps", {}).keys())
-            try:
-                # Bounded so no single swap can hold the per-wallet evaluation
-                # lock indefinitely. The precise hang (a provider that never
-                # answers the createswap RPC) is already bounded inside the
-                # transport; this coarse backstop covers anything else that could
-                # stall (see REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as
-                # asyncio.TimeoutError, handled below like any unresponsive
-                # provider.
-                funding_txid = await asyncio.wait_for(
-                    sm.reverse_swap(**reverse_swap_kwargs),
-                    timeout=self._reverse_swap_timeout_sec,
-                )
-            except UserFacingException as e:
-                # e.g. the provider deems the swap uneconomical for this amount.
-                # This is a legitimate response, NOT a reliability fault; just
-                # wait for the channel to grow.
-                self.logger.info(
-                    f"provider declined reverse swap of {lightning_amount_sat} sat: "
-                    f"{scrub_text(e)}")
-                self._diag_event(wallet, category="error", kind="swap",
-                                 reason="provider declined reverse swap", source=npub,
-                                 detail=f"{lightning_amount_sat} sat: {e}")
-                return
-            except asyncio.TimeoutError as e:
-                # Either the createswap RPC reply never arrived (bounded in the
-                # transport) or the whole attempt exceeded the coarse backstop
-                # while its Lightning payment was in flight. Both mean an
-                # unresponsive provider -> a genuine reliability fault, so
-                # escalate normally. If a swap object was already created (the
-                # payment leg had started before the backstop fired), track it so
-                # reconciliation still attributes its eventual outcome (funded ->
-                # success, never funds -> stuck) instead of silently losing it.
-                self._track_new_swaps(wallet, sm, swaps_before, npub, action,
-                                      expected_onchain_sat)
-                self.logger.warning(f"reverse swap timed out [DO NOT TRUST]: {e!r}")
-                self._record_provider_fault(wallet, npub, f"RPC timeout: {type(e).__name__}")
-                self._diag_event(wallet, category="error", kind="swap",
-                                 reason="reverse swap RPC timed out", source=npub,
-                                 detail=f"{type(e).__name__}: {e}")
-                return
-            except SwapServerError as e:
-                # The server rejected createswap, but masks the real cause as a
-                # generic "Internal Server Error" (see NostrTransport), so we cannot
-                # cleanly attribute it. The overwhelmingly common cause is transient
-                # capacity: the provider's advertised max_forward was drawn down
-                # (often by our OWN earlier swap this cycle) between advertisement
-                # and execution, so its create_normal_swap hits "no onchain amount".
-                # The engine's per-provider capacity budgeting prevents most of
-                # these, so a residual one is treated as a SOFT (non-escalating)
-                # fault: recorded for visibility but not enough to poison a healthy
-                # provider's ranking. It self-heals next cycle once the provider
-                # re-advertises its reduced capacity.
-                self.logger.info(
-                    f"provider rejected reverse swap of {lightning_amount_sat} sat "
-                    f"(likely transient capacity) [DO NOT TRUST]: {e!r}")
+        except UserFacingException as e:
+            # e.g. the provider deems the swap uneconomical for this amount.
+            # This is a legitimate response, NOT a reliability fault. It is raised
+            # by _sanity_check_swap_costs, the very first statement of
+            # reverse_swap, so nothing has moved -- and since the verdict depends
+            # on THIS provider's quoted amount, another one may well accept.
+            self.logger.info(
+                f"provider {provider_label[:20]}… declined reverse swap of "
+                f"{lightning_amount_sat} sat: {scrub_text(e)}")
+            self._diag_event(wallet, category="error", kind="swap",
+                             reason="provider declined reverse swap", source=npub,
+                             detail=f"{lightning_amount_sat} sat: {e}")
+            return _SwapAttempt.NEXT
+        except asyncio.TimeoutError as e:
+            # Either the createswap RPC reply never arrived (bounded in the
+            # transport) or the whole attempt exceeded the coarse backstop
+            # while its Lightning payment was in flight. Both mean an
+            # unresponsive provider -> a genuine reliability fault, so
+            # escalate normally. If a swap object was already created (the
+            # payment leg had started before the backstop fired), track it so
+            # reconciliation still attributes its eventual outcome (funded ->
+            # success, never funds -> stuck) instead of silently losing it.
+            #
+            # That same check decides whether we may fail over. A swap object
+            # exists => Electrum passed add_reverse_swap and our Lightning
+            # payment may be in flight; draining this channel again through
+            # another provider could double-spend the outbound we just committed,
+            # so the cascade STOPS. No swap object => the stall was before any
+            # payment existed and the next provider is safe to try.
+            committed = bool(set(getattr(sm, "_swaps", {}).keys()) - swaps_before)
+            self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                  expected_onchain_sat)
+            self.logger.warning(
+                f"reverse swap timed out [DO NOT TRUST]: {e!r}"
+                + (" (a swap was already created; not failing over)" if committed
+                   else " (no swap created; safe to try the next provider)"))
+            self._record_provider_fault(wallet, npub, f"RPC timeout: {type(e).__name__}")
+            self._diag_event(wallet, category="error", kind="swap",
+                             reason="reverse swap RPC timed out", source=npub,
+                             detail=f"{type(e).__name__}: {e}")
+            return _SwapAttempt.COMMITTED if committed else _SwapAttempt.NEXT
+        except SwapServerError as e:
+            # The server rejected createswap, but masks the real cause as a
+            # generic "Internal Server Error" (see NostrTransport), so we cannot
+            # cleanly attribute it. The overwhelmingly common cause is transient
+            # capacity: the provider's advertised max_forward was drawn down
+            # (often by our OWN earlier swap this cycle) between advertisement
+            # and execution, so its create_normal_swap hits "no onchain amount".
+            # The engine's per-provider capacity budgeting prevents most of
+            # these, so a residual one is treated as a SOFT (non-escalating)
+            # fault: recorded for visibility but not enough to poison a healthy
+            # provider's ranking. It self-heals next cycle once the provider
+            # re-advertises its reduced capacity.
+            #
+            # createswap is rejected before any invoice is paid, and a rejection
+            # is that provider's own capacity verdict -- precisely the case
+            # failover exists for, so try the next one now rather than next cycle.
+            self.logger.info(
+                f"provider {provider_label[:20]}… rejected reverse swap of "
+                f"{lightning_amount_sat} sat (likely transient capacity) "
+                f"[DO NOT TRUST]: {e!r}")
+            self._record_provider_fault(
+                wallet, npub, "swap rejected (likely transient capacity)", soft=True)
+            self._diag_event(wallet, category="error", kind="swap",
+                             reason="provider rejected reverse swap (transient?)",
+                             source=npub, detail=f"{type(e).__name__}: {e}")
+            return _SwapAttempt.NEXT
+        except Exception as e:
+            if any(m in str(e) for m in _REVERSE_SWAP_CHEAT_MARKERS):
+                # Electrum's pre-payment sanity checks caught an UNAMBIGUOUS
+                # provider cheat (short-changed on-chain amount, mismatched
+                # RHASH, or wrong invoice amount). No funds are at risk -- these
+                # fire before any Lightning payment -- but the provider tried to
+                # cheat, so charge an escalating (hard) fault: repeat offenders
+                # sink in the ranking toward a ban, and we stop wasting cycles
+                # re-picking them. The message carries provider-influenced
+                # numbers, so scrub it before logging/recording.
+                #
+                # A cheat is the strongest possible reason to prefer somebody
+                # else, and nothing was paid, so fail over immediately.
+                self.logger.warning(
+                    f"provider failed reverse-swap sanity check (possible cheat) "
+                    f"[DO NOT TRUST]: {scrub_text(e)}")
                 self._record_provider_fault(
-                    wallet, npub, "swap rejected (likely transient capacity)", soft=True)
-                self._diag_event(wallet, category="error", kind="swap",
-                                 reason="provider rejected reverse swap (transient?)",
-                                 source=npub, detail=f"{type(e).__name__}: {e}")
-                return
-            except Exception as e:
-                if any(m in str(e) for m in _REVERSE_SWAP_CHEAT_MARKERS):
-                    # Electrum's pre-payment sanity checks caught an UNAMBIGUOUS
-                    # provider cheat (short-changed on-chain amount, mismatched
-                    # RHASH, or wrong invoice amount). No funds are at risk -- these
-                    # fire before any Lightning payment -- but the provider tried to
-                    # cheat, so charge an escalating (hard) fault: repeat offenders
-                    # sink in the ranking toward a ban, and we stop wasting cycles
-                    # re-picking them. The message carries provider-influenced
-                    # numbers, so scrub it before logging/recording.
-                    self.logger.warning(
-                        f"provider failed reverse-swap sanity check (possible cheat) "
-                        f"[DO NOT TRUST]: {scrub_text(e)}")
-                    self._record_provider_fault(
-                        wallet, npub,
-                        f"failed swap sanity check: {scrub_text(e, max_len=80)}")
-                    self._diag_event(
-                        wallet, category="error", kind="swap",
-                        reason="provider failed reverse-swap sanity check (possible cheat)",
-                        source=npub, detail=scrub_text(e))
-                    return
-                # Any other exception is our-side, not the provider misbehaving: a
-                # stale local tip or too-close locktime relative to OUR height, or a
-                # genuine bug (e.g. a bad argument to reverse_swap). Log it with a
-                # traceback and record it as an internal error -- do NOT penalise
-                # the provider's reliability for our own condition (a healthy
-                # provider must not be de-prioritised or banned because of it).
-                self.logger.error(f"reverse swap failed (internal/our-side): {e!r}", exc_info=True)
-                self._diag_event(wallet, category="error", kind="swap",
-                                 reason="reverse swap internal error", source=npub,
-                                 detail=f"{type(e).__name__}: {e}")
-                return
+                    wallet, npub,
+                    f"failed swap sanity check: {scrub_text(e, max_len=80)}")
+                self._diag_event(
+                    wallet, category="error", kind="swap",
+                    reason="provider failed reverse-swap sanity check (possible cheat)",
+                    source=npub, detail=scrub_text(e))
+                return _SwapAttempt.NEXT
+            # Any other exception is our-side, not the provider misbehaving: a
+            # stale local tip or too-close locktime relative to OUR height, or a
+            # genuine bug (e.g. a bad argument to reverse_swap). Log it with a
+            # traceback and record it as an internal error -- do NOT penalise
+            # the provider's reliability for our own condition (a healthy
+            # provider must not be de-prioritised or banned because of it).
+            #
+            # Whether to fail over splits this arm in two. A marker from
+            # _REVERSE_SWAP_OUR_SIDE_MARKERS is provider-independent (our tip is
+            # stale): every other provider would fail identically, so abort and
+            # let the next cycle retry once the condition clears. Everything else
+            # here is either provider-influenced (a too-close locktime, which the
+            # provider chose) or an unknown fault. A too-close locktime is worth
+            # another provider; an unknown one is not -- we cannot show it left no
+            # funds committed, and the conservative reading of an unrecognised
+            # error is to stop touching this channel until we understand it.
+            our_side = any(m in str(e) for m in _REVERSE_SWAP_OUR_SIDE_MARKERS)
+            retryable = (not our_side) and any(
+                m in str(e) for m in _REVERSE_SWAP_RETRYABLE_MARKERS)
+            self.logger.error(
+                f"reverse swap failed (internal/our-side): {e!r}"
+                + ("; provider-independent, aborting the cascade" if our_side
+                   else "; trying the next provider" if retryable
+                   else "; unrecognised, aborting the cascade"),
+                exc_info=True)
+            self._diag_event(wallet, category="error", kind="swap",
+                             reason="reverse swap internal error", source=npub,
+                             detail=f"{type(e).__name__}: {e}")
+            return _SwapAttempt.NEXT if retryable else _SwapAttempt.ABORT
         if funding_txid:
             # The provider created the on-chain funding output: it honoured the
             # swap. Count it as a success straight away (the claim is Electrum's
@@ -4699,10 +4870,12 @@ class LiquidityPlugin(BasePlugin):
             source=action.short_id, dest="on-chain",
             reason=action.reason,
             detail=(f"funding txid {funding_txid}; expected on-chain {expected_onchain_sat} sat; "
-                    f"provider {provider_label}"),
+                    f"provider {provider_label}"
+                    + (f" (attempt {index} of {total})" if index > 1 else "")),
             state=state)
         self.on_action_done(
             wallet, _("Reverse swap {} sat from {}").format(lightning_amount_sat, action.short_id))
+        return _SwapAttempt.COMMITTED
 
     def _track_new_swaps(self, wallet: 'Abstract_Wallet', sm, swaps_before: set,
                          npub: str, action: ReverseSwapAction,

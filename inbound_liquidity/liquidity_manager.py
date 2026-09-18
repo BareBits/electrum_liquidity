@@ -1300,27 +1300,30 @@ def _offer_available_sat(offer: ProviderOffer,
     return max(0, offer.max_reverse_sat - int(consumed.get(offer.npub, 0)))
 
 
-def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
-                    claim_fee_sat: int, config: LiquidityConfig,
-                    consumed: Optional[Mapping[str, int]] = None) -> Optional[ProviderSelection]:
-    """Pick the best eligible provider for a swap of up to ``desired_amount_sat``.
+def rank_providers(offers: Sequence[ProviderOffer], desired_amount_sat: int,
+                   claim_fee_sat: int, config: LiquidityConfig,
+                   consumed: Optional[Mapping[str, int]] = None) -> List[ProviderSelection]:
+    """Every eligible provider that can host a swap of up to ``desired_amount_sat``
+    and passes the cost gate, best first.
 
     Each provider would swap ``min(desired, its remaining capacity)`` (and must
     clear its own minimum). Only providers whose *real* all-in cost passes the
-    ``max_swap_fee_pct`` gate are considered. Among those, providers are ordered
-    by all-in cost *plus* their reliability penalty (so a flaky provider sinks
-    behind reliable ones -- soft de-prioritisation, never an outright exclusion);
-    ties break in favour of the higher proof-of-work (more established) provider.
-    Returns None if no eligible provider both can host the swap and passes the
-    gate -- use :func:`cheapest_hosting_cost` to tell those two cases apart for
-    logging.
+    ``max_swap_fee_pct`` gate are included. Those are ordered by all-in cost
+    *plus* their reliability penalty (so a flaky provider sinks behind reliable
+    ones -- soft de-prioritisation, never an outright exclusion); ties break in
+    favour of the higher proof-of-work (more established) provider.
+
+    The head of this list is the provider to try first; the tail is the failover
+    order the executor walks when an attempt fails without committing funds (see
+    ``ReverseSwapAction.alternates``). Note that each entry carries its OWN
+    ``amount_sat``: providers advertise different capacities, so a failover is a
+    differently-sized swap, not merely the same swap re-addressed.
 
     ``consumed`` (npub -> sat) lets a caller draining several channels in one pass
     subtract capacity already committed to each provider, so the engine never
     plans two swaps that together exceed a provider's advertised ``max_forward``.
     """
-    best: Optional[ProviderSelection] = None
-    best_key: Optional[Tuple[float, int]] = None
+    ranked: List[ProviderSelection] = []
     for offer in eligible_providers(offers, config):
         amount = min(desired_amount_sat, _offer_available_sat(offer, consumed))
         if amount <= 0 or amount < offer.min_amount_sat:
@@ -1331,13 +1334,27 @@ def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
         if cost_pct > config.max_swap_fee_pct:
             continue
         rank_cost_pct = cost_pct + max(0.0, offer.reliability_penalty_pct)
-        # Lower rank cost wins; on a tie prefer higher PoW (negate for ascending sort).
-        key = (rank_cost_pct, -offer.pow_bits)
-        if best_key is None or key < best_key:
-            best_key = key
-            best = ProviderSelection(offer=offer, amount_sat=amount,
-                                     all_in_cost_pct=cost_pct, rank_cost_pct=rank_cost_pct)
-    return best
+        ranked.append(ProviderSelection(offer=offer, amount_sat=amount,
+                                        all_in_cost_pct=cost_pct,
+                                        rank_cost_pct=rank_cost_pct))
+    # Lower rank cost wins; on a tie prefer higher PoW (negate for ascending sort).
+    # Python's sort is stable, so providers that tie on both keys keep discovery
+    # order -- matching the first-wins behaviour this replaced.
+    ranked.sort(key=lambda s: (s.rank_cost_pct, -s.offer.pow_bits))
+    return ranked
+
+
+def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
+                    claim_fee_sat: int, config: LiquidityConfig,
+                    consumed: Optional[Mapping[str, int]] = None) -> Optional[ProviderSelection]:
+    """The single best eligible provider -- the head of :func:`rank_providers`.
+
+    Returns None if no eligible provider both can host the swap and passes the
+    gate -- use :func:`cheapest_hosting_cost` to tell those two cases apart for
+    logging.
+    """
+    ranked = rank_providers(offers, desired_amount_sat, claim_fee_sat, config, consumed)
+    return ranked[0] if ranked else None
 
 
 def cheapest_hosting_cost(offers: Sequence[ProviderOffer], desired_amount_sat: int,
@@ -1391,6 +1408,32 @@ class OpenChannelAction:
     reason: str
 
 
+# How many providers one swap decision may try in a single cycle (the chosen
+# provider plus its failovers). Each attempt costs a provider round-trip and, in
+# the worst case, a full REVERSE_SWAP_TIMEOUT_SEC backstop, all while holding the
+# per-wallet evaluation lock -- so the cascade is capped rather than walking every
+# discovered provider. Providers left untried are simply retried next cycle, by
+# which time the failed ones have sunk in the ranking.
+MAX_SWAP_PROVIDER_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class ProviderAttempt:
+    """One provider to try for a swap, with the amount and cost specific to it.
+
+    A failover is NOT the same swap re-addressed: providers advertise different
+    remaining capacities, so each attempt has its own ``amount_sat`` (and hence
+    its own all-in cost). Carrying them here keeps every bit of the cost
+    arithmetic in the engine -- the executor never recomputes a swap's size.
+
+    ``all_in_cost_pct`` is None only for the attempt the executor synthesises for
+    the *chosen* provider, whose cost the action already states in its reason.
+    """
+    npub: str
+    amount_sat: int
+    all_in_cost_pct: Optional[float] = None
+
+
 @dataclass(frozen=True)
 class ReverseSwapAction:
     channel_id: str
@@ -1400,6 +1443,12 @@ class ReverseSwapAction:
     # Chosen provider's nostr identity. Empty string means "use the single
     # configured provider" (URL mode / legacy), preserving old behaviour.
     provider_npub: str = ""
+    # Ranked failover providers, best first, to try if the chosen one fails
+    # WITHOUT committing funds. Empty in legacy/URL mode (only one provider
+    # exists) and whenever no other provider passed the cost gate. Never includes
+    # the chosen provider itself, and is already capped to leave at most
+    # MAX_SWAP_PROVIDER_ATTEMPTS total attempts.
+    alternates: Tuple[ProviderAttempt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1882,7 +1931,8 @@ def _decide_reverse_swaps(
                         f"outbound liquidity"),
             ))
             continue
-        selection = select_provider(offers, desired, claim_fee, config, consumed)
+        ranked = rank_providers(offers, desired, claim_fee, config, consumed)
+        selection = ranked[0] if ranked else None
         if selection is None:
             # No eligible provider both hosts the amount AND passes the cost gate,
             # at the capacity that remains after swaps already planned this pass.
@@ -1927,9 +1977,21 @@ def _decide_reverse_swaps(
                 ))
             continue
         # Reserve the chosen provider's capacity so a later channel in this pass
-        # plans against what actually remains (see `consumed` above).
+        # plans against what actually remains (see `consumed` above). Only the
+        # CHOSEN provider is charged: the failovers below are contingencies that
+        # will most likely never run, and reserving capacity against all of them
+        # would starve later channels of providers for no reason. If a failover
+        # does run, its capacity assumption may be stale by exactly the amount an
+        # earlier swap this pass committed -- the provider rejects that with a
+        # SwapServerError, which is already handled as a soft, self-healing fault.
         consumed[selection.offer.npub] = (
             consumed.get(selection.offer.npub, 0) + selection.amount_sat)
+        # Failover order: the rest of the ranking, capped so the whole cascade
+        # stays within MAX_SWAP_PROVIDER_ATTEMPTS attempts.
+        alternates = tuple(
+            ProviderAttempt(npub=s.offer.npub, amount_sat=s.amount_sat,
+                            all_in_cost_pct=s.all_in_cost_pct)
+            for s in ranked[1:MAX_SWAP_PROVIDER_ATTEMPTS])
         amount = selection.amount_sat
         cost_pct = selection.all_in_cost_pct
         provider_desc = (f"provider {selection.offer.npub[:12]}…"
@@ -1945,11 +2007,14 @@ def _decide_reverse_swaps(
                 short_id=chan.short_id,
                 lightning_amount_sat=amount,
                 provider_npub=selection.offer.npub,
+                alternates=alternates,
                 reason=(
                     f"channel {chan.short_id} local {chan.local_sat} over "
                     f"{trigger} trigger; swapping {amount} via {provider_desc} "
                     f"(all-in cost {cost_pct:.3f}% <= {config.max_swap_fee_pct}%{rank_note}, "
                     f"best of {len(eligible)} eligible)"
+                    + (f", {len(alternates)} failover provider(s) ready"
+                       if alternates else "")
                 ),
             )
         )

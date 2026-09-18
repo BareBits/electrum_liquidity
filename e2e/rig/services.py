@@ -35,6 +35,10 @@ class Endpoints:
     ln_listen_client: int
     ln_listen_partner: int
     swapserver_port: int
+    # Second swap provider (``--second-provider`` only). Allocated unconditionally
+    # so Endpoints stays a fixed shape; simply unused when the flag is off.
+    ln_listen_partner2: int = 0
+    swapserver_port2: int = 0
 
     @property
     def nostr_relay_url(self) -> str:
@@ -296,6 +300,12 @@ class ElectrumInstance:
 
 CLIENT = ElectrumInstance("client", paths.CLIENT_DATADIR, paths.CLIENT_WALLET_NAME)
 PARTNER = ElectrumInstance("partner", paths.PARTNER_DATADIR, paths.PARTNER_WALLET_NAME)
+# Second swap provider; only brought up under ``--second-provider``.
+PARTNER2 = ElectrumInstance("partner2", paths.PARTNER2_DATADIR,
+                            paths.PARTNER2_WALLET_NAME)
+
+# Every instance that runs a swapserver, i.e. advertises swap offers on nostr.
+PROVIDERS: tuple[ElectrumInstance, ...] = (PARTNER, PARTNER2)
 
 
 def wallet_path(inst: ElectrumInstance) -> str:
@@ -436,14 +446,26 @@ def partner_lightning_invoice(sat: int, *, memo: str = "electrum_liquidity dev f
     return invoice
 
 
-def _partner_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
-    """Swap-partner extras: enable the (cmdline-only) swapserver plugin, give it
-    an HTTP port, and advertise LN<->onchain swaps at 0.5% (5000 millionths)."""
+# Advertised swap fee per provider, in millionths. PARTNER2 deliberately
+# undercuts PARTNER so the plugin's cheapest-first ranking always picks PARTNER2
+# — which is what lets a failover test control WHICH provider is tried first.
+PARTNER_FEE_MILLIONTHS: int = 5000     # 0.5%
+PARTNER2_FEE_MILLIONTHS: int = 1000    # 0.1% -- always ranked ahead of PARTNER
+
+
+def _partner_config_pairs(ep: Endpoints,
+                          inst: ElectrumInstance = PARTNER) -> list[tuple[str, str]]:
+    """Swap-provider extras: enable the (cmdline-only) swapserver plugin, give it
+    an HTTP port, and advertise LN<->onchain swaps at its configured rate."""
+    second = inst is PARTNER2
     return _common_config_pairs(ep) + [
-        ("lightning_listen", f"127.0.0.1:{ep.ln_listen_partner}"),
+        ("lightning_listen",
+         f"127.0.0.1:{ep.ln_listen_partner2 if second else ep.ln_listen_partner}"),
         ("plugins.swapserver.enabled", "true"),
-        ("plugins.swapserver.port", str(ep.swapserver_port)),
-        ("plugins.swapserver.fee_millionths", "5000"),
+        ("plugins.swapserver.port",
+         str(ep.swapserver_port2 if second else ep.swapserver_port)),
+        ("plugins.swapserver.fee_millionths",
+         str(PARTNER2_FEE_MILLIONTHS if second else PARTNER_FEE_MILLIONTHS)),
     ]
 
 
@@ -459,7 +481,8 @@ def setup_wallet(ep: Endpoints, inst: ElectrumInstance) -> str:
     except json.JSONDecodeError:
         pass
 
-    pairs = _partner_config_pairs(ep) if inst is PARTNER else _client_config_pairs(ep)
+    pairs = (_partner_config_pairs(ep, inst) if inst in PROVIDERS
+             else _client_config_pairs(ep))
     for key, value in pairs:
         electrum_cli("setconfig", key, value, inst=inst, offline=True)
 
@@ -656,12 +679,19 @@ def open_channels(
     capacity_btc: float,
     mine_cb,
     log,
+    already_open: int = 0,
 ) -> list[dict]:
     """Open ``num_channels`` balanced channels from ``opener`` to ``peer``.
 
     Each channel is funded with ``capacity_btc`` and ``push_amount`` of half
     that, giving a 50/50 inbound/outbound split. Funding txs are confirmed by
     ``mine_cb(n)`` and the call blocks until every channel reaches state OPEN.
+
+    ``already_open`` is how many channels the opener held BEFORE this call, so
+    the final wait targets the right total. It matters when opening to a second
+    peer (``--second-provider``): the opener's channel list is cumulative, so a
+    wait for ``num_channels`` alone would be satisfied by the pre-existing ones
+    and return before the new funding tx had confirmed.
 
     Electrum derives a channel's multisig funding key from the funding tx's
     ``nlocktime`` (== current block height). Two channels to the *same* peer at
@@ -691,7 +721,8 @@ def open_channels(
         mine_cb(3)
         wait_wallet_height(opener, ep)
 
-    return wait_channels_open(opener, expected=num_channels, mine_cb=mine_cb, log=log)
+    return wait_channels_open(opener, expected=already_open + num_channels,
+                              mine_cb=mine_cb, log=log)
 
 
 def wait_channels_open(inst: ElectrumInstance, *, expected: int, mine_cb,
@@ -712,16 +743,21 @@ def wait_channels_open(inst: ElectrumInstance, *, expected: int, mine_cb,
 # ==========================================================================
 # Nostr swap-provider discovery
 # ==========================================================================
-def discover_swap_provider(
+def discover_swap_providers(
     client: ElectrumInstance,
     *,
-    expected_fee_fraction: float,
     log,
+    min_providers: int = 1,
     attempts: int = 12,
     query_time: int = 12,
-) -> tuple[str, dict]:
-    """Poll the client for swap providers over nostr until the partner's offer
-    appears, set ``swapserver_npub`` to it, and return ``(npub, offer)``."""
+) -> dict[str, dict]:
+    """Poll the client over nostr until at least ``min_providers`` offers appear,
+    and return them all as ``{npub: offer}``.
+
+    ``min_providers`` matters with ``--second-provider``: the two swapservers
+    publish independently, so a poll can easily see one and not yet the other.
+    Returning early there would leave a failover test racing discovery.
+    """
     last = "no offers"
     for attempt in range(1, attempts + 1):
         # ``query_time`` is an *optional* Electrum CLI arg, so it must be passed
@@ -732,12 +768,36 @@ def discover_swap_provider(
             providers = json.loads(out) if out else {}
         except json.JSONDecodeError:
             providers = {}
-        if providers:
-            npub, offer = next(iter(providers.items()))
-            electrum_cli("setconfig", "swapserver_npub", npub, inst=client)
-            log(f"  discovered swap provider {npub} "
-                f"(fee {offer.get('percentage_fee')}%) on attempt {attempt}")
-            return npub, offer
-        last = f"attempt {attempt}: none yet"
+        if len(providers) >= min_providers:
+            for npub, offer in providers.items():
+                log(f"  discovered swap provider {npub} "
+                    f"(fee {offer.get('percentage_fee')}%) on attempt {attempt}")
+            return providers
+        last = f"attempt {attempt}: {len(providers)}/{min_providers} so far"
         log(f"  {last}")
-    raise TimeoutError(f"no swap provider discovered over nostr: {last}")
+    raise TimeoutError(f"swap providers not discovered over nostr: {last}")
+
+
+def discover_swap_provider(
+    client: ElectrumInstance,
+    *,
+    expected_fee_fraction: float,
+    log,
+    attempts: int = 12,
+    query_time: int = 12,
+    min_providers: int = 1,
+) -> tuple[str, dict]:
+    """Discover providers and pin the client's legacy ``swapserver_npub`` to the
+    CHEAPEST one, returning ``(npub, offer)``.
+
+    Picking the cheapest (rather than whichever the dict yielded first) makes the
+    choice deterministic once ``--second-provider`` puts two providers on the
+    relay -- and it matches how the plugin itself ranks them.
+    """
+    providers = discover_swap_providers(
+        client, log=log, min_providers=min_providers,
+        attempts=attempts, query_time=query_time)
+    npub, offer = min(providers.items(),
+                      key=lambda kv: float(kv[1].get("percentage_fee") or 0.0))
+    electrum_cli("setconfig", "swapserver_npub", npub, inst=client)
+    return npub, offer

@@ -55,6 +55,13 @@ CLIENT_DATADIR: Path = RUN_DIR / "electrum-client"
 CLIENT_WALLET_NAME: str = "electrum_liqtest"
 PARTNER_DATADIR: Path = RUN_DIR / "electrum-partner"
 PARTNER_WALLET_NAME: str = "electrum_liqtest_swap_partner"
+# Optional SECOND swap provider, brought up only with ``--second-provider``.
+# It exists so a test can have the plugin choose one provider and fail over to
+# another within a single evaluation cycle. Off by default: every other e2e
+# suite asserts against the one-partner topology, and a third daemon is pure
+# cost for them.
+PARTNER2_DATADIR: Path = RUN_DIR / "electrum-partner2"
+PARTNER2_WALLET_NAME: str = "electrum_liqtest_swap_partner2"
 
 # ---- Bitcoind miner wallet ------------------------------------------------
 MINER_WALLET: str = "rigminer"

@@ -18,6 +18,10 @@ from rig.procman import _proc_cmdline_is_ours, _proc_marker  # noqa: E402
 from rig.services import (  # noqa: E402
     CLIENT,
     PARTNER,
+    PARTNER2,
+    PARTNER_FEE_MILLIONTHS,
+    PARTNER2_FEE_MILLIONTHS,
+    PROVIDERS,
     Endpoints,
     _client_config_pairs,
     _partner_config_pairs,
@@ -29,7 +33,7 @@ def _endpoints() -> Endpoints:
     return Endpoints(
         btc_rpc=18001, btc_p2p=18002, fulcrum_tcp=18003, fulcrum_admin=18004,
         nostr=18005, ln_listen_client=18006, ln_listen_partner=18007,
-        swapserver_port=18008,
+        swapserver_port=18008, ln_listen_partner2=18009, swapserver_port2=18010,
     )
 
 
@@ -85,6 +89,44 @@ def test_client_does_not_enable_swapserver():
     ep = _endpoints()
     d = dict(_client_config_pairs(ep))
     assert "plugins.swapserver.enabled" not in d
+
+
+# -- second swap provider (--second-provider) ------------------------------
+def test_second_provider_gets_its_own_ports_and_undercuts_the_first():
+    """The failover e2e depends on provider 2 being ranked FIRST by the plugin's
+    cheapest-first selection, so its advertised fee must be strictly lower."""
+    ep = _endpoints()
+    first = dict(_partner_config_pairs(ep, PARTNER))
+    second = dict(_partner_config_pairs(ep, PARTNER2))
+    assert second["plugins.swapserver.fee_millionths"] == str(PARTNER2_FEE_MILLIONTHS)
+    assert PARTNER2_FEE_MILLIONTHS < PARTNER_FEE_MILLIONTHS
+    # Distinct listen/RPC ports, or the two daemons would collide.
+    assert second["lightning_listen"] == "127.0.0.1:18009"
+    assert second["plugins.swapserver.port"] == "18010"
+    assert first["lightning_listen"] != second["lightning_listen"]
+    assert first["plugins.swapserver.port"] != second["plugins.swapserver.port"]
+
+
+def test_partner_config_still_defaults_to_the_first_provider():
+    """The inst argument is optional; omitting it must keep the original
+    behaviour every other rig caller and suite relies on."""
+    ep = _endpoints()
+    assert dict(_partner_config_pairs(ep)) == dict(_partner_config_pairs(ep, PARTNER))
+
+
+def test_both_providers_run_a_swapserver_and_are_distinct():
+    assert PROVIDERS == (PARTNER, PARTNER2)
+    assert PARTNER2.datadir != PARTNER.datadir
+    assert PARTNER2.wallet_name != PARTNER.wallet_name
+    assert wallet_path(PARTNER2).endswith("regtest/wallets/electrum_liqtest_swap_partner2")
+
+
+def test_second_provider_is_off_by_default():
+    """Every other e2e suite asserts the one-partner topology, so the flag must
+    default to off."""
+    import run as run_mod  # noqa: PLC0415 -- rig entrypoint, imported lazily
+    assert run_mod.parse_args(["--no-gui"]).second_provider is False
+    assert run_mod.parse_args(["--no-gui", "--second-provider"]).second_provider is True
 
 
 # -- wallet paths / instances ----------------------------------------------

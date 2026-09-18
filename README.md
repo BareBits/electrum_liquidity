@@ -68,6 +68,27 @@ prepayment) and both have to fit. Opening a channel funds with the **maximum
 minus the on-chain reserve**, with the mining fee deducted so the transaction is
 feasible.
 
+If that swap **fails**, the plugin does not give up on the cycle: it walks the
+other eligible providers in cost order (up to 3 attempts in total, within a 500
+second budget) and retries with each in turn, so one unreachable or unwilling
+provider no longer costs you a whole 3-minute channel cooldown. Every provider
+in the cascade must still pass the `max_swap_fee_pct` gate on its **own** real
+all-in cost — a failover is never an excuse to overpay — and because providers
+advertise different capacities, each retry is sized to what *that* provider will
+actually host.
+
+The cascade stops immediately, and never retries, once funds may have moved.
+Electrum's pre-payment checks (cost sanity, the provider's `createswap` reply,
+script/RHASH/invoice verification, locktime) all raise *before* the Lightning
+payment is issued, so those failures are safe to retry elsewhere. Past that
+point — or on any error the plugin cannot positively classify — the swap is left
+alone for reconciliation to resolve, because retrying could drain the same
+channel twice. A provider-independent condition on our side (a stale local tip)
+also ends the cascade rather than burning attempts on a guaranteed repeat.
+Failures are still recorded against the provider's reliability exactly as
+before, so a repeatedly-failing provider sinks in the ranking and stops being
+tried first.
+
 By default the plugin manages **only the channels it opened itself**
 (`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a
 channel you set up by hand is never drained unless you turn that switch off.
