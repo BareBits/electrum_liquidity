@@ -1172,6 +1172,30 @@ class LiquidityConfig:
     # callers, for which "off" preserves the pre-feature behaviour they were
     # written against.
     liquidity_goal_sat: int = 0
+    # --- liquidity sink ---------------------------------------------------
+    # An optional Lightning address (``user@domain``, an ``lnurl1…`` string, or a
+    # bare LNURL-pay https URL) to drain outbound into INSTEAD of reverse-swapping
+    # it on-chain. Paying it moves local balance out of the channel exactly as a
+    # swap's Lightning leg does -- restoring the same inbound capacity -- but
+    # settles in seconds with no on-chain claim, no provider, and no cost gate to
+    # clear. Empty (the default) leaves the plugin swap-only, as before.
+    #
+    # The engine only *plans* sink payments; resolving the address and paying it
+    # is glue work. What lives here is the amount ladder (see
+    # :func:`sink_attempt_amounts`) and the decision of whether the sink, a swap,
+    # or neither is what this channel should do.
+    liquidity_sink_address: str = ""
+    # Sink-only mode. When True, a channel over its trigger is drained through the
+    # sink or not at all: no reverse swap is planned, not even as a fallback for a
+    # sink that fails.
+    #
+    # Deliberately honoured even when no sink address is set, which leaves nothing
+    # able to drain a channel. The alternative -- quietly re-enabling swaps
+    # because the sink is empty -- would move a user's funds on-chain through a
+    # third-party provider after they explicitly asked for no swaps, which is the
+    # worse failure by a wide margin. The engine declines with exactly that
+    # reason, so the decision log says what is wrong and how to fix it.
+    disable_submarine_swaps: bool = False
 
 
 @dataclass(frozen=True)
@@ -1451,6 +1475,88 @@ class ReverseSwapAction:
     alternates: Tuple[ProviderAttempt, ...] = ()
 
 
+# --- liquidity sink -------------------------------------------------------
+# Draining a channel by PAYING somebody rather than swapping on-chain. The
+# effect on liquidity is identical -- local balance leaves the channel, inbound
+# capacity comes back -- but the sats land in whatever account the address
+# belongs to (typically the user's own custodial wallet) instead of on-chain.
+#
+# Lower bound on a single sink payment. Below this the ladder stops: a drain
+# worth less than this is not worth the routing attempt, and it is the floor the
+# feature was specified with.
+SINK_MIN_PAYMENT_SAT: int = 10_000
+
+# Runaway backstop on the ladder's length. Pure halving from 10k reaches 327M sat
+# in 16 rungs -- above any channel Electrum will open -- so this never truncates a
+# real ladder; it exists so a nonsense ``desired`` from a corrupted snapshot
+# cannot generate an unbounded list of payment attempts. A truncated ladder says
+# so in the action's reason rather than silently under-draining.
+SINK_MAX_ATTEMPTS: int = 16
+
+
+def sink_attempt_amounts(desired_sat: int, *,
+                         floor_sat: int = SINK_MIN_PAYMENT_SAT,
+                         max_attempts: int = SINK_MAX_ATTEMPTS) -> Tuple[int, ...]:
+    """The descending ladder of amounts to try paying the sink, best first.
+
+    A big Lightning payment can fail for reasons a smaller one would not -- no
+    single route with enough liquidity, an MPP split that cannot be assembled --
+    so a failed attempt is retried at HALF the amount, repeatedly, rather than
+    abandoning the drain. Each rung is a genuinely different payment (its own
+    invoice from the sink), which is why this is a list of amounts and not a
+    retry count.
+
+    The ladder halves while it stays at or above ``floor_sat``, then makes ONE
+    final attempt at exactly ``floor_sat`` -- the last rung the feature is
+    willing to send. That clamp is why 200k ends ``…, 25_000, 12_500, 10_000``
+    and not ``…, 12_500`` (6_250 would be below the floor): 12_500 failing says
+    nothing about 10_000, and stopping there would leave a drainable channel
+    undrained. The clamp is skipped when it would merely repeat the previous rung
+    (a ladder that already ended exactly on the floor).
+
+    Returns an empty tuple when ``desired_sat`` is below the floor -- there is no
+    sink payment to make at all, and the caller decides whether a swap can do
+    better.
+    """
+    if desired_sat < floor_sat or floor_sat <= 0:
+        return ()
+    rungs: List[int] = []
+    amount = int(desired_sat)
+    while amount >= floor_sat and len(rungs) < max_attempts:
+        rungs.append(amount)
+        amount //= 2
+    # The clamped final rung, only when the ladder did not already end on the
+    # floor and there is room for it.
+    if rungs and rungs[-1] > floor_sat and len(rungs) < max_attempts:
+        rungs.append(floor_sat)
+    return tuple(rungs)
+
+
+@dataclass(frozen=True)
+class LiquiditySinkAction:
+    """Drain one channel by paying the user's liquidity sink, with a reverse swap
+    held in reserve.
+
+    ``amounts`` is the halving ladder (see :func:`sink_attempt_amounts`), already
+    reduced by the outbound-preservation floor and sized to what the channel can
+    actually send. The executor walks it, minting a fresh invoice per rung, and
+    stops at the first payment that settles.
+
+    ``swap_fallback`` is a fully-planned :class:`ReverseSwapAction` -- provider
+    ranking, per-provider amounts and all -- to run if EVERY rung fails. It is
+    None in sink-only mode (``disable_submarine_swaps``) and whenever no provider
+    could have hosted the swap anyway, so the executor never has to ask the engine
+    a second question. Note that a sink failure and a swap are not the same
+    amount: the swap is sized against provider capacity, not the ladder.
+    """
+    channel_id: str
+    short_id: str
+    address: str
+    amounts: Tuple[int, ...]
+    reason: str
+    swap_fallback: Optional['ReverseSwapAction'] = None
+
+
 @dataclass(frozen=True)
 class CloseChannelAction:
     """Close an undersized channel so its slot can be reused by a bigger one.
@@ -1467,7 +1573,8 @@ class CloseChannelAction:
     reason: str
 
 
-Action = Union[OpenChannelAction, ReverseSwapAction, CloseChannelAction]
+Action = Union[OpenChannelAction, ReverseSwapAction, LiquiditySinkAction,
+               CloseChannelAction]
 
 
 @dataclass(frozen=True)
@@ -1828,11 +1935,112 @@ def _decide_undersized_closes(
     ), []
 
 
+def _plan_reverse_swap(
+    chan: ChannelSnapshot, trigger: str, desired: int,
+    offers: Sequence[ProviderOffer], eligible: Sequence[ProviderOffer],
+    claim_fee: int, config: LiquidityConfig,
+    consumed: Optional[Mapping[str, int]],
+) -> Tuple[Optional[ReverseSwapAction], Optional[DeclineRecord]]:
+    """Plan the reverse swap for one already-qualified channel: pick the provider,
+    size the swap, and rank the failovers -- or explain why no swap is possible.
+
+    Split out of :func:`_decide_reverse_swaps` because a swap is now one of two
+    ways to drain a channel, and the sink path needs this same plan as its
+    fallback. Everything here is exactly what the single-path version did; the
+    caller owns the gates above it (trigger, activity, HTLCs, the outbound floor)
+    and the ``consumed`` bookkeeping below it.
+    """
+    # Rule: don't swap LN -> on-chain unless an *eligible* provider is known.
+    # Distinguish "none discovered yet" from "discovered but all filtered out
+    # by the preferred/banned lists" so the decline log is actionable.
+    if not eligible:
+        if not offers:
+            why = "no swap provider is known yet"
+        elif config.preferred_npubs:
+            why = "none of your preferred swap providers are currently available"
+        else:
+            why = "every available swap provider is banned"
+        return None, DeclineRecord(
+            kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+            reason=(f"channel {chan.short_id} over {trigger} trigger but "
+                    f"{why}; skipping"))
+    ranked = rank_providers(offers, desired, claim_fee, config, consumed)
+    selection = ranked[0] if ranked else None
+    if selection is None:
+        # No eligible provider both hosts the amount AND passes the cost gate,
+        # at the capacity that remains after swaps already planned this pass.
+        # cheapest_hosting_cost tells the cases apart for an actionable decline.
+        host = cheapest_hosting_cost(offers, desired, claim_fee, config, consumed)
+        if host is None:
+            # Nobody can host it at their *remaining* capacity. Before blaming
+            # the amount for being below every provider's minimum, check whether
+            # a provider *could* have hosted it absent this pass's own earlier
+            # swaps -- if so, it is simply that we have already committed that
+            # provider's capacity this cycle, and this channel should just wait
+            # for the next cycle (after those swaps settle / it re-advertises).
+            # That is expected batching, NOT a fault or a real near miss.
+            host_full = cheapest_hosting_cost(offers, desired, claim_fee, config)
+            if host_full is not None:
+                amount, _cost = host_full
+                return None, DeclineRecord(
+                    kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                    amount_sat=amount,
+                    reason=(f"channel {chan.short_id} over {trigger} trigger but "
+                            f"the eligible provider(s)' capacity is already "
+                            f"committed to earlier swaps this cycle; will retry "
+                            f"next cycle"))
+            min_amount = min((o.min_amount_sat for o in eligible), default=0)
+            amount = min(desired, max((o.max_reverse_sat for o in eligible), default=desired))
+            return None, DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                amount_sat=amount,
+                reason=(f"channel {chan.short_id} swap amount {amount} below "
+                        f"provider minimum {min_amount}; skipping"))
+        amount, cost_pct = host
+        return None, DeclineRecord(
+            kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+            amount_sat=amount,
+            reason=(f"channel {chan.short_id} swap of {amount} all-in cost "
+                    f"{cost_pct:.3f}% > ceiling {config.max_swap_fee_pct}% "
+                    f"(cheapest of {len(eligible)} provider(s)); skipping"))
+    # Failover order: the rest of the ranking, capped so the whole cascade
+    # stays within MAX_SWAP_PROVIDER_ATTEMPTS attempts.
+    alternates = tuple(
+        ProviderAttempt(npub=s.offer.npub, amount_sat=s.amount_sat,
+                        all_in_cost_pct=s.all_in_cost_pct)
+        for s in ranked[1:MAX_SWAP_PROVIDER_ATTEMPTS])
+    amount = selection.amount_sat
+    cost_pct = selection.all_in_cost_pct
+    provider_desc = (f"provider {selection.offer.npub[:12]}…"
+                     if selection.offer.npub else "configured provider")
+    # Note the penalty in the reason only when it actually moved the ranking,
+    # so the log explains a non-cheapest pick.
+    penalty = selection.rank_cost_pct - cost_pct
+    rank_note = (f", rank cost {selection.rank_cost_pct:.3f}% incl. "
+                 f"{penalty:.3f}% reliability penalty" if penalty > 0 else "")
+    return ReverseSwapAction(
+        channel_id=chan.channel_id,
+        short_id=chan.short_id,
+        lightning_amount_sat=amount,
+        provider_npub=selection.offer.npub,
+        alternates=alternates,
+        reason=(
+            f"channel {chan.short_id} local {chan.local_sat} over "
+            f"{trigger} trigger; swapping {amount} via {provider_desc} "
+            f"(all-in cost {cost_pct:.3f}% <= {config.max_swap_fee_pct}%{rank_note}, "
+            f"best of {len(eligible)} eligible)"
+            + (f", {len(alternates)} failover provider(s) ready"
+               if alternates else "")),
+    ), None
+
+
 def _decide_reverse_swaps(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
-) -> Tuple[List[ReverseSwapAction], List[DeclineRecord]]:
-    actions: List[ReverseSwapAction] = []
+) -> Tuple[List[Action], List[DeclineRecord]]:
+    actions: List[Action] = []
     declines: List[DeclineRecord] = []
+    sink_address = (config.liquidity_sink_address or "").strip()
+    swaps_enabled = not config.disable_submarine_swaps
     offers = _candidate_offers(snapshot)
     eligible = eligible_providers(offers, config)
     claim_fee = snapshot.swap_claim_fee_sat or 0
@@ -1890,28 +2098,13 @@ def _decide_reverse_swaps(
                 reason=reason,
             ))
             continue
-        # Rule: don't swap LN -> on-chain unless an *eligible* provider is known.
-        # Distinguish "none discovered yet" from "discovered but all filtered out
-        # by the preferred/banned lists" so the decline log is actionable.
-        if not eligible:
-            if not offers:
-                why = "no swap provider is known yet"
-            elif config.preferred_npubs:
-                why = "none of your preferred swap providers are currently available"
-            else:
-                why = "every available swap provider is banned"
-            declines.append(DeclineRecord(
-                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                reason=(f"channel {chan.short_id} over {trigger} trigger but "
-                        f"{why}; skipping"),
-            ))
-            continue
-        # Rule: swap out the maximum a provider allows (bounded by what this
-        # channel can actually send after its reserves), via the best eligible
-        # provider for that amount. "Best" = lowest all-in cost plus reliability
-        # penalty (flaky providers sink behind reliable ones); ties favour higher
-        # PoW. The cost gate (below) is enforced inside select_provider on the
-        # REAL cost, so the penalty only reorders -- it never blocks a swap.
+        # Rule: drain the maximum this channel can actually send (after its
+        # reserves), either by paying the liquidity sink or by reverse-swapping
+        # via the best eligible provider for that amount. "Best" = lowest all-in
+        # cost plus reliability penalty (flaky providers sink behind reliable
+        # ones); ties favour higher PoW. The cost gate is enforced inside
+        # select_provider on the REAL cost, so the penalty only reorders -- it
+        # never blocks a swap.
         # Outbound-preservation floor: never drain below `min_outbound_sat` of
         # local balance. We can only move the *spendable* portion, so the amount we
         # are willing to swap is the spendable balance minus the floor. Because
@@ -1931,93 +2124,86 @@ def _decide_reverse_swaps(
                         f"outbound liquidity"),
             ))
             continue
-        ranked = rank_providers(offers, desired, claim_fee, config, consumed)
-        selection = ranked[0] if ranked else None
-        if selection is None:
-            # No eligible provider both hosts the amount AND passes the cost gate,
-            # at the capacity that remains after swaps already planned this pass.
-            # cheapest_hosting_cost tells the cases apart for an actionable decline.
-            host = cheapest_hosting_cost(offers, desired, claim_fee, config, consumed)
-            if host is None:
-                # Nobody can host it at their *remaining* capacity. Before blaming
-                # the amount for being below every provider's minimum, check whether
-                # a provider *could* have hosted it absent this pass's own earlier
-                # swaps -- if so, it is simply that we have already committed that
-                # provider's capacity this cycle, and this channel should just wait
-                # for the next cycle (after those swaps settle / it re-advertises).
-                # That is expected batching, NOT a fault or a real near miss.
-                host_full = cheapest_hosting_cost(offers, desired, claim_fee, config)
-                if host_full is not None:
-                    amount, _cost = host_full
-                    declines.append(DeclineRecord(
-                        kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                        amount_sat=amount,
-                        reason=(f"channel {chan.short_id} over {trigger} trigger but "
-                                f"the eligible provider(s)' capacity is already "
-                                f"committed to earlier swaps this cycle; will retry "
-                                f"next cycle"),
-                    ))
-                else:
-                    min_amount = min((o.min_amount_sat for o in eligible), default=0)
-                    amount = min(desired, max((o.max_reverse_sat for o in eligible), default=desired))
-                    declines.append(DeclineRecord(
-                        kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                        amount_sat=amount,
-                        reason=(f"channel {chan.short_id} swap amount {amount} below "
-                                f"provider minimum {min_amount}; skipping"),
-                    ))
-            else:
-                amount, cost_pct = host
-                declines.append(DeclineRecord(
-                    kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
-                    amount_sat=amount,
-                    reason=(f"channel {chan.short_id} swap of {amount} all-in cost "
-                            f"{cost_pct:.3f}% > ceiling {config.max_swap_fee_pct}% "
-                            f"(cheapest of {len(eligible)} provider(s)); skipping"),
-                ))
-            continue
-        # Reserve the chosen provider's capacity so a later channel in this pass
-        # plans against what actually remains (see `consumed` above). Only the
-        # CHOSEN provider is charged: the failovers below are contingencies that
-        # will most likely never run, and reserving capacity against all of them
-        # would starve later channels of providers for no reason. If a failover
-        # does run, its capacity assumption may be stale by exactly the amount an
-        # earlier swap this pass committed -- the provider rejects that with a
-        # SwapServerError, which is already handled as a soft, self-healing fault.
-        consumed[selection.offer.npub] = (
-            consumed.get(selection.offer.npub, 0) + selection.amount_sat)
-        # Failover order: the rest of the ranking, capped so the whole cascade
-        # stays within MAX_SWAP_PROVIDER_ATTEMPTS attempts.
-        alternates = tuple(
-            ProviderAttempt(npub=s.offer.npub, amount_sat=s.amount_sat,
-                            all_in_cost_pct=s.all_in_cost_pct)
-            for s in ranked[1:MAX_SWAP_PROVIDER_ATTEMPTS])
-        amount = selection.amount_sat
-        cost_pct = selection.all_in_cost_pct
-        provider_desc = (f"provider {selection.offer.npub[:12]}…"
-                         if selection.offer.npub else "configured provider")
-        # Note the penalty in the reason only when it actually moved the ranking,
-        # so the log explains a non-cheapest pick.
-        penalty = selection.rank_cost_pct - cost_pct
-        rank_note = (f", rank cost {selection.rank_cost_pct:.3f}% incl. "
-                     f"{penalty:.3f}% reliability penalty" if penalty > 0 else "")
-        actions.append(
-            ReverseSwapAction(
+        # The sink ladder for this channel (empty when no sink is configured, or
+        # when the drain is too small to be worth a payment).
+        ladder = (sink_attempt_amounts(desired) if sink_address else ())
+        # The swap, planned in full -- as the primary action when there is no
+        # sink, or as the sink's fallback. Skipped entirely in sink-only mode, so
+        # a disabled swap can never be planned, logged, or executed.
+        swap_action: Optional[ReverseSwapAction] = None
+        swap_decline: Optional[DeclineRecord] = None
+        if swaps_enabled:
+            swap_action, swap_decline = _plan_reverse_swap(
+                chan, trigger, desired, offers, eligible, claim_fee, config, consumed)
+        if ladder:
+            # Sink first. The swap rides along as a fallback if one could be
+            # planned; if it could not, the sink is simply the only option and
+            # the swap's decline is NOT recorded -- it would read as a near miss
+            # on a tick where we are, in fact, acting on this channel.
+            truncated = (len(ladder) >= SINK_MAX_ATTEMPTS
+                         and ladder[-1] > SINK_MIN_PAYMENT_SAT)
+            actions.append(LiquiditySinkAction(
                 channel_id=chan.channel_id,
                 short_id=chan.short_id,
-                lightning_amount_sat=amount,
-                provider_npub=selection.offer.npub,
-                alternates=alternates,
+                address=sink_address,
+                amounts=ladder,
+                swap_fallback=swap_action,
                 reason=(
                     f"channel {chan.short_id} local {chan.local_sat} over "
-                    f"{trigger} trigger; swapping {amount} via {provider_desc} "
-                    f"(all-in cost {cost_pct:.3f}% <= {config.max_swap_fee_pct}%{rank_note}, "
-                    f"best of {len(eligible)} eligible)"
-                    + (f", {len(alternates)} failover provider(s) ready"
-                       if alternates else "")
-                ),
-            )
-        )
+                    f"{trigger} trigger; paying {ladder[0]} to the liquidity sink"
+                    + (f" (halving down to {ladder[-1]} over {len(ladder)} "
+                       f"attempt(s) if it fails)" if len(ladder) > 1 else "")
+                    + (f", ladder truncated at {SINK_MAX_ATTEMPTS} attempts"
+                       if truncated else "")
+                    + (f"; reverse swap of {swap_action.lightning_amount_sat} "
+                       f"held in reserve" if swap_action is not None
+                       else ("; submarine swaps are disabled, so the sink is the "
+                             "only option" if not swaps_enabled
+                             else "; no swap provider available as a fallback"))),
+            ))
+            continue
+        if swap_action is not None:
+            # Reserve the chosen provider's capacity so a later channel in this
+            # pass plans against what actually remains (see `consumed` above).
+            # Only the CHOSEN provider of an action we are actually taking is
+            # charged: the failovers are contingencies that will most likely never
+            # run, and reserving capacity against all of them would starve later
+            # channels of providers for no reason. A swap held in reserve behind a
+            # sink (above) is not charged either, for the same reason and more so
+            # -- it only runs if every rung of the ladder fails. If such a
+            # contingency does run, its capacity assumption may be stale by
+            # exactly the amount an earlier swap this pass committed -- the
+            # provider rejects that with a SwapServerError, which is already
+            # handled as a soft, self-healing fault.
+            consumed[swap_action.provider_npub] = (
+                consumed.get(swap_action.provider_npub, 0)
+                + swap_action.lightning_amount_sat)
+            actions.append(swap_action)
+            continue
+        # Nothing can drain this channel. Explain which half is missing: with
+        # swaps enabled the provider-side decline is the whole story, but in
+        # sink-only mode there is no swap decline to fall back on and the reason
+        # has to name the sink.
+        if swap_decline is not None:
+            declines.append(swap_decline)
+        elif not sink_address:
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                amount_sat=desired,
+                reason=(f"channel {chan.short_id} over {trigger} trigger but "
+                        f"submarine swaps are disabled and no liquidity sink is "
+                        f"configured; nothing can drain it (set a liquidity sink, "
+                        f"or re-enable submarine swaps)"),
+            ))
+        else:
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                amount_sat=desired,
+                reason=(f"channel {chan.short_id} over {trigger} trigger but its "
+                        f"drainable {desired} is below the "
+                        f"{SINK_MIN_PAYMENT_SAT} sat liquidity-sink minimum, and "
+                        f"submarine swaps are disabled; skipping"),
+            ))
     return actions, declines
 
 

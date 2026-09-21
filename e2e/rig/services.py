@@ -336,7 +336,7 @@ def electrum_cli(*args: str, inst: ElectrumInstance, offline: bool = False,
     return result.stdout.strip()
 
 
-def _common_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
+def _common_config_pairs(ep: Endpoints, *, gossip: bool = False) -> list[tuple[str, str]]:
     """Config shared by both wallets.
 
     * ``server``/``oneserver``/``auto_connect=false`` pin Electrum to our
@@ -351,15 +351,30 @@ def _common_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
       announcement proof-of-work (default target is 30 bits -> would hang). The
       client also enforces this target when filtering offers, so it must be 0 on
       both sides or the zero-PoW offer is rejected.
+
+    ``gossip=True`` flips the Lightning routing model to the real channel graph
+    (``use_gossip=true``) so payments can traverse MORE THAN ONE HOP. Trampoline
+    mode cannot do that here: ``hardcoded_trampoline_nodes()`` is empty on
+    regtest, and a plain Electrum wallet does not forward for others -- so with
+    the default config the client can only ever pay a node it has a channel to.
+    Opt-in (``run.py --gossip``), because announced channels + graph sync change
+    the topology every other suite asserts against, and cost a slower bring-up.
+
+    It also switches on ``lightning_forward_payments``, which Electrum requires
+    for BOTH halves of that: ``channel_establishment_flow`` refuses to open a
+    public (announced) channel without it ("Cannot create public channels"), and
+    an intermediate node will not forward an HTLC for anyone else without it.
+    Gossip alone would give us a graph nobody would route over.
     """
-    return [
+    forwarding = [("lightning_forward_payments", "true")] if gossip else []
+    return forwarding + [
         ("server", ep.electrum_server),
         ("oneserver", "true"),
         ("auto_connect", "false"),
         ("check_updates", "false"),
         ("dont_show_testnet_warning", "true"),
         ("log_to_file", "true"),
-        ("use_gossip", "false"),
+        ("use_gossip", "true" if gossip else "false"),
         ("lightning_to_self_delay", "144"),
         ("test_force_disable_mpp", "true"),
         ("nostr_relays", ep.nostr_relay_url),
@@ -367,11 +382,11 @@ def _common_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
     ]
 
 
-def _client_config_pairs(ep: Endpoints) -> list[tuple[str, str]]:
+def _client_config_pairs(ep: Endpoints, *, gossip: bool = False) -> list[tuple[str, str]]:
     # The client wallet is the user-facing one and hosts the inbound-liquidity
     # plugin; enable it here (channel_peer is set later, once the partner's LN
     # node id is known -- see run.py).
-    return _common_config_pairs(ep) + [
+    return _common_config_pairs(ep, gossip=gossip) + [
         ("lightning_listen", f"127.0.0.1:{ep.ln_listen_client}"),
         ("plugins.inbound_liquidity.enabled", "true"),
         # Start paused so the rig can open its own baseline channels before the
@@ -425,6 +440,31 @@ def set_client_channel_peer(connect_str: str) -> None:
                  inst=CLIENT, offline=True)
 
 
+def set_gossip_seed_peers(inst: ElectrumInstance,
+                          peers: list[tuple[str, int, str]]) -> None:
+    """Seed a node's ``lightning_peers`` so its gossip node has somebody to ask.
+
+    Without this a regtest node in gossip mode never learns the graph, and the
+    reason is a chicken-and-egg: ``LNGossip`` is a SEPARATE node from the wallet
+    (it does not reuse the wallet's channel peers), and it finds peers from
+    ``channel_db``'s recent peers, then from the graph itself, then from
+    ``FALLBACK_LN_NODES``, then from DNS seeds. On regtest the last two are empty
+    and the first two start empty -- so it connects to nobody, learns nothing,
+    and the graph stays empty forever. Channels announce themselves perfectly
+    well; there is simply no one listening.
+
+    ``lightning_peers`` is the one input that breaks the cycle: every
+    ``LNPeerManager.start_network`` (the gossip node's included) dials it at
+    startup. Written offline, before the daemon comes up, so it is read at load.
+
+    Note this patches nothing and modifies no Electrum code -- unlike the
+    trampoline stub next door, which has to monkey-patch because regtest has no
+    equivalent config input for hardcoded trampoline nodes.
+    """
+    value = json.dumps([[host, int(port), pubkey] for host, port, pubkey in peers])
+    electrum_cli("setconfig", "lightning_peers", value, inst=inst, offline=True)
+
+
 def set_client_dev_fee_address(address: str) -> None:
     """Point the plugin's dev-fee payout at the local LNURL stub (rig only).
     Written offline before the client comes up so it's read at load."""
@@ -432,18 +472,39 @@ def set_client_dev_fee_address(address: str) -> None:
                  inst=CLIENT, offline=True)
 
 
+def lightning_invoice(sat: int, *, inst: ElectrumInstance = PARTNER,
+                      memo: str = "electrum_liquidity rig") -> str:
+    """Mint a bolt11 invoice for ``sat`` from a running daemon.
+
+    ``inst`` chooses who gets paid, which is what decides how many hops the
+    payment takes: an invoice from PARTNER is a one-hop payment over the client's
+    own channel, while one from PARTNER2 (with no client->partner2 channel) must
+    be ROUTED through the partner -- the whole point of the gossip-mode rig.
+    """
+    btc = f"{sat / 1e8:.8f}"
+    out = electrum_cli("add_request", btc, "--memo", memo, "--lightning",
+                       inst=inst)
+    data = json.loads(out)
+    invoice = data.get("lightning_invoice")
+    if not invoice:
+        raise RuntimeError(f"{inst.name} produced no lightning invoice: {out[:200]}")
+    return invoice
+
+
 def partner_lightning_invoice(sat: int, *, memo: str = "electrum_liquidity dev fee") -> str:
     """Mint a bolt11 invoice for ``sat`` from the (running) swap-partner daemon.
     Used by the rig's LNURL stub to answer the client's payout invoice request, so
     a dev-fee payout flows as a real Lightning payment client -> partner."""
-    btc = f"{sat / 1e8:.8f}"
-    out = electrum_cli("add_request", btc, "--memo", memo, "--lightning",
-                       inst=PARTNER)
-    data = json.loads(out)
-    invoice = data.get("lightning_invoice")
-    if not invoice:
-        raise RuntimeError(f"partner produced no lightning invoice: {out[:200]}")
-    return invoice
+    return lightning_invoice(sat, inst=PARTNER, memo=memo)
+
+
+def partner2_lightning_invoice(sat: int,
+                               *, memo: str = "electrum_liquidity sink") -> str:
+    """Mint a bolt11 invoice for ``sat`` from the SECOND provider's daemon. The
+    client holds no channel to it, so paying this is a genuine two-hop routed
+    payment through the partner -- and fails on capacity if the partner's
+    forwarding channel is too small for the amount."""
+    return lightning_invoice(sat, inst=PARTNER2, memo=memo)
 
 
 # Advertised swap fee per provider, in millionths. PARTNER2 deliberately
@@ -454,11 +515,12 @@ PARTNER2_FEE_MILLIONTHS: int = 1000    # 0.1% -- always ranked ahead of PARTNER
 
 
 def _partner_config_pairs(ep: Endpoints,
-                          inst: ElectrumInstance = PARTNER) -> list[tuple[str, str]]:
+                          inst: ElectrumInstance = PARTNER,
+                          *, gossip: bool = False) -> list[tuple[str, str]]:
     """Swap-provider extras: enable the (cmdline-only) swapserver plugin, give it
     an HTTP port, and advertise LN<->onchain swaps at its configured rate."""
     second = inst is PARTNER2
-    return _common_config_pairs(ep) + [
+    return _common_config_pairs(ep, gossip=gossip) + [
         ("lightning_listen",
          f"127.0.0.1:{ep.ln_listen_partner2 if second else ep.ln_listen_partner}"),
         ("plugins.swapserver.enabled", "true"),
@@ -469,7 +531,8 @@ def _partner_config_pairs(ep: Endpoints,
     ]
 
 
-def setup_wallet(ep: Endpoints, inst: ElectrumInstance) -> str:
+def setup_wallet(ep: Endpoints, inst: ElectrumInstance, *,
+                 gossip: bool = False) -> str:
     """Create a fresh (unencrypted) wallet offline, write config, return a
     funding address."""
     Path(wallet_path(inst)).parent.mkdir(parents=True, exist_ok=True)
@@ -481,8 +544,8 @@ def setup_wallet(ep: Endpoints, inst: ElectrumInstance) -> str:
     except json.JSONDecodeError:
         pass
 
-    pairs = (_partner_config_pairs(ep, inst) if inst in PROVIDERS
-             else _client_config_pairs(ep))
+    pairs = (_partner_config_pairs(ep, inst, gossip=gossip) if inst in PROVIDERS
+             else _client_config_pairs(ep, gossip=gossip))
     for key, value in pairs:
         electrum_cli("setconfig", key, value, inst=inst, offline=True)
 
@@ -680,6 +743,8 @@ def open_channels(
     mine_cb,
     log,
     already_open: int = 0,
+    push_btc: Optional[float] = None,
+    public: bool = False,
 ) -> list[dict]:
     """Open ``num_channels`` balanced channels from ``opener`` to ``peer``.
 
@@ -693,6 +758,12 @@ def open_channels(
     wait for ``num_channels`` alone would be satisfied by the pre-existing ones
     and return before the new funding tx had confirmed.
 
+    ``push_btc`` overrides the balanced default, which is how a deliberately
+    LOPSIDED channel is made -- e.g. a forwarding hop with only a little
+    outbound, so a large payment through it fails on capacity while a smaller one
+    succeeds. ``public`` announces the channel to the gossip network, which is
+    required before any node other than the two endpoints can route through it.
+
     Electrum derives a channel's multisig funding key from the funding tx's
     ``nlocktime`` (== current block height). Two channels to the *same* peer at
     the same height would reuse that key (Electrum rejects this), so between
@@ -705,7 +776,7 @@ def open_channels(
     conn = peer_nodeid if "@" in peer_nodeid else f"{peer_nodeid}@127.0.0.1:{peer_listen_port}"
     electrum_cli("add_peer", conn, inst=opener)
 
-    push_btc = capacity_btc / 2.0
+    push_btc = capacity_btc / 2.0 if push_btc is None else push_btc
     for i in range(num_channels):
         if i > 0:
             # New height (=> new funding nlocktime => new multisig key) before
@@ -713,9 +784,13 @@ def open_channels(
             mine_cb(1)
             wait_wallet_height(opener, ep)
         log(f"  opening channel {i + 1}/{num_channels} "
-            f"({capacity_btc} BTC, push {push_btc}) -> {peer.name}")
-        electrum_cli("open_channel", conn, f"{capacity_btc:.8f}",
-                     "--push_amount", f"{push_btc:.8f}", inst=opener)
+            f"({capacity_btc} BTC, push {push_btc}"
+            f"{', public' if public else ''}) -> {peer.name}")
+        args = ["open_channel", conn, f"{capacity_btc:.8f}",
+                "--push_amount", f"{push_btc:.8f}"]
+        if public:
+            args.append("--public")
+        electrum_cli(*args, inst=opener)
         # Confirm this funding tx before opening the next so coin selection
         # always has a settled input to choose.
         mine_cb(3)
@@ -738,6 +813,81 @@ def wait_channels_open(inst: ElectrumInstance, *, expected: int, mine_cb,
         mine_cb(1)
         time.sleep(1.0)
     raise TimeoutError(f"channels not all OPEN: {last}")
+
+
+def gossip_info(inst: ElectrumInstance) -> dict:
+    """Electrum's own view of the gossip graph (``gossip_info``): how many
+    announcements arrived and what the channel_db now holds. Empty dict when the
+    node is in trampoline mode (no lngossip), so callers can treat "not in gossip
+    mode" and "graph still empty" the same way."""
+    try:
+        return json.loads(electrum_cli("gossip_info", inst=inst))
+    except Exception:
+        return {}
+
+
+def wait_gossip_graph(inst: ElectrumInstance, *, min_channels: int,
+                      min_policies: int, mine_cb, log,
+                      timeout: float = 300.0) -> dict:
+    """Block until ``inst`` has learned at least ``min_channels`` channels AND
+    ``min_policies`` channel policies from gossip.
+
+    Both halves matter and the second is the one that bites. A channel with no
+    POLICIES is unusable for routing -- the path-finder needs the fee and CLTV
+    each direction advertises -- so waiting only on ``num_channels`` produces a
+    node that knows the topology and still cannot build a route, which surfaces
+    much later as an inexplicable payment failure.
+
+    Expect ONE policy per channel here, not two. Each end advertises its own
+    direction, and in this rig only the partner pushes gossip to the client's
+    gossip node (it is the only node the client's gossip peer is connected to).
+    The missing directions are the ones pointing back toward us, which no route
+    out of this wallet ever traverses. Waiting for both would hang forever; the
+    honest check that the graph is USABLE is the probe payment the caller makes
+    afterwards.
+
+    Announcement needs the funding tx buried 6 deep, so this mines while it
+    waits, exactly as the other rig waiters do.
+    """
+    deadline = time.monotonic() + timeout
+    last = "no gossip yet"
+    while time.monotonic() < deadline:
+        info = gossip_info(inst)
+        db = info.get("database") or {}
+        channels, policies = db.get("channels", 0), db.get("channel_policies", 0)
+        if channels >= min_channels and policies >= min_policies:
+            log(f"  gossip graph: {channels} channel(s), {policies} policy(ies), "
+                f"{db.get('nodes', 0)} node(s)")
+            return info
+        last = (f"channels={channels}/{min_channels} "
+                f"policies={policies}/{min_policies}")
+        mine_cb(1)
+        time.sleep(2.0)
+    raise TimeoutError(f"gossip graph did not fill in time: {last}")
+
+
+def probe_routed_payment(*, payer: ElectrumInstance, payee: ElectrumInstance,
+                         amount_sat: int, log, timeout: int = 90) -> None:
+    """Prove the graph is actually USABLE by making a small routed payment.
+
+    Counting entries in the channel_db says the payer knows the topology; it does
+    not say the path-finder can build a route over it. This settles the question
+    the only way that counts, and does it during bring-up -- so a broken routing
+    setup fails here, loudly, instead of surfacing as a mysterious test failure
+    several minutes later.
+
+    Deliberately tiny, so it barely perturbs the balances a later test reasons
+    about.
+    """
+    invoice = lightning_invoice(amount_sat, inst=payee, memo="rig routing probe")
+    log(f"probing a routed payment of {amount_sat} sat "
+        f"{payer.name} -> {payee.name} ...")
+    out = electrum_cli("lnpay", invoice, "--timeout", str(timeout), inst=payer)
+    if "true" not in out.lower():
+        raise RuntimeError(
+            f"routed probe payment failed -- the gossip graph is not usable "
+            f"for routing: {out[:300]}")
+    log("  probe payment settled: multi-hop routing works")
 
 
 # ==========================================================================

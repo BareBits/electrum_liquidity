@@ -50,11 +50,14 @@ from rig.services import (
     bitcoin_cli,
     discover_swap_provider,
     ensure_miner_wallet,
+    electrum_cli,
     ensure_plugin_installed,
     fund_address,
     partner_lightning_invoice,
+    partner2_lightning_invoice,
     set_client_channel_peer,
     set_client_dev_fee_address,
+    set_gossip_seed_peers,
     mine,
     open_channels,
     setup_wallet,
@@ -67,9 +70,12 @@ from rig.services import (
     wait_bitcoind,
     wait_electrum_ready,
     wait_fulcrum,
+    probe_routed_payment,
+    wait_gossip_graph,
     wait_lightning_ready,
     wait_nostr_relay,
     wait_onchain_funds,
+    wait_wallet_height,
     wallet_balance,
 )
 
@@ -81,6 +87,28 @@ DEFAULT_WALLET_FUNDING_BTC = 12.0   # per wallet, >=5 BTC after channels
 DEFAULT_NUM_CHANNELS = 2
 DEFAULT_CHANNEL_BTC = 0.02
 SWAP_FEE_FRACTION = 0.005           # 0.5%
+
+# --- gossip mode (--gossip) ----------------------------------------------
+# The forwarding hop PARTNER -> PARTNER2, deliberately starved of outbound so a
+# payment routed through it succeeds only below a known size. Sized against the
+# client's own drainable balance (~960k sat on a 0.02 BTC 50/50 channel), so the
+# liquidity-sink ladder must halve TWICE before a rung fits:
+#
+#   ~960k  no route at all (above this channel's announced capacity)
+#    ~480k route exists on paper, HTLC fails on the hop's real balance
+#    ~240k fits under the ~300k the partner can forward  -> settles
+#
+# This is the only way a multi-hop capacity failure can be produced here: on a
+# DIRECT channel, Electrum's available_to_spend already folds in the reserve, the
+# fee-spike buffer, remaining_max_inflight and HTLC slots, and the plugin
+# subtracts more headroom still -- so the ladder's top rung is always sized to
+# succeed and there is nothing left for halving to fix.
+GOSSIP_HOP_CHANNEL_BTC = 0.006      # 600_000 sat capacity
+GOSSIP_HOP_PUSH_BTC = 0.003         # 300_000 sat pushed -> that much forwardable
+# A tiny payment made during bring-up to PROVE the graph can actually be routed
+# over. Small enough not to meaningfully move the balances a test then reasons
+# about (0.0003% of the hop).
+GOSSIP_PROBE_SAT = 1_000
 
 
 def log(msg: str) -> None:
@@ -104,8 +132,22 @@ class Rig:
         self.channels: list[dict] = []
         self.lnurl_stub: Optional[LnurlPayStub] = None
         self.lnurl_stub_port: Optional[int] = None
+        # Gossip mode only: a SECOND LNURL endpoint whose invoices are minted by
+        # partner2, so paying it is a routed two-hop payment rather than a direct
+        # one. This is the liquidity sink the sink e2e points the plugin at.
+        self.sink_stub: Optional[LnurlPayStub] = None
+        self.sink_stub_port: Optional[int] = None
+        self.hop_channel: Optional[dict] = None
         self._stop = threading.Event()
         self._miner: Optional[threading.Thread] = None
+
+    @property
+    def needs_partner2(self) -> bool:
+        """Whether a third Electrum node is required. ``--second-provider`` wants
+        it as a competing swapserver (with a channel from the client);
+        ``--gossip`` wants it as a routing DESTINATION, deliberately WITHOUT a
+        client channel, so reaching it requires a real multi-hop route."""
+        return bool(self.args.second_provider or self.args.gossip)
 
     # -- lifecycle ----------------------------------------------------------
     def preflight(self) -> None:
@@ -132,11 +174,14 @@ class Rig:
             f"fulcrum-tcp={fulcrum_tcp} admin={fulcrum_admin}")
         log(f"ports: nostr={nostr}  ln-client={ln_client} ln-partner={ln_partner}  "
             f"swapserver={swapserver}")
-        if self.args.second_provider:
+        if self.needs_partner2:
             log(f"ports: ln-partner2={ln_partner2} swapserver2={swapserver2}")
         # A separate free port for the local LNURL-pay stub (dev-fee payout target).
         self.lnurl_stub_port = ports.free_port()
         log(f"ports: lnurl-stub={self.lnurl_stub_port}")
+        if self.args.gossip:
+            self.sink_stub_port = ports.free_port()
+            log(f"ports: sink-stub={self.sink_stub_port}")
 
     def bring_up(self) -> None:
         assert self.ep is not None
@@ -158,23 +203,23 @@ class Rig:
         log(f"nostr relay ready ({ep.nostr_relay_url})")
 
         log("creating client wallet (electrum_liqtest) + config ...")
-        self.client_address = setup_wallet(ep, CLIENT)
+        self.client_address = setup_wallet(ep, CLIENT, gossip=self.args.gossip)
         log(f"  client funding address: {self.client_address}")
 
         log("creating swap-partner wallet (electrum_liqtest_swap_partner) + config ...")
-        self.partner_address = setup_wallet(ep, PARTNER)
+        self.partner_address = setup_wallet(ep, PARTNER, gossip=self.args.gossip)
         log(f"  partner funding address: {self.partner_address}")
 
-        if self.args.second_provider:
+        if self.needs_partner2:
             log("creating SECOND swap-provider wallet "
                 "(electrum_liqtest_swap_partner2) + config ...")
-            self.partner2_address = setup_wallet(ep, PARTNER2)
+            self.partner2_address = setup_wallet(ep, PARTNER2, gossip=self.args.gossip)
             log(f"  partner2 funding address: {self.partner2_address}")
 
         log(f"funding each wallet with {self.args.funding} BTC ...")
         self._fund_wallet(self.client_address)
         self._fund_wallet(self.partner_address)
-        if self.args.second_provider:
+        if self.needs_partner2:
             self._fund_wallet(self.partner2_address)
         mine(ep, self.miner_address, 6)   # confirm funding
 
@@ -192,17 +237,26 @@ class Rig:
         # channels to the swap provider (= partner), so we must know the
         # partner's LN node id before the client comes up.
         self._bring_up_partner()
-        if self.args.second_provider:
+        if self.needs_partner2:
             self._bring_up_partner2()
         peer = self.partner_nodeid
         log(f"pointing liquidity plugin preferred partner at partner: {peer[:24]}...")
         set_client_channel_peer(peer)
+
+        if self.args.gossip:
+            # The client's gossip node is separate from its wallet and, on
+            # regtest, has no way to find anybody -- see set_gossip_seed_peers.
+            # Point it at the partner, which serves gossip queries and holds both
+            # announced channels.
+            self._seed_gossip_peers()
 
         # Local LNURL-pay stub for the dev fee: mints invoices from the partner so
         # a dev-fee payout is a real Lightning payment over the rig's channels.
         # Started (and trusted, and pointed at) before the client comes up so the
         # client reads the payout address at load and validates the endpoint's TLS.
         self._bring_up_lnurl_stub()
+        if self.args.gossip:
+            self._bring_up_sink_stub()
 
         # Client wallet: GUI by default (the user-facing wallet that hosts the
         # liquidity plugin).
@@ -217,7 +271,7 @@ class Rig:
         pbal = wait_onchain_funds(PARTNER, min_btc=self.args.funding * 0.9,
                                   mine_cb=mine_cb, log=log)
         log(f"  client {cbal} BTC, partner {pbal} BTC confirmed")
-        if self.args.second_provider:
+        if self.needs_partner2:
             p2bal = wait_onchain_funds(PARTNER2, min_btc=self.args.funding * 0.9,
                                        mine_cb=mine_cb, log=log)
             log(f"  partner2 {p2bal} BTC confirmed")
@@ -231,11 +285,17 @@ class Rig:
             capacity_btc=self.args.channel_btc,
             mine_cb=lambda n: mine(ep, self.miner_address, n),
             log=log,
+            # In gossip mode every channel must be ANNOUNCED or the graph stays
+            # empty and nothing can be routed through it.
+            public=self.args.gossip,
         )
         log(f"  {len(self.channels)} channel(s) OPEN")
         for c in self.channels:
             log(f"    {c['short_channel_id']}  local={c['local_balance']} "
                 f"remote={c['remote_balance']} sat")
+
+        if self.args.gossip:
+            self._open_forwarding_hop()
 
         if self.args.second_provider:
             # The second provider needs a channel from the client for two
@@ -294,6 +354,125 @@ class Rig:
         log(f"client online (nodeid {self.client_nodeid[:16]}..., "
             f"balance {bal}) ")
 
+    def _restart_client_for_gossip(self) -> None:
+        """Bounce the headless client so its gossip node re-queries the graph.
+
+        Only meaningful (and only possible) headless: under the GUI the client is
+        an interactive process the rig must not kill out from under the user, so
+        there we simply wait the peer's own 600s re-announcement cycle out --
+        which is why ``wait_gossip_graph`` is given a timeout above it.
+        """
+        if self.args.gui:
+            log("client is a GUI; waiting out the peer's own gossip cycle instead")
+            return
+        log("restarting client so its gossip node re-queries the graph ...")
+        stop_daemon(CLIENT)
+        start_electrum_daemon_ready(self.pm, CLIENT, log=log)
+        wait_electrum_ready(CLIENT)
+        wait_lightning_ready(CLIENT)
+        log("  client back up")
+
+    def _seed_gossip_peers(self) -> None:
+        """Give the CLIENT's gossip node a peer to query, so the announced
+        channel graph actually reaches it.
+
+        Only the client needs this: it is the one that has to BUILD a route, and
+        route-building is what needs the graph. Partner2 merely receives, and its
+        channel to the partner is announced, so a payer can find it without
+        partner2 knowing anything. (It is also the only node whose config we may
+        still write -- the partner daemons are already running by now, and this
+        has to be set offline, before load.)
+        """
+        assert self.ep is not None and self.partner_nodeid
+        pubkey = self.partner_nodeid.split("@")[0]
+        set_gossip_seed_peers(CLIENT, [("127.0.0.1", self.ep.ln_listen_partner, pubkey)])
+        log(f"seeded client gossip peer -> partner {pubkey[:16]}...")
+
+    def _open_forwarding_hop(self) -> None:
+        """Open the announced, deliberately under-funded PARTNER -> PARTNER2
+        channel that makes multi-hop routing both possible and *limited*.
+
+        The client holds no channel to partner2, so every payment to it must be
+        routed through the partner -- and the partner can only forward what it
+        holds on this hop. That is what lets a large payment fail on real
+        capacity while a smaller one settles, which is the only honest way to
+        exercise the liquidity sink's halving retry end to end.
+        """
+        assert self.ep is not None
+        ep = self.ep
+        existing = len(json.loads(electrum_cli("list_channels", inst=PARTNER)))
+        log(f"opening forwarding hop (partner -> partner2, "
+            f"{GOSSIP_HOP_CHANNEL_BTC} BTC, push {GOSSIP_HOP_PUSH_BTC}) ...")
+        hop = open_channels(
+            ep,
+            opener=PARTNER, peer=PARTNER2,
+            peer_listen_port=ep.ln_listen_partner2,
+            num_channels=1,
+            capacity_btc=GOSSIP_HOP_CHANNEL_BTC,
+            push_btc=GOSSIP_HOP_PUSH_BTC,
+            public=True,
+            mine_cb=lambda n: mine(ep, self.miner_address, n),
+            log=log,
+            already_open=existing,
+        )
+        self.hop_channel = next(
+            (c for c in hop if c.get("short_channel_id")
+             and c not in self.channels), hop[-1] if hop else None)
+        log(f"  forwarding hop OPEN ({len(hop)} partner channel(s) in total)")
+
+        # A channel is only announced once its funding tx is 6 deep, and only
+        # routable once its POLICIES have propagated. Bury everything, then wait
+        # for the client's own channel_db to hold the full picture: our
+        # client->partner channels plus this hop, both directions each.
+        log("burying funding txs so channels can be announced ...")
+        mine(ep, self.miner_address, 8)
+        wait_wallet_height(CLIENT, ep)
+
+        # Restart the client so its gossip node re-queries the channel range.
+        #
+        # Without this the graph takes TEN MINUTES to arrive, for a dull reason:
+        # a node pushes its own announcements to a peer 10s after that peer
+        # connects and then only every 600s (`Peer._send_own_gossip`). The
+        # client's gossip node connected before these channels existed, so it
+        # missed the first push and the next one is ten minutes out. A reconnect
+        # re-runs `query_channel_range` over a span that now CONTAINS the
+        # channels, so the graph lands in seconds instead.
+        self._restart_client_for_gossip()
+
+        expected_channels = self.args.channels + 1
+        log(f"waiting for the client's gossip graph "
+            f"({expected_channels} channels, {expected_channels} policies) ...")
+        wait_gossip_graph(
+            CLIENT,
+            min_channels=expected_channels,
+            min_policies=expected_channels,
+            mine_cb=lambda n: mine(ep, self.miner_address, n),
+            log=log,
+            # Headless this resolves in seconds (we just reconnected); under the
+            # GUI we have to outlast the peer's 600s re-announcement cycle.
+            timeout=180.0 if not self.args.gui else 780.0,
+        )
+        # Knowing the topology is not the same as being able to route over it.
+        probe_routed_payment(payer=CLIENT, payee=PARTNER2,
+                             amount_sat=GOSSIP_PROBE_SAT, log=log)
+
+    def _bring_up_sink_stub(self) -> None:
+        """Gossip mode only: a second LNURL-pay endpoint that mints its invoices
+        from PARTNER2, so paying it is a routed two-hop payment. Pointed at by
+        the sink e2e; the plugin's own sink address stays unset by default."""
+        assert self.sink_stub_port is not None
+        stub = LnurlPayStub(
+            self.sink_stub_port,
+            invoice_provider=partner2_lightning_invoice,
+            cert_dir=paths.RUN_DIR / "sink-stub",
+            username="liquidity_sink",
+        )
+        stub.start()
+        stub.trust_in_certifi(paths.certifi_ca_bundle())
+        self.sink_stub = stub
+        log(f"LNURL liquidity-sink stub up at {stub.base_url} "
+            f"(address {stub.lightning_address}; invoices minted by partner2)")
+
     def _bring_up_lnurl_stub(self) -> None:
         """Start the local LNURL-pay endpoint the dev fee is paid to, trust its
         self-signed cert in the venv's certifi bundle, and point the client's
@@ -345,7 +524,7 @@ class Rig:
         log(f"  nostr relay       : {ep.nostr_relay_url}")
         log(f"  client wallet     : {paths.CLIENT_WALLET_NAME}  (dir {CLIENT.datadir})")
         log(f"  partner wallet    : {paths.PARTNER_WALLET_NAME}  (dir {PARTNER.datadir})")
-        if self.args.second_provider:
+        if self.needs_partner2:
             log(f"  partner2 wallet   : {paths.PARTNER2_WALLET_NAME}  (dir {PARTNER2.datadir})")
         log(f"  channels open     : {len(self.channels)} x {self.args.channel_btc} BTC (50/50)")
         log(f"  swap provider npub: {self.swap_npub}")
@@ -353,6 +532,11 @@ class Rig:
         if self.lnurl_stub is not None:
             log(f"  dev-fee payout    : {self.lnurl_stub.lightning_address} "
                 f"(local LNURL stub; invoices minted by the partner)")
+        if self.sink_stub is not None:
+            log(f"  liquidity sink    : {self.sink_stub.lightning_address} "
+                f"(local LNURL stub; invoices minted by partner2, 2 hops away)")
+            log(f"  forwarding hop    : partner -> partner2, "
+                f"{GOSSIP_HOP_PUSH_BTC} BTC forwardable (gossip mode)")
         log(bar)
         log("Drive a wallet, e.g.:")
         log(f"  {paths.ELECTRUM_BIN} --regtest --dir {CLIENT.datadir} "
@@ -380,9 +564,11 @@ class Rig:
         log("shutting down ...")
         if self.lnurl_stub is not None:
             self.lnurl_stub.stop()
+        if self.sink_stub is not None:
+            self.sink_stub.stop()
         stop_daemon(CLIENT)
         stop_daemon(PARTNER)
-        if self.args.second_provider:
+        if self.needs_partner2:
             stop_daemon(PARTNER2)
         self.pm.shutdown()
         log("all rig processes stopped")
@@ -417,6 +603,13 @@ class Rig:
                 self.lnurl_stub.lightning_address if self.lnurl_stub else None),
             "dev_fee_lnurl_stub_url": (
                 self.lnurl_stub.base_url if self.lnurl_stub else None),
+            "gossip": bool(self.args.gossip),
+            "liquidity_sink_address": (
+                self.sink_stub.lightning_address if self.sink_stub else None),
+            "liquidity_sink_stub_url": (
+                self.sink_stub.base_url if self.sink_stub else None),
+            "forwarding_hop_push_sat": (
+                int(GOSSIP_HOP_PUSH_BTC * 1e8) if self.args.gossip else None),
             "blocks": self.args.blocks,
         }
         paths.READY_FILE.write_text(json.dumps(payload, indent=2))
@@ -442,6 +635,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                              "first on fee) so provider failover can be tested; "
                              "off by default -- the other e2e suites assume the "
                              "one-partner topology")
+    parser.add_argument("--gossip", action="store_true",
+                        help="use the real Lightning channel graph "
+                             "(use_gossip=true, announced channels) instead of "
+                             "trampoline mode, and add a deliberately "
+                             "under-funded partner->partner2 forwarding hop so "
+                             "MULTI-HOP payments can be routed -- and can fail "
+                             "on capacity. Brings up partner2 as a routing "
+                             "destination with no client channel, plus a second "
+                             "LNURL stub minting from it. Off by default: it "
+                             "changes the topology the other suites assert "
+                             "against and slows bring-up with graph sync")
     parser.add_argument("--no-gui", dest="gui", action="store_false",
                         help="run the client wallet headless too (no Qt GUI)")
     parser.add_argument("--display", default=None,

@@ -20,7 +20,8 @@ import time
 from concurrent import futures
 from contextlib import asynccontextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional,
+                    Sequence, Tuple)
 
 from electrum import util
 from electrum.i18n import _
@@ -59,6 +60,7 @@ from .liquidity_manager import (
     DAILY_WINDOW_SEC,
     DeclineRecord,
     LiquidityConfig,
+    LiquiditySinkAction,
     LiquiditySnapshot,
     MAX_SUGGESTED_PARTNERS,
     MAX_SWAP_PROVIDER_ATTEMPTS,
@@ -71,6 +73,7 @@ from .liquidity_manager import (
     ProviderReliability,
     ReleaseInfo,
     ReverseSwapAction,
+    SINK_MIN_PAYMENT_SAT,
     COOP_BEFORE_FORCE_WINDOW_SEC,
     COOP_MAX_ATTEMPTS,
     WEDGE_ABSOLUTE_CAP_SEC,
@@ -119,6 +122,8 @@ from .log_buffer import (
 if TYPE_CHECKING:
     from electrum.wallet import Abstract_Wallet
     from electrum.submarine_swaps import SwapOffer, SwapServerTransport
+    from electrum.lnurl import LNURL6Data
+    from electrum.invoices import Invoice
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -239,6 +244,28 @@ REVERSE_SWAP_TIMEOUT_SEC = 300.0
 # can never consume the budget before a second is even tried.
 SWAP_CASCADE_DEADLINE_SEC = 500.0
 
+# --- liquidity sink timing ------------------------------------------------
+# Coarse backstop on ONE sink payment. Electrum gives up on a payment of its own
+# accord at LNWallet.PAYMENT_TIMEOUT (120s), so this sits just above it: high
+# enough never to cut short a payment Electrum still believes in, low enough that
+# a wedge somewhere below pay_invoice cannot hold the evaluation lock. Referenced
+# via ``self._sink_payment_timeout_sec`` so tests can shrink it.
+SINK_PAYMENT_TIMEOUT_SEC = 150.0
+
+# Wall-clock ceiling on one channel's whole sink ladder. Checked BEFORE starting
+# each rung, never mid-payment -- the same rule the swap cascade follows, and for
+# the same reason: abandoning a payment whose HTLC may already be in flight is
+# precisely what must not happen.
+#
+# Deliberately a SEPARATE budget from SWAP_CASCADE_DEADLINE_SEC rather than a
+# shared one. The swap fallback is the safety net for a sink that cannot deliver,
+# so a slow ladder must not be able to consume the budget the fallback needs --
+# which is exactly what one shared deadline would do. The cost is the worst case:
+# a channel whose sink is dead slow AND whose providers are all slow can hold the
+# evaluation lock for this plus the swap cascade (~800s). That is bounded, rare,
+# and strictly better than silently skipping the fallback.
+SINK_CASCADE_DEADLINE_SEC = 300.0
+
 # Substrings that identify an UNAMBIGUOUS provider cheat among the bare
 # ``Exception``s Electrum's ``reverse_swap`` raises from its pre-payment sanity
 # checks (submarine_swaps.py): a short-changed on-chain amount, an invoice whose
@@ -288,6 +315,21 @@ class _SwapAttempt(Enum):
     COMMITTED = auto()   # funds committed (funded, accepted, or possibly in flight): STOP
     NEXT = auto()        # failed with nothing committed: safe to try the next provider
     ABORT = auto()       # our-side condition or unknown bug: stop trying providers
+
+
+# What one liquidity-sink payment attempt concluded, and hence what the ladder
+# does next. The distinction that matters is NEXT vs ABORT: halving and retrying
+# is only safe once we know the failed attempt left nothing committed on the
+# channel (see ``_payment_still_inflight``).
+class _SinkAttempt(Enum):
+    PAID = auto()        # the payment settled: the channel is drained, STOP
+    NEXT = auto()        # failed cleanly, nothing in flight: halve and retry
+    UNUSABLE = auto()    # the ENDPOINT is the problem, not the amount: no smaller
+                         # rung would fare better, so stop the ladder and let the
+                         # swap fallback (if any) take over
+    ABORT = auto()       # an HTLC may still be in flight: do not retry, and do
+                         # NOT fall back to a swap -- draining twice is the one
+                         # outcome worth giving up the whole tick to avoid
 
 
 # Startup window. For this long after a wallet is loaded, the plugin takes NO
@@ -743,9 +785,10 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
                         "share of the amount) exceeds this."))
 SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.dev_fee_pct', default=0.1, type_=float, plugin=_PLUGIN_NAME,
-    short_desc=lambda: _("Dev fee (% of amount swapped)"),
-    long_desc=lambda: _("Optional fee to support plugin development, charged on the on-chain "
-                        "amount received from reverse swaps the plugin initiates. Accrues until "
+    short_desc=lambda: _("Dev fee (% of amount drained)"),
+    long_desc=lambda: _("Optional fee to support plugin development, charged on what the plugin "
+                        "drains from a channel: the on-chain amount received from a reverse "
+                        "swap, or the amount paid to your liquidity sink. Accrues until "
                         "at least {thr} sat is owed, then is paid automatically to the payout "
                         "Lightning address (capped at {cap} sat/day). Range 0-{max}%; 0 disables "
                         "it.").format(thr=DEV_FEE_PAYOUT_THRESHOLD_SAT,
@@ -756,6 +799,27 @@ SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = ConfigVar(
     short_desc=lambda: _("Dev fee payout address"),
     long_desc=lambda: _("Lightning address (user@domain) or LNURL-pay the accrued dev fee is "
                         "paid to. Leave at the default to support development of this plugin."))
+SimpleConfig.INBOUND_LIQUIDITY_SINK_ADDRESS = ConfigVar(
+    'plugins.inbound_liquidity.sink_address', default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Liquidity sink (Lightning address)"),
+    long_desc=lambda: _("Optional. A Lightning address (user@domain), LNURL-pay string or "
+                        "LNURL-pay URL to send a channel's outbound balance to instead of "
+                        "reverse-swapping it on-chain. Paying it frees exactly the same "
+                        "inbound capacity, but settles in seconds with no on-chain claim "
+                        "and no swap provider -- typically pointed at your own account "
+                        "elsewhere. A payment that fails is retried at half the amount, "
+                        "repeatedly, down to {floor} sat. If every attempt fails, a reverse "
+                        "swap is used instead unless you disable submarine swaps. Leave "
+                        "empty to reverse-swap as before.").format(floor=SINK_MIN_PAYMENT_SAT))
+SimpleConfig.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = ConfigVar(
+    'plugins.inbound_liquidity.disable_submarine_swaps', default=False, type_=bool,
+    plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Disable submarine swaps (liquidity sink only)"),
+    long_desc=lambda: _("When on, outbound is only ever drained by paying the liquidity "
+                        "sink -- a reverse swap is never made, not even when the sink "
+                        "fails. Note that turning this on WITHOUT a liquidity sink leaves "
+                        "nothing able to drain a channel: the plugin will say so in its "
+                        "decision log rather than swap against your wishes."))
 SimpleConfig.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = ConfigVar(
     'plugins.inbound_liquidity.swap_trigger_pct', default=25.0, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Swap-out trigger (% of capacity)"),
@@ -1133,6 +1197,7 @@ class LiquidityPlugin(BasePlugin):
         # Coarse backstop on a whole reverse-swap attempt, as an instance
         # attribute so tests can shrink it (the module constant is the default).
         self._reverse_swap_timeout_sec: float = REVERSE_SWAP_TIMEOUT_SEC
+        self._sink_payment_timeout_sec: float = SINK_PAYMENT_TIMEOUT_SEC
         # wallet -> payment_hash hexes of stuck swaps we have already logged as
         # having aged out of the freeze, so the escape is logged once per swap (not
         # every tick) while it stays pending. Pruned against the live pending set.
@@ -1793,7 +1858,23 @@ class LiquidityPlugin(BasePlugin):
             liquidity_goal_sat=self._liquidity_goal_sat(),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
+            liquidity_sink_address=self._liquidity_sink_address(),
+            disable_submarine_swaps=self._submarine_swaps_disabled(),
         )
+
+    def _liquidity_sink_address(self) -> str:
+        """The configured liquidity-sink address, trimmed. Empty means the
+        feature is off and the plugin reverse-swaps as it always did. Read via
+        getattr so a config predating this setting (or a stubbed one in tests)
+        reads as "off" rather than raising on every tick."""
+        return (getattr(self.config, "INBOUND_LIQUIDITY_SINK_ADDRESS", "") or "").strip()
+
+    def _submarine_swaps_disabled(self) -> bool:
+        """Whether the user has turned reverse swaps off entirely, leaving the
+        liquidity sink as the only way to drain a channel. Honoured even with no
+        sink configured -- see the note on ``LiquidityConfig.disable_submarine_swaps``."""
+        return bool(getattr(
+            self.config, "INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS", False))
 
     def _manual_run_only(self) -> bool:
         """Whether the user has put the plugin in "manual run only" mode: no
@@ -2019,6 +2100,56 @@ class LiquidityPlugin(BasePlugin):
             return addr
         return None
 
+    async def _lnurl_pay_params(self, address: str, *,
+                                purpose: str) -> Optional['LNURL6Data']:
+        """Resolve a payout target to its LNURL-pay parameters (min/max sendable
+        and the callback URL), or None with a logged reason.
+
+        Shared by the two things this plugin pays over LNURL -- the dev fee and
+        the liquidity sink -- so there is one implementation of "is this address
+        usable at all". Callers own the amount policy that follows; this only
+        answers whether there is an LNURL-pay endpoint at the other end.
+        """
+        from electrum.lnurl import request_lnurl, LNURL6Data
+        url = self._resolve_lnurl_pay_url(address)
+        if url is None:
+            self.logger.warning(
+                f"{purpose}: address {scrub_text(address, max_len=80)!r} is not a "
+                f"valid Lightning address / LNURL; skipping")
+            return None
+        lnurl_data = await request_lnurl(url)
+        if not isinstance(lnurl_data, LNURL6Data):
+            self.logger.warning(f"{purpose}: address is not an LNURL-pay endpoint")
+            return None
+        return lnurl_data
+
+    async def _lnurl_invoice(self, lnurl_data: 'LNURL6Data', pay_sat: int, *,
+                             purpose: str) -> Optional['Invoice']:
+        """Ask an LNURL-pay endpoint for an invoice for exactly ``pay_sat``, and
+        verify that is what came back.
+
+        The amount check is the security-relevant part and is why this is shared
+        rather than duplicated: the endpoint chooses the invoice, so an endpoint
+        that returns an invoice for MORE than we asked would otherwise be paid
+        without complaint. Returns None (logged) on anything unusable; the caller
+        decides whether that is worth a retry.
+        """
+        from electrum.lnurl import callback_lnurl
+        from electrum.invoices import Invoice
+        invoice_data = await callback_lnurl(lnurl_data.callback_url,
+                                            params={"amount": pay_sat * 1000})
+        bolt11 = invoice_data.get("pr")
+        if not bolt11:
+            self.logger.warning(f"{purpose}: LNURL callback returned no invoice")
+            return None
+        invoice = Invoice.from_bech32(bolt11)
+        if invoice.get_amount_sat() != pay_sat:
+            self.logger.warning(
+                f"{purpose}: invoice amount {invoice.get_amount_sat()} sat != "
+                f"requested {pay_sat} sat; refusing to pay")
+            return None
+        return invoice
+
     def _maybe_pay_dev_fee(self, wallet: 'Abstract_Wallet') -> None:
         """Cheap synchronous gate, run on each evaluation tick: if enough dev fee
         has accrued and the daily cap allows it, launch a background payout. A
@@ -2060,23 +2191,14 @@ class LiquidityPlugin(BasePlugin):
         pay it. On success, draw the amount down from the owed ledger and stamp it
         against the rolling-24h cap. On any failure, leave the ledger untouched
         and set a backoff so the same fee is retried later."""
-        from electrum.lnurl import request_lnurl, callback_lnurl, LNURL6Data
-        from electrum.invoices import Invoice
         lnworker = getattr(wallet, "lnworker", None)
         ok = False
         try:
             if lnworker is None:
                 self.logger.info("dev-fee payout skipped: wallet has no lnworker")
                 return
-            url = self._resolve_lnurl_pay_url(address)
-            if url is None:
-                self.logger.warning(
-                    f"dev-fee payout address {address!r} is not a valid Lightning "
-                    f"address / LNURL; skipping")
-                return
-            lnurl_data = await request_lnurl(url)
-            if not isinstance(lnurl_data, LNURL6Data):
-                self.logger.warning("dev-fee payout: address is not an LNURL-pay endpoint")
+            lnurl_data = await self._lnurl_pay_params(address, purpose="dev-fee payout")
+            if lnurl_data is None:
                 return
             # Respect the endpoint's min/max sendable. If we owe less than the
             # minimum, wait for more to accrue; if more than the maximum, send the
@@ -2089,17 +2211,9 @@ class LiquidityPlugin(BasePlugin):
                     f"dev-fee payout deferred: {amount_sat} sat owed is below the "
                     f"address minimum of {lnurl_data.min_sendable_sat} sat")
                 return
-            params = {"amount": pay_sat * 1000}
-            invoice_data = await callback_lnurl(lnurl_data.callback_url, params=params)
-            bolt11 = invoice_data.get("pr")
-            if not bolt11:
-                self.logger.warning("dev-fee payout: LNURL callback returned no invoice")
-                return
-            invoice = Invoice.from_bech32(bolt11)
-            if invoice.get_amount_sat() != pay_sat:
-                self.logger.warning(
-                    f"dev-fee payout: invoice amount {invoice.get_amount_sat()} sat "
-                    f"!= requested {pay_sat} sat; refusing to pay")
+            invoice = await self._lnurl_invoice(lnurl_data, pay_sat,
+                                                purpose="dev-fee payout")
+            if invoice is None:
                 return
             success, log = await lnworker.pay_invoice(invoice)
             if not success:
@@ -4374,6 +4488,8 @@ class LiquidityPlugin(BasePlugin):
                        candidates: Optional[List[str]] = None) -> None:
         if isinstance(action, OpenChannelAction):
             await self._open_channel(wallet, action, state, candidates)
+        elif isinstance(action, LiquiditySinkAction):
+            await self._liquidity_sink_drain(wallet, action, state, transport)
         elif isinstance(action, ReverseSwapAction):
             await self._reverse_swap(wallet, action, state, transport)
         elif isinstance(action, CloseChannelAction):
@@ -4895,6 +5011,324 @@ class LiquidityPlugin(BasePlugin):
             self._track_pending_swap(wallet, ph_hex, npub,
                                      node_id=peer_node_id, channel_id=action.channel_id,
                                      fee_basis_sat=expected_onchain_sat)
+
+    # --- liquidity sink ---------------------------------------------------
+    # Draining a channel by PAYING somebody, instead of reverse-swapping on-chain.
+    # The liquidity effect is identical -- local balance leaves the channel and
+    # inbound capacity comes back -- but it settles in seconds, needs no provider,
+    # no on-chain claim tx and no cost gate, and the sats land in whatever account
+    # the address belongs to rather than in this wallet's on-chain balance.
+    #
+    # The engine plans the ladder (``LiquiditySinkAction.amounts``); everything
+    # here is the I/O: resolving the address, minting one invoice per rung, and
+    # paying it pinned to the channel being drained.
+    async def _liquidity_sink_drain(self, wallet: 'Abstract_Wallet',
+                                    action: LiquiditySinkAction,
+                                    state: Optional[Dict] = None,
+                                    transport: Optional['SwapServerTransport'] = None) -> None:
+        """Drain one channel into the liquidity sink, falling back to a reverse
+        swap if the sink cannot do it.
+
+        Cooldown ownership is the subtle part. ``_reverse_swap`` arms the
+        per-channel cooldown itself and returns early if it is already armed, so
+        arming it here before delegating would silently cancel the fallback --
+        the exact bug that would make "swaps as a backstop" a lie. So the cooldown
+        is armed here only on the paths that do NOT delegate; when we do delegate,
+        the swap path owns it.
+        """
+        now = time.monotonic()
+        if now < self._swap_cooldown_until.get(action.channel_id, 0.0):
+            return
+        self.logger.info(
+            f"liquidity sink for {action.short_id}: {len(action.amounts)} amount(s) "
+            f"to try, {action.amounts[0] if action.amounts else 0} sat first "
+            f"({action.reason})")
+        outcome = await self._pay_liquidity_sink(wallet, action, state)
+        if outcome in (_SinkAttempt.PAID, _SinkAttempt.ABORT):
+            # Drained, or possibly-committed and therefore untouchable: either
+            # way this channel is done for now.
+            self._swap_cooldown_until[action.channel_id] = time.monotonic() + SWAP_COOLDOWN_SEC
+            return
+        if action.swap_fallback is None:
+            self.logger.info(
+                f"liquidity sink could not drain {action.short_id} and no reverse "
+                f"swap is available as a fallback; waiting for the next cycle")
+            self._diag_event(
+                wallet, category="error", kind="sink",
+                reason="liquidity sink failed with no swap fallback",
+                dest=action.address,
+                detail=f"{len(action.amounts)} amount(s) tried on {action.short_id}")
+            self._swap_cooldown_until[action.channel_id] = time.monotonic() + SWAP_COOLDOWN_SEC
+            return
+        self.logger.info(
+            f"liquidity sink exhausted for {action.short_id}; falling back to a "
+            f"reverse swap of {action.swap_fallback.lightning_amount_sat} sat")
+        self._diag_event(
+            wallet, category="error", kind="sink",
+            reason="liquidity sink failed; falling back to a reverse swap",
+            dest=action.address,
+            detail=f"{len(action.amounts)} amount(s) tried on {action.short_id}")
+        await self._reverse_swap(wallet, action.swap_fallback, state, transport)
+
+    def _sink_rungs_within_bounds(self, amounts: Sequence[int],
+                                  lnurl_data: 'LNURL6Data') -> List[int]:
+        """The engine's ladder reshaped to what this endpoint will actually
+        accept.
+
+        The engine sizes the ladder against the CHANNEL; the endpoint has its own
+        min/max sendable, which the engine cannot know (it is discovered over the
+        network, and the engine does no I/O). So the top rung is clamped down to
+        ``max_sendable`` and anything under ``min_sendable`` is dropped -- which
+        can raise the effective floor above SINK_MIN_PAYMENT_SAT, or empty the
+        ladder entirely (the caller then falls back to a swap).
+
+        Clamping can make the top rung equal the one below it, so the result is
+        deduplicated: paying the identical amount twice would be a wasted attempt
+        that tells us nothing new.
+        """
+        lo = max(int(lnurl_data.min_sendable_sat), 1)
+        hi = int(lnurl_data.max_sendable_sat)
+        out: List[int] = []
+        for amount in amounts:
+            capped = min(int(amount), hi)
+            if capped < lo or capped in out:
+                continue
+            out.append(capped)
+        return out
+
+    def _sink_fee_budget(self, amount_sat: int):
+        """The routing-fee budget for a sink payment: the user's existing
+        ``max_swap_fee_pct`` ceiling, applied to the amount being sent.
+
+        The same knob governs both drain routes on purpose -- it is the answer to
+        "how much am I willing to pay to convert outbound into inbound", and a
+        sink payment converts exactly what a reverse swap does. Note the ceiling
+        is strict: a route costing more is not taken, which surfaces as a payment
+        failure and drops the ladder to its next rung. A ceiling of 0 therefore
+        permits only zero-fee routes (a direct channel to the sink's node).
+        """
+        from electrum.lnutil import PaymentFeeBudget
+        pct = max(0.0, float(getattr(self.config,
+                                     "INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT", 0.9)))
+        cap_msat = int(amount_sat * 1000 * pct / 100.0)
+        return PaymentFeeBudget.from_invoice_amount(
+            invoice_amount_msat=amount_sat * 1000, config=self.config,
+            max_fee_msat=cap_msat)
+
+    @staticmethod
+    def _payment_still_inflight(lnworker, payment_hash: bytes) -> bool:
+        """Whether a payment we just gave up on may still have an HTLC committed.
+
+        This is the safety gate on the whole halving loop, and the direct analogue
+        of the ``add_reverse_swap`` commit boundary on the swap path. A failed
+        ``pay_invoice`` does NOT prove nothing was sent: ``pay_to_node`` raises
+        PaymentFailure once it passes ``LNWallet.PAYMENT_TIMEOUT`` (120s) or runs
+        out of attempts, and its ``finally`` clause deliberately keeps the
+        paysession alive when HTLCs have not resolved. If we halved and paid again
+        while the first HTLC were still live and it later settled, the channel
+        would be drained by both -- past the outbound floor the user configured,
+        and for more than the plugin ever decided to send.
+
+        Best-effort by design: any lookup failure conservatively answers True
+        (stop), because the cost of a false "all clear" is a double drain while the
+        cost of a false alarm is one skipped tick.
+        """
+        try:
+            return payment_hash in lnworker.get_payments(status='inflight')
+        except Exception as e:  # noqa: BLE001
+            _logger.info(
+                f"could not determine whether the sink payment is still in "
+                f"flight ({e!r}); assuming it is")
+            return True
+
+    async def _pay_liquidity_sink(self, wallet: 'Abstract_Wallet',
+                                  action: LiquiditySinkAction,
+                                  state: Optional[Dict]) -> '_SinkAttempt':
+        """Walk the ladder until a payment settles. Returns what the caller should
+        do next -- see :class:`_SinkAttempt`."""
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            self.logger.info("liquidity sink skipped: wallet has no lnworker")
+            return _SinkAttempt.UNUSABLE
+        # Resolve the endpoint ONCE for the whole ladder: every rung mints a fresh
+        # invoice from the same callback URL, and re-resolving per rung would add a
+        # DNS+TLS round trip to each retry for no new information.
+        try:
+            lnurl_data = await self._lnurl_pay_params(action.address,
+                                                      purpose="liquidity sink")
+        except Exception as e:  # noqa: BLE001
+            # Unreachable endpoint, TLS failure, malformed reply. Halving cannot
+            # fix any of these -- the amount was never the problem.
+            self.logger.warning(
+                f"liquidity sink {scrub_text(action.address, max_len=80)} could not "
+                f"be resolved: {e!r}")
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity sink address could not be resolved",
+                             dest=action.address, detail=f"{type(e).__name__}: {e}")
+            return _SinkAttempt.UNUSABLE
+        if lnurl_data is None:
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity sink is not a usable LNURL-pay endpoint",
+                             dest=action.address, detail=None)
+            return _SinkAttempt.UNUSABLE
+        rungs = self._sink_rungs_within_bounds(action.amounts, lnurl_data)
+        if not rungs:
+            self.logger.info(
+                f"liquidity sink cannot host any amount on this channel: ladder "
+                f"{action.amounts[0] if action.amounts else 0}..."
+                f"{action.amounts[-1] if action.amounts else 0} sat vs endpoint "
+                f"bounds {lnurl_data.min_sendable_sat}..{lnurl_data.max_sendable_sat} sat")
+            self._diag_event(
+                wallet, category="error", kind="sink",
+                reason="liquidity sink accepts no amount this channel can send",
+                dest=action.address,
+                detail=(f"endpoint accepts {lnurl_data.min_sendable_sat}.."
+                        f"{lnurl_data.max_sendable_sat} sat"))
+            return _SinkAttempt.UNUSABLE
+        # Pin the payment to the channel the engine chose to drain -- without this
+        # lnworker routes over ANY channel with enough outbound, so a drain planned
+        # for channel X can empty channel Y instead, leaving X over its trigger
+        # forever. Same reasoning (and same defensive fallback) as the swap path.
+        chan = None
+        try:
+            if action.channel_id:
+                chan = wallet.lnworker.get_channel_by_id(bytes.fromhex(action.channel_id))
+        except Exception as e:  # noqa: BLE001
+            self.logger.info(
+                f"could not resolve channel {action.short_id} to pin the sink "
+                f"payment ({e!r}); routing unpinned")
+        deadline = time.monotonic() + SINK_CASCADE_DEADLINE_SEC
+        total = len(rungs)
+        for index, amount in enumerate(rungs, start=1):
+            if time.monotonic() >= deadline:
+                remaining = total - index + 1
+                self.logger.warning(
+                    f"liquidity sink ladder for {action.short_id} hit its "
+                    f"{SINK_CASCADE_DEADLINE_SEC:.0f}s deadline with {remaining} "
+                    f"amount(s) untried")
+                self._diag_event(
+                    wallet, category="error", kind="sink",
+                    reason="liquidity sink ladder deadline reached",
+                    dest=action.address,
+                    detail=f"{remaining} amount(s) untried after {index - 1} attempt(s)")
+                break
+            outcome = await self._attempt_sink_payment(
+                wallet, action, lnurl_data, amount, chan, lnworker, state,
+                index=index, total=total)
+            if outcome is not _SinkAttempt.NEXT:
+                return outcome
+            if index < total:
+                self.logger.info(
+                    f"halving the liquidity-sink payment for {action.short_id}: "
+                    f"trying {rungs[index]} sat next ({index + 1} of {total})")
+        return _SinkAttempt.NEXT
+
+    async def _attempt_sink_payment(self, wallet: 'Abstract_Wallet',
+                                    action: LiquiditySinkAction,
+                                    lnurl_data: 'LNURL6Data', amount_sat: int,
+                                    chan, lnworker, state: Optional[Dict],
+                                    *, index: int, total: int) -> '_SinkAttempt':
+        """One rung: mint an invoice for ``amount_sat`` and pay it."""
+        of_n = f" ({index} of {total})" if total > 1 else ""
+        self.logger.info(
+            f"paying liquidity sink{of_n}: {amount_sat} sat from channel "
+            f"{action.short_id}")
+        self._set_status(
+            wallet,
+            f"paying liquidity sink{of_n} ({amount_sat:,} sat from channel "
+            f"{action.short_id})")
+        try:
+            invoice = await self._lnurl_invoice(lnurl_data, amount_sat,
+                                                purpose="liquidity sink")
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(
+                f"liquidity sink would not issue an invoice for {amount_sat} sat: {e!r}")
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity sink would not issue an invoice",
+                             dest=action.address,
+                             detail=f"{amount_sat} sat: {type(e).__name__}: {e}")
+            return _SinkAttempt.UNUSABLE
+        if invoice is None:
+            # No invoice, or one for the wrong amount. Both are the endpoint
+            # misbehaving rather than the amount being unroutable, and an endpoint
+            # that does this at one amount will do it at half that amount too.
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity sink returned no usable invoice",
+                             dest=action.address, detail=f"{amount_sat} sat")
+            return _SinkAttempt.UNUSABLE
+        try:
+            payment_hash = bytes.fromhex(invoice.rhash)
+        except Exception:  # noqa: BLE001
+            payment_hash = b""
+        kwargs: Dict[str, Any] = {"budget": self._sink_fee_budget(amount_sat)}
+        if chan is not None:
+            kwargs["channels"] = [chan]
+        try:
+            success, _log = await asyncio.wait_for(
+                lnworker.pay_invoice(invoice, **kwargs),
+                timeout=self._sink_payment_timeout_sec)
+        except asyncio.TimeoutError:
+            # Past our coarse backstop, which sits above Electrum's own payment
+            # timeout -- so this is a wedge below pay_invoice, not a slow route.
+            # Whether we may halve is decided entirely by the in-flight check.
+            self.logger.warning(
+                f"liquidity-sink payment of {amount_sat} sat timed out after "
+                f"{self._sink_payment_timeout_sec:.0f}s")
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity-sink payment timed out",
+                             dest=action.address, detail=f"{amount_sat} sat")
+            success = False
+        except Exception as e:  # noqa: BLE001
+            # An unrecognised failure out of pay_invoice. We cannot show it left
+            # nothing committed, so the conservative reading applies: stop.
+            self.logger.error(
+                f"liquidity-sink payment of {amount_sat} sat failed: {e!r}",
+                exc_info=True)
+            self._diag_event(wallet, category="error", kind="sink",
+                             reason="liquidity-sink payment raised", dest=action.address,
+                             detail=f"{amount_sat} sat: {type(e).__name__}: {e}")
+            return (_SinkAttempt.ABORT
+                    if payment_hash and self._payment_still_inflight(lnworker, payment_hash)
+                    else _SinkAttempt.UNUSABLE)
+        if success:
+            self.logger.info(
+                f"liquidity-sink payment of {amount_sat} sat from {action.short_id} "
+                f"settled to {action.address}")
+            # A settled drain is a completed conversion of outbound into inbound,
+            # which is what the dev fee is charged on -- here on the amount sent,
+            # the sink's equivalent of a swap's net on-chain receipt.
+            self._accrue_dev_fee(wallet, amount_sat, source=action.short_id)
+            self._log_action(
+                wallet, kind="sink", amount_sat=amount_sat,
+                source=action.short_id, dest=action.address,
+                reason=action.reason,
+                detail=(f"paid {amount_sat} sat to {action.address}"
+                        + (f" (attempt {index} of {total})" if index > 1 else "")),
+                state=state)
+            self.on_action_done(
+                wallet, _("Paid liquidity sink {} sat from {}").format(
+                    amount_sat, action.short_id))
+            return _SinkAttempt.PAID
+        # Failed. Halving is only safe once we know this attempt left nothing
+        # committed on the channel -- see _payment_still_inflight.
+        if payment_hash and self._payment_still_inflight(lnworker, payment_hash):
+            self.logger.warning(
+                f"liquidity-sink payment of {amount_sat} sat failed but an HTLC may "
+                f"still be in flight; NOT retrying or swapping on {action.short_id}")
+            self._diag_event(
+                wallet, category="error", kind="sink",
+                reason="liquidity-sink payment failed with an HTLC possibly in flight",
+                dest=action.address,
+                detail=f"{amount_sat} sat on {action.short_id}; cascade stopped")
+            return _SinkAttempt.ABORT
+        self.logger.info(
+            f"liquidity-sink payment of {amount_sat} sat did not settle "
+            f"(nothing in flight){of_n}")
+        self._diag_event(wallet, category="error", kind="sink",
+                         reason="liquidity-sink payment did not settle",
+                         dest=action.address,
+                         detail=f"{amount_sat} sat from {action.short_id}")
+        return _SinkAttempt.NEXT
 
     # --- helpers ----------------------------------------------------------
     def _migrate_channel_peer(self) -> None:

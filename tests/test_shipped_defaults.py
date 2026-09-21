@@ -43,6 +43,18 @@ def test_max_swap_fee_pct_default() -> None:
 EXPECTED_LIQUIDITY_GOAL_SAT: int = 100_000
 
 
+def test_liquidity_sink_ships_off() -> None:
+    """The sink is opt-in. It sends a channel's outbound to a third party rather
+    than converting it to this wallet's own on-chain coins, so an untouched
+    install must never do it, and "disable submarine swaps" must never be on --
+    together they would stop the plugin draining anything at all."""
+    address = SimpleConfig.INBOUND_LIQUIDITY_SINK_ADDRESS.get_default_value()
+    assert address == ""
+    assert isinstance(address, str)
+    disabled = SimpleConfig.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS.get_default_value()
+    assert disabled is False
+
+
 def test_liquidity_goal_default() -> None:
     default = SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value()
     assert default == EXPECTED_LIQUIDITY_GOAL_SAT
