@@ -161,6 +161,59 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def _silence_log_tab_timer(monkeypatch):
+    """Disconnect the Log tab's refresh timer on every tab any test builds.
+
+    The Log tab owns a QTimer parented to it, and nothing ever stops it: a tab is
+    simply abandoned when a test ends, and `_remove_liquidity_tab` (where it is
+    called at all) only takes the widget out of its QTabWidget. Those timers go
+    on firing into widgets Python is collecting, which raises out of the QT EVENT
+    LOOP -- where pytest-qt blames whichever test is running, never the one that
+    leaked it.
+
+    It was invisible for a long time because the leaked timers had nothing left
+    to fire during: the suite ended. Appending tests to this module gave them
+    somewhere to land, and the suite began failing about one run in three, in a
+    different innocent test each time.
+
+    Three things this had to get right, each learned by getting it wrong:
+      * Disconnect at BUILD time, not in fixture teardown. pytest-qt drains the
+        event loop inside `pytest_runtest_call`, which runs before any fixture
+        teardown -- so by then the queued timeout has already fired.
+      * DISCONNECT, not just stop(). stop() prevents future timeouts but does not
+        withdraw one already queued.
+      * Silence the timer; do not delete the widgets. deleteLater()/sip.delete()
+        removes the flake and replaces it with an intermittent SEGFAULT, because
+        a timer firing mid-deletion reaches genuinely freed C++ objects rather
+        than ones PyQt can still report on.
+
+    Nothing here depends on the periodic refresh -- the tests that exercise the
+    Log tab's rendering drive it explicitly -- so removing the timer costs no
+    coverage. The leak itself is the plugin's (`_remove_liquidity_tab` stops no
+    timers), but fixing it at the source belongs in a change about the Log tab,
+    not one about the liquidity sink.
+    """
+    from PyQt6.QtCore import QTimer
+    original = qt_mod.Plugin._add_liquidity_tab
+
+    def _add_and_silence(self, window, wallet, *args, **kwargs):
+        result = original(self, window, wallet, *args, **kwargs)
+        state = (getattr(self, "_tabs", None) or {}).get(wallet)
+        container = getattr(state, "container", None)
+        if container is not None:
+            for timer in container.findChildren(QTimer):
+                try:
+                    timer.timeout.disconnect()
+                except TypeError:
+                    pass            # nothing was connected
+                timer.stop()
+        return result
+
+    monkeypatch.setattr(qt_mod.Plugin, "_add_liquidity_tab", _add_and_silence)
+    yield
+
+
 def _make_plugin() -> qt_mod.Plugin:
     p = object.__new__(qt_mod.Plugin)
     p.config = _FakeConfig()
@@ -1203,11 +1256,6 @@ def test_buffer_size_rejects_a_non_numeric_entry(qapp):
 
 
 # --- liquidity sink settings ----------------------------------------------
-def _settings_tab(p, wallet):
-    from PyQt6.QtWidgets import QTabWidget
-    return p._tabs[wallet].container.findChild(QTabWidget).widget(0)
-
-
 def _sink_edit(settings_tab):
     # Index 6: see the field order pinned in test_apply_persists_and_clamps.
     return _plain_line_edits(settings_tab)[6]
