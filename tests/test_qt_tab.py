@@ -113,6 +113,8 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG = False
         self.INBOUND_LIQUIDITY_DEV_FEE_PCT = 0.1
         self.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = "electrum_liqhelper@getbarebits.com"
+        self.INBOUND_LIQUIDITY_SINK_ADDRESS = ""
+        self.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = False
         self.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = False
         self.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = False
         self.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0
@@ -157,6 +159,59 @@ def _plain_line_edits(widget):
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+@pytest.fixture(autouse=True)
+def _silence_log_tab_timer(monkeypatch):
+    """Disconnect the Log tab's refresh timer on every tab any test builds.
+
+    The Log tab owns a QTimer parented to it, and nothing ever stops it: a tab is
+    simply abandoned when a test ends, and `_remove_liquidity_tab` (where it is
+    called at all) only takes the widget out of its QTabWidget. Those timers go
+    on firing into widgets Python is collecting, which raises out of the QT EVENT
+    LOOP -- where pytest-qt blames whichever test is running, never the one that
+    leaked it.
+
+    It was invisible for a long time because the leaked timers had nothing left
+    to fire during: the suite ended. Appending tests to this module gave them
+    somewhere to land, and the suite began failing about one run in three, in a
+    different innocent test each time.
+
+    Three things this had to get right, each learned by getting it wrong:
+      * Disconnect at BUILD time, not in fixture teardown. pytest-qt drains the
+        event loop inside `pytest_runtest_call`, which runs before any fixture
+        teardown -- so by then the queued timeout has already fired.
+      * DISCONNECT, not just stop(). stop() prevents future timeouts but does not
+        withdraw one already queued.
+      * Silence the timer; do not delete the widgets. deleteLater()/sip.delete()
+        removes the flake and replaces it with an intermittent SEGFAULT, because
+        a timer firing mid-deletion reaches genuinely freed C++ objects rather
+        than ones PyQt can still report on.
+
+    Nothing here depends on the periodic refresh -- the tests that exercise the
+    Log tab's rendering drive it explicitly -- so removing the timer costs no
+    coverage. The leak itself is the plugin's (`_remove_liquidity_tab` stops no
+    timers), but fixing it at the source belongs in a change about the Log tab,
+    not one about the liquidity sink.
+    """
+    from PyQt6.QtCore import QTimer
+    original = qt_mod.Plugin._add_liquidity_tab
+
+    def _add_and_silence(self, window, wallet, *args, **kwargs):
+        result = original(self, window, wallet, *args, **kwargs)
+        state = (getattr(self, "_tabs", None) or {}).get(wallet)
+        container = getattr(state, "container", None)
+        if container is not None:
+            for timer in container.findChildren(QTimer):
+                try:
+                    timer.timeout.disconnect()
+                except TypeError:
+                    pass            # nothing was connected
+                timer.stop()
+        return result
+
+    monkeypatch.setattr(qt_mod.Plugin, "_add_liquidity_tab", _add_and_silence)
+    yield
 
 
 def _make_plugin() -> qt_mod.Plugin:
@@ -284,19 +339,23 @@ def test_apply_persists_and_clamps(qapp):
                      if b.text() == "Apply")
 
     # Settings-tab QLineEdit order after the Advanced-tab reorg: 0 min-onchain,
-    # 1 max-channels, 2 max-cost, 3 trigger-%, 4 trigger-sat, 5 dev-fee-%.
+    # 1 max-channels, 2 max-cost, 3 trigger-%, 4 trigger-sat, 5 dev-fee-%,
+    # 6 liquidity-sink address.
     # (Automation on/off is the slider, applied immediately and independently of
     # this Apply button. Reserve / log-retention / tuning knobs live on Advanced.)
-    assert len(line_edits) == 6
+    assert len(line_edits) == 7
     line_edits[1].setText("5")              # Maximum number of channels
     line_edits[5].setText("99")             # dev fee % -> clamped to DEV_FEE_MAX_PCT
+    line_edits[6].setText("  alice@example.com  ")   # sink -> stored trimmed
     apply_btn.click()
 
     assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 5
     from electrum.plugins.inbound_liquidity import DEV_FEE_MAX_PCT  # noqa
     assert p.config.INBOUND_LIQUIDITY_DEV_FEE_PCT == DEV_FEE_MAX_PCT
-    # Field reloaded to the clamped value.
+    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == "alice@example.com"
+    # Fields reloaded to the clamped / normalised values.
     assert line_edits[5].text() == str(DEV_FEE_MAX_PCT)
+    assert line_edits[6].text() == "alice@example.com"
 
 
 def test_apply_rejects_invalid_without_persisting(qapp):
@@ -1194,3 +1253,111 @@ def test_buffer_size_rejects_a_non_numeric_entry(qapp):
     edit.editingFinished.emit()
     assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == DEFAULT_LOG_BUFFER_LINES
     assert edit.text() == str(DEFAULT_LOG_BUFFER_LINES)
+
+
+# --- liquidity sink settings ----------------------------------------------
+def _sink_edit(settings_tab):
+    # Index 6: see the field order pinned in test_apply_persists_and_clamps.
+    return _plain_line_edits(settings_tab)[6]
+
+
+def _sink_only_checkbox(settings_tab):
+    from PyQt6.QtWidgets import QCheckBox
+    return next(cb for cb in settings_tab.findChildren(QCheckBox)
+                if "Disable submarine swaps" in cb.text())
+
+
+def _apply_button(settings_tab):
+    from PyQt6.QtWidgets import QPushButton
+    return next(b for b in settings_tab.findChildren(QPushButton)
+                if b.text() == "Apply")
+
+
+def _status_text(settings_tab):
+    from PyQt6.QtWidgets import QLabel
+    # The save/validation status label sits immediately above the Apply row.
+    return [lbl.text() for lbl in settings_tab.findChildren(QLabel)]
+
+
+def test_sink_address_accepts_a_lightning_address(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_edit(tab).setText("myname@strike.me")
+    _apply_button(tab).click()
+    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == "myname@strike.me"
+
+
+def test_sink_address_that_cannot_be_resolved_is_refused(qapp):
+    # Stored-but-unusable would read as "configured" on this tab while every
+    # drain silently fell back to a reverse swap.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_edit(tab).setText("definitely not an address")
+    _apply_button(tab).click()
+    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == ""
+    assert any("Not a Lightning address" in t for t in _status_text(tab))
+
+
+def test_a_blank_sink_address_is_accepted_as_off(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_edit(tab).setText("")
+    _apply_button(tab).click()
+    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == ""
+    assert any(t == "Settings saved." for t in _status_text(tab))
+
+
+def test_sink_only_checkbox_applies_immediately(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p._add_liquidity_tab(window, wallet)
+    cb = _sink_only_checkbox(_settings_tab(p, wallet))
+
+    cb.setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
+    cb.setChecked(False)
+    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is False
+
+
+def test_sink_only_without_a_sink_warns_that_nothing_can_drain(qapp):
+    # Legal but inert: the engine honours the switch and declines. The tab must
+    # say so rather than let the user believe automation is still working.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_only_checkbox(tab).setChecked(True)
+    assert any("nothing can drain a channel" in t for t in _status_text(tab))
+
+
+def test_the_warning_clears_once_a_sink_is_saved(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_only_checkbox(tab).setChecked(True)
+    _sink_edit(tab).setText("myname@strike.me")
+    _apply_button(tab).click()
+    assert any(t == "Settings saved." for t in _status_text(tab))
+    assert not any("nothing can drain a channel" in t for t in _status_text(tab))
+
+
+def test_the_checkbox_reflects_the_persisted_value_on_build(qapp):
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = True
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert _sink_only_checkbox(_settings_tab(p, wallet)).isChecked()

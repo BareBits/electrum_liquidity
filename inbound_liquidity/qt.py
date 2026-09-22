@@ -1049,6 +1049,7 @@ class Plugin(LiquidityPlugin):
         vbox.addLayout(run_now_row)
 
         grid = QGridLayout()
+        sink_label_text = _("Liquidity sink (Lightning address; blank = off)")
         # (label, current value as text, parser, setter) for each tunable kept on
         # the main Settings tab. Power-user knobs (on-chain reserve, reliability
         # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
@@ -1076,6 +1077,14 @@ class Plugin(LiquidityPlugin):
              str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
                                max(0.0, min(float(v), DEV_FEE_MAX_PCT)))),
+            # The liquidity sink: pay outbound away over Lightning instead of
+            # reverse-swapping it on-chain. Validated in on_apply -- an address
+            # that cannot be resolved is refused rather than saved, because a
+            # silently-bad sink would look configured while every drain quietly
+            # fell back to a swap.
+            (sink_label_text,
+             str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''), str,
+             lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
         edits = []
         for row, (label, value, parser, setter) in enumerate(fields):
@@ -1146,6 +1155,39 @@ class Plugin(LiquidityPlugin):
                 _signal.connect(_reload_goal)
         vbox.addLayout(grid)
 
+        # Sink-only mode. Sits directly under the sink address it qualifies, and
+        # applies immediately on toggle (like the plugin-opened-only switch above)
+        # rather than waiting for Apply.
+        sink_only_cb = QCheckBox(_("Disable submarine swaps (use the liquidity sink only)"))
+        sink_only_cb.setToolTip(_(
+            "When on, outbound is only ever drained by paying the liquidity sink; "
+            "a reverse swap is never made, not even when the sink fails.\n\n"
+            "Turning this on without a liquidity sink leaves nothing able to drain "
+            "a channel. The plugin will say so in its decision log rather than "
+            "reverse-swap against your wishes."))
+        sink_only_cb.setChecked(
+            bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)))
+
+        def _sink_only_warning() -> str:
+            """The warning text for the current pair of sink settings, or ""."""
+            if (bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False))
+                    and not self._liquidity_sink_address()):
+                return _("Submarine swaps are disabled but no liquidity sink is set: "
+                         "nothing can drain a channel until you set one.")
+            return ""
+
+        def on_sink_only(checked: bool) -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', bool(checked))
+            warning = _sink_only_warning()
+            if warning:
+                status_label.setStyleSheet("color: red;")
+                status_label.setText(warning)
+            else:
+                status_label.setText("")
+
+        sink_only_cb.toggled.connect(on_sink_only)
+        vbox.addWidget(sink_only_cb)
+
         # Live read-out of the dev-fee ledger: sats owed (accrued, not yet paid)
         # and sats paid out in the trailing 24h (against the daily cap).
         dev_fee_label = QLabel("")
@@ -1185,6 +1227,18 @@ class Plugin(LiquidityPlugin):
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_("Invalid value for: {}").format(label))
                     return
+                # A sink address that cannot be resolved to an LNURL-pay target is
+                # refused rather than saved: stored but unusable, it would read as
+                # "configured" on this tab while every drain silently fell back to
+                # a reverse swap. Blank is fine -- that is how the feature is
+                # turned off.
+                if label == sink_label_text and text and \
+                        self._resolve_lnurl_pay_url(text) is None:
+                    status_label.setStyleSheet("color: red;")
+                    status_label.setText(_(
+                        "Not a Lightning address, LNURL or LNURL-pay URL: {}").format(
+                            text[:60]))
+                    return
             # The goal comes from the amount widget (already in sat). An empty or
             # unparseable field is an error rather than "0": silently reading a
             # cleared box as 0 would DISABLE the feature, which is not something a
@@ -1208,6 +1262,13 @@ class Plugin(LiquidityPlugin):
             self._reload_settings_fields(edits, _sync_toggle_from_config)
             _reload_goal()
             _refresh_dev_fee_label()
+            # Saving a blank sink while swaps are disabled is a legal but inert
+            # combination; say so instead of reporting a bare success.
+            warning = _sink_only_warning()
+            if warning:
+                status_label.setStyleSheet("color: red;")
+                status_label.setText(_("Settings saved.") + " " + warning)
+                return
             status_label.setStyleSheet("color: green;")
             status_label.setText(_("Settings saved."))
 
@@ -1885,6 +1946,7 @@ class Plugin(LiquidityPlugin):
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
             str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT),
+            str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''),
         ]
         for (edit, _parser, _setter, _label), value in zip(edits, values):
             edit.setText(value)

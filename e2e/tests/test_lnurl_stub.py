@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rig.lnurl_stub import LnurlPayStub, _CA_BEGIN, _CA_END  # noqa: E402
+from rig.lnurl_stub import LnurlPayStub  # noqa: E402
 from rig import ports  # noqa: E402
 
 
@@ -82,9 +82,38 @@ def test_certifi_append_is_idempotent(stub, tmp_path) -> None:
     stub.trust_in_certifi(ca)
     stub.trust_in_certifi(ca)          # second launch must replace, not accumulate
     text = ca.read_text()
-    assert text.count(_CA_BEGIN) == 1
-    assert text.count(_CA_END) == 1
+    assert text.count(stub._ca_begin) == 1
+    assert text.count(stub._ca_end) == 1
     assert text.startswith("# preexisting system cert")   # original content kept
+
+
+def test_two_stubs_do_not_evict_each_others_certs(tmp_path) -> None:
+    # The gossip-mode rig runs TWO endpoints at once (dev-fee payout and the
+    # liquidity sink). A single shared delimiter would have the second stub's
+    # trust call strip the first stub's cert, and whichever endpoint the client
+    # reached second would fail TLS verification far from the cause.
+    a = LnurlPayStub(ports.free_port(), _fake_invoice,
+                     cert_dir=tmp_path / "a", username="electrum_liqhelper")
+    b = LnurlPayStub(ports.free_port(), _fake_invoice,
+                     cert_dir=tmp_path / "b", username="liquidity_sink")
+    a.start()
+    b.start()
+    try:
+        ca = tmp_path / "cacert.pem"
+        ca.write_text("# preexisting system cert\n")
+        a.trust_in_certifi(ca)
+        b.trust_in_certifi(ca)
+        text = ca.read_text()
+        assert text.count(a._ca_begin) == 1
+        assert text.count(b._ca_begin) == 1
+        # Both certs are still usable: each endpoint verifies against the bundle.
+        for stub_ in (a, b):
+            got = _tls_get(
+                f"{stub_.base_url}/.well-known/lnurlp/{stub_.username}", ca)
+            assert got["tag"] == "payRequest"
+    finally:
+        a.stop()
+        b.stop()
 
 
 def test_untrusted_cert_is_rejected(stub, tmp_path) -> None:

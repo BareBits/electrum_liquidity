@@ -40,18 +40,33 @@ import ipaddress
 
 # Delimiters bounding the cert we append to the certifi bundle, so each launch
 # strips the previous rig cert and appends a fresh one (no unbounded growth).
-_CA_BEGIN = "# --- electrum_liqtest rig LNURL stub cert (auto-managed) ---\n"
-_CA_END = "# --- end electrum_liqtest rig LNURL stub cert ---\n"
+#
+# Keyed by the stub's username, because a rig may run MORE THAN ONE of these at
+# once (the dev-fee payout endpoint and the liquidity-sink endpoint). With a
+# single shared delimiter the second stub's trust call would strip the first
+# stub's cert on its way in, and whichever endpoint the client reached second
+# would fail TLS verification -- a confusing failure a long way from its cause.
+_CA_BEGIN_FMT = "# --- electrum_liqtest rig LNURL stub cert [{key}] (auto-managed) ---\n"
+_CA_END_FMT = "# --- end electrum_liqtest rig LNURL stub cert [{key}] ---\n"
 
 # The username portion of the payout Lightning address the client is pointed at.
 STUB_USERNAME = "electrum_liqhelper"
 
 
-def _generate_self_signed_cert(cert_path: Path, key_path: Path) -> None:
-    """Write a self-signed cert/key for 127.0.0.1 (SAN IP:127.0.0.1) to disk."""
+def _generate_self_signed_cert(cert_path: Path, key_path: Path, *,
+                               label: str = STUB_USERNAME) -> None:
+    """Write a self-signed cert/key for 127.0.0.1 (SAN IP:127.0.0.1) to disk.
+
+    ``label`` is folded into the subject DN so that two stubs running at once
+    (the dev-fee endpoint and the liquidity sink) do not produce two DIFFERENT
+    self-signed certs sharing one subject. OpenSSL indexes a CA bundle by subject
+    hash, so identical DNs make trust depend on which cert it happens to resolve
+    -- one endpoint then fails verification while the other works. Hostname
+    verification is unaffected: it matches the SAN, not the CN.
+    """
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1"),
+        x509.NameAttribute(NameOID.COMMON_NAME, f"127.0.0.1 ({label})"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "electrum_liqtest-rig"),
     ])
     # Fixed validity window (no Date.now-style clock dependence at import time):
@@ -117,7 +132,8 @@ class LnurlPayStub:
 
     def start(self) -> None:
         self._cert_dir.mkdir(parents=True, exist_ok=True)
-        _generate_self_signed_cert(self._cert_path, self._key_path)
+        _generate_self_signed_cert(self._cert_path, self._key_path,
+                                   label=self.username)
         handler = self._make_handler()
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), handler)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -137,29 +153,38 @@ class LnurlPayStub:
                 pass
             self._httpd = None
 
+    @property
+    def _ca_begin(self) -> str:
+        return _CA_BEGIN_FMT.format(key=self.username)
+
+    @property
+    def _ca_end(self) -> str:
+        return _CA_END_FMT.format(key=self.username)
+
     def trust_in_certifi(self, ca_bundle_path: Path) -> None:
         """Append our cert to the venv's certifi bundle so the client validates
-        the local endpoint. Idempotent across launches: any prior rig cert block
-        is stripped first, so the bundle never grows without bound."""
+        the local endpoint. Idempotent across launches: any prior block for THIS
+        stub is stripped first, so the bundle never grows without bound -- while
+        blocks belonging to other stubs are left untouched."""
         cert_pem = self._cert_path.read_text()
         existing = ca_bundle_path.read_text() if ca_bundle_path.exists() else ""
         existing = self._strip_managed_block(existing)
-        block = _CA_BEGIN + cert_pem + ("" if cert_pem.endswith("\n") else "\n") + _CA_END
+        block = (self._ca_begin + cert_pem
+                 + ("" if cert_pem.endswith("\n") else "\n") + self._ca_end)
         ca_bundle_path.write_text(existing + block)
 
-    @staticmethod
-    def _strip_managed_block(text: str) -> str:
-        start = text.find(_CA_BEGIN)
+    def _strip_managed_block(self, text: str) -> str:
+        start = text.find(self._ca_begin)
         if start == -1:
             return text
-        end = text.find(_CA_END, start)
+        end = text.find(self._ca_end, start)
         if end == -1:
             return text[:start]
-        return text[:start] + text[end + len(_CA_END):]
+        return text[:start] + text[end + len(self._ca_end):]
 
     def _lnurl6_metadata(self) -> str:
         return json.dumps([
-            ["text/plain", "electrum_liquidity dev fee (rig)"],
+            ["text/plain", f"electrum_liquidity {self.username} (rig)"],
             ["text/identifier", self.lightning_address],
         ])
 

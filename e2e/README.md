@@ -16,6 +16,12 @@ the mocked unit tests in [`../tests/`](../tests) cannot prove.
   swaps at 0.5% over nostr).
 - Two 0.02 BTC channels client→partner (50/50), and a local **LNURL-pay stub** so
   the dev-fee payout path can be exercised with real invoices minted by the partner.
+- Optionally (`--second-provider`) a **second** headless swapserver, advertising at
+  0.1% so it always outranks the first, plus one more 0.02 BTC channel to it. Off
+  by default — every other suite asserts the one-partner topology. It exists so
+  provider *failover* can be tested: kill the cheap provider and the plugin must
+  still complete the swap via the survivor (see
+  `tests/test_swap_provider_failover_e2e.py`).
 
 The plugin is loaded as an **internal** Electrum plugin (auto-authorized) by
 symlinking `../inbound_liquidity` into the Electrum checkout — see
@@ -45,6 +51,8 @@ shared build).
 python run.py                     # brings the stack up, opens the Qt client GUI
 python run.py --no-gui            # headless (both daemons; no GUI)
 python run.py --exit-when-ready   # smoke: bring up, confirm readiness, tear down
+python run.py --no-gui --second-provider   # two competing swap providers
+python run.py --no-gui --gossip --channels 1   # real channel graph + a routed hop
 ```
 
 Endpoints/nodeids/channels/swap-npub are written to `.run/ready.json`.
@@ -66,7 +74,41 @@ RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q -s
 | `test_offline_autoclose_e2e` | only plugin-opened channels are force-closed when the peer goes offline |
 | `test_manual_close_not_faulted_e2e` | a user-initiated close is not charged to the peer |
 | `test_reverse_swap_e2e` | the plugin executes a real reverse swap, **increasing inbound liquidity**, and accrues a dev fee |
+| `test_swap_provider_failover_e2e` | killing the first-ranked provider still completes the swap, via the survivor, in the same cycle (`--second-provider`) |
+| `test_liquidity_sink_e2e` | the plugin drains a channel by **paying a Lightning address**, halving the amount until one routes, and honours "disable submarine swaps" (`--gossip`) |
 | `test_rig_unit`, `test_lnurl_stub` | fast rig-plumbing checks (no services launched) |
+
+### Gossip mode (`--gossip`)
+
+Off by default. It replaces trampoline mode with Electrum's real channel graph,
+announces every channel, switches on `lightning_forward_payments`, and adds a
+**deliberately under-funded** `partner -> partner2` forwarding hop (0.006 BTC
+capacity, 0.003 BTC pushed). The client gets no channel to partner2, so reaching
+it is a genuine two-hop routed payment — which succeeds only below the hop's
+balance.
+
+That is the only way to produce a real capacity failure here, and it is what the
+liquidity sink's halving retry needs: on a *direct* channel Electrum's
+`available_to_spend` already folds in the reserve, the fee-spike buffer,
+`remaining_max_inflight` and HTLC slots — and the plugin subtracts more headroom
+still — so the top rung is always sized to succeed and halving has nothing to fix.
+
+Two rig-specific wrinkles it handles, both chicken-and-egg problems:
+
+* **Nobody to ask.** `LNGossip` is a separate node from the wallet and finds
+  peers via recent peers → the graph → `FALLBACK_LN_NODES` → DNS seeds. On
+  regtest the last two are empty and the first two start empty, so it connects to
+  nobody and never learns anything. The rig seeds `lightning_peers` (a plain
+  config input — no patching) to break the cycle.
+* **Ten-minute gossip.** A node pushes its own announcements 10s after a peer
+  connects, then every 600s. The client's gossip node connects *before* the
+  channels exist, so headless the rig restarts the client afterwards to re-run
+  `query_channel_range` over a span that now contains them. Under the GUI it
+  cannot do that, and simply waits the 600s cycle out.
+
+Bring-up ends with a small **probe payment** client → partner2. Counting
+channel_db rows only proves the topology is known; the probe proves it is
+routable, and fails loudly during bring-up rather than mid-test.
 
 > On the rig's small (0.02 BTC) channels a reverse swap's effective all-in cost
 > is several percent (a fixed ~45k-sat prepayment dominates), so at the default

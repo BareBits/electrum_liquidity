@@ -21,8 +21,14 @@ liquidity (remote-side channel balance). This plugin keeps it topped up:
   balance out to on-chain coins, which restores that channel's *inbound*
   capacity. This is the core "make room to receive again" move, triggered once a
   channel's local balance grows past a threshold (i.e. after you've received).
+- A **liquidity sink** (optional) does the same job by *paying* a Lightning
+  address instead: the outbound leaves the channel over Lightning, freeing
+  exactly the same inbound capacity, but it settles in seconds with no on-chain
+  claim, no swap provider and no cost gate. Point it at an account you control
+  (`myname@strike.me`) and the sats land there rather than in this wallet's
+  on-chain balance. See [The liquidity sink](#the-liquidity-sink).
 - **Opening a channel** (funded from on-chain coins) creates new capacity; once
-  its local balance is reverse-swapped out, that capacity becomes pure inbound.
+  its local balance is drained out, that capacity becomes pure inbound.
 
 A debounced main loop runs whenever an inbound payment (on-chain or Lightning)
 arrives — or any wallet/channel/swap-provider event fires — snapshots the
@@ -45,7 +51,9 @@ ceilings, diagnostics, etc.).
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
-| `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on the on-chain amount received from plugin-initiated reverse swaps (0 = off). Paid automatically to a fixed payout address | `0.1` |
+| `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on what the plugin drains from a channel — the on-chain amount received from a reverse swap, or the amount paid to your liquidity sink (0 = off). Paid automatically to a fixed payout address | `0.1` |
+| `sink_address` | Settings | **Liquidity sink** — a Lightning address (`user@domain`), LNURL-pay string or LNURL-pay URL to drain outbound into *instead of* reverse-swapping it on-chain. A payment that fails is retried at half the amount, down to 10 000 sat; if every attempt fails, a reverse swap is used instead. Empty = off (swap only). See [The liquidity sink](#the-liquidity-sink) | `""` (off) |
+| `disable_submarine_swaps` | Settings | **Use the liquidity sink only** — never make a reverse swap, not even when the sink fails. Honoured even with no sink set, which leaves nothing able to drain a channel: the plugin says so in its decision log rather than swapping against your wishes | `false` |
 | `manage_plugin_opened_only` | Settings | **Only manage channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; a channel you opened by hand is left entirely alone and its outbound is never drained. When off, every channel is managed. On by default, so an untouched install never touches a channel you set up yourself | `true` |
 | `onchain_reserve_sat` | Advanced | Always leave this much on-chain when opening | `10_000` |
 | `min_outbound_sat` | Advanced | **Keep outbound per channel** — never let a reverse swap drain a channel's outbound (local) balance below this, so the wallet keeps some ability to send. Applied per channel to the swappable amount; `0` drains everything for maximum inbound | `0` |
@@ -68,6 +76,27 @@ prepayment) and both have to fit. Opening a channel funds with the **maximum
 minus the on-chain reserve**, with the mining fee deducted so the transaction is
 feasible.
 
+If that swap **fails**, the plugin does not give up on the cycle: it walks the
+other eligible providers in cost order (up to 3 attempts in total, within a 500
+second budget) and retries with each in turn, so one unreachable or unwilling
+provider no longer costs you a whole 3-minute channel cooldown. Every provider
+in the cascade must still pass the `max_swap_fee_pct` gate on its **own** real
+all-in cost — a failover is never an excuse to overpay — and because providers
+advertise different capacities, each retry is sized to what *that* provider will
+actually host.
+
+The cascade stops immediately, and never retries, once funds may have moved.
+Electrum's pre-payment checks (cost sanity, the provider's `createswap` reply,
+script/RHASH/invoice verification, locktime) all raise *before* the Lightning
+payment is issued, so those failures are safe to retry elsewhere. Past that
+point — or on any error the plugin cannot positively classify — the swap is left
+alone for reconciliation to resolve, because retrying could drain the same
+channel twice. A provider-independent condition on our side (a stale local tip)
+also ends the cascade rather than burning attempts on a guaranteed repeat.
+Failures are still recorded against the provider's reliability exactly as
+before, so a repeatedly-failing provider sinks in the ranking and stops being
+tried first.
+
 By default the plugin manages **only the channels it opened itself**
 (`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a
 channel you set up by hand is never drained unless you turn that switch off.
@@ -76,6 +105,61 @@ adds to Electrum's own **Channels** tab (`Plugin` vs `Manual`).
 
 To preserve some outbound (send) capacity within the channels it *does* manage,
 `min_outbound_sat` holds back a per-channel floor.
+
+### The liquidity sink
+
+A reverse swap is not the only way to free inbound capacity. Paying *anyone* over
+Lightning moves local balance out of a channel and turns it into inbound, and if
+you pay an account you control, the sats are not spent so much as moved. Set
+`sink_address` to a Lightning address (`myname@strike.me`), an `lnurl1…` string
+or an LNURL-pay URL, and the plugin drains through it in preference to swapping.
+
+Compared with a reverse swap, a sink payment:
+
+* settles in **seconds** rather than waiting on an on-chain claim,
+* needs **no swap provider** — no nostr discovery, no provider ranking, no
+  prepayment, and no reliability bookkeeping,
+* clears **no cost gate** — `max_swap_fee_pct` still bounds it, but as the
+  routing-fee budget rather than as a veto, so a channel no provider would
+  swap cheaply can still be drained,
+* sends the sats **to that address**, not to this wallet's on-chain balance.
+  This is the real trade-off, and the reason the feature is off by default.
+
+**Halving on failure.** A large Lightning payment can fail where a smaller one
+succeeds — no single route with enough liquidity, or an MPP split that cannot be
+assembled. So a failed attempt is retried at **half** the amount, repeatedly,
+down to a floor of **10 000 sat**, with one final attempt clamped to exactly the
+floor. A 200 000 sat drain is therefore attempted at:
+
+```
+200_000 → 100_000 → 50_000 → 25_000 → 12_500 → 10_000
+```
+
+Each rung is a genuinely different payment (its own invoice from the sink), and
+the first one that settles ends the ladder. A drain below 10 000 sat is not
+attempted at all.
+
+**Falling back to a swap.** If every rung fails, the plugin falls back to the
+reverse swap it had planned all along — provider ranking, failover and all —
+unless you turn `disable_submarine_swaps` on. Failures that are the *endpoint's*
+fault rather than the amount's (an address that will not resolve, something that
+is not an LNURL-pay endpoint, an invoice for the wrong amount) skip the ladder
+entirely and go straight to the fallback: no smaller amount would fare better.
+
+**The one case that stops everything.** A failed `pay_invoice` does not prove
+nothing was sent — Electrum gives up on a payment at its own 120s timeout while
+HTLCs may still be unresolved. So after every failure the plugin checks whether a
+payment with that hash is still in flight, and if it is, it stops: no halving,
+and no swap fallback either. Draining a channel twice — past the outbound floor
+you configured, for more than the plugin ever decided to send — is the one
+outcome worth giving up a whole tick to avoid. This is the same commit-boundary
+reasoning the swap-provider cascade uses around `add_reverse_swap`.
+
+**Sink-only mode.** `disable_submarine_swaps` means what it says: no reverse swap
+is ever made, not even as a backstop. It is honoured even when no sink address is
+set, which leaves nothing able to drain a channel — the plugin records that in the
+decision log rather than quietly swapping. Silently moving your funds on-chain
+through a third party after you asked for no swaps would be the worse failure.
 
 ### Replacing undersized channels (the liquidity goal)
 
