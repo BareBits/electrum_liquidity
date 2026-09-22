@@ -115,6 +115,9 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS = "electrum_liqhelper@getbarebits.com"
         self.INBOUND_LIQUIDITY_SINK_ADDRESS = ""
         self.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = False
+        # Mirrors the shipped ConfigVar default (on: the sink waits until the
+        # channel build-out has reached the liquidity goal).
+        self.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = True
         self.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = False
         self.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = False
         self.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0
@@ -1267,6 +1270,12 @@ def _sink_only_checkbox(settings_tab):
                 if "Disable submarine swaps" in cb.text())
 
 
+def _defer_sink_checkbox(settings_tab):
+    from PyQt6.QtWidgets import QCheckBox
+    return next(cb for cb in settings_tab.findChildren(QCheckBox)
+                if "until inbound liquidity goal is met" in cb.text())
+
+
 def _apply_button(settings_tab):
     from PyQt6.QtWidgets import QPushButton
     return next(b for b in settings_tab.findChildren(QPushButton)
@@ -1349,6 +1358,10 @@ def test_the_warning_clears_once_a_sink_is_saved(qapp):
     tab = _settings_tab(p, wallet)
 
     _sink_only_checkbox(tab).setChecked(True)
+    # ...and the sink must be free to run: held back until the goal (the shipped
+    # default) it would still leave nothing able to drain a channel, which is a
+    # warning of its own -- asserted below.
+    _defer_sink_checkbox(tab).setChecked(False)
     _sink_edit(tab).setText("myname@strike.me")
     _apply_button(tab).click()
     assert any(t == "Settings saved." for t in _status_text(tab))
@@ -1361,3 +1374,71 @@ def test_the_checkbox_reflects_the_persisted_value_on_build(qapp):
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
     assert _sink_only_checkbox(_settings_tab(p, wallet)).isChecked()
+
+
+# --- "don't use the sink until the goal is met" ---------------------------
+def test_defer_sink_checkbox_is_checked_by_default(qapp):
+    # It ships ON: a sink configured on a wallet still building its channels
+    # would otherwise pay away the very balance those opens need.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert _defer_sink_checkbox(_settings_tab(p, wallet)).isChecked()
+
+
+def test_defer_sink_checkbox_applies_immediately(qapp):
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p._add_liquidity_tab(window, wallet)
+    cb = _defer_sink_checkbox(_settings_tab(p, wallet))
+
+    cb.setChecked(False)
+    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
+    cb.setChecked(True)
+    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is True
+
+
+def test_defer_sink_reflects_the_persisted_value_on_build(qapp):
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = False
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    assert not _defer_sink_checkbox(_settings_tab(p, wallet)).isChecked()
+
+
+def test_deferred_sink_with_swaps_disabled_warns_that_nothing_can_drain(qapp):
+    # Both switches are honoured by the engine, and together they leave the
+    # plugin with no way to drain a channel until the goal is met. Say so at the
+    # moment the user creates the combination, not only in the decision log.
+    p = _make_plugin()
+    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    _sink_only_checkbox(tab).setChecked(True)
+    assert any("held back until the liquidity goal is met" in t
+               for t in _status_text(tab))
+    # Letting the sink run again resolves it: the sink alone can drain.
+    _defer_sink_checkbox(tab).setChecked(False)
+    assert not any("nothing can drain a channel" in t for t in _status_text(tab))
+
+
+def test_refresh_resyncs_both_sink_switches(qapp):
+    # They can be changed from outside this tab (the cmdline plugin, a
+    # hand-edited config); a stale tick-box would misreport whether the sink is
+    # in use at all.
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tab = _settings_tab(p, wallet)
+
+    p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = False
+    p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = True
+    p._tabs[wallet].refresh()
+    assert not _defer_sink_checkbox(tab).isChecked()
+    assert _sink_only_checkbox(tab).isChecked()
+    # Re-syncing must not have written anything back through the toggle handlers.
+    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
+    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
