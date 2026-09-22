@@ -76,6 +76,7 @@ RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q -s
 | `test_reverse_swap_e2e` | the plugin executes a real reverse swap, **increasing inbound liquidity**, and accrues a dev fee |
 | `test_swap_provider_failover_e2e` | killing the first-ranked provider still completes the swap, via the survivor, in the same cycle (`--second-provider`) |
 | `test_liquidity_sink_e2e` | the plugin drains a channel by **paying a Lightning address**, halving the amount until one routes, and honours "disable submarine swaps" (`--gossip`) |
+| `test_sink_goal_gate_e2e` | with the liquidity goal **unmet** the plugin reverse-swaps and leaves a configured sink alone; once it is **met** the same config pays the sink instead — and unticking the switch pays it either way |
 | `test_rig_unit`, `test_lnurl_stub` | fast rig-plumbing checks (no services launched) |
 
 ### Gossip mode (`--gossip`)

@@ -531,6 +531,24 @@ def test_read_config_defaults_the_sink_off_on_an_older_config() -> None:
     assert cfg.disable_submarine_swaps is False
 
 
+def test_read_config_carries_the_defer_until_goal_switch() -> None:
+    p = _plugin()
+    p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK,
+                            INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL=False)
+    assert p.read_config().defer_sink_until_goal is False
+
+
+def test_defer_until_goal_defaults_ON_on_an_older_config() -> None:
+    # Note this default is the opposite of the two above: a config predating the
+    # switch must read as ON, which is the funds-preserving answer -- the sink
+    # keeps sending outbound out of the wallet only once the goal it would
+    # otherwise starve has been met. (The engine dataclass defaults the other
+    # way, for the pure tests; read_config always passes this explicitly.)
+    p = _plugin()
+    p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK)
+    assert p.read_config().defer_sink_until_goal is True
+
+
 # --- the outcome enum -----------------------------------------------------
 def test_pay_liquidity_sink_reports_its_outcome() -> None:
     p = _plugin()

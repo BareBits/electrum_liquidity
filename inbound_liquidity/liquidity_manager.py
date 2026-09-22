@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, Union
 
 # Electrum's hard floor for funding a new channel (lnutil.MIN_FUNDING_SAT).
@@ -1196,6 +1196,29 @@ class LiquidityConfig:
     # worse failure by a wide margin. The engine declines with exactly that
     # reason, so the decision log says what is wrong and how to fix it.
     disable_submarine_swaps: bool = False
+    # Hold the sink back until the liquidity goal is met (see
+    # :func:`liquidity_goal_met`). A sink payment sends a channel's outbound to
+    # an account OUTSIDE this wallet, so while the wallet is still building its
+    # channels it starves the very on-chain balance those opens need: a reverse
+    # swap brings the same drain back as coins that can fund the next (or a
+    # bigger) channel, the sink does not. With this on, a channel over its
+    # trigger is swapped rather than sunk until the build-out is done, and the
+    # sink takes over afterwards.
+    #
+    # Deliberately honoured even when it leaves nothing able to drain a channel
+    # (sink-only mode with the goal unmet): as with
+    # ``disable_submarine_swaps``, an explicit user switch is not quietly
+    # overridden -- doing so would pay the user's outbound away to a third party
+    # exactly when they asked for it to be kept. The engine declines with that
+    # reason instead.
+    #
+    # NB: as with ``manage_plugin_opened_only`` and ``liquidity_goal_sat``, the
+    # dataclass default and the SHIPPED default differ on purpose --
+    # ``INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL`` ships ON. ``read_config``
+    # always passes the user's value explicitly, so False here is only ever seen
+    # by pure tests and non-populating callers, where it keeps the pre-feature
+    # "the sink always wins" behaviour they were written against.
+    defer_sink_until_goal: bool = False
 
 
 @dataclass(frozen=True)
@@ -1777,6 +1800,44 @@ def _decide_channel_open(
     )
 
 
+# --- the liquidity goal: is the channel build-out done? -------------------
+def liquidity_goal_met(snapshot: LiquiditySnapshot,
+                       config: LiquidityConfig) -> bool:
+    """Whether the wallet's channel build-out has reached the liquidity goal --
+    i.e. whether another satoshi on-chain could still buy a better channel.
+
+    This is the gate behind ``defer_sink_until_goal``, and it is deliberately a
+    question about CHANNELS rather than about a running total of inbound. The
+    goal (``liquidity_goal_sat``) is a per-channel capacity target: what on-chain
+    balance is *for*, in this plugin, is opening a channel that reaches it (or
+    replacing one that does not -- see :func:`_decide_undersized_closes`). So the
+    build-out is done exactly when neither of those moves is left:
+
+      * we hold ``max_channels`` channels -- below the ceiling, on-chain funds
+        can still open another one alongside; and
+      * no PLUGIN-OPENED channel is under the goal -- each of those is still
+        replaceable by a bigger one, which is again what on-chain funds buy.
+
+    Only plugin-opened channels are considered in the second test, matching the
+    replacement rule's own gate 4: a channel the user opened by hand is never
+    closed by the plugin, so a small one would otherwise hold the gate shut
+    forever with no action able to open it.
+
+    Channels are counted exactly as the open rule counts them (everything not yet
+    closed, including one whose close is settling), so the two rules cannot
+    disagree about whether there is room for another channel.
+
+    A goal of 0 disables the goal itself, and with it this gate: there is no
+    build-out to wait for, so the answer is "met".
+    """
+    if config.liquidity_goal_sat <= 0:
+        return True
+    if len(snapshot.channels) < config.max_channels:
+        return False
+    return all(c.capacity_sat >= config.liquidity_goal_sat
+               for c in snapshot.channels if c.is_plugin_opened)
+
+
 # --- undersized-channel replacement (the "liquidity goal") ----------------
 # The problem this solves: the plugin opens channels for inbound liquidity, but
 # once it is holding ``max_channels`` of them it will not open another -- even
@@ -2041,6 +2102,18 @@ def _decide_reverse_swaps(
     declines: List[DeclineRecord] = []
     sink_address = (config.liquidity_sink_address or "").strip()
     swaps_enabled = not config.disable_submarine_swaps
+    # Is the sink held back until the build-out is done? Snapshot-level, so it is
+    # decided once for the whole pass: the goal is a question about the wallet's
+    # channels, not about the channel being drained. While it is held back the
+    # plugin swaps instead, which returns the same drained balance as on-chain
+    # coins -- the funds the next (or bigger) channel is opened with.
+    sink_deferred = (bool(sink_address) and config.defer_sink_until_goal
+                     and not liquidity_goal_met(snapshot, config))
+    goal_note = (f"the liquidity sink is held back until the "
+                 f"{config.liquidity_goal_sat} sat liquidity goal is met "
+                 f"({len(snapshot.channels)}/{config.max_channels} channel(s), "
+                 f"none of them plugin-opened below the goal)"
+                 if sink_deferred else "")
     offers = _candidate_offers(snapshot)
     eligible = eligible_providers(offers, config)
     claim_fee = snapshot.swap_claim_fee_sat or 0
@@ -2124,9 +2197,11 @@ def _decide_reverse_swaps(
                         f"outbound liquidity"),
             ))
             continue
-        # The sink ladder for this channel (empty when no sink is configured, or
-        # when the drain is too small to be worth a payment).
-        ladder = (sink_attempt_amounts(desired) if sink_address else ())
+        # The sink ladder for this channel (empty when no sink is configured,
+        # when the sink is held back until the goal is met, or when the drain is
+        # too small to be worth a payment).
+        ladder = (sink_attempt_amounts(desired)
+                  if sink_address and not sink_deferred else ())
         # The swap, planned in full -- as the primary action when there is no
         # sink, or as the sink's fallback. Skipped entirely in sink-only mode, so
         # a disabled swap can never be planned, logged, or executed.
@@ -2163,6 +2238,15 @@ def _decide_reverse_swaps(
             ))
             continue
         if swap_action is not None:
+            # Say so in the action's reason when this swap is happening *because*
+            # the sink is held back -- otherwise a user with a sink configured
+            # reads "swapping" in the log with nothing explaining why their sink
+            # was not used. Not recorded as a decline: we are acting on this
+            # channel, and the sink was not a near miss but a deliberate skip.
+            if sink_deferred:
+                swap_action = replace(
+                    swap_action,
+                    reason=f"{swap_action.reason}; {goal_note}")
             # Reserve the chosen provider's capacity so a later channel in this
             # pass plans against what actually remains (see `consumed` above).
             # Only the CHOSEN provider of an action we are actually taking is
@@ -2185,7 +2269,29 @@ def _decide_reverse_swaps(
         # sink-only mode there is no swap decline to fall back on and the reason
         # has to name the sink.
         if swap_decline is not None:
+            # A held-back sink makes the swap decline only half the story: the
+            # channel has a sink that *could* have drained it. The gate goes in
+            # `detail` rather than the reason so the decline keeps its existing
+            # dedup signature (and stays the same row it would otherwise be).
+            if sink_deferred:
+                swap_decline = replace(swap_decline, detail=goal_note)
             declines.append(swap_decline)
+        elif sink_deferred:
+            # Sink-only mode with the sink held back: both halves are switched
+            # off by the user's own settings, so nothing drains this channel
+            # until the goal is met. Honoured rather than second-guessed (see
+            # `defer_sink_until_goal`), but said plainly, with both switches
+            # named so the log shows which one to change.
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                amount_sat=desired,
+                reason=(f"channel {chan.short_id} over {trigger} trigger but "
+                        f"submarine swaps are disabled and the liquidity sink is "
+                        f"held back until the liquidity goal is met; nothing can "
+                        f"drain it (re-enable submarine swaps, or let the sink "
+                        f"run before the goal is met)"),
+                detail=goal_note,
+            ))
         elif not sink_address:
             declines.append(DeclineRecord(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,

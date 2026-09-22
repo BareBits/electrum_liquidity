@@ -23,6 +23,7 @@ from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
     SINK_MAX_ATTEMPTS,
     SINK_MIN_PAYMENT_SAT,
     evaluate,
+    liquidity_goal_met,
     sink_attempt_amounts,
 )
 
@@ -296,3 +297,165 @@ def test_a_reserved_swap_does_not_consume_provider_capacity() -> None:
     assert len(sinks) == 2
     assert all(s.swap_fallback is not None for s in sinks)
     assert [s.swap_fallback.lightning_amount_sat for s in sinks] == [900_000, 900_000]
+
+
+# --- holding the sink back until the liquidity goal is met ----------------
+# A sink payment leaves the wallet for good: it lands in whatever account the
+# address belongs to, NOT on-chain here. While the wallet is still building its
+# channels that starves the very balance the next (or bigger) channel is opened
+# with, so `defer_sink_until_goal` (SHIPPED ON) swaps instead until the build-out
+# is done -- a swap returns the same drain as on-chain coins.
+#
+# "Done" is `liquidity_goal_met`: at the channel ceiling, with no PLUGIN-OPENED
+# channel still under the goal (those are the two things on-chain funds can buy).
+def _deferred(**overrides):
+    base = dict(liquidity_sink_address=SINK, defer_sink_until_goal=True,
+                liquidity_goal_sat=1_000_000, max_channels=2)
+    base.update(overrides)
+    return make_config(**base)
+
+
+def test_goal_is_met_when_the_ceiling_is_full_and_nothing_is_undersized() -> None:
+    chans = (make_channel(channel_id="aa" * 32, capacity_sat=1_000_000),
+             make_channel(channel_id="bb" * 32, capacity_sat=2_000_000))
+    snap = make_snapshot([], channels=chans)
+    assert liquidity_goal_met(snap, _deferred())
+
+
+def test_goal_is_unmet_below_the_channel_ceiling() -> None:
+    # Room for another channel: on-chain funds can still open one, so the
+    # build-out is not done however big the existing channels are.
+    snap = make_snapshot([], channels=(make_channel(capacity_sat=9_000_000),))
+    assert not liquidity_goal_met(snap, _deferred())
+
+
+def test_goal_is_unmet_while_a_plugin_channel_is_under_the_goal() -> None:
+    # At the ceiling, but the small one is still replaceable by a bigger one --
+    # which is exactly what on-chain balance is for.
+    chans = (make_channel(channel_id="aa" * 32, capacity_sat=300_000),
+             make_channel(channel_id="bb" * 32, capacity_sat=2_000_000))
+    snap = make_snapshot([], channels=chans)
+    assert not liquidity_goal_met(snap, _deferred())
+
+
+def test_a_hand_opened_undersized_channel_does_not_hold_the_goal_open() -> None:
+    # The plugin never closes a channel the user opened, so a small one would
+    # otherwise keep the gate shut forever with no action able to open it.
+    chans = (make_channel(channel_id="aa" * 32, capacity_sat=300_000,
+                          is_plugin_opened=False),
+             make_channel(channel_id="bb" * 32, capacity_sat=2_000_000))
+    snap = make_snapshot([], channels=chans)
+    assert liquidity_goal_met(snap, _deferred())
+
+
+def test_goal_of_zero_is_always_met() -> None:
+    # 0 disables the goal itself, and with it this gate -- there is no build-out
+    # to wait for.
+    snap = make_snapshot([], channels=(make_channel(capacity_sat=1_000),))
+    assert liquidity_goal_met(snap, _deferred(liquidity_goal_sat=0))
+
+
+def test_channels_are_counted_as_the_open_rule_counts_them() -> None:
+    # Everything not yet closed, including one whose close is settling -- so the
+    # two rules cannot disagree about whether there is room for another channel.
+    chans = (make_channel(channel_id="aa" * 32, capacity_sat=1_000_000),
+             make_channel(channel_id="bb" * 32, capacity_sat=1_000_000,
+                          is_active=False))
+    snap = make_snapshot([], channels=chans, closing_channel_count=1)
+    assert liquidity_goal_met(snap, _deferred())
+
+
+def test_deferred_sink_swaps_instead_and_says_why() -> None:
+    # The whole feature: the drain still happens, but on-chain where it can fund
+    # the next channel -- and the log explains the sink's absence.
+    snap = make_snapshot([make_offer("npubA", pct=0.2)])
+    result = evaluate(snap, _deferred())
+    assert not _sinks(result)
+    [swap] = _swaps(result)
+    assert swap.lightning_amount_sat == 900_000
+    assert "the liquidity sink is held back until the 1000000 sat liquidity goal" \
+        in swap.reason
+    # Acting on the channel, so the skipped sink is not also a near miss.
+    assert not result.declines
+
+
+def test_the_sink_takes_over_once_the_goal_is_met() -> None:
+    chans = (make_channel(channel_id="aa" * 32, capacity_sat=1_000_000,
+                          spendable_local_sat=900_000),
+             make_channel(channel_id="bb" * 32, capacity_sat=1_000_000,
+                          spendable_local_sat=0, local_sat=0,
+                          remote_sat=1_000_000))
+    snap = make_snapshot([make_offer("npubA", pct=0.2)], channels=chans)
+    result = evaluate(snap, _deferred())
+    [sink] = _sinks(result)
+    assert sink.short_id == "100x1x0"
+    assert sink.amounts == sink_attempt_amounts(900_000)
+    assert "held back" not in sink.reason
+
+
+def test_the_gate_is_off_by_default_in_the_engine() -> None:
+    # The dataclass default preserves the pre-feature behaviour every existing
+    # pure test was written against (the shipped ConfigVar default is the
+    # opposite -- see the note on LiquidityConfig.defer_sink_until_goal).
+    snap = make_snapshot([make_offer("npubA", pct=0.2)])
+    result = evaluate(snap, make_config(liquidity_sink_address=SINK,
+                                        liquidity_goal_sat=1_000_000))
+    assert _sinks(result) and not _swaps(result)
+
+
+def test_the_gate_does_nothing_without_a_sink() -> None:
+    # Nothing to hold back: the swap is the only drain either way, and its reason
+    # must not grow a note about a sink the user never configured.
+    snap = make_snapshot([make_offer("npubA", pct=0.2)])
+    result = evaluate(snap, make_config(defer_sink_until_goal=True,
+                                        liquidity_goal_sat=1_000_000))
+    [swap] = _swaps(result)
+    assert "held back" not in swap.reason
+
+
+def test_a_deferred_sink_is_not_used_when_no_swap_can_be_planned() -> None:
+    # Strictly honoured: the sink stays held back even though it is the only
+    # thing that COULD drain this channel. Paying the user's outbound away to a
+    # third party is not a fallback for a missing provider -- the funds stay in
+    # the channel, recoverable, and the decline says so.
+    snap = make_snapshot([])
+    result = evaluate(snap, _deferred())
+    assert not result.actions
+    [decline] = result.declines
+    assert "no swap provider is known yet" in decline.reason
+    # The gate rides in `detail`, so the decline keeps its existing dedup
+    # signature and still reads as one steady-state row.
+    assert "the liquidity sink is held back" in (decline.detail or "")
+
+
+def test_a_deferred_sink_over_the_cost_ceiling_declines_too() -> None:
+    snap = make_snapshot([make_offer("dear", pct=5.0)])
+    result = evaluate(snap, _deferred(max_swap_fee_pct=0.6))
+    assert not result.actions
+    [decline] = result.declines
+    assert "all-in cost" in decline.reason
+    assert "the liquidity sink is held back" in (decline.detail or "")
+
+
+def test_a_deferred_sink_with_swaps_disabled_declines_naming_both() -> None:
+    # Both halves switched off by the user's own settings. Honoured rather than
+    # second-guessed, but the decline names both switches so the log shows which
+    # one to change.
+    snap = make_snapshot([make_offer("npubA", pct=0.2)])
+    result = evaluate(snap, _deferred(disable_submarine_swaps=True))
+    assert not result.actions
+    [decline] = result.declines
+    assert "submarine swaps are disabled and the liquidity sink is held back" \
+        in decline.reason
+    assert decline.amount_sat == 900_000
+    assert "the liquidity sink is held back" in (decline.detail or "")
+
+
+def test_a_deferred_sink_still_respects_the_triggers() -> None:
+    # The gate only chooses BETWEEN drains; a channel under both triggers is
+    # still nothing to do, not a near miss.
+    chan = make_channel(capacity_sat=2_000_000, local_sat=10_000,
+                        spendable_local_sat=9_000)
+    snap = make_snapshot([make_offer("npubA", pct=0.2)], channels=(chan,))
+    result = evaluate(snap, _deferred())
+    assert not result.actions and not result.declines

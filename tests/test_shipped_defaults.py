@@ -55,6 +55,23 @@ def test_liquidity_sink_ships_off() -> None:
     assert disabled is False
 
 
+def test_the_sink_ships_held_back_until_the_goal_is_met() -> None:
+    """``defer_sink_until_goal`` ships ON, and unlike the settings above it is
+    funds-affecting on UPGRADE too: an existing wallet with a sink configured
+    stops paying it until the build-out reaches the liquidity goal, swapping
+    instead. That is the conservative direction (the drained balance comes back
+    to this wallet as on-chain coins rather than leaving it), which is why it is
+    the default -- but it changes behaviour, so it is pinned here."""
+    default = SimpleConfig.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL.get_default_value()
+    assert default is True
+
+
+def test_the_sink_gate_is_inert_on_a_fresh_install() -> None:
+    # It only qualifies a sink, and the sink itself ships off -- so a fresh
+    # install swaps exactly as it did before the feature existed.
+    assert SimpleConfig.INBOUND_LIQUIDITY_SINK_ADDRESS.get_default_value() == ""
+
+
 def test_liquidity_goal_default() -> None:
     default = SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value()
     assert default == EXPECTED_LIQUIDITY_GOAL_SAT

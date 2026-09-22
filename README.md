@@ -26,7 +26,10 @@ liquidity (remote-side channel balance). This plugin keeps it topped up:
   exactly the same inbound capacity, but it settles in seconds with no on-chain
   claim, no swap provider and no cost gate. Point it at an account you control
   (`myname@strike.me`) and the sats land there rather than in this wallet's
-  on-chain balance. See [The liquidity sink](#the-liquidity-sink).
+  on-chain balance — which is why, by default, it waits until the wallet's
+  channels have reached the **liquidity goal** before it is used at all. See
+  [The liquidity sink](#the-liquidity-sink) and
+  [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met).
 - **Opening a channel** (funded from on-chain coins) creates new capacity; once
   its local balance is drained out, that capacity becomes pure inbound.
 
@@ -53,6 +56,7 @@ ceilings, diagnostics, etc.).
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on what the plugin drains from a channel — the on-chain amount received from a reverse swap, or the amount paid to your liquidity sink (0 = off). Paid automatically to a fixed payout address | `0.1` |
 | `sink_address` | Settings | **Liquidity sink** — a Lightning address (`user@domain`), LNURL-pay string or LNURL-pay URL to drain outbound into *instead of* reverse-swapping it on-chain. A payment that fails is retried at half the amount, down to 10 000 sat; if every attempt fails, a reverse swap is used instead. Empty = off (swap only). See [The liquidity sink](#the-liquidity-sink) | `""` (off) |
+| `defer_sink_until_goal` | Settings | **Don't use liquidity sink until inbound liquidity goal is met** — while the wallet is still building its channels, drain by reverse-swapping (the balance comes back as on-chain coins that can fund the next channel) instead of paying it away to the sink. The sink takes over once you hold `max_channels` channels with none of the plugin-opened ones below `liquidity_goal_sat`. On by default. See [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met) | `true` |
 | `disable_submarine_swaps` | Settings | **Use the liquidity sink only** — never make a reverse swap, not even when the sink fails. Honoured even with no sink set, which leaves nothing able to drain a channel: the plugin says so in its decision log rather than swapping against your wishes | `false` |
 | `manage_plugin_opened_only` | Settings | **Only manage channels the plugin opened** — when on, the plugin only reverse-swaps channels it opened itself; a channel you opened by hand is left entirely alone and its outbound is never drained. When off, every channel is managed. On by default, so an untouched install never touches a channel you set up yourself | `true` |
 | `onchain_reserve_sat` | Advanced | Always leave this much on-chain when opening | `10_000` |
@@ -160,6 +164,54 @@ is ever made, not even as a backstop. It is honoured even when no sink address i
 set, which leaves nothing able to drain a channel — the plugin records that in the
 decision log rather than quietly swapping. Silently moving your funds on-chain
 through a third party after you asked for no swaps would be the worse failure.
+
+### Holding the sink back until the goal is met
+
+A sink payment leaves this wallet for good: it lands in whatever account the
+address belongs to, not in your on-chain balance. That is the point of the
+feature — but it collides with how the plugin *builds* inbound liquidity in the
+first place, which is by spending on-chain coins to open channels. A wallet with
+a sink configured from day one drains every channel to the sink, never
+accumulates on-chain, and so never opens (or replaces) a channel big enough to
+reach its **liquidity goal**.
+
+`defer_sink_until_goal` (**on by default**) resolves that in the order you would
+do it by hand: build first, then harvest. Until the build-out is done, a channel
+over its trigger is **reverse-swapped** instead of sunk — the same outbound
+leaves the channel and frees the same inbound, but it comes back as on-chain
+coins that can fund the next channel. Once it is done, the sink takes over and
+behaves exactly as described above.
+
+The build-out is **done** when neither move on-chain funds can buy is left:
+
+1. you hold `max_channels` channels (below the ceiling, another one can simply be
+   opened), **and**
+2. no **plugin-opened** channel is below `liquidity_goal_sat` (each of those is
+   still replaceable by a bigger one — see
+   [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal)).
+
+Channels you opened by hand are ignored in test 2: the plugin never closes one,
+so a small one would otherwise hold the gate shut forever. A `liquidity_goal_sat`
+of `0` disables the goal, and with it this gate. Channels are counted exactly as
+the open rule counts them (everything not yet closed), so the two rules cannot
+disagree about whether there is room for another channel.
+
+Every tick that swaps instead of sinking says so in the action's reason, so the
+decision log never leaves you wondering why a configured sink went unused.
+
+**When nothing can drain.** The switch is honoured literally, like
+`disable_submarine_swaps`. If the goal is not met and no reverse swap can be
+planned — no provider discovered, every provider over the cost ceiling, or
+`disable_submarine_swaps` on — the channel is simply **left undrained** and a
+decline explains it. Using the sink as the fallback would pay your outbound away
+to a third party at exactly the moment you asked for it to be kept; leaving it as
+outbound keeps it in your wallet and costs you only the wait.
+
+> **Upgrading:** this ships **on**, so a wallet that already has a sink
+> configured will start reverse-swapping instead of paying the sink until its
+> build-out reaches the goal. Untick it next to the sink address on the Settings
+> tab for the previous behaviour (or set `liquidity_goal_sat` to `0`, which
+> turns off the goal — and this gate — entirely).
 
 ### Replacing undersized channels (the liquidity goal)
 

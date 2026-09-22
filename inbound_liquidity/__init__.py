@@ -94,6 +94,7 @@ from .liquidity_manager import (
     extract_release,
     is_channel_size_rejection,
     is_newer_version,
+    liquidity_goal_met,
     normalize_node_id,
     order_channel_partners,
     record_uptime_sample,
@@ -811,6 +812,22 @@ SimpleConfig.INBOUND_LIQUIDITY_SINK_ADDRESS = ConfigVar(
                         "repeatedly, down to {floor} sat. If every attempt fails, a reverse "
                         "swap is used instead unless you disable submarine swaps. Leave "
                         "empty to reverse-swap as before.").format(floor=SINK_MIN_PAYMENT_SAT))
+SimpleConfig.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = ConfigVar(
+    'plugins.inbound_liquidity.defer_sink_until_goal', default=True, type_=bool,
+    plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Don't use liquidity sink until inbound liquidity goal is met"),
+    long_desc=lambda: _("On by default. A sink payment sends a channel's outbound to an "
+                        "account outside this wallet, so while the wallet is still "
+                        "building its channels it starves the on-chain balance those "
+                        "opens need. With this on, a channel over its trigger is "
+                        "reverse-swapped instead -- which brings the same balance back "
+                        "as coins that can fund a bigger channel -- and the sink takes "
+                        "over once the goal is met: the maximum number of channels is "
+                        "held, and none of the ones the plugin opened is below the "
+                        "liquidity goal. Note that with submarine swaps also disabled, "
+                        "nothing drains a channel until the goal is met; the plugin says "
+                        "so in its decision log rather than pay your outbound away "
+                        "against your wishes."))
 SimpleConfig.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = ConfigVar(
     'plugins.inbound_liquidity.disable_submarine_swaps', default=False, type_=bool,
     plugin=_PLUGIN_NAME,
@@ -1860,6 +1877,7 @@ class LiquidityPlugin(BasePlugin):
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
             liquidity_sink_address=self._liquidity_sink_address(),
             disable_submarine_swaps=self._submarine_swaps_disabled(),
+            defer_sink_until_goal=self._defer_sink_until_goal(),
         )
 
     def _liquidity_sink_address(self) -> str:
@@ -1875,6 +1893,16 @@ class LiquidityPlugin(BasePlugin):
         sink configured -- see the note on ``LiquidityConfig.disable_submarine_swaps``."""
         return bool(getattr(
             self.config, "INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS", False))
+
+    def _defer_sink_until_goal(self) -> bool:
+        """Whether the liquidity sink is held back until the channel build-out
+        reaches the liquidity goal (see ``liquidity_goal_met``). Defaults to True
+        -- the shipped default -- so a config predating this setting reads as ON,
+        which is the funds-preserving answer: the sink keeps sending outbound out
+        of the wallet only once the goal it would otherwise starve has been
+        met."""
+        return bool(getattr(
+            self.config, "INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL", True))
 
     def _manual_run_only(self) -> bool:
         """Whether the user has put the plugin in "manual run only" mode: no
@@ -5735,6 +5763,13 @@ class LiquidityPlugin(BasePlugin):
                 "swap_trigger_sat": config.swap_trigger_sat,
                 "min_outbound_sat": config.min_outbound_sat,
                 "liquidity_goal_sat": config.liquidity_goal_sat,
+                "liquidity_goal_met": liquidity_goal_met(snapshot, config),
+                # The sink address itself is an identity, so only whether one is
+                # set is dumped; the pair below is what answers "why was my sink
+                # not used on this tick".
+                "liquidity_sink_configured": bool(config.liquidity_sink_address),
+                "defer_sink_until_goal": config.defer_sink_until_goal,
+                "disable_submarine_swaps": config.disable_submarine_swaps,
                 "manage_plugin_opened_only": config.manage_plugin_opened_only,
                 "max_opens_per_day": config.max_opens_per_day,
                 "max_closes_per_day": self._max_closes_per_day(),

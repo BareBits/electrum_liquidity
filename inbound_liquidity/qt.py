@@ -1155,9 +1155,30 @@ class Plugin(LiquidityPlugin):
                 _signal.connect(_reload_goal)
         vbox.addLayout(grid)
 
-        # Sink-only mode. Sits directly under the sink address it qualifies, and
-        # applies immediately on toggle (like the plugin-opened-only switch above)
-        # rather than waiting for Apply.
+        # The two switches that qualify the sink address. Both sit directly under
+        # it and apply immediately on toggle (like the plugin-opened-only switch
+        # above) rather than waiting for Apply.
+        #
+        # Defer-until-goal first, because it is the one that ships ON: until the
+        # wallet holds its full complement of channels with none below the
+        # liquidity goal, a drain is reverse-swapped (the balance comes back
+        # on-chain, where it can fund the next channel) instead of being paid
+        # away to the sink.
+        defer_sink_cb = QCheckBox(
+            _("Don't use liquidity sink until inbound liquidity goal is met"))
+        defer_sink_cb.setToolTip(_(
+            "On by default. Paying the sink sends a channel's outbound to an "
+            "account outside this wallet, which starves the on-chain balance the "
+            "plugin needs to open channels that reach your liquidity goal.\n\n"
+            "While this is on, a channel over its trigger is reverse-swapped "
+            "instead -- the same balance comes back as on-chain coins -- and the "
+            "sink takes over once the goal is met: the maximum number of channels "
+            "is held, and none of the ones the plugin opened is below the goal.\n\n"
+            "With submarine swaps also disabled, nothing drains a channel until "
+            "the goal is met. The plugin says so in its decision log rather than "
+            "pay your outbound away against your wishes."))
+        defer_sink_cb.setChecked(self._defer_sink_until_goal())
+
         sink_only_cb = QCheckBox(_("Disable submarine swaps (use the liquidity sink only)"))
         sink_only_cb.setToolTip(_(
             "When on, outbound is only ever drained by paying the liquidity sink; "
@@ -1169,15 +1190,23 @@ class Plugin(LiquidityPlugin):
             bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)))
 
         def _sink_only_warning() -> str:
-            """The warning text for the current pair of sink settings, or ""."""
-            if (bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False))
-                    and not self._liquidity_sink_address()):
+            """The warning text for the current combination of sink settings, or
+            "". Both cases it catches are legal but leave the plugin with nothing
+            able to drain a channel, which is worth saying out loud at the moment
+            the user creates the situation rather than only in the decision log.
+            """
+            if not bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)):
+                return ""
+            if not self._liquidity_sink_address():
                 return _("Submarine swaps are disabled but no liquidity sink is set: "
                          "nothing can drain a channel until you set one.")
+            if self._defer_sink_until_goal():
+                return _("Submarine swaps are disabled and the liquidity sink is held "
+                         "back until the liquidity goal is met: nothing can drain a "
+                         "channel until then.")
             return ""
 
-        def on_sink_only(checked: bool) -> None:
-            setattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', bool(checked))
+        def _show_sink_warning() -> None:
             warning = _sink_only_warning()
             if warning:
                 status_label.setStyleSheet("color: red;")
@@ -1185,7 +1214,17 @@ class Plugin(LiquidityPlugin):
             else:
                 status_label.setText("")
 
+        def on_defer_sink(checked: bool) -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL', bool(checked))
+            _show_sink_warning()
+
+        def on_sink_only(checked: bool) -> None:
+            setattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', bool(checked))
+            _show_sink_warning()
+
+        defer_sink_cb.toggled.connect(on_defer_sink)
         sink_only_cb.toggled.connect(on_sink_only)
+        vbox.addWidget(defer_sink_cb)
         vbox.addWidget(sink_only_cb)
 
         # Live read-out of the dev-fee ledger: sats owed (accrued, not yet paid)
@@ -1262,8 +1301,10 @@ class Plugin(LiquidityPlugin):
             self._reload_settings_fields(edits, _sync_toggle_from_config)
             _reload_goal()
             _refresh_dev_fee_label()
-            # Saving a blank sink while swaps are disabled is a legal but inert
-            # combination; say so instead of reporting a bare success.
+            # Saving a sink setting that leaves nothing able to drain a channel
+            # (no sink at all, or a sink held back until the goal, with swaps
+            # disabled either way) is legal but inert; say so instead of
+            # reporting a bare success.
             warning = _sink_only_warning()
             if warning:
                 status_label.setStyleSheet("color: red;")
@@ -1332,6 +1373,17 @@ class Plugin(LiquidityPlugin):
             plugin_only_cb.setChecked(
                 bool(getattr(c, 'INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY', True)))
             plugin_only_cb.blockSignals(False)
+            # The two sink switches, same treatment: they can be changed from
+            # outside this tab (the cmdline plugin, a hand-edited config), and a
+            # stale tick-box next to the sink address would misreport whether the
+            # sink is actually in use.
+            defer_sink_cb.blockSignals(True)
+            defer_sink_cb.setChecked(self._defer_sink_until_goal())
+            defer_sink_cb.blockSignals(False)
+            sink_only_cb.blockSignals(True)
+            sink_only_cb.setChecked(
+                bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)))
+            sink_only_cb.blockSignals(False)
             _set_tick_status(self.tick_status(wallet))
             _refresh_update_label()
             self._populate_log_tree(actions_tree, self.get_decision_log(wallet, "action"))
