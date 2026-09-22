@@ -107,7 +107,7 @@ GOSSIP_HOP_CHANNEL_BTC = 0.006      # 600_000 sat capacity
 GOSSIP_HOP_PUSH_BTC = 0.003         # 300_000 sat pushed -> that much forwardable
 # A tiny payment made during bring-up to PROVE the graph can actually be routed
 # over. Small enough not to meaningfully move the balances a test then reasons
-# about (0.0003% of the hop).
+# about (a third of a percent of the hop's forwardable balance).
 GOSSIP_PROBE_SAT = 1_000
 
 
