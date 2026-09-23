@@ -9,7 +9,11 @@ Covered here:
   * any OTHER exception -> internal error, provider NOT faulted (documents current
     behaviour; Phase 3 revisits which of these are really provider-caused);
   * a funded swap -> provider success recorded AND dev fee accrued;
-  * an accepted-but-not-yet-funded swap -> tracked for reconciliation, no success/fee yet.
+  * an unfunded swap whose Lightning payment cannot be shown to have failed ->
+    tracked for reconciliation, no success/fee, and the attempt is treated as
+    committed. (Whether an unfunded swap may instead fail over to the next
+    provider is decided by _unfunded_swap_outcome and covered in
+    test_swap_provider_failover_glue.)
 
 Heavy Electrum objects are faked; skipped outside the Electrum venv.
 """
@@ -217,10 +221,15 @@ def test_funded_swap_records_success_and_dev_fee() -> None:
     assert len(p.logged) == 1
 
 
-# --- accepted but not yet funded -> tracked, no success/fee yet -----------
-def test_accepted_not_funded_is_tracked() -> None:
+# --- unfunded, cause undeterminable -> tracked, no success/fee yet --------
+def test_unfunded_swap_of_unknown_cause_is_tracked() -> None:
+    """``reverse_swap`` returning None means its Lightning payment task finished
+    before any funding appeared -- usually because the payment FAILED. With no
+    swap object to inspect (this fake creates none) the executor cannot show the
+    channel is clear, so it takes the conservative branch: track the swap and
+    treat the attempt as committed rather than risk draining twice."""
     async def _rs(**kw):
-        return None                      # accepted, funding not created yet
+        return None                      # no funding txid
     p = _plugin()
     _run(p, _wallet(_sm(_rs)), _action(), _transport())
     assert p.successes == [] and p.dev_fees == []

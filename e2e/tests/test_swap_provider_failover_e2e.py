@@ -20,7 +20,14 @@ What is asserted:
     (the action's detail records it as attempt 2),
   * inbound liquidity actually increased -- a real swap, not just a log line.
 
-Heavy and slow (~8-12 min); needs the electrum venv + docker. Function-scoped
+A second test covers the failure on the OTHER side of that RPC: a provider that
+answers createswap normally but cannot be paid over Lightning. It reaches the
+executor as ``reverse_swap`` returning None, which used to be misread as "the
+provider accepted, funding is pending" and ended the cascade with nothing done.
+There the cheap provider's CHANNEL is closed instead of its daemon killed, so its
+swapserver keeps answering while the payment has nowhere to route.
+
+Heavy and slow (~8-12 min each); needs the electrum venv + docker. Function-scoped
 rig (wipes .run, kills any previous rig), so it must NOT run while a manual
 run.py rig is up. Gated behind RUN_RIG_E2E=1.
 
@@ -204,3 +211,101 @@ def test_dead_provider_is_skipped_and_the_swap_completes_via_the_next_one(rig):
     dead_faults = [s for s in _reliability().values()
                    if int(s.get("fault_count", 0)) > 0]
     assert dead_faults, "the dead provider was not demoted for the next cycle"
+
+
+def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
+    """The OTHER way a swap dies: the provider answers createswap perfectly well,
+    but our Lightning payment to it never lands.
+
+    This one hid behind a wrong reading of Electrum for a long time.
+    ``reverse_swap`` races ``pay_invoice`` against funding detection
+    (``asyncio.wait(..., FIRST_COMPLETED)``) and then returns
+    ``swap.funding_txid``; because ``pay_invoice`` RETURNS ``(success, log)``
+    rather than raising, a failed payment simply wins the race and the function
+    returns None. The executor used to read that None as "provider accepted,
+    funding pending", score it as a completed swap and stop -- so the ranked
+    failover providers were never tried and the channel burned its cooldown on a
+    swap that had moved nothing. Live symptom: a 125s gap (Electrum's
+    ``PAYMENT_TIMEOUT`` of 120s plus the createswap round trip) followed by
+    ``reverse swap funding txid: None`` and no second attempt.
+
+    Sabotage: cooperatively close the client's channel to the CHEAP provider
+    (partner2) while leaving its daemon running. Its swapserver still answers
+    createswap over nostr and its offer stays fresh on the relay for an hour, so
+    the plugin still ranks it first -- but with gossip off and the swap's
+    Lightning leg pinned to the channel being drained (a partner1 channel), there
+    is no route to partner2 and the payment must fail. The surviving provider is
+    reachable from that very channel, so the failover can complete a real swap.
+    """
+    assert rig.partner2_nodeid, "rig did not bring up a second provider"
+    chans = _channels()
+    assert len(chans) == 3, f"expected 2 partner + 1 partner2 channels, got {len(chans)}"
+
+    # Close the route to the cheap provider, leaving its swapserver up.
+    p2_chans = [c for c in chans if c["remote_pubkey"] == rig.partner2_nodeid]
+    assert len(p2_chans) == 1, f"expected exactly one partner2 channel, got {p2_chans}"
+    electrum_cli("close_channel", p2_chans[0]["channel_point"], inst=CLIENT)
+    assert _wait_until(
+        lambda: not [c for c in _channels()
+                     if c["remote_pubkey"] == rig.partner2_nodeid
+                     and c["state"] == "OPEN"],
+        rig=rig, timeout=180), "the partner2 channel never left the OPEN state"
+
+    # Measure inbound across OPEN channels only: the channel we just closed
+    # lingers in list_channels with its balances frozen, and would otherwise sit
+    # in the max forever and mask the swap we are waiting for.
+    def _max_inbound_open() -> int:
+        return max((c["remote_balance"] for c in _channels()
+                    if c["state"] == "OPEN"), default=0)
+
+    baseline_inbound = _max_inbound_open()
+
+    _arm_swap_config()
+    # Only the two partner1 channels are usable now, so cap at 2: with the
+    # default 3 the engine would want to OPEN a replacement instead of swapping.
+    _setcfg("plugins.inbound_liquidity.max_channels", "2")
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")   # arm last
+
+    # 1) A reverse swap completes despite the first-ranked provider being
+    #    unpayable. Generous: the doomed payment may burn the full 120s
+    #    PAYMENT_TIMEOUT before the cascade is allowed to move on.
+    assert _wait_until(lambda: len(_swap_actions()) >= 1, rig=rig, timeout=480), \
+        ("plugin never completed a reverse swap -- the cascade did not advance "
+         "past the provider whose Lightning payment failed")
+
+    # 2) It completed on a LATER attempt: the first provider was really tried.
+    action = _swap_actions()[0]
+    detail = action.get("detail", "")
+    assert "attempt 2 of" in detail, \
+        f"swap did not come from a failover attempt; detail was: {detail!r}"
+
+    # 3) The failure was classified as a failed payment -- not as an accepted
+    #    swap, which is precisely the bug -- and the cascade advanced on it.
+    log_text = _client_log_text()
+    assert "the Lightning payment failed (no funds committed)" in log_text, \
+        ("the unfunded swap was not classified as a failed payment; the executor "
+         "most likely scored it as accepted and stopped")
+    assert "failing over to the next provider" in log_text, \
+        "no failover was logged -- the cascade did not advance past provider 1"
+
+    # 4) Both sides end up faulted, from two different places. The executor
+    #    charges the PROVIDER as it fails over (softly -- attribution is
+    #    ambiguous), while the PEER's share is left to _reconcile_pending_swaps,
+    #    which recognises the same swap's failed payment on a later tick. Charging
+    #    the peer in both places would count one failure twice, so the peer fault
+    #    is expected to arrive second rather than immediately.
+    assert any(int(s.get("fault_count", 0)) > 0 for s in _reliability().values()), \
+        f"the unpayable provider collected no reliability fault: {_reliability()}"
+    assert _wait_until(
+        lambda: any(int(s.get("fault_count", 0)) > 0
+                    for s in (_wallet_db().get(
+                        "inbound_liquidity_peer_reliability", {}) or {}).values()),
+        rig=rig, timeout=240), \
+        ("reconciliation never charged the channel peer for the failed payment: "
+         f"{_wallet_db().get('inbound_liquidity_peer_reliability', {})}")
+
+    # 5) A real swap: inbound liquidity actually increased.
+    assert _wait_until(lambda: _max_inbound_open() > baseline_inbound + 100_000,
+                       rig=rig, timeout=300), \
+        (f"inbound liquidity did not increase "
+         f"(max open remote_balance={_max_inbound_open()})")
