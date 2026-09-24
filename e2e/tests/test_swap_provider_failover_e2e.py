@@ -273,8 +273,15 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
          "executor most likely scored it as accepted and stopped the cascade")
 
     # 2) ... and the cascade actually advanced on that classification.
-    assert "failing over to the next provider" in _client_log_text(), \
-        "the failed payment did not advance the cascade to the next provider"
+    #    Waited for rather than asserted outright: a given attempt only advances
+    #    if it HAS a ranked failover left (capacity budgeting often leaves one
+    #    provider) and if the swap's prepayment HTLC -- unpinned and
+    #    fire-and-forget -- has already resolved, since a live one deliberately
+    #    holds the cascade. Neither is true every cycle, so give the wallet a few.
+    assert _wait_until(
+        lambda: "failing over to the next provider" in _client_log_text(),
+        rig=rig, timeout=600), \
+        "the failed payment never advanced the cascade to the next provider"
 
     # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
     assert _wait_until(
@@ -282,6 +289,18 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         rig=rig, timeout=480), \
         (f"no swap completed via a failover attempt; swap actions were: "
          f"{[a.get('detail') for a in _swap_actions()]}")
+
+    # 3b) The funding waiter Electrum orphans for the dead attempt was cancelled
+    #     rather than left polling at 10Hz for the life of the daemon. Asserted
+    #     against a REAL Electrum here, because the reaper identifies the task by
+    #     matching a closure inside third-party code -- the unit tests fake that
+    #     shape faithfully, but only this run proves the shape is still real.
+    assert "reaped" in _client_log_text() and \
+        "orphaned funding waiter" in _client_log_text(), \
+        ("no funding waiter was reaped; Electrum's reverse_swap has most likely "
+         "changed shape and the match silently stopped firing")
+    assert "may have changed shape" not in _client_log_text(), \
+        "the reaper ran but matched nothing -- upstream shape has changed"
 
     # 4) Both sides end up faulted, from two different places. The executor
     #    charges the PROVIDER as it fails over (softly -- attribution is

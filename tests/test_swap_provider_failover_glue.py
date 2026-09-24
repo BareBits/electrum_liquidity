@@ -393,10 +393,36 @@ def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
     assert p.successes == [] and p.dev_fees == []
 
 
+def test_the_cascade_deadline_lets_every_ranked_provider_start() -> None:
+    """The deadline is checked before each attempt, and an attempt in progress
+    runs to its own backstop -- so the LAST provider is only reached at
+    (cap - 1) * backstop. A deadline below that silently drops a failover the
+    engine had already ranked and vetted, which is what a flat 500s used to do
+    with a cap of 3 and a 300s backstop.
+
+    Pinned as an invariant rather than a value so the cap and the backstop can be
+    retuned without quietly reintroducing the gap."""
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        REVERSE_SWAP_TIMEOUT_SEC, SWAP_CASCADE_DEADLINE_SEC)
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        MAX_SWAP_PROVIDER_ATTEMPTS)
+    latest_start = (MAX_SWAP_PROVIDER_ATTEMPTS - 1) * REVERSE_SWAP_TIMEOUT_SEC
+    assert SWAP_CASCADE_DEADLINE_SEC > latest_start, (
+        f"cascade deadline {SWAP_CASCADE_DEADLINE_SEC}s cannot reach provider "
+        f"{MAX_SWAP_PROVIDER_ATTEMPTS}, which starts at {latest_start}s")
+
+
 def test_a_live_prepay_htlc_blocks_failover() -> None:
     """The minerFeeInvoice is a separate fire-and-forget payment. Its HTLC is
     still something committed on this channel, so it must gate failover even when
-    the main invoice has definitively failed."""
+    the main invoice has definitively failed.
+
+    Deliberately conservative: the prepay is small (2x mining fee) and unpinned,
+    so it does not itself risk draining the target channel twice -- but holding
+    the cascade while ANY HTLC for the swap is live is the chosen trade, at the
+    cost of deferring that channel to the next cycle. Observed live: a main
+    payment that fails instantly for want of a route returns while its prepay is
+    still in flight, and the cascade stops there."""
     prepay = bytes.fromhex("ab" * 32)
 
     async def _accept_with_live_prepay(sm, **kw):
