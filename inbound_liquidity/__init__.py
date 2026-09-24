@@ -241,9 +241,18 @@ REVERSE_SWAP_TIMEOUT_SEC = 300.0
 # because aborting a swap whose Lightning payment may already be in flight is
 # exactly what we must not do. Any providers left untried are simply retried on
 # the next evaluation cycle, by which time the failed ones have sunk in the
-# ranking. Sized above one worst-case backstop (300s) so a single slow provider
-# can never consume the budget before a second is even tried.
-SWAP_CASCADE_DEADLINE_SEC = 500.0
+# ranking.
+#
+# DERIVED, not picked: at one worst-case backstop per attempt, the last provider
+# starts at (cap - 1) * backstop, so anything smaller silently drops it. The old
+# flat 500s did exactly that -- two slow providers put the check at 600s and the
+# third was never tried, wasting a ranked failover the engine had already vetted.
+# Deriving it means the cap and the backstop can move without quietly reintroducing
+# that. The cost is the ceiling on how long one cascade can hold the per-wallet
+# evaluation lock, which this raises from 600s to 900s in the pathological case
+# where every attempt runs its full backstop; a realistic failing attempt is far
+# shorter (bounded createswap RPC ~60s plus PAYMENT_TIMEOUT 120s).
+SWAP_CASCADE_DEADLINE_SEC = MAX_SWAP_PROVIDER_ATTEMPTS * REVERSE_SWAP_TIMEOUT_SEC
 
 # --- liquidity sink timing ------------------------------------------------
 # Coarse backstop on ONE sink payment. Electrum gives up on a payment of its own
@@ -4864,17 +4873,11 @@ class LiquidityPlugin(BasePlugin):
         # here means Electrum reached add_reverse_swap and fired the payment.
         swaps_before = set(getattr(sm, "_swaps", {}).keys())
         try:
-            # Bounded so no single swap can hold the per-wallet evaluation
-            # lock indefinitely. The precise hang (a provider that never
-            # answers the createswap RPC) is already bounded inside the
-            # transport; this coarse backstop covers anything else that could
-            # stall (see REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as
-            # asyncio.TimeoutError, handled below like any unresponsive
-            # provider.
-            funding_txid = await asyncio.wait_for(
-                sm.reverse_swap(**reverse_swap_kwargs),
-                timeout=self._reverse_swap_timeout_sec,
-            )
+            # Bounded, and reaps Electrum's orphaned funding waiter on every exit
+            # path -- see _call_reverse_swap. A timeout surfaces here as
+            # asyncio.TimeoutError, handled below like any unresponsive provider.
+            funding_txid = await self._call_reverse_swap(
+                sm, reverse_swap_kwargs, swaps_before)
         except UserFacingException as e:
             # e.g. the provider deems the swap uneconomical for this amount.
             # This is a legitimate response, NOT a reliability fault. It is raised
@@ -5062,6 +5065,114 @@ class LiquidityPlugin(BasePlugin):
         self.on_action_done(
             wallet, _("Reverse swap {} sat from {}").format(lightning_amount_sat, action.short_id))
         return _SwapAttempt.COMMITTED
+
+    async def _call_reverse_swap(self, sm, kwargs: Dict[str, Any],
+                                 swaps_before: Set[str]) -> Optional[str]:
+        """Run ``sm.reverse_swap`` under the coarse timeout, then clean up the
+        funding waiter Electrum leaves behind.
+
+        Bounded so no single swap can hold the per-wallet evaluation lock
+        indefinitely. The precise hang (a provider that never answers the
+        createswap RPC) is already bounded inside the transport; this coarse
+        backstop covers anything else that could stall (see
+        REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as asyncio.TimeoutError,
+        handled by the caller like any unresponsive provider.
+
+        The reap runs in a ``finally`` so it covers every exit: a normal return,
+        any of the provider-failure exceptions, and the timeout -- which needs it
+        most, because ``asyncio.wait_for`` cancelling ``reverse_swap`` does NOT
+        cancel the tasks it left running inside its own ``asyncio.wait``.
+        """
+        try:
+            return await asyncio.wait_for(
+                sm.reverse_swap(**kwargs),
+                timeout=self._reverse_swap_timeout_sec,
+            )
+        finally:
+            self._reap_funding_waiters(sm, swaps_before)
+
+    def _reap_funding_waiters(self, sm, swaps_before: Set[str]) -> int:
+        """Cancel the ``wait_for_funding`` task Electrum orphans for each swap we
+        just created. Returns how many were reaped (for tests).
+
+        ``reverse_swap`` races the Lightning payment against funding detection::
+
+            async def wait_for_funding(swap):
+                while swap.funding_txid is None:
+                    await asyncio.sleep(0.1)
+            tasks = [create_task(pay_invoice(...)), create_task(wait_for_funding(swap))]
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            return swap.funding_txid
+
+        It never cancels the loser. When the payment finishes first -- the whole
+        reason the failover cascade exists -- the waiter is left polling at 10Hz
+        forever, pinning the swap object with it. One per failed attempt, up to
+        three per cascade, accumulating for the lifetime of the process.
+
+        Cancelling it is safe because it does nothing anyone reads: its body
+        returns None and exists solely to unblock that ``asyncio.wait``. Once
+        ``reverse_swap`` has returned, no one awaits it, and real funding
+        detection belongs to the swap manager's watcher, which sets
+        ``swap.funding_txid`` from the adb txin independently of this loop. On the
+        funded path the waiter has already completed and there is nothing to reap.
+
+        Only waiters for swaps that appeared during OUR call are touched, so a
+        concurrent user-initiated swap keeps its own. That scoping shares one
+        narrow race with ``_track_new_swaps``: a swap the user starts by hand
+        *during* our attempt also lands in the delta. The consequence is mild --
+        their ``reverse_swap`` returns None early instead of a txid, while the
+        watcher still funds and completes the swap -- and it is the same
+        identification the tracking path has always used.
+
+        Deliberately best-effort. Identifying the task means matching a closure
+        inside third-party code, so if Electrum restructures ``reverse_swap`` the
+        match stops firing and this quietly becomes a no-op -- i.e. the leak
+        returns, nothing breaks. The debug line below is what makes that
+        diagnosable rather than silent.
+        """
+        new_hashes = set(getattr(sm, "_swaps", {}).keys()) - swaps_before
+        if not new_hashes:
+            return 0
+        try:
+            tasks = asyncio.all_tasks()
+        except RuntimeError:  # no running loop
+            return 0
+        reaped = 0
+        for task in tasks:
+            if task.done():
+                continue
+            try:
+                coro = task.get_coro()
+                qualname = getattr(coro, "__qualname__", "") or ""
+                if not qualname.endswith("reverse_swap.<locals>.wait_for_funding"):
+                    continue
+                frame = getattr(coro, "cr_frame", None)
+                swap = frame.f_locals.get("swap") if frame is not None else None
+                payment_hash = getattr(swap, "payment_hash", None)
+                if payment_hash is None or payment_hash.hex() not in new_hashes:
+                    continue
+                task.cancel()
+                reaped += 1
+            except Exception as e:  # noqa: BLE001
+                # Introspection is inherently brittle; never let it break a swap.
+                self.logger.debug(f"could not inspect a task while reaping "
+                                  f"funding waiters ({e!r})")
+        if reaped:
+            self.logger.debug(f"reaped {reaped} orphaned funding waiter(s)")
+        else:
+            # Finding nothing is EXPECTED on the funded path: there the waiter is
+            # what won the race, so it has already exited and there is no orphan.
+            # Only an unfunded swap should still have one alive -- so only that
+            # case means the match failed, which is the signal worth surfacing.
+            swaps = getattr(sm, "_swaps", {})
+            unfunded = [h for h in new_hashes
+                        if not getattr(swaps.get(h), "funding_txid", None)]
+            if unfunded:
+                self.logger.debug(
+                    f"no funding waiter found to reap for {len(unfunded)} "
+                    f"unfunded swap(s); Electrum's reverse_swap may have "
+                    f"changed shape")
+        return reaped
 
     def _track_new_swaps(self, wallet: 'Abstract_Wallet', sm, swaps_before: set,
                          npub: str, action: ReverseSwapAction,
