@@ -134,8 +134,10 @@ def _wallet(sm, ln_payment: str = "failed") -> SimpleNamespace:
       "failed"    -- PR_UNPAID, nothing in flight, route attempts logged: we
                      tried and gave up (the 120s PAYMENT_TIMEOUT case).
       "inflight"  -- an HTLC may still be live: must NOT fail over.
-      "undecided" -- PR_UNPAID, nothing in flight, but no logs either, so
-                     Electrum cannot call it failed: must NOT fail over.
+      "no_route"  -- PR_UNPAID, nothing in flight, and no route was ever
+                     attempted so there are no logs. The fastest failure there
+                     is (well under a second) and nothing is committed, so it
+                     MUST fail over -- see _unfunded_swap_outcome.
       "paid"      -- it settled; funding just has not landed yet.
     """
     return SimpleNamespace(lnworker=_LnWorker(sm, ln_payment))
@@ -364,14 +366,29 @@ def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
     assert len(p.logged) == 1
 
 
-@pytest.mark.parametrize("ln_payment", ["undecided", "paid"])
-def test_unfunded_swap_stops_when_the_payment_cannot_be_called_failed(ln_payment) -> None:
-    """Not in flight is not the same as provably failed: with no route-attempt
-    logs Electrum cannot call it failed, and a settled payment may simply be
-    waiting on funding. Both keep the conservative answer."""
+def test_unfunded_swap_with_no_route_to_the_provider_fails_over() -> None:
+    """The fastest failure there is: no route to the provider, so the payment
+    gives up in well under a second having logged no route attempts at all.
+
+    Electrum's own derivation cannot call that "failed" (it needs logs), which is
+    why the gate asks whether anything is COMMITTED rather than whether failure
+    is provable. Nothing is in flight and nothing settled, so the next provider
+    is safe to try -- and this is the case failover is most useful for, since a
+    provider we cannot reach at all is precisely the one to skip."""
     sm = _SM({A: _accept_without_funding})
     p = _plugin()
-    _run(p, sm, _action(alternates=(B,)), ln_payment=ln_payment)
+    _run(p, sm, _action(alternates=(B,)), ln_payment="no_route")
+    assert [n for n, _amt in sm.attempts] == [A, B]
+    assert p.successes == [B]
+
+
+def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
+    """A reverse swap's main invoice is a hold invoice, so a payment that reached
+    the provider normally reads as in flight. PR_PAID here therefore means the
+    swap really is progressing and only its funding txid is lagging."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="paid")
     assert [n for n, _amt in sm.attempts] == [A]
     assert p.successes == [] and p.dev_fees == []
 

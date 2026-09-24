@@ -5100,17 +5100,29 @@ class LiquidityPlugin(BasePlugin):
         can return after ``pay_to_node`` gave up while HTLCs it sent are still
         unresolved. Failing over then could drain the channel twice.
 
-        So a swap only clears for failover when BOTH hold for every payment it
-        involves: nothing is in ``inflight_payments``, and Electrum's own derived
-        status says the payment definitively failed. Anything else -- in flight,
-        undecided, unparseable, or no swap object to inspect at all -- answers
-        COMMITTED, because the cost of a false "all clear" is a double drain while
-        the cost of a false alarm is one skipped cascade.
+        So a swap clears for failover only when, for every payment it involves,
+        nothing sits in ``inflight_payments`` AND nothing has settled. Both arms
+        matter: in flight means an HTLC may still resolve in the provider's
+        favour, and settled means it already has (with the funding txid merely
+        lagging). Neither leaves the channel free. Anything we cannot look up --
+        an unparseable hash, a failed query, or no swap object at all -- also
+        answers COMMITTED, because the cost of a false "all clear" is a double
+        drain while the cost of a false alarm is one skipped cascade.
+
+        Note this deliberately does NOT ask ``_ln_payment_failed``, which is the
+        stricter question reconciliation asks when it needs to blame somebody.
+        That derivation requires route-attempt logs, so it cannot recognise the
+        quickest failure of all -- a payment with no route to the provider, which
+        gives up in under a second having logged no attempts. Such a payment is
+        not in flight and has not settled, so nothing is committed and the next
+        provider is safe to try; demanding proof of failure would strand exactly
+        the case failover is most useful for.
 
         The prepayment (``minerFeeInvoice``) is checked alongside the main invoice:
         it is a separate fire-and-forget payment, and a live prepay HTLC is still
         something committed on this channel.
         """
+        from electrum.invoices import PR_PAID
         lnworker = getattr(wallet, "lnworker", None)
         if lnworker is None or not tracked:
             # No swap object was created, or no wallet to ask. We cannot show the
@@ -5135,9 +5147,20 @@ class LiquidityPlugin(BasePlugin):
                 return _SwapAttempt.COMMITTED
             if any(self._payment_still_inflight(lnworker, h) for h in hashes):
                 return _SwapAttempt.COMMITTED
-            if not self._ln_payment_failed(wallet, ph_hex):
-                # Not in flight, but not provably failed either -- e.g. it settled
-                # and the funding txid simply has not landed yet. Do not touch it.
+            # A reverse swap's main invoice is a HOLD invoice: the provider keeps
+            # the HTLC until we claim the on-chain output, so a payment that has
+            # reached it reads as in flight above, not as settled. Seeing PR_PAID
+            # here therefore means the swap really is progressing and its funding
+            # txid is merely lagging -- leave it alone.
+            try:
+                from electrum.lnutil import Direction
+                if any(lnworker.get_payment_status(h, direction=Direction.SENT)
+                       == PR_PAID for h in hashes):
+                    return _SwapAttempt.COMMITTED
+            except Exception as e:  # noqa: BLE001
+                self.logger.info(
+                    f"could not read the payment status for swap {ph_hex[:10]}… "
+                    f"({e!r}); not failing over")
                 return _SwapAttempt.COMMITTED
         return _SwapAttempt.NEXT
 
