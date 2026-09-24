@@ -226,6 +226,7 @@ def _make_plugin() -> qt_mod.Plugin:
     p._last_offers = {}
     p._tick_status = {}
     p.wallets = {}
+    p._send_warning_refreshers = {}
     # The Log tab reads both of these; a fresh buffer per plugin keeps tests
     # isolated, and the capture is left detached (no global handler installed).
     p.log_buffer = LogRingBuffer()
