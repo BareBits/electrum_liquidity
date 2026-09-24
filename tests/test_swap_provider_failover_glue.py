@@ -57,6 +57,7 @@ def _plugin(**config_over) -> LiquidityPlugin:
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
     p.faults = []        # (npub, reason, kwargs)
+    p.peer_faults = []   # (node_id, reason, kwargs)
     p.successes = []     # npub
     p.dev_fees = []      # (amount_sat, source)
     p.tracked = []       # (npub, expected_onchain_sat)
@@ -64,13 +65,22 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p.logged = []        # _log_action kwargs
     p._record_provider_fault = lambda wallet, npub, reason, **kw: \
         p.faults.append((npub, reason, kw))
+    p._record_peer_fault = lambda wallet, node_id, reason, **kw: \
+        p.peer_faults.append((node_id, reason, kw))
     p._record_provider_success = lambda wallet, npub: p.successes.append(npub)
     p._accrue_dev_fee = lambda wallet, amount_sat, source=None: \
         p.dev_fees.append((amount_sat, source))
-    # Mirrors the real helper's guard: it records only swaps that actually
-    # appeared, so `tracked` reflects what reconciliation would really pick up.
-    p._track_new_swaps = lambda wallet, sm, before, npub, action, exp: \
-        p.tracked.append((npub, exp)) if set(sm._swaps) - before else None
+    p._channel_peer_node_id = lambda wallet, channel_id: "peer-node-id"
+
+    # Mirrors the real helper: records only swaps that actually appeared (so
+    # `tracked` reflects what reconciliation would really pick up) and RETURNS
+    # their payment hashes, which is what _unfunded_swap_outcome classifies.
+    def _track(wallet, sm, before, npub, action, exp):
+        new = set(sm._swaps) - before
+        if new:
+            p.tracked.append((npub, exp))
+        return new
+    p._track_new_swaps = _track
     p._diag_event = lambda wallet, **kw: p.diags.append(kw)
     p._log_action = lambda wallet, **kw: p.logged.append(kw)
     p.on_action_done = lambda wallet, msg: None
@@ -102,6 +112,9 @@ class _SM(SimpleNamespace):
             return self._recv_amount(self._current, amt)
         return amt - 500
 
+    def get_swap(self, payment_hash: bytes):
+        return self._swaps.get(payment_hash.hex())
+
     async def reverse_swap(self, **kw):
         npub = self._current
         self.attempts.append((npub, kw["lightning_amount_sat"]))
@@ -113,11 +126,55 @@ class _SM(SimpleNamespace):
         return outcome
 
 
-def _wallet(sm) -> SimpleNamespace:
-    return SimpleNamespace(lnworker=SimpleNamespace(
-        swap_manager=sm,
-        channels={},
-        get_channel_by_id=lambda cid: SimpleNamespace(node_id=b"\x11" * 33)))
+def _wallet(sm, ln_payment: str = "failed") -> SimpleNamespace:
+    """``ln_payment`` describes what Electrum would say about the Lightning
+    payment of any swap this wallet created, which is what decides whether an
+    unfunded swap may fail over:
+
+      "failed"    -- PR_UNPAID, nothing in flight, route attempts logged: we
+                     tried and gave up (the 120s PAYMENT_TIMEOUT case).
+      "inflight"  -- an HTLC may still be live: must NOT fail over.
+      "no_route"  -- PR_UNPAID, nothing in flight, and no route was ever
+                     attempted so there are no logs. The fastest failure there
+                     is (well under a second) and nothing is committed, so it
+                     MUST fail over -- see _unfunded_swap_outcome.
+      "paid"      -- it settled; funding just has not landed yet.
+    """
+    return SimpleNamespace(lnworker=_LnWorker(sm, ln_payment))
+
+
+class _LnWorker:
+    """Reports on the swaps the SM has created *at call time* -- the swap does
+    not exist yet when the wallet is built, so these must not be snapshotted."""
+
+    def __init__(self, sm, ln_payment: str) -> None:
+        self.swap_manager = sm
+        self.channels: dict = {}
+        self._sm = sm
+        self._ln_payment = ln_payment
+
+    @staticmethod
+    def get_channel_by_id(cid):
+        return SimpleNamespace(node_id=b"\x11" * 33)
+
+    def get_payments(self, *, status=None):
+        if status == "inflight" and self._ln_payment == "inflight":
+            return {bytes.fromhex(k) for k in self._sm._swaps}
+        return set()
+
+    def get_payment_status(self, ph, direction=None):
+        from electrum.invoices import PR_PAID, PR_UNPAID  # type: ignore
+        return PR_PAID if self._ln_payment == "paid" else PR_UNPAID
+
+    @property
+    def inflight_payments(self):
+        return set(self._sm._swaps) if self._ln_payment == "inflight" else set()
+
+    @property
+    def logs(self):
+        if self._ln_payment != "failed":
+            return {}
+        return {k: ["route attempt"] for k in self._sm._swaps}
 
 
 def _transport(npubs) -> SimpleNamespace:
@@ -141,8 +198,8 @@ def _action(chosen: str = A, alternates=(B,), amount: int = 400_000,
                          for n in alternates))
 
 
-def _run(p, sm, action, transport=None) -> None:
-    asyncio.run(p._reverse_swap(_wallet(sm), action, state={},
+def _run(p, sm, action, transport=None, ln_payment: str = "failed") -> None:
+    asyncio.run(p._reverse_swap(_wallet(sm, ln_payment), action, state={},
                                 transport=transport or _transport(
                                     [action.provider_npub]
                                     + [a.npub for a in action.alternates])))
@@ -249,20 +306,126 @@ def test_timeout_before_any_swap_exists_does_fail_over() -> None:
     assert len(p.faults) == 1 and p.faults[0][0] == A
 
 
-def test_accepted_but_unfunded_swap_stops_the_cascade() -> None:
-    """reverse_swap returning None means the provider ACCEPTED (funds committed,
-    funding not yet seen). That is a completed action, not a failure."""
-    async def _accept_without_funding(sm, **kw):
-        sm._swaps["ff" * 32] = object()       # add_reverse_swap happened
-        return None                            # ... but no funding txid yet
+# --- the unfunded (no funding txid) swap -----------------------------------
+# Electrum's reverse_swap races pay_invoice against funding detection and returns
+# whichever finishes FIRST, then `return swap.funding_txid`. Because pay_invoice
+# RETURNS (success, log) instead of raising, a failed payment simply completes the
+# race -- so None overwhelmingly means "the Lightning payment failed", not
+# "accepted, funding pending". Which one it is decides whether we may fail over.
+async def _accept_without_funding(sm, **kw):
+    sm._swaps["ff" * 32] = SimpleNamespace(prepay_hash=None)  # add_reverse_swap ran
+    return None                                                # ... no funding txid
 
+
+def test_unfunded_swap_with_a_failed_payment_fails_over() -> None:
+    """The regression this file exists for. The payment gave up (PAYMENT_TIMEOUT =
+    120s), nothing is committed on the channel, and two ranked failover providers
+    were sitting ready -- so the cascade must move on instead of scoring the dead
+    attempt as a completed swap."""
     sm = _SM({A: _accept_without_funding})
     p = _plugin()
-    _run(p, sm, _action())
-    assert [n for n, _amt in sm.attempts] == [A]
+    _run(p, sm, _action(alternates=(B,)), ln_payment="failed")
+    assert [n for n, _amt in sm.attempts] == [A, B]    # B was actually tried
+    assert p.successes == [B]                          # and it delivered
+    assert p.dev_fees == [(399_500, "1x1x1")]
+    # The dead attempt is still tracked, so reconciliation keeps its own verdict.
+    assert p.tracked == [(A, 399_500)]
+    # No swap action is logged for the attempt that moved nothing.
+    assert len(p.logged) == 1
+
+
+def test_failed_payment_softly_faults_the_provider_exactly_once() -> None:
+    """Attribution is genuinely ambiguous -- our peer could not route it, and the
+    provider may equally be offline or out of inbound -- so the provider's share
+    is soft: it should weigh on the ranking, not escalate toward a ban.
+
+    The PEER's share is deliberately not charged here. ``_reconcile_pending_swaps``
+    already recognises this swap's failed payment on the next tick and faults the
+    peer then, so doing it here too would count one failure twice against the same
+    peer. The provider has no such path -- that branch drops the record without
+    faulting it -- which is why this arm exists at all.
+    """
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="failed")
+    assert [(n, kw) for n, _r, kw in p.faults] == [(A, {"soft": True})]
+    assert p.peer_faults == []                         # reconciliation's job, not ours
+    assert [d["reason"] for d in p.diags] == ["reverse-swap Lightning payment failed"]
+
+
+def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
+    """The safety-critical half. An HTLC may still be live, so draining this
+    channel again through another provider could pay out twice."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="inflight")
+    assert [n for n, _amt in sm.attempts] == [A]       # B never tried
     assert p.tracked == [(A, 399_500)]
     assert p.successes == [] and p.dev_fees == []
+    assert p.faults == [] and p.peer_faults == []
     assert len(p.logged) == 1
+
+
+def test_unfunded_swap_with_no_route_to_the_provider_fails_over() -> None:
+    """The fastest failure there is: no route to the provider, so the payment
+    gives up in well under a second having logged no route attempts at all.
+
+    Electrum's own derivation cannot call that "failed" (it needs logs), which is
+    why the gate asks whether anything is COMMITTED rather than whether failure
+    is provable. Nothing is in flight and nothing settled, so the next provider
+    is safe to try -- and this is the case failover is most useful for, since a
+    provider we cannot reach at all is precisely the one to skip."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="no_route")
+    assert [n for n, _amt in sm.attempts] == [A, B]
+    assert p.successes == [B]
+
+
+def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
+    """A reverse swap's main invoice is a hold invoice, so a payment that reached
+    the provider normally reads as in flight. PR_PAID here therefore means the
+    swap really is progressing and only its funding txid is lagging."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="paid")
+    assert [n for n, _amt in sm.attempts] == [A]
+    assert p.successes == [] and p.dev_fees == []
+
+
+def test_a_live_prepay_htlc_blocks_failover() -> None:
+    """The minerFeeInvoice is a separate fire-and-forget payment. Its HTLC is
+    still something committed on this channel, so it must gate failover even when
+    the main invoice has definitively failed."""
+    prepay = bytes.fromhex("ab" * 32)
+
+    async def _accept_with_live_prepay(sm, **kw):
+        sm._swaps["ff" * 32] = SimpleNamespace(prepay_hash=prepay)
+        return None
+
+    sm = _SM({A: _accept_with_live_prepay})
+    p = _plugin()
+    wallet = _wallet(sm, "failed")
+    # Main invoice: failed. Prepay: still in flight.
+    wallet.lnworker.get_payments = lambda *, status=None: (
+        {prepay} if status == "inflight" else set())
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]       # B never tried
+    assert p.successes == []
+
+
+def test_unfunded_swap_with_no_swap_object_stops_the_cascade() -> None:
+    """No swap object means nothing to inspect. We cannot show the channel is
+    clear, so the conservative answer wins even though nothing looks committed."""
+    async def _return_none_without_creating(sm, **kw):
+        return None
+
+    sm = _SM({A: _return_none_without_creating})
+    p = _plugin()
+    _run(p, sm, _action(alternates=(B,)), ln_payment="failed")
+    assert [n for n, _amt in sm.attempts] == [A]
+    assert p.tracked == []
 
 
 # --- abort: failing over would be pointless or unsafe ---------------------

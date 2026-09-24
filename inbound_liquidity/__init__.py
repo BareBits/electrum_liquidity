@@ -21,7 +21,7 @@ from concurrent import futures
 from contextlib import asynccontextmanager
 from enum import Enum, auto
 from typing import (TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional,
-                    Sequence, Tuple)
+                    Sequence, Set, Tuple)
 
 from electrum import util
 from electrum.i18n import _
@@ -5003,11 +5003,53 @@ class LiquidityPlugin(BasePlugin):
             self._record_provider_success(wallet, npub)
             self._accrue_dev_fee(wallet, expected_onchain_sat, source=action.short_id)
         else:
-            # Accepted but no funding yet -- watch it; reconciliation records a
-            # success once it funds, a provider stuck fault if it never does, or a
-            # peer fault if our Lightning payment for it fails.
-            self._track_new_swaps(wallet, sm, swaps_before, npub, action,
-                                  expected_onchain_sat)
+            # No funding txid. Electrum's reverse_swap races the Lightning payment
+            # against funding detection and returns whichever finishes FIRST
+            # (submarine_swaps.py: asyncio.wait(..., FIRST_COMPLETED) then
+            # `return swap.funding_txid`). So None does not mean "accepted, funding
+            # pending" -- it means the payment task won the race, and because
+            # lnworker.pay_invoice RETURNS (success, log) rather than raising, the
+            # dominant cause is a payment that FAILED (it gives up at
+            # LNWallet.PAYMENT_TIMEOUT = 120s).
+            #
+            # Track it either way -- reconciliation still owns the eventual verdict
+            # -- then ask which arm of the race we are in before deciding whether
+            # the cascade may continue.
+            tracked = self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                            expected_onchain_sat)
+            if self._unfunded_swap_outcome(wallet, sm, tracked) is _SwapAttempt.NEXT:
+                # The payment is definitively dead and nothing is committed on this
+                # channel, so another provider is safe to try -- this is exactly
+                # what the cascade exists for.
+                #
+                # Both sides are at fault here, but only the PROVIDER is charged
+                # from this arm. The peer side is already owned by
+                # ``_reconcile_pending_swaps``, which sees this very swap on the
+                # next tick, recognises the failed payment and charges the peer
+                # then; doing it here as well would count one failure twice
+                # against the same peer. The provider had no such path -- that
+                # branch resolves and drops the record without ever faulting it --
+                # so this is the only place the provider's share can land.
+                #
+                # Soft, because attribution is genuinely ambiguous: our peer could
+                # not route it, and the provider being offline or out of inbound
+                # would look identical from here. A signal this ambiguous should
+                # weigh on the ranking, not escalate anyone toward a ban.
+                self.logger.warning(
+                    f"reverse swap via {provider_label[:20]}… produced no funding: "
+                    f"the Lightning payment failed (no funds committed); "
+                    f"trying the next provider")
+                self._record_provider_fault(
+                    wallet, npub, "reverse-swap Lightning payment failed", soft=True)
+                self._diag_event(
+                    wallet, category="error", kind="swap",
+                    reason="reverse-swap Lightning payment failed", source=npub,
+                    detail=(f"{lightning_amount_sat} sat from channel "
+                            f"{action.short_id} (attempt {index} of {total})"))
+                return _SwapAttempt.NEXT
+            # Either an HTLC may still be live, or we could not tell. Both mean the
+            # channel may already be committed, so stop: draining it again through
+            # another provider is the one outcome worth giving up the tick to avoid.
         self.logger.info(f"reverse swap funding txid: {funding_txid}")
         self._log_action(
             wallet, kind="swap", amount_sat=lightning_amount_sat,
@@ -5023,22 +5065,104 @@ class LiquidityPlugin(BasePlugin):
 
     def _track_new_swaps(self, wallet: 'Abstract_Wallet', sm, swaps_before: set,
                          npub: str, action: ReverseSwapAction,
-                         expected_onchain_sat: int) -> None:
+                         expected_onchain_sat: int) -> Set[str]:
         """Track any reverse swap the swap manager gained during this attempt
         (``sm._swaps`` keys not present in ``swaps_before``) for later
         reconciliation. Stashes the channel's peer so a failed Lightning payment
         can be attributed to it, and the expected on-chain amount so the dev fee
-        is accrued iff the swap later completes. Used both on the accepted-but-
-        not-yet-funded path and on a timeout that fired after the swap object was
-        already created (its payment leg was in flight)."""
+        is accrued iff the swap later completes. Used both on the unfunded path
+        (``reverse_swap`` returned no txid, whatever the cause) and on a timeout
+        that fired after the swap object was already created (its payment leg was
+        in flight).
+
+        Returns the payment hashes (hex) it tracked, so the caller can ask what
+        became of their Lightning payments -- see ``_unfunded_swap_outcome``."""
         new_swaps = set(getattr(sm, "_swaps", {}).keys()) - swaps_before
         if not new_swaps:
-            return
+            return set()
         peer_node_id = self._channel_peer_node_id(wallet, action.channel_id)
         for ph_hex in new_swaps:
             self._track_pending_swap(wallet, ph_hex, npub,
                                      node_id=peer_node_id, channel_id=action.channel_id,
                                      fee_basis_sat=expected_onchain_sat)
+        return new_swaps
+
+    def _unfunded_swap_outcome(self, wallet: 'Abstract_Wallet', sm,
+                               tracked: Set[str]) -> '_SwapAttempt':
+        """Whether a reverse swap that returned no funding txid left this channel
+        free (NEXT) or possibly committed (COMMITTED).
+
+        This is the swap-path analogue of the liquidity sink's in-flight gate, and
+        the safety-critical half of the failover decision. ``reverse_swap``
+        returning None means its Lightning payment task finished before any
+        funding appeared; that is USUALLY a failed payment, but "the pay task
+        returned" is not by itself proof that nothing is committed -- ``pay_invoice``
+        can return after ``pay_to_node`` gave up while HTLCs it sent are still
+        unresolved. Failing over then could drain the channel twice.
+
+        So a swap clears for failover only when, for every payment it involves,
+        nothing sits in ``inflight_payments`` AND nothing has settled. Both arms
+        matter: in flight means an HTLC may still resolve in the provider's
+        favour, and settled means it already has (with the funding txid merely
+        lagging). Neither leaves the channel free. Anything we cannot look up --
+        an unparseable hash, a failed query, or no swap object at all -- also
+        answers COMMITTED, because the cost of a false "all clear" is a double
+        drain while the cost of a false alarm is one skipped cascade.
+
+        Note this deliberately does NOT ask ``_ln_payment_failed``, which is the
+        stricter question reconciliation asks when it needs to blame somebody.
+        That derivation requires route-attempt logs, so it cannot recognise the
+        quickest failure of all -- a payment with no route to the provider, which
+        gives up in under a second having logged no attempts. Such a payment is
+        not in flight and has not settled, so nothing is committed and the next
+        provider is safe to try; demanding proof of failure would strand exactly
+        the case failover is most useful for.
+
+        The prepayment (``minerFeeInvoice``) is checked alongside the main invoice:
+        it is a separate fire-and-forget payment, and a live prepay HTLC is still
+        something committed on this channel.
+        """
+        from electrum.invoices import PR_PAID
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None or not tracked:
+            # No swap object was created, or no wallet to ask. We cannot show the
+            # channel is clear, so treat it as committed.
+            return _SwapAttempt.COMMITTED
+        for ph_hex in tracked:
+            hashes: List[bytes] = []
+            try:
+                hashes.append(bytes.fromhex(ph_hex))
+            except ValueError:
+                return _SwapAttempt.COMMITTED
+            # Include the prepayment hash when the swap carries one.
+            try:
+                swap = sm.get_swap(bytes.fromhex(ph_hex))
+                prepay_hash = getattr(swap, "prepay_hash", None) if swap else None
+                if prepay_hash:
+                    hashes.append(prepay_hash)
+            except Exception as e:  # noqa: BLE001
+                self.logger.info(
+                    f"could not read the prepay hash for swap {ph_hex[:10]}… "
+                    f"({e!r}); not failing over")
+                return _SwapAttempt.COMMITTED
+            if any(self._payment_still_inflight(lnworker, h) for h in hashes):
+                return _SwapAttempt.COMMITTED
+            # A reverse swap's main invoice is a HOLD invoice: the provider keeps
+            # the HTLC until we claim the on-chain output, so a payment that has
+            # reached it reads as in flight above, not as settled. Seeing PR_PAID
+            # here therefore means the swap really is progressing and its funding
+            # txid is merely lagging -- leave it alone.
+            try:
+                from electrum.lnutil import Direction
+                if any(lnworker.get_payment_status(h, direction=Direction.SENT)
+                       == PR_PAID for h in hashes):
+                    return _SwapAttempt.COMMITTED
+            except Exception as e:  # noqa: BLE001
+                self.logger.info(
+                    f"could not read the payment status for swap {ph_hex[:10]}… "
+                    f"({e!r}); not failing over")
+                return _SwapAttempt.COMMITTED
+        return _SwapAttempt.NEXT
 
     # --- liquidity sink ---------------------------------------------------
     # Draining a channel by PAYING somebody, instead of reverse-swapping on-chain.
