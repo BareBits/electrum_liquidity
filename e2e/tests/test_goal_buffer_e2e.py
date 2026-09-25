@@ -48,15 +48,6 @@ if os.environ.get("RUN_RIG_E2E") != "1":
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# Bind the REAL electrum package before the rig's directory goes on sys.path.
-# ``e2e/electrum`` is a symlink to the Electrum *repo root*, which has no
-# __init__.py -- once it is first on sys.path it shadows the installed package
-# as a namespace package, leaving ``electrum.__file__`` None and breaking
-# ``from . import ...`` inside Electrum's own modules. Importing it first pins
-# the real one in sys.modules. The other e2e suites never import electrum.* at
-# all, which is why only this one needs the precaution.
-import electrum  # noqa: E402,F401
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import run as run_mod  # noqa: E402
@@ -65,6 +56,52 @@ from rig.services import (  # noqa: E402
     electrum_cli,
     wallet_path,
 )
+
+
+def _import_real_electrum():
+    """Bind the INSTALLED ``electrum`` package, not the rig's source symlink.
+
+    ``e2e/electrum`` is a symlink to the Electrum *repo root*, which is not a
+    package (no ``__init__.py``). Every e2e module puts ``e2e/`` on
+    ``sys.path[0]`` so it can ``import run``, and once it is there ``import
+    electrum`` resolves to that bare directory as a NAMESPACE package:
+    ``electrum.__file__`` is None, and ``from . import GuiImportError`` inside
+    Electrum's own ``commands.py`` then fails.
+
+    Whoever imports first decides, and pytest imports test modules in
+    alphabetical order -- which is why running this file ALONE worked and running
+    it in the suite did not (``test_daily_caps_e2e`` gets there first). Rather
+    than depend on that ordering, the e2e directory is lifted out of ``sys.path``
+    for the duration of the import and any half-bound namespace package is
+    purged first.
+
+    The heavy Qt chain is imported here too, while the path is clean, so the
+    in-test imports later resolve from ``sys.modules`` instead of re-running
+    resolution against the poisoned path. Returns the import error, if any, so
+    the Qt test can skip rather than fail on a machine with no PyQt6.
+    """
+    e2e_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bound = sys.modules.get("electrum")
+    if bound is None or getattr(bound, "__file__", None) is None:
+        for name in [n for n in list(sys.modules)
+                     if n == "electrum" or n.startswith("electrum.")]:
+            del sys.modules[name]
+    saved = list(sys.path)
+    sys.path[:] = [p for p in sys.path if os.path.abspath(p) != e2e_dir]
+    try:
+        import electrum  # noqa: F401
+        assert electrum.__file__ is not None, \
+            "still bound to the namespace package after cleaning sys.path"
+        import electrum.gui.qt.balance_dialog  # noqa: F401
+        import electrum.plugins.inbound_liquidity.qt  # noqa: F401
+        return None
+    except Exception as exc:       # no PyQt6, or Electrum not installed
+        return exc
+    finally:
+        sys.path[:] = saved
+
+
+_ELECTRUM_IMPORT_ERROR = _import_real_electrum()
 
 GOAL_SAT = 1_500_000
 
@@ -319,7 +356,8 @@ def test_real_balance_dialog_grows_the_buffer_slice(rig, live_wallet):
     """Electrum's own Wallet Balance dialog, built against the real wallet, with
     the plugin's patch installed -- the full monkeypatch path on a real balance.
     """
-    pytest.importorskip("PyQt6.QtWidgets")
+    if _ELECTRUM_IMPORT_ERROR is not None:
+        pytest.skip(f"Electrum's Qt GUI is unavailable: {_ELECTRUM_IMPORT_ERROR!r}")
     from PyQt6.QtWidgets import QApplication, QGridLayout, QLabel, QWidget
     from electrum.gui.qt.balance_dialog import (
         COLOR_CONFIRMED, BalanceDialog, LegendWidget, PieChartWidget,
