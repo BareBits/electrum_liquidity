@@ -627,3 +627,35 @@ cd e2e && ./setup.sh                        # one-time: builds the venv, clones 
 python e2e/run.py --exit-when-ready         # smoke: bring the whole stack up
 RUN_RIG_E2E=1 e2e/.venv-electrum/bin/python -m pytest e2e/tests -q -s   # full e2e suite
 ```
+
+## Releases
+
+Tagging `v*` builds the plugin zip and publishes a GitHub Release
+(`.github/workflows/release.yml`). The version in the release comes from
+`inbound_liquidity/manifest.json`, which is bumped in its own `chore: release
+vX.Y.Z` commit immediately before the tag.
+
+**Two channels, decided by the tag itself:**
+
+| Tag | Published as | Offered by the update check |
+|---|---|---|
+| `v0.4.0` | release | yes |
+| `v0.4.0-beta.1` | **pre-release** | **no** |
+
+A tag whose version carries a suffix — semver's rule: a hyphen after the version
+core — is published with `--prerelease`. That flag is what keeps a beta build to
+the people who went looking for it, and it works because the plugin's update
+check polls `releases/latest`, which GitHub documents as excluding pre-releases;
+`extract_release` then independently discards any payload flagged `prerelease`,
+so a change at the endpoint cannot re-expose one. Install a beta by hand:
+download its zip from the Releases page and import it in Electrum's plugin
+manager.
+
+Betas are cut on the **`beta`** branch — the same commits as `main` plus its
+version-bump commit, so a build can go out ahead of a final release without
+moving `main`'s version. CI runs on both branches.
+
+> A user who installs `v0.4.0-beta.1` is **not** notified when the final
+> `v0.4.0` ships: `parse_version` reads a numeric prefix, so the two compare
+> equal. That is the accepted cost of the prefix scheme — a beta is installed by
+> hand, so whoever opted in is the person who can opt back out.
