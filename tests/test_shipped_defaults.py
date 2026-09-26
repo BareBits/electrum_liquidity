@@ -11,6 +11,7 @@ outside the electrum venv)."""
 from __future__ import annotations
 
 import json
+import re
 import pathlib
 
 import pytest
@@ -160,9 +161,24 @@ def test_readme_documents_the_shipped_defaults() -> None:
 
 
 def test_manifest_version_is_wellformed() -> None:
-    """The release workflow reads this value to name the zip and the tag."""
+    """The release workflow reads this value to name the zip and the tag.
+
+    ``X.Y.Z`` with all three numeric, optionally followed by a semver
+    pre-release suffix (``0.4.0-beta.1``) -- the beta channel publishes those,
+    and the suffix is what ``release.yml`` keys the ``--prerelease`` flag on.
+
+    The numeric core is still pinned: ``parse_version`` reads a dotted-number
+    PREFIX, so a version whose core was not three plain numbers would either
+    fail to parse (the update check silently reporting "no answer" forever) or
+    order wrongly against published tags.
+    """
     manifest = json.loads(
         (pathlib.Path(__file__).resolve().parent.parent / "inbound_liquidity" / "manifest.json")
         .read_text(encoding="utf-8"))
-    parts = manifest["version"].split(".")
-    assert len(parts) == 3 and all(p.isdigit() for p in parts), manifest["version"]
+    version = manifest["version"]
+    core, sep, suffix = version.partition("-")
+    parts = core.split(".")
+    assert len(parts) == 3 and all(p.isdigit() for p in parts), version
+    if sep:
+        assert suffix, f"trailing '-' with no pre-release identifier: {version}"
+        assert re.fullmatch(r"[0-9A-Za-z.-]+", suffix), version
