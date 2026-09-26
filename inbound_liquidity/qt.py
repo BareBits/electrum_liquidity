@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget,
@@ -34,7 +34,7 @@ from . import (
     PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
-from .liquidity_manager import normalize_node_id
+from .liquidity_manager import BufferSplit, normalize_node_id, split_goal_buffer
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
 from .qt_widgets import ToggleSwitch
 
@@ -108,6 +108,430 @@ def _patch_channels_list_managed_column() -> bool:
         return True
     except Exception:
         return False
+
+
+# --- Electrum's balance pie chart: a "liquidity goal buffer" slice ---------
+# The user's liquidity goal is sats they intend NOT to spend, but Electrum draws
+# them as ordinary balance -- so the chart says "you have 1M" when 100k of it is
+# spoken for. We split a slice off for the buffer: out of on-chain first (that is
+# what funds a channel open), spilling into Lightning for whatever on-chain
+# cannot cover.
+#
+# Electrum offers no hook for this, so -- as with the Channels column above -- we
+# monkeypatch, but only by WRAPPING: each patch lets Electrum build its own
+# entry list exactly as it always did, then rewrites the finished list. Nothing
+# about how the chart is computed or painted is duplicated here, so an Electrum
+# that changes its slices keeps working; we only ever look for the one entry we
+# need and leave the rest untouched.
+#
+# Both patches are installed once, globally, and read the live buffer through
+# ``_BUFFER_PROVIDER`` rather than capturing a plugin instance: a class patch
+# outlives any one wallet, and a stale captured reference would keep a closed
+# wallet's plugin alive (and keep reserving against it). A None provider -- the
+# plugin unloaded -- means every patch falls through to stock behaviour.
+
+# The blue asked for. NOT ColorScheme.BLUE, which Electrum already spends on the
+# "Frozen" slice: two blues in one pie is two slices the user cannot tell apart.
+# This is a deliberately lighter, more saturated blue that stays distinct from
+# frozen-blue, from cyan (frozen Lightning) and from green (on-chain) in both
+# Electrum's light and dark themes.
+COLOR_GOAL_BUFFER = QColor(64, 148, 255)
+
+def _goal_buffer_label() -> str:
+    """The slice's label, for both the pie entry and the Balance dialog legend.
+
+    A function rather than a module constant so the string is translated at the
+    moment it is shown -- a constant would bake in whatever language was active
+    when this module was first imported.
+    """
+    return _("Liquidity goal buffer")
+
+# Callable[[Abstract_Wallet], int] -- the live plugin's goal_buffer_sat, or None
+# when no plugin is loaded. Set by Plugin.load_wallet, cleared by close_wallet.
+_BUFFER_PROVIDER: Optional[Callable[['Abstract_Wallet'], int]] = None
+
+# Fired from the patched update_status so the Send tab's warning tracks the
+# BALANCE, not just the amount field. The warning threshold is
+# "total balance - buffer", so a label refreshed only on keystrokes would go
+# stale the moment a payment arrived while the user sat on the Send tab.
+_SEND_WARNING_REFRESH: Optional[Callable[[], None]] = None
+
+
+def _set_buffer_provider(provider: Optional[Callable[['Abstract_Wallet'], int]]) -> None:
+    global _BUFFER_PROVIDER
+    _BUFFER_PROVIDER = provider
+
+
+def _set_send_warning_refresher(refresher: Optional[Callable[[], None]]) -> None:
+    global _SEND_WARNING_REFRESH
+    _SEND_WARNING_REFRESH = refresher
+
+
+def _buffer_split_for(wallet: 'Abstract_Wallet', *, onchain_sat: int,
+                      lightning_sat: int) -> BufferSplit:
+    """The buffer split for one wallet, or an all-zero split when no plugin is
+    loaded / the wallet is unmanaged / the goal is 0. Never raises: this runs
+    inside Electrum's status-bar repaint."""
+    provider = _BUFFER_PROVIDER
+    buffer_sat = 0
+    if provider is not None:
+        try:
+            buffer_sat = int(provider(wallet))
+        except Exception:
+            buffer_sat = 0
+    return split_goal_buffer(onchain_sat=onchain_sat, lightning_sat=lightning_sat,
+                             buffer_sat=buffer_sat)
+
+
+# Where the status-bar button keeps Electrum's own entry list, so a rewrite can
+# always start from the stock slices rather than from its own last output.
+_STOCK_ENTRIES_ATTR = "_inbound_liquidity_stock_entries"
+
+
+def _carries_buffer_slice(entries) -> bool:
+    """Whether this entry list is one we already rewrote."""
+    return any(color == COLOR_GOAL_BUFFER for _name, color, _amount in entries)
+
+
+def _rewrite_piechart_entries(entries, wallet: 'Abstract_Wallet'):
+    """Take Electrum's ``[(name, color, amount)]`` pie entries and return a new
+    list with the buffer split out of the On-chain and Lightning slices.
+
+    Matching is by COLOR, not by the translated slice name: the names are
+    user-language strings, so a German Electrum would silently never match. The
+    colours are module constants in Electrum's balance_dialog and are what the
+    chart is actually keyed on.
+
+    Returns the input unchanged (same object) when there is no buffer to show, so
+    the common case costs one comparison and no allocation.
+    """
+    try:
+        from electrum.gui.qt.balance_dialog import COLOR_CONFIRMED, COLOR_LIGHTNING
+    except Exception:
+        return entries
+    onchain_sat = 0
+    lightning_sat = 0
+    for name, color, amount in entries:
+        if color == COLOR_CONFIRMED:
+            onchain_sat = int(amount)
+        elif color == COLOR_LIGHTNING:
+            lightning_sat = int(amount)
+    split = _buffer_split_for(wallet, onchain_sat=onchain_sat,
+                              lightning_sat=lightning_sat)
+    if split.total() <= 0:
+        return entries
+    out = []
+    for name, color, amount in entries:
+        if color == COLOR_CONFIRMED:
+            out.append((name, color, split.onchain_remaining))
+        elif color == COLOR_LIGHTNING:
+            out.append((name, color, split.lightning_remaining))
+        else:
+            out.append((name, color, amount))
+    # Appended last so the existing slices keep the order (and therefore the
+    # start angles) Electrum gave them; the buffer takes the wedge at the end.
+    out.append((_goal_buffer_label(), COLOR_GOAL_BUFFER, split.total()))
+    return out
+
+
+def _patch_status_bar_piechart() -> bool:
+    """Add the buffer slice to the pie in Electrum's status bar.
+
+    Wraps ``ElectrumWindow.update_status``: the original runs and populates the
+    BalanceToolButton exactly as usual, then we rewrite the list it just stored.
+    Deliberately NOT a reimplementation of update_status -- that method decides
+    between several network states and only paints a pie in one of them, and
+    duplicating that condition would be a bug waiting for the next Electrum.
+
+    When Electrum is showing its low-reserve warning the button draws a warning
+    icon instead of a pie, so there is nothing to restyle and we leave it alone.
+    """
+    try:
+        from electrum.gui.qt.main_window import ElectrumWindow
+    except Exception:
+        return False
+    if getattr(ElectrumWindow.update_status, "_inbound_liquidity_patched", False):
+        return True
+    orig_update_status = ElectrumWindow.update_status
+
+    def update_status(self) -> None:
+        orig_update_status(self)
+        try:
+            button = getattr(self, "balance_label", None)
+            current = getattr(button, "_list", None)
+            if current and not getattr(button, "_warning", False):
+                # Only the CONNECTED branch of update_status rebuilds the entry
+                # list; offline / not-connected / synchronizing all leave
+                # whatever was on the button. So on those passes what we are
+                # handed is our own previous output -- and rewriting that would
+                # subtract the buffer from an already-reduced on-chain slice and
+                # append a second wedge, shrinking the pie a little more on every
+                # repaint. Re-derive from the stock list stashed alongside it.
+                stock = (getattr(button, _STOCK_ENTRIES_ATTR, None)
+                         if _carries_buffer_slice(current) else current)
+                if stock is not None:
+                    rewritten = _rewrite_piechart_entries(stock, self.wallet)
+                    # Compared by VALUE, not identity: re-deriving builds a new
+                    # list every pass, and repainting an unchanged chart on every
+                    # status tick is wasted work. This is also what puts the
+                    # stock slices back when the goal is set to 0 -- the rewrite
+                    # then returns the stock list, which differs from the
+                    # buffered one still on the button.
+                    if rewritten != current:
+                        setattr(button, _STOCK_ENTRIES_ATTR, stock)
+                        button.update_list(rewritten, getattr(button, "_warning", False))
+        except Exception:
+            # A repaint must never take the main window down.
+            pass
+        # The balance just moved, so the Send tab's threshold did too.
+        refresher = _SEND_WARNING_REFRESH
+        if refresher is not None:
+            try:
+                refresher()
+            except Exception:
+                pass
+
+    update_status._inbound_liquidity_patched = True
+    # Kept reachable so a caller can still get at Electrum's own implementation
+    # once the class attribute is ours -- the assumption guards read its source
+    # to notice if Electrum ever stops building the pie the way we match on.
+    update_status._inbound_liquidity_orig = orig_update_status
+    ElectrumWindow.update_status = update_status
+    return True
+
+
+def _restate_legend_amount(grid: QGridLayout, color, amount_sat: int,
+                           config, fx) -> bool:
+    """Rewrite the Balance dialog legend row whose swatch is ``color`` to read
+    ``amount_sat``. Returns whether a row was found and changed.
+
+    The row is located by its ``LegendWidget``'s colour rather than by index or
+    by label text: Electrum only emits a row for a balance that is non-zero, so
+    row numbers shift with the wallet, and the labels are translated.
+
+    Column layout is Electrum's: 0 swatch, 1 name, 2 amount, 3 fiat.
+    """
+    try:
+        from electrum.gui.qt.balance_dialog import LegendWidget
+    except Exception:
+        return False
+    for row in range(grid.rowCount()):
+        swatch = grid.itemAtPosition(row, 0)
+        widget = swatch.widget() if swatch is not None else None
+        if not isinstance(widget, LegendWidget) or widget.color != color:
+            continue
+        amount_item = grid.itemAtPosition(row, 2)
+        if amount_item is None or amount_item.widget() is None:
+            return False
+        amount_item.widget().setText(config.format_amount_and_units(amount_sat))
+        fiat_item = grid.itemAtPosition(row, 3)
+        if fiat_item is not None and fiat_item.widget() is not None and fx:
+            fiat_item.widget().setText(fx.format_amount_and_units(amount_sat))
+        return True
+    return False
+
+
+def _patch_balance_dialog() -> bool:
+    """Add the buffer slice (and its legend row) to the Wallet Balance dialog.
+
+    Wraps ``BalanceDialog.__init__``: the dialog builds itself in full, then we
+    find the pie widget by type and the legend by layout type and amend both.
+    ``findChild`` rather than an index walk, so re-ordering the dialog's layout
+    does not silently put the legend row in the wrong place.
+    """
+    try:
+        from electrum.gui.qt.balance_dialog import (
+            BalanceDialog, LegendWidget, PieChartWidget,
+        )
+        from electrum.gui.qt.util import AmountLabel
+    except Exception:
+        return False
+    if getattr(BalanceDialog.__init__, "_inbound_liquidity_patched", False):
+        return True
+    orig_init = BalanceDialog.__init__
+
+    def __init__(self, parent, *, wallet, **kwargs) -> None:
+        orig_init(self, parent, wallet=wallet, **kwargs)
+        try:
+            piechart = self.findChild(PieChartWidget)
+            if piechart is None:
+                return
+            entries = getattr(piechart, "_list", None)
+            if not entries:
+                return
+            rewritten = _rewrite_piechart_entries(entries, wallet)
+            if rewritten is entries:
+                return
+            piechart.update_list(rewritten)
+            buffer_sat = rewritten[-1][2]
+            grid = self.findChild(QGridLayout)
+            if grid is None:
+                return
+            # The legend rows have to follow the wedges. Electrum builds them
+            # straight from the raw PiechartBalance, so without this the dialog
+            # shows a shrunken on-chain wedge beside a legend still quoting the
+            # full on-chain balance -- and the rows no longer add up to the
+            # total. Rewritten in place, keyed on the swatch's colour (the
+            # labels are translated).
+            for name, color, amount in rewritten[:-1]:
+                _restate_legend_amount(grid, color, amount, self.config,
+                                       getattr(self, "fx", None))
+            # Below every stock row. rowCount() is the grid's own idea of its
+            # extent, so this cannot land on top of an existing legend entry
+            # however many of them Electrum decided to show.
+            row = grid.rowCount()
+            fiat_str = (self.fx.format_amount_and_units(buffer_sat)
+                        if getattr(self, "fx", None) else '')
+            grid.addWidget(LegendWidget(COLOR_GOAL_BUFFER), row, 0)
+            grid.addWidget(QLabel(_goal_buffer_label() + ':'), row, 1)
+            grid.addWidget(AmountLabel(self.config.format_amount_and_units(buffer_sat)),
+                           row, 2, alignment=Qt.AlignmentFlag.AlignRight)
+            grid.addWidget(AmountLabel(fiat_str), row, 3,
+                           alignment=Qt.AlignmentFlag.AlignRight)
+        except Exception:
+            # An amended legend is a nicety; a dialog that cannot open is not.
+            pass
+
+    __init__._inbound_liquidity_patched = True
+    __init__._inbound_liquidity_orig = orig_init
+    BalanceDialog.__init__ = __init__
+    return True
+
+
+def _patch_balance_piechart() -> bool:
+    """Install both pie-chart patches. True only if BOTH took, so a caller can
+    tell "the chart now shows the buffer" from "it silently does not"."""
+    status_ok = _patch_status_bar_piechart()
+    dialog_ok = _patch_balance_dialog()
+    return bool(status_ok and dialog_ok)
+
+
+# --- Electrum's Send tab: the inline liquidity-buffer warning --------------
+# Deliberately an inline label and nothing else. No dialog, no confirmation, no
+# extra click: the warning appears under the Amount field as the user types past
+# what they can spend and disappears when they come back under it. It never
+# blocks the send and never interposes itself between the Pay button and the
+# payment -- it is the user's money, and the buffer is a goal they set, not a
+# rule they agreed to be held to.
+#
+# It also covers BOTH payment rails for free, because on-chain and Lightning
+# sends are entered into the same ``amount_e`` widget. Intercepting the send
+# calls instead would have meant patching two methods and un-picking the
+# Lightning-falls-back-to-on-chain path that calls one from the other.
+#
+# The row the label lands on: Electrum's send grid uses rows 0-3 (pay-to,
+# description, comment, amount) and row 6 (the buttons), leaving 4 and 5 free.
+# Row 4 puts the warning directly under the amount it is about, which is where it
+# has to be to read as being about that amount -- but a future Electrum may claim
+# that row, and two widgets in one QGridLayout cell overlap rather than error. So
+# the row is checked for occupants first and we fall to the bottom if it is taken.
+SEND_WARNING_GRID_ROW = 4
+
+
+def _free_grid_row(grid: QGridLayout, preferred_row: int) -> int:
+    """``preferred_row`` if every cell in it is empty, else a fresh row past the
+    end of the grid."""
+    try:
+        for col in range(max(1, grid.columnCount())):
+            if grid.itemAtPosition(preferred_row, col) is not None:
+                return grid.rowCount()
+        return preferred_row
+    except Exception:
+        return grid.rowCount()
+
+
+def _send_tab_amount_sat(send_tab) -> Optional[int]:
+    """What the Send tab is currently set to send, in sat, or None if there is no
+    usable amount on screen.
+
+    ``amount_e`` is the single source for both rails and for the Max button
+    (``spend_max`` writes its computed maximum back into the field), so one read
+    covers on-chain, Lightning and max sends alike.
+
+    Pay-to-many is the exception: its per-line amounts live in the pay-to field
+    and ``amount_e`` stays empty, so the outputs are summed instead. A '!' line
+    among them makes the total unknowable until a tx is built, and is reported as
+    "no amount" rather than guessed at -- a warning invented from a wrong number
+    is worse than no warning.
+    """
+    try:
+        amount = send_tab.amount_e.get_amount()
+    except Exception:
+        amount = None
+    if amount is not None:
+        return int(amount)
+    try:
+        pi = send_tab.payto_e.payment_identifier
+        if pi is None or not pi.is_multiline():
+            return None
+        # The argument is the amount to use for a single-output identifier and is
+        # ignored on the multiline branch (which returns its parsed per-line
+        # outputs), so the 0 here is never spent -- it only satisfies the
+        # signature. The multiline guard above is what makes that safe.
+        outputs = pi.get_onchain_outputs(0)
+        total = 0
+        for out in outputs:
+            value = out.value
+            if not isinstance(value, int):
+                return None      # a '!' weight: not a knowable amount
+            total += value
+        return total or None
+    except Exception:
+        return None
+
+
+def _install_send_tab_warning(grid: QGridLayout,
+                              warning_text: Callable[['Abstract_Wallet', Optional[int]], str],
+                              ) -> Optional[Callable[[], None]]:
+    """Add the inline buffer warning to a Send tab, given its grid.
+
+    Returns a refresh callable the plugin can fire when the BALANCE moves (the
+    threshold is balance-dependent, so a label refreshed only on keystrokes would
+    go stale while the user sits on the tab), or None if the tab could not be
+    identified. Uses Electrum's ``create_send_tab`` hook rather than a
+    monkeypatch -- this is the one part of the feature Electrum has a real
+    extension point for.
+    """
+    try:
+        from electrum.gui.qt.util import ColorScheme
+    except Exception:
+        return None
+    send_tab = grid.parentWidget()
+    wallet = getattr(send_tab, "wallet", None)
+    amount_e = getattr(send_tab, "amount_e", None)
+    if wallet is None or amount_e is None:
+        return None
+
+    label = QLabel("")
+    label.setWordWrap(True)
+    label.setStyleSheet(ColorScheme.RED.as_stylesheet())
+    # Hidden until there is something to say, so an ordinary send shows no trace
+    # of the feature and the tab does not reserve a blank strip for it.
+    label.setVisible(False)
+    row = _free_grid_row(grid, SEND_WARNING_GRID_ROW)
+    grid.addWidget(label, row, 1, 1, 4)
+
+    def refresh() -> None:
+        try:
+            text = warning_text(wallet, _send_tab_amount_sat(send_tab))
+            label.setText(text)
+            label.setVisible(bool(text))
+        except RuntimeError:
+            pass    # the C++ widget went away with its window; nothing to do
+        except Exception:
+            pass    # never let the Send tab break over an advisory label
+
+    amount_e.textChanged.connect(lambda _text: refresh())
+    # Pay-to-many keeps its amounts in the pay-to field, which leaves amount_e
+    # silent -- so the multiline case needs its own trigger.
+    payto_e = getattr(send_tab, "payto_e", None)
+    if payto_e is not None:
+        try:
+            payto_e.textChanged.connect(refresh)
+        except Exception:
+            pass
+    refresh()
+    return refresh
 
 
 def _wrapped_label(text: str) -> QLabel:
@@ -220,6 +644,10 @@ class Plugin(LiquidityPlugin):
         # The persisted flag records the *answer*; this guards against opening a
         # second wallet stacking a second dialog before the first is answered.
         self._update_opt_in_asked: bool = False
+        # One Send-tab buffer-warning refresher per open wallet. Keyed by wallet
+        # rather than window because that is the key the buffer itself is looked
+        # up by, and Electrum opens one window per wallet.
+        self._send_warning_refreshers: Dict['Abstract_Wallet', Callable[[], None]] = {}
 
     @hook
     def load_wallet(self, wallet: 'Abstract_Wallet', window: 'ElectrumWindow') -> None:
@@ -237,7 +665,22 @@ class Plugin(LiquidityPlugin):
                 window.channels_list.update_rows.emit(wallet)
             except Exception:
                 self.logger.debug("could not refresh channels list after column patch")
+        # The liquidity-goal buffer slice on the balance pie chart. Published
+        # BEFORE start_wallet so the first repaint after the wallet becomes
+        # managed already carries the slice.
+        _set_buffer_provider(self.goal_buffer_sat)
+        _set_send_warning_refresher(self._refresh_send_warnings)
+        if not _patch_balance_piechart():
+            self.logger.debug("could not add the liquidity-buffer slice to the balance chart")
         self.start_wallet(wallet)
+        # start_wallet decides whether this wallet is managed at all, and the
+        # Send tab was built (and first refreshed) back in the window's
+        # constructor, long before that -- so re-ask now that the answer is known.
+        self._refresh_send_warnings()
+        try:
+            window.update_status()
+        except Exception:
+            self.logger.debug("could not refresh the balance chart after load")
         self._maybe_prompt_update_opt_in(window, wallet)
 
     def _maybe_prompt_update_opt_in(self, window: 'ElectrumWindow',
@@ -288,6 +731,41 @@ class Plugin(LiquidityPlugin):
             self._request_update_check(wallet)
 
     @hook
+    def create_send_tab(self, grid: QGridLayout) -> None:
+        """Add the inline liquidity-buffer warning to a Send tab as it is built.
+
+        Fires from ``SendTab.__init__``, which Electrum runs in the window
+        constructor -- BEFORE ``load_wallet``, and so before ``start_wallet`` has
+        decided whether this wallet is managed. That is why the label starts
+        hidden and is re-asked on every refresh rather than being decided once
+        here: at this instant the honest answer is always "no buffer".
+
+        Returns None unconditionally. ``run_hook`` asserts that at most one
+        plugin returns a truthy value, so a stray return here would break any
+        other plugin that legitimately answers this hook.
+        """
+        try:
+            refresh = _install_send_tab_warning(grid, self.send_warning_text)
+        except Exception:
+            self.logger.exception("could not add the liquidity-buffer warning to the Send tab")
+            return
+        if refresh is None:
+            return
+        wallet = getattr(grid.parentWidget(), "wallet", None)
+        if wallet is not None:
+            self._send_warning_refreshers[wallet] = refresh
+
+    def _refresh_send_warnings(self) -> None:
+        """Re-evaluate every open Send tab's buffer warning. Called whenever the
+        balance moves (from the patched ``update_status``) and once the wallet is
+        known to be managed."""
+        for refresh in list(self._send_warning_refreshers.values()):
+            try:
+                refresh()
+            except Exception:
+                pass
+
+    @hook
     def close_wallet(self, wallet: 'Abstract_Wallet') -> None:
         self.stop_wallet(wallet)
         self._remove_liquidity_tab(wallet)
@@ -295,6 +773,14 @@ class Plugin(LiquidityPlugin):
         # should not silence the prompt for a wallet the user just opened.
         self._unlock_declined_at.pop(wallet, None)
         self._unlock_prompting.discard(wallet)
+        # Drop the Send tab's refresher with its window; the class patches stay
+        # installed (they are global and idempotent) but go inert once the last
+        # wallet closes and the provider is cleared.
+        self._send_warning_refreshers.pop(wallet, None)
+        if not self._send_warning_refreshers:
+            _set_send_warning_refresher(None)
+        if not self.wallets:
+            _set_buffer_provider(None)
 
     def requires_settings(self) -> bool:
         # Settings now live in the Liquidity tab rather than a settings dialog.

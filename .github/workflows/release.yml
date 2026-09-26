@@ -1,11 +1,15 @@
 name: CI
 
+# `beta` is the pre-release channel: it carries the same commits as main but is
+# tagged ahead of it (v0.4.0-beta.1), so a build can be published and installed
+# by hand without being offered to everyone. See the pre-release note on the
+# release step below for what actually keeps those builds out of users' way.
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, beta]
   workflow_dispatch:
 
 permissions:
@@ -101,8 +105,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -eu
+          # A tag whose version carries a suffix (v0.4.0-beta.1) is published as
+          # a GitHub PRE-RELEASE. This flag is load-bearing, not cosmetic: the
+          # plugin's update check reads /releases/latest, which GitHub documents
+          # as excluding pre-releases, and `extract_release` independently drops
+          # any payload flagged `prerelease`. Those two together are the whole
+          # mechanism that keeps a beta build from being offered to everyone --
+          # drop the flag and the next beta tag notifies every user who opted
+          # into update checks.
+          #
+          # The test is semver's own: a hyphen after the version core marks a
+          # pre-release, so v0.4.0 ships normally and v0.4.0-beta.1 does not.
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease="--prerelease"; kind="pre-release" ;;
+            *)   prerelease="";            kind="release" ;;
+          esac
+          echo "publishing ${GITHUB_REF_NAME} as a ${kind}"
           gh release create "${GITHUB_REF_NAME}" \
             "${{ steps.meta.outputs.zip }}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
+            ${prerelease} \
             --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. Install by importing the attached zip into Electrum's plugin manager."

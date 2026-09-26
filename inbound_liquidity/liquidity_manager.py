@@ -1838,6 +1838,125 @@ def liquidity_goal_met(snapshot: LiquiditySnapshot,
                for c in snapshot.channels if c.is_plugin_opened)
 
 
+# --- the liquidity-goal buffer (a DISPLAY concern) ------------------------
+# Everything below turns the configured goal into the two numbers the GUI needs:
+# how much of the balance to *reserve* on screen, and whether a send the user is
+# typing would spend into that reserve.
+#
+# These are deliberately separate from the rules above and never feed a
+# decision. Nothing here freezes automation, blocks a send, or moves a satoshi;
+# the buffer is advisory, and the user is always free to spend straight through
+# it. Keeping it in the pure engine is purely so the arithmetic -- which is
+# fiddly at the edges (a buffer bigger than the balance, a balance of zero) --
+# is testable without a running Qt.
+
+@dataclass(frozen=True)
+class BufferSplit:
+    """How a liquidity-goal buffer is carved out of the balance for display.
+
+    ``from_onchain`` + ``from_lightning`` == ``total()``, and the four
+    ``*_remaining`` / ``from_*`` numbers always re-add to exactly the on-chain
+    and Lightning balances that went in -- the pie chart must not gain or lose
+    satoshis just because a slice was split off it.
+    """
+    from_onchain: int
+    from_lightning: int
+    onchain_remaining: int
+    lightning_remaining: int
+
+    def total(self) -> int:
+        """The buffer actually shown, which is capped by the balance available
+        to back it (see :func:`split_goal_buffer`)."""
+        return self.from_onchain + self.from_lightning
+
+
+def goal_buffer_sat(config: LiquidityConfig) -> int:
+    """The liquidity-goal buffer: how many sat the user wants kept in the wallet
+    so the goal stays reachable.
+
+    Deliberately just the configured goal, held unconditionally -- NOT reduced as
+    channels get built, and not zeroed once :func:`liquidity_goal_met` turns
+    true. The goal is a per-channel capacity target, so "keep one goal's worth
+    around" is the honest reading of what it costs to reach it, and a reserve
+    that silently evaporated the moment the build-out finished would stop
+    defending the very thing the user asked to protect: a channel that later
+    closes, or a goal the user raises, puts the wallet straight back into
+    build-out with the buffer already spent.
+
+    A goal of 0 (the feature switched off) means no buffer at all, which in turn
+    means no blue slice and no send warning -- see :func:`send_dips_into_buffer`.
+    """
+    return max(0, int(config.liquidity_goal_sat))
+
+
+def split_goal_buffer(*, onchain_sat: int, lightning_sat: int,
+                      buffer_sat: int) -> BufferSplit:
+    """Carve ``buffer_sat`` out of the displayed balance: on-chain first, then
+    spilling into Lightning for whatever on-chain could not cover.
+
+    On-chain leads because that is what the buffer is *for* -- on-chain coins are
+    what fund a channel open, so they are the sats the goal actually needs. The
+    spill into Lightning matters when the wallet is mid-build-out and most of the
+    balance is already in channels: without it the reserve would silently shrink
+    to whatever happened to be sitting on-chain, which is precisely when the user
+    most needs to see the full goal held back.
+
+    Every input is floored at 0 and the buffer is capped at what the two balances
+    can actually back, so the result can never show a negative slice or a buffer
+    larger than the wallet. A buffer that exceeds the whole balance is a normal
+    state, not an error: it just means the entire balance is spoken for.
+    """
+    onchain = max(0, int(onchain_sat))
+    lightning = max(0, int(lightning_sat))
+    wanted = max(0, int(buffer_sat))
+    from_onchain = min(wanted, onchain)
+    from_lightning = min(wanted - from_onchain, lightning)
+    return BufferSplit(
+        from_onchain=from_onchain,
+        from_lightning=from_lightning,
+        onchain_remaining=onchain - from_onchain,
+        lightning_remaining=lightning - from_lightning,
+    )
+
+
+def spendable_before_buffer_sat(total_balance_sat: int, buffer_sat: int) -> int:
+    """The largest amount that can be sent without eating into the buffer --
+    the "x" the send warning triggers above.
+
+    Floored at 0: once the buffer is at or above the whole balance there is no
+    headroom left, so *every* amount dips in. That is the truthful answer rather
+    than a degenerate negative threshold, and it is a state a user reaches
+    routinely (a fresh wallet funded with less than its goal).
+    """
+    return max(0, int(total_balance_sat) - max(0, int(buffer_sat)))
+
+
+def send_dips_into_buffer(*, amount_sat: Optional[int], total_balance_sat: int,
+                          buffer_sat: int) -> bool:
+    """Whether sending ``amount_sat`` would leave the wallet unable to reach the
+    liquidity goal -- i.e. whether the Send tab should show its warning.
+
+    ``None`` (an empty or unparseable amount field) is not a send, so it never
+    warns; neither does a non-positive amount. With no buffer configured the
+    answer is always False, which is what switches the whole feature off at a
+    goal of 0.
+
+    Note the comparison is against the amount ALONE, not amount + mining fee: the
+    fee is not known while the user is still typing, and a warning that flickered
+    as fee estimates moved would be worse than one that is a few hundred sat
+    optimistic. The warning is advisory either way.
+    """
+    if amount_sat is None:
+        return False
+    amount = int(amount_sat)
+    if amount <= 0:
+        return False
+    buffer_ = max(0, int(buffer_sat))
+    if buffer_ <= 0:
+        return False
+    return amount > spendable_before_buffer_sat(total_balance_sat, buffer_)
+
+
 # --- undersized-channel replacement (the "liquidity goal") ----------------
 # The problem this solves: the plugin opens channels for inbound liquidity, but
 # once it is holding ``max_channels`` of them it will not open another -- even

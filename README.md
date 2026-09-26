@@ -33,6 +33,11 @@ liquidity (remote-side channel balance). This plugin keeps it topped up:
 - **Opening a channel** (funded from on-chain coins) creates new capacity; once
   its local balance is drained out, that capacity becomes pure inbound.
 
+It also keeps the goal in front of you rather than only in its own tab: the
+balance pie chart grows a blue **liquidity goal buffer** slice, and the Send tab
+warns inline when an amount would spend through it. See
+[The liquidity goal buffer](#the-liquidity-goal-buffer).
+
 A debounced main loop runs whenever an inbound payment (on-chain or Lightning)
 arrives — or any wallet/channel/swap-provider event fires — snapshots the
 wallet, applies the rules below, and executes the resulting actions.
@@ -50,7 +55,7 @@ ceilings, diagnostics, etc.).
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
 | `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
-| `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) | `100_000` |
+| `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. Also sets the **buffer** reserved on the balance pie chart and warned about in the Send tab. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) and [The liquidity goal buffer](#the-liquidity-goal-buffer) | `100_000` |
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
@@ -269,6 +274,76 @@ cooperative first, force-close only as a documented backstop, and counted agains
 > channel smaller than the goal that has already been drained will be replaced
 > the first time you are at your channel ceiling with the funds to do better. Set
 > `liquidity_goal_sat` to `0` on the Settings tab to turn it off.
+
+### The liquidity goal buffer
+
+A goal you can spend straight past is not much of a goal. The **buffer** is the
+goal made visible in the two places you would otherwise walk into it: the balance
+pie chart, and the Send tab.
+
+The buffer is simply `liquidity_goal_sat` — the sats it takes to fund one channel
+that reaches the goal — held **unconditionally**. It is deliberately *not* reduced
+as channels get built and *not* zeroed once the build-out is finished: a channel
+that later closes, or a goal you raise, puts the wallet straight back into
+build-out, and a reserve that evaporated the moment it looked unnecessary would
+already be spent by then.
+
+It applies only to wallets the plugin is actually managing (Lightning enabled and
+the plugin running). A goal of `0` switches it off entirely, along with everything
+below.
+
+**On the pie chart.** Electrum's balance chart — both the small one in the status
+bar and the big one in Wallet → Balance — grows a blue **Liquidity goal buffer**
+slice, taken out of the on-chain slice first:
+
+```
+100 sat on-chain, 10 sat goal   ->   90 sat On-chain  +  10 sat Liquidity goal buffer
+```
+
+When on-chain cannot cover the whole goal, the remainder spills into the Lightning
+slice — which is the case that matters most, because a wallet mid-build-out has
+most of its balance in channels and would otherwise see the reserve silently shrink
+to whatever happened to be sitting on-chain:
+
+```
+30k on-chain, 500k Lightning, 100k goal
+   ->  0 On-chain  +  430k Lightning  +  100k Liquidity goal buffer
+```
+
+The frozen slices are never touched — frozen coins cannot fund a channel open, and
+a channel frozen for sending is balance you have already set aside. The chart's
+total is unchanged either way: the buffer is split *off* the existing slices, never
+added on top of them, and the Balance dialog's legend is restated to match, so the
+rows still add up to your balance. If the whole balance is smaller than the goal,
+the buffer is simply the whole balance — and an on-chain balance entirely absorbed
+into it reads `On-chain: 0`, which is the useful thing to say rather than hiding
+the row.
+
+**On the Send tab.** Type an amount larger than `total balance − goal` and an
+inline warning appears under the Amount field:
+
+> Spending this much will make it impossible to hit your liquidity goal of
+> 100,000 sats, keep 100,000 sats as a buffer
+
+It covers on-chain **and** Lightning sends — both are entered into the same amount
+box — and it tracks your balance as well as the amount, so it appears on its own
+if a payment goes out while you are on the tab.
+
+It is a **warning and nothing else**: no dialog, no confirmation, no extra click,
+and the Pay button is never disabled. It is your money and the goal is one you set,
+so spending through the buffer takes no more effort than spending anything else.
+Note the comparison is against the amount alone, not amount + mining fee — the fee
+is not known while you are still typing, and a warning that flickered as fee
+estimates moved would be worse than one that is a few hundred sat optimistic.
+
+Two edge cases worth knowing:
+
+- **A wallet holding less than its goal has no headroom at all**, so *every* send
+  warns. That is noisy on purpose: the alternative is to stop defending the goal
+  at exactly the moment it is furthest away.
+- **Pay-to-many** puts its amounts in the pay-to field rather than the amount box;
+  those are summed. A `!` weight among them makes the total unknowable until a
+  transaction is built, and is reported as "no amount" rather than guessed at.
 
 ### In-flight freeze
 
@@ -494,7 +569,10 @@ inbound_liquidity/
                         store, dev fee, daily ceilings, offline auto-close, MIN_FUNDING_SAT floor override
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
-                        Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs)
+                        Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs),
+                        plus the grafts onto Electrum's own GUI: the Channels tab's "Managed by"
+                        column, the balance pie chart's liquidity-goal-buffer slice, and the
+                        Send tab's inline buffer warning
   qt_widgets.py         custom Qt widgets (the ENABLED/DISABLED ToggleSwitch)
   swap_transport.py     nostr swap-provider discovery / transport helper
   diag_log.py           optional on-disk diagnostic log (opt-in; no key material)
@@ -549,3 +627,35 @@ cd e2e && ./setup.sh                        # one-time: builds the venv, clones 
 python e2e/run.py --exit-when-ready         # smoke: bring the whole stack up
 RUN_RIG_E2E=1 e2e/.venv-electrum/bin/python -m pytest e2e/tests -q -s   # full e2e suite
 ```
+
+## Releases
+
+Tagging `v*` builds the plugin zip and publishes a GitHub Release
+(`.github/workflows/release.yml`). The version in the release comes from
+`inbound_liquidity/manifest.json`, which is bumped in its own `chore: release
+vX.Y.Z` commit immediately before the tag.
+
+**Two channels, decided by the tag itself:**
+
+| Tag | Published as | Offered by the update check |
+|---|---|---|
+| `v0.4.0` | release | yes |
+| `v0.4.0-beta.1` | **pre-release** | **no** |
+
+A tag whose version carries a suffix — semver's rule: a hyphen after the version
+core — is published with `--prerelease`. That flag is what keeps a beta build to
+the people who went looking for it, and it works because the plugin's update
+check polls `releases/latest`, which GitHub documents as excluding pre-releases;
+`extract_release` then independently discards any payload flagged `prerelease`,
+so a change at the endpoint cannot re-expose one. Install a beta by hand:
+download its zip from the Releases page and import it in Electrum's plugin
+manager.
+
+Betas are cut on the **`beta`** branch — the same commits as `main` plus its
+version-bump commit, so a build can go out ahead of a final release without
+moving `main`'s version. CI runs on both branches.
+
+> A user who installs `v0.4.0-beta.1` is **not** notified when the final
+> `v0.4.0` ships: `parse_version` reads a numeric prefix, so the two compare
+> equal. That is the accepted cost of the prefix scheme — a beta is installed by
+> hand, so whoever opted in is the person who can opt back out.

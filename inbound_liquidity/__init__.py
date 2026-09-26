@@ -54,6 +54,7 @@ from .liquidity_manager import (
     BLOCK_LOCKED,
     BLOCK_NOT_MANAGED,
     Action,
+    BufferSplit,
     ChannelSnapshot,
     clean_npub,
     CloseChannelAction,
@@ -92,6 +93,7 @@ from .liquidity_manager import (
     eligible_providers,
     evaluate,
     extract_release,
+    goal_buffer_sat,
     is_channel_size_rejection,
     is_newer_version,
     liquidity_goal_met,
@@ -102,9 +104,12 @@ from .liquidity_manager import (
     reliability_penalty_pct,
     resolve_channel_partners,
     scrub_text,
+    send_dips_into_buffer,
     should_auto_ban,
     should_commit_offline_close,
     should_remediate_wedged_open,
+    spendable_before_buffer_sat,
+    split_goal_buffer,
     uptime_ratio,
     validate_offer,
     wallet_readiness_block,
@@ -623,6 +628,22 @@ DEFAULT_MAX_CLOSES_PER_DAY = 5
 # rule only fires when a small channel is actually in the way) and the swap
 # trigger (a channel is only replaceable once the plugin has drained it).
 DEFAULT_LIQUIDITY_GOAL_SAT = 100_000
+
+
+def format_goal_buffer_warning(buffer_sat: int) -> str:
+    """The Send tab's inline liquidity-buffer warning, ready to display.
+
+    Kept next to the goal's own default rather than in the pure engine because
+    it is the one piece of this feature that is a *translated string*, and the
+    engine imports nothing from Electrum (not even ``_``).
+
+    The satoshi count is grouped with thin separators -- a bare ``100000`` in a
+    warning about money is a number the eye has to count digits on.
+    """
+    amount = "{:,}".format(max(0, int(buffer_sat)))
+    return _("Spending this much will make it impossible to hit your liquidity "
+             "goal of {goal} sats, keep {goal} sats as a buffer").format(goal=amount)
+
 
 # --- channel-funding floor override ---------------------------------------
 # Electrum's stock MIN_FUNDING_SAT (lnutil, 200_000) is a hard floor on new-
@@ -1932,6 +1953,83 @@ class LiquidityPlugin(BasePlugin):
                                       DEFAULT_LIQUIDITY_GOAL_SAT)))
         except (TypeError, ValueError):
             return DEFAULT_LIQUIDITY_GOAL_SAT
+
+    # --- the liquidity-goal buffer (GUI-facing) ---------------------------
+    # Read by the Qt layer on every balance repaint and on every keystroke in the
+    # Send tab's amount field, so everything here is cheap (a config read and, at
+    # most, one balance call) and total: it answers 0 rather than raising, on any
+    # wallet, in any state. A crash in here would take out Electrum's status bar.
+
+    def goal_buffer_sat(self, wallet: 'Abstract_Wallet') -> int:
+        """The liquidity-goal buffer to reserve for ``wallet``, or 0 if none.
+
+        0 for a wallet this plugin is not managing -- ``start_wallet`` declines
+        wallets without Lightning, and reserving "liquidity goal" sats on a
+        wallet that can never hold a channel would be reserving them for nothing.
+        ``self.wallets`` is the managed set, so this tracks the plugin being
+        stopped/started on a wallet without any extra bookkeeping.
+        """
+        try:
+            if wallet not in self.wallets:
+                return 0
+            return goal_buffer_sat(self.read_config())
+        except Exception:
+            # Never let a config or wallet-state problem break a repaint.
+            return 0
+
+    def goal_buffer_split(self, wallet: 'Abstract_Wallet', *,
+                          onchain_sat: int, lightning_sat: int) -> BufferSplit:
+        """The buffer carved out of one wallet's on-chain/Lightning balances, for
+        the pie chart. An unmanaged wallet (or a goal of 0) yields an all-zero
+        split, which leaves the chart exactly as Electrum drew it."""
+        return split_goal_buffer(onchain_sat=onchain_sat,
+                                 lightning_sat=lightning_sat,
+                                 buffer_sat=self.goal_buffer_sat(wallet))
+
+    def wallet_total_balance_sat(self, wallet: 'Abstract_Wallet') -> int:
+        """The wallet's total balance in sat, as the status bar shows it.
+
+        Deliberately Electrum's own pie-chart total (confirmed + unconfirmed +
+        unmatured + frozen + Lightning, frozen included) rather than a spendable
+        figure: this is the number the send warning is measured against, and it
+        has to agree with the balance the user is reading off the status bar next
+        to the pie -- otherwise the warning and the chart tell different stories
+        about the same wallet.
+
+        Called once per keystroke in the Send tab and left UNCACHED on purpose.
+        The underlying ``adb.get_balance`` memoises its result (and is
+        invalidated on wallet activity), so a repeat call costs a sort and a hash
+        over the address domain rather than a rescan -- and Electrum itself calls
+        this same method on every status-bar repaint. A TTL cache here would buy
+        no measurable time and would add a staleness window to a number the user
+        is watching change.
+        """
+        try:
+            return int(wallet.get_balances_for_piechart().total())
+        except Exception:
+            return 0
+
+    def send_warning_text(self, wallet: 'Abstract_Wallet',
+                          amount_sat: Optional[int]) -> str:
+        """The Send tab's inline warning for ``amount_sat``, or "" for no warning.
+
+        Returning a plain string (empty == hide) keeps every decision about
+        *whether* to warn on this side of the GUI boundary, so the Qt layer is
+        reduced to ``label.setText(...)`` and the rule is unit-testable without a
+        running Qt.
+        """
+        buffer_sat = self.goal_buffer_sat(wallet)
+        if buffer_sat <= 0:
+            # Checked before the balance is read: with the feature off (or the
+            # wallet unmanaged) there is no warning to give, and reading the
+            # balance on every keystroke to establish that would be pure waste.
+            return ""
+        if not send_dips_into_buffer(
+                amount_sat=amount_sat,
+                total_balance_sat=self.wallet_total_balance_sat(wallet),
+                buffer_sat=buffer_sat):
+            return ""
+        return format_goal_buffer_warning(buffer_sat)
 
     # --- daily action ceilings (rolling 24h) ------------------------------
     # A runaway guard: at most N opens / N closes in any trailing 24h window.

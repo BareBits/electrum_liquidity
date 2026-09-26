@@ -99,6 +99,7 @@ def _plugin() -> qt_mod.Plugin:
     p.wallets = {}
     p._unlock_declined_at = {}
     p._unlock_prompting = set()
+    p._send_warning_refreshers = {}
     p._unlock_prompt_cooldown_sec = qt_mod.UNLOCK_PROMPT_COOLDOWN_SEC
     p.evaluations: List[object] = []
     p.request_evaluation = lambda wallet, **kw: p.evaluations.append(wallet)

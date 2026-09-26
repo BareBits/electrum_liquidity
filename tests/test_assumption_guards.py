@@ -12,10 +12,19 @@ users without failing a test:
   3. The provider offer terms the plugin feeds to sm.update_pairs (SwapFees)
      still carry max_reverse -- our own offer validation only checks max_forward,
      so we rely on Electrum always supplying max_reverse.
+  4. The liquidity-goal buffer's four footholds in Electrum's own GUI: the
+     `create_send_tab` hook, the free grid row the warning lands on, the colours
+     the pie-chart rewrite matches on, and the widgets the Balance dialog patch
+     looks for. All four are places where a stock-Electrum change would leave the
+     plugin silently doing nothing rather than failing -- the buffer would simply
+     stop appearing, and every mocked test would still pass.
 
 Skipped outside the Electrum venv.
 """
 from __future__ import annotations
+
+import inspect
+import re
 
 import pytest
 
@@ -105,3 +114,92 @@ def test_swapfees_still_carries_max_reverse() -> None:
     fields = {a.name for a in attr.fields(SwapFees)}
     assert {"percentage", "mining_fee", "min_amount",
             "max_forward", "max_reverse"} <= fields
+
+
+# --- 4. the liquidity-goal buffer's footholds in Electrum's GUI -----------
+def _original(func):
+    """Electrum's own implementation of a method the plugin may have wrapped.
+
+    The pie-chart patches are installed on the real classes by the Qt suite, and
+    test order is not guaranteed -- so reading a patched method's source would
+    inspect the PLUGIN's wrapper and pass no matter what Electrum did. The
+    wrappers keep the original reachable for exactly this.
+    """
+    return getattr(func, "_inbound_liquidity_orig", func)
+
+
+def test_send_tab_still_offers_the_create_send_tab_hook() -> None:
+    # The Send tab's inline buffer warning is installed through this hook rather
+    # than a monkeypatch. If Electrum ever drops the call, the warning silently
+    # never appears and no mocked test notices -- they all drive the installer
+    # directly.
+    pytest.importorskip("PyQt6.QtWidgets")
+    from electrum.gui.qt.send_tab import SendTab
+
+    src = inspect.getsource(SendTab.__init__)
+    assert "run_hook('create_send_tab', grid)" in src
+
+
+def test_send_grid_still_leaves_the_warning_row_free() -> None:
+    # The warning lands on row 4 so it sits directly under the Amount field
+    # (row 3) rather than below the buttons (row 6). Two widgets in one
+    # QGridLayout cell OVERLAP rather than raise, so a future Electrum claiming
+    # row 4 would draw its widget and ours on top of each other. The installer
+    # falls back to the bottom of the grid when the row is taken -- this guard
+    # is what tells us the fallback has started being used, and that the
+    # preferred row should be moved.
+    pytest.importorskip("PyQt6.QtWidgets")
+    from electrum.gui.qt.send_tab import SendTab
+    from electrum.plugins.inbound_liquidity.qt import (  # type: ignore
+        SEND_WARNING_GRID_ROW,
+    )
+
+    src = inspect.getsource(SendTab.__init__)
+    rows = {int(r) for r in re.findall(
+        r"grid\.add(?:Widget|Layout)\(\s*[^,]+,\s*(\d+)\s*,", src)}
+    assert rows, "could not parse any rows out of SendTab's grid"
+    assert SEND_WARNING_GRID_ROW not in rows
+
+
+def test_status_bar_pie_is_still_built_the_way_the_patch_rewrites() -> None:
+    # The patch wraps update_status and rewrites the list it stored on
+    # balance_label, keying on the two colour constants. If Electrum stops
+    # calling update_list, or stops using these colours for the on-chain and
+    # Lightning slices, the rewrite matches nothing and the buffer slice quietly
+    # never appears.
+    pytest.importorskip("PyQt6.QtWidgets")
+    from electrum.gui.qt.main_window import ElectrumWindow
+
+    src = inspect.getsource(_original(ElectrumWindow.update_status))
+    assert "balance_label.update_list" in src
+    assert "COLOR_CONFIRMED" in src
+    assert "COLOR_LIGHTNING" in src
+
+
+def test_balance_dialog_still_builds_the_widgets_the_patch_looks_for() -> None:
+    # The dialog patch finds the pie by type (findChild(PieChartWidget)) and the
+    # legend by type (findChild(QGridLayout)). Both have to exist, and the pie
+    # has to be the only chart in the dialog for findChild to be unambiguous.
+    pytest.importorskip("PyQt6.QtWidgets")
+    from electrum.gui.qt.balance_dialog import BalanceDialog
+
+    src = inspect.getsource(_original(BalanceDialog.__init__))
+    assert "PieChartWidget(" in src
+    assert src.count("PieChartWidget(") == 1
+    assert "QGridLayout()" in src
+    assert src.count("QGridLayout()") == 1
+
+
+def test_piechart_balance_still_reports_both_rails() -> None:
+    # wallet_total_balance_sat measures the send threshold against
+    # PiechartBalance.total(), so that the warning and the chart cannot disagree
+    # about the same wallet. If the shape of that total changes, the threshold
+    # silently starts measuring something else.
+    import dataclasses
+    from electrum.wallet import PiechartBalance  # type: ignore
+
+    fields = {f.name for f in dataclasses.fields(PiechartBalance)}
+    assert {"confirmed", "unconfirmed", "unmatured", "frozen",
+            "lightning", "lightning_frozen"} == fields
+    assert PiechartBalance(confirmed=1, unconfirmed=2, unmatured=4, frozen=8,
+                           lightning=16, lightning_frozen=32).total() == 63
