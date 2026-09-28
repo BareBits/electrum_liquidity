@@ -162,6 +162,159 @@ def test_autoban_disabled_with_zero_threshold() -> None:
     assert p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS == ""
 
 
+# --- escalation ages out; the auto-ban tally does not ----------------------
+# The ranking counter and the ban tally answer different questions, so only one
+# of them heals. Previously neither did: a peer forgiven down to a zero penalty
+# still resumed at base * 2^(old faults) on its next fault.
+HALFLIFE_SEC = 6 * 3600     # the shipped default, shared with provider tuning
+
+
+def _backdate_peer(p, w, node_id: str, seconds: float) -> None:
+    data = p._load_peer_reliability(w)
+    data[node_id.lower()]["last_fault_ts"] = time.time() - seconds
+    p._save_peer_reliability(w, data)
+
+
+def test_peer_escalation_ages_out_one_level_per_half_life() -> None:
+    p, w = _plugin(), _FakeWallet()
+    for _ in range(3):
+        p._record_peer_fault(w, NODE_A, "x", hard=False)
+    assert p._load_peer_reliability(w)[NODE_A.lower()]["consecutive_faults"] == 3
+    _backdate_peer(p, w, NODE_A, 2 * HALFLIFE_SEC)      # two levels forgiven
+    p._record_peer_fault(w, NODE_A, "y", hard=False)
+    s = p._load_peer_reliability(w)[NODE_A.lower()]
+    assert s["consecutive_faults"] == 2                 # 3 - 2 + 1
+    assert s["fault_count"] == 4                        # lifetime tally untouched
+    assert p.peer_reliability_rows(w)[NODE_A.lower()]["penalty_pct"] == \
+        pytest.approx(1.0, abs=1e-3)
+
+
+def test_peer_escalation_fully_forgiven_after_a_long_quiet_period() -> None:
+    p, w = _plugin(), _FakeWallet()
+    for _ in range(4):
+        p._record_peer_fault(w, NODE_A, "x", hard=False)
+    _backdate_peer(p, w, NODE_A, 30 * 86400)           # ~120 half-lives
+    p._record_peer_fault(w, NODE_A, "y", hard=False)
+    s = p._load_peer_reliability(w)[NODE_A.lower()]
+    assert s["consecutive_faults"] == 1                 # starts over at the base
+    assert p.peer_reliability_rows(w)[NODE_A.lower()]["penalty_pct"] == \
+        pytest.approx(0.5, abs=1e-3)
+
+
+def test_peer_bursts_still_compound_inside_one_half_life() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_peer_fault(w, NODE_A, "x", hard=False)
+    _backdate_peer(p, w, NODE_A, HALFLIFE_SEC * 0.9)    # not yet a whole level
+    p._record_peer_fault(w, NODE_A, "y", hard=False)
+    assert p._load_peer_reliability(w)[NODE_A.lower()]["consecutive_faults"] == 2
+
+
+def test_aging_does_not_forgive_the_autoban_tally() -> None:
+    """The decision that keeps auto-ban meaningful: a peer that force-closes three
+    times, however far apart, is still banned. Only the ranking penalty heals."""
+    p, w = _plugin(INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS=3), _FakeWallet()
+    for i in range(2):
+        p._record_peer_fault(w, NODE_A, "force-closed", hard=True)
+        _backdate_peer(p, w, NODE_A, 30 * 86400)        # a month between each
+    s = p._load_peer_reliability(w)[NODE_A.lower()]
+    assert s["hard_fault_count"] == 2                   # tally does NOT age
+    assert s["consecutive_faults"] == 1                 # ranking counter does
+    assert NODE_A.lower() not in _parse_banned_partners(
+        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+    p._record_peer_fault(w, NODE_A, "force-closed", hard=True)   # third, crosses
+    assert p._load_peer_reliability(w)[NODE_A.lower()]["hard_fault_count"] == 3
+    assert NODE_A.lower() in _parse_banned_partners(
+        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+
+
+def test_peer_aging_is_skipped_when_decay_is_disabled() -> None:
+    p, w = _plugin(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=0.0), _FakeWallet()
+    p._record_peer_fault(w, NODE_A, "x", hard=False)
+    _backdate_peer(p, w, NODE_A, 365 * 86400)
+    p._record_peer_fault(w, NODE_A, "y", hard=False)
+    assert p._load_peer_reliability(w)[NODE_A.lower()]["consecutive_faults"] == 2
+
+
+def test_peer_aging_is_not_applied_on_read() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_peer_fault(w, NODE_A, "x", hard=False)
+    p._record_peer_fault(w, NODE_A, "y", hard=False)     # 2 levels -> 1.0% fresh
+    _backdate_peer(p, w, NODE_A, HALFLIFE_SEC)
+    rows = p.peer_reliability_rows(w)[NODE_A.lower()]
+    assert rows["consecutive_faults"] == 2               # counter unchanged
+    assert rows["penalty_pct"] == pytest.approx(0.5, abs=1e-3)   # 1.0 halved
+
+
+# --- peer store housekeeping ----------------------------------------------
+def test_prune_drops_idle_unpenalised_peer_rows() -> None:
+    p, w = _plugin(), _FakeWallet()
+    now = time.time()
+    ancient = now - 200 * 86400
+    p._save_peer_reliability(w, {
+        "aa": {"consecutive_faults": 2, "fault_count": 2, "last_fault_ts": ancient},
+        "bb": {"success_count": 3, "last_success_ts": ancient},
+        "cc": {"consecutive_faults": 1, "fault_count": 1, "last_fault_ts": now},
+    })
+    p._prune_peer_reliability_store(w)
+    assert set(p._load_peer_reliability(w)) == {"cc"}
+
+
+def test_prune_never_drops_a_row_carrying_an_autoban_tally() -> None:
+    """The load-bearing guard. A peer one force-close short of the threshold must
+    not be pardoned just for going quiet -- that would silently undo the ban the
+    operator is relying on."""
+    p, w = _plugin(INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS=3), _FakeWallet()
+    ancient = time.time() - 200 * 86400
+    p._save_peer_reliability(w, {
+        NODE_A.lower(): {"consecutive_faults": 0, "fault_count": 2,
+                         "hard_fault_count": 2, "last_fault_ts": ancient},
+    })
+    p._prune_peer_reliability_store(w)
+    assert NODE_A.lower() in p._load_peer_reliability(w), (
+        "an idle row with hard faults was pruned, pardoning a ban candidate")
+    # And the tally it preserved still bans on the next force-close.
+    p._record_peer_fault(w, NODE_A, "force-closed", hard=True)
+    assert NODE_A.lower() in _parse_banned_partners(
+        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+
+
+def test_prune_keeps_an_idle_peer_row_that_still_carries_a_penalty() -> None:
+    p, w = _plugin(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0), _FakeWallet()
+    p._save_peer_reliability(w, {
+        "aa": {"consecutive_faults": 3, "fault_count": 3,
+               "last_fault_ts": time.time() - 100 * 86400},
+    })
+    assert p.peer_reliability_rows(w)["aa"]["penalty_pct"] > 0.001    # premise
+    p._prune_peer_reliability_store(w)
+    assert "aa" in p._load_peer_reliability(w)
+
+
+def test_prune_peer_rows_is_not_a_wipe_when_the_feature_is_off() -> None:
+    p, w = _plugin(INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED=False,
+                   INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0), _FakeWallet()
+    p._save_peer_reliability(w, {
+        "aa": {"consecutive_faults": 3, "fault_count": 3,
+               "last_fault_ts": time.time() - 100 * 86400},
+    })
+    p._prune_peer_reliability_store(w)
+    assert "aa" in p._load_peer_reliability(w)
+
+
+def test_prune_peer_rows_does_not_write_when_nothing_is_dropped() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_peer_fault(w, NODE_A, "x", hard=False)
+    saves_before = w.saved
+    p._prune_peer_reliability_store(w)
+    assert w.saved == saves_before
+    assert NODE_A.lower() in p._load_peer_reliability(w)
+
+
+def test_prune_of_an_empty_peer_store_is_a_noop() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._prune_peer_reliability_store(w)
+    assert w.saved == 0
+
+
 # --- channel-health watchdog ----------------------------------------------
 class _Chan:
     """A mutable fake channel: reassign ``state`` / ``active`` / ``confs`` /
