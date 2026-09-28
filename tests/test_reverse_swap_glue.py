@@ -44,6 +44,9 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p._last_offers = {}
     p._swap_cooldown_until = {}
     p._reverse_swap_timeout_sec = 5.0
+    # Per-provider wait for advertised terms; shrunk so an unreachable
+    # provider trips the init timeout instantly instead of in 15s.
+    p._swap_init_timeout_sec = 0.01
     cfg = dict(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
