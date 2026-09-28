@@ -2766,6 +2766,12 @@ class LiquidityPlugin(BasePlugin):
         closed by peer / open failure / peer offline) bump the auto-ban tally;
         soft faults only feed the decaying penalty.
 
+        The ranking counter escalates from its *aged* value
+        (:meth:`_aged_consecutive_faults`); the auto-ban tally does not age. The
+        two answer different questions -- "how badly should this peer be
+        de-prioritised right now", which quiet time should heal, versus "how many
+        times has this peer force-closed on us", which it should not.
+
         ``rate_key`` + ``rate_limit_sec`` rate-limit a *recurring* condition (e.g.
         a peer that stays offline) so it faults at most once per window: if the
         same ``rate_key`` was stamped within ``rate_limit_sec``, the call is a
@@ -2782,9 +2788,21 @@ class LiquidityPlugin(BasePlugin):
             if now - last < rate_limit_sec:
                 return False  # within the rate-limit window; don't re-count
             s[rate_key] = now
-        s["consecutive_faults"] = int(s.get("consecutive_faults", 0)) + 1
+        # Escalate from the AGED counter, so quiet time forgives escalation at the
+        # same rate it forgives the penalty's magnitude. Shares the provider
+        # helper because it shares the tuning: ``_peer_reliability_params`` takes
+        # base/cap/half-life straight from ``_reliability_params``, so the rate
+        # that helper reads is the rate ``_peer_penalty`` decays at.
+        s["consecutive_faults"] = self._aged_consecutive_faults(s) + 1
         s["fault_count"] = int(s.get("fault_count", 0)) + 1
         if hard:
+            # NOT aged, deliberately. This is the auto-ban tally, not a ranking
+            # input: a force-close is a serious, deliberate act, it is remembered
+            # for the life of the wallet, and the operator can already clear it
+            # from the Channel partners tab. Ageing it would also have to use a
+            # window far longer than the 6h penalty half-life to leave auto-ban
+            # reachable at all (3 hard faults inside 18h), which is a different
+            # policy than this counter is asked to express.
             s["hard_fault_count"] = int(s.get("hard_fault_count", 0)) + 1
         s["last_fault_ts"] = now
         s["last_reason"] = reason
@@ -2833,6 +2851,52 @@ class LiquidityPlugin(BasePlugin):
         self.logger.warning(
             f"auto-banned channel peer {node_id[:12]}… after "
             f"{int(stats.get('hard_fault_count', 0))} hard fault(s)")
+
+    def _prune_peer_reliability_store(self, wallet: 'Abstract_Wallet') -> None:
+        """Drop channel-peer reliability rows that have gone idle and hold nothing.
+
+        The peer mirror of :meth:`_prune_reliability_store`, with one extra
+        condition that matters more here than anything else: a row carrying any
+        ``hard_fault_count`` is NEVER pruned, however idle. That tally is the
+        auto-ban input and it deliberately does not age (see
+        :meth:`_record_peer_fault`), so dropping its row would silently pardon a
+        peer sitting one force-close short of the threshold -- quietly undoing a
+        protection the operator is relying on. Idleness may retire a ranking
+        penalty; it must not retire the ban tally.
+
+        So a row goes only when all three hold: no fault and no success in
+        ``RELIABILITY_ROW_MAX_IDLE_SEC``, no remaining decayed penalty, and no
+        hard faults ever recorded.
+
+        Peer rows accumulate far more slowly than provider rows (one per channel
+        partner ever tried, against one per npub ever advertised), so this is
+        housekeeping rather than a pressing bound -- which is also why it can
+        afford to be this conservative.
+        """
+        data = self._load_peer_reliability(wallet)
+        if not data:
+            return
+        params = dict(self._peer_reliability_params())
+        params["enabled"] = True   # never let a disabled feature read as "no penalty"
+        now = time.time()
+        keep: Dict[str, Dict] = {}
+        for node_id, stats in data.items():
+            last_active = max(float(stats.get("last_fault_ts", 0.0) or 0.0),
+                              float(stats.get("last_success_ts", 0.0) or 0.0))
+            idle = now - last_active > RELIABILITY_ROW_MAX_IDLE_SEC
+            penalty = self._peer_penalty(node_id, stats, params, now)
+            hard = int(stats.get("hard_fault_count", 0) or 0)
+            if idle and hard == 0 and penalty < RELIABILITY_PRUNE_MIN_PENALTY_PCT:
+                continue
+            keep[node_id] = stats
+        if len(keep) == len(data):
+            return
+        dropped = len(data) - len(keep)
+        self.logger.info(
+            f"pruned {dropped} idle channel-peer reliability row(s) "
+            f"(no activity in {int(RELIABILITY_ROW_MAX_IDLE_SEC // 86400)} days, "
+            f"no remaining penalty, no hard faults)")
+        self._save_peer_reliability(wallet, keep)
 
     def clear_peer_reliability(self, wallet: 'Abstract_Wallet',
                                node_id: Optional[str] = None) -> None:
@@ -4581,10 +4645,13 @@ class LiquidityPlugin(BasePlugin):
                 # penalties folded into this tick's offers are up to date.
                 self._set_status(wallet, "reconciling pending swaps")
                 self._reconcile_pending_swaps(wallet)
-                # Housekeeping on the reliability store: drop rows that have been
-                # idle long enough to hold no information the ranking can use, so
-                # a churning provider set cannot grow the wallet file forever.
+                # Housekeeping on both reliability stores: drop rows that have
+                # been idle long enough to hold no information the ranking can
+                # use, so a churning provider set cannot grow the wallet file
+                # forever. The peer pass additionally never drops a row carrying
+                # an auto-ban tally.
                 self._prune_reliability_store(wallet)
+                self._prune_peer_reliability_store(wallet)
                 # Pay out any dev fee that has accrued past the batch threshold
                 # (runs as a guarded background task; never blocks this tick).
                 self._maybe_pay_dev_fee(wallet)

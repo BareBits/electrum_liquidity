@@ -517,16 +517,26 @@ providers**, **Channel partners** and **Advanced**):
   swaps, failed opens, force-closes) that feed the decaying reliability penalties
   used to rank providers and channel partners.
 
-  A provider's penalty fades on its own: it halves every
-  `reliability_halflife_hours` since the last fault, and the *escalation* fades
-  at the same rate — one doubling forgiven per elapsed half-life — so a provider
-  that stops failing climbs all the way back rather than resuming where it left
-  off months later. A success clears it outright. Provider faults only ever
+  A penalty fades on its own, for providers and channel partners alike: it halves
+  every `reliability_halflife_hours` since the last fault, and the *escalation*
+  fades at the same rate — one doubling forgiven per elapsed half-life — so
+  whoever stops failing climbs all the way back rather than resuming where they
+  left off months later. A success clears it outright. Provider faults only ever
   re-order the try list; unlike channel partners, a provider is never auto-banned.
-  Two stores behind this are bounded at 90 days: an unresolved pending-swap
+
+  A channel partner's **hard**-fault tally — force-closes, channel closed by the
+  peer, repeated open failures — is the exception that deliberately does *not*
+  fade. It is what `peer_autoban_faults` counts, and a force-close is remembered
+  for the life of the wallet; clear it from the **Channel partners** tab if you
+  want to give a peer a fresh start. Failing to *connect* is a soft fault and
+  never counts toward it.
+
+  Three stores behind this are bounded at 90 days: an unresolved pending-swap
   record older than that is dropped *unresolved* rather than blamed on anybody,
-  and a provider row with no fault, no success and no remaining penalty for that
-  long is dropped.
+  and provider or peer rows with no fault, no success and no remaining penalty
+  for that long are dropped. A peer row carrying any hard-fault tally is never
+  dropped, however idle — retiring it would silently pardon a peer one
+  force-close short of the ban threshold.
 
 Expanding a row (the disclosure triangle) shows the **state behind the
 decision**: on-chain spendable, channel counts (active / pending), in-flight
