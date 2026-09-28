@@ -20,8 +20,8 @@ import time
 from concurrent import futures
 from contextlib import asynccontextmanager
 from enum import Enum, auto
-from typing import (TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, List, Optional,
-                    Sequence, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, AsyncContextManager, AsyncIterator, Callable,
+                    Dict, List, Optional, Sequence, Set, Tuple)
 
 from electrum import util
 from electrum.i18n import _
@@ -240,6 +240,19 @@ SWAP_COOLDOWN_SEC = 180.0
 # ``self._reverse_swap_timeout_sec`` so tests can shrink it.
 REVERSE_SWAP_TIMEOUT_SEC = 300.0
 
+# How long to wait for the swap manager to report a provider's terms
+# (``sm.is_initialized``) before giving up on that provider for this attempt.
+# Exceeding it is the reachability signal -- but see ``_CascadeFaults``: on its
+# own it does NOT prove the provider is at fault, because our own relay being
+# down looks identical. Referenced via ``self._swap_init_timeout_sec`` so tests
+# can shrink it.
+SWAP_INIT_TIMEOUT_SEC = 15.0
+
+# The reason string recorded for a provider we could not reach. One constant
+# because it is now produced in ``_attempt_reverse_swap`` and consumed later, in
+# ``_commit_cascade_faults``.
+SWAP_UNREACHABLE_REASON = "not reachable (init timeout)"
+
 # Wall-clock ceiling on one channel's whole provider cascade (chosen provider
 # plus failovers). Checked BEFORE starting each attempt, never mid-attempt: once
 # an attempt is under way it runs to its own REVERSE_SWAP_TIMEOUT_SEC backstop,
@@ -330,6 +343,46 @@ class _SwapAttempt(Enum):
     COMMITTED = auto()   # funds committed (funded, accepted, or possibly in flight): STOP
     NEXT = auto()        # failed with nothing committed: safe to try the next provider
     ABORT = auto()       # our-side condition or unknown bug: stop trying providers
+
+
+class _CascadeFaults:
+    """Reachability faults buffered across ONE provider cascade, so a failure that
+    is really ours is not charged to every provider we happened to try.
+
+    The reachability signal is ``sm.is_initialized`` not firing within
+    ``SWAP_INIT_TIMEOUT_SEC``, which we reach over the nostr transport. A provider
+    that has gone away and OUR relay connection being down are indistinguishable
+    from that one observation -- and the readiness gate does not cover this,
+    because it checks the Electrum server connection and wallet sync, not relay
+    health. Charging the timeout immediately therefore let one local outage land a
+    hard, escalating fault on every provider in the cascade at once.
+
+    A cascade gives us the extra observation needed to tell those apart: if ANY
+    provider got past ``is_initialized``, the transport demonstrably works and
+    every timeout in that cascade is real evidence about its provider. If none
+    did, the common factor is us. So the buffer is committed unless the failure
+    was common-mode across at least two providers:
+
+        3 timed out, none reached -> suppressed (0 faults, diag event only)
+        2 timed out, 1 reached    -> 2 hard faults (the transport was fine)
+        1 attempt, timed out      -> 1 hard fault (one sample proves nothing
+                                     either way, so behave as before)
+
+    Only this one arm is buffered. Every other failure classification in
+    ``_attempt_reverse_swap`` is already provider-specific -- a rejection, a
+    cheat, a declined quote -- and a cascade cannot collect two samples of the
+    RPC-timeout arm anyway, since that arm stops the cascade when a swap object
+    was created.
+    """
+
+    def __init__(self) -> None:
+        self.init_timeouts: List[str] = []   # npubs that timed out, in attempt order
+        self.reached_init: bool = False      # some provider's terms did arrive
+
+    @property
+    def is_common_mode(self) -> bool:
+        """Whether the evidence points at our transport rather than at providers."""
+        return not self.reached_init and len(self.init_timeouts) >= 2
 
 
 # What one liquidity-sink payment attempt concluded, and hence what the ladder
@@ -515,6 +568,26 @@ PEER_RELIABILITY_DB_KEY = "inbound_liquidity_peer_reliability"
 # by payment_hash hex -> {npub, started_ts, node_id, channel_id}. Survives
 # restarts so a swap stuck across a restart is still attributed.
 PENDING_SWAPS_DB_KEY = "inbound_liquidity_pending_swap_providers"
+# Hard retention bound on ONE pending-swap record. Reconciliation normally
+# resolves a record within the stuck timeout (an hour by default), so anything
+# this old means reconciliation never ran on it -- automation was switched off,
+# or the wallet was closed, for months. Such a record cannot be attributed: the
+# swap manager has long since dropped an unfunded swap (``_fail_swap`` pops it),
+# so the "no funding yet" branch would read a months-dead event as a fresh
+# stuck-swap fault against a provider, stamped with today's timestamp and at
+# full escalating strength. It is dropped UNRESOLVED instead -- no fault, no
+# success -- which is also what keeps this store from growing without bound.
+PENDING_SWAP_MAX_AGE_SEC = 90 * 86400.0
+# Idle-row retention for the provider reliability store. A nostr provider set
+# churns, and every npub ever seen otherwise keeps a row forever. A row with no
+# fault and no success in this long AND no remaining penalty holds nothing the
+# ranking can use, so it is dropped. The penalty check is what makes this safe:
+# an operator running a very long half-life keeps their penalised rows.
+RELIABILITY_ROW_MAX_IDLE_SEC = 90 * 86400.0
+# Penalty (percentage points) below which a row counts as carrying none. Not
+# exactly 0.0: the decay is exponential and lands on denormal floats rather than
+# a clean zero, which would keep idle rows alive forever.
+RELIABILITY_PRUNE_MIN_PENALTY_PCT = 0.001
 # First time (epoch sec) each still-pending reverse swap was observed freezing
 # automation: payment_hash hex -> first_seen_ts. A swap whose funding is broadcast
 # but not yet swept freezes the engine (see the in-flight freeze); this lets a
@@ -1244,6 +1317,9 @@ class LiquidityPlugin(BasePlugin):
         # Coarse backstop on a whole reverse-swap attempt, as an instance
         # attribute so tests can shrink it (the module constant is the default).
         self._reverse_swap_timeout_sec: float = REVERSE_SWAP_TIMEOUT_SEC
+        # Per-provider wait for advertised terms to arrive, as an instance
+        # attribute so tests can shrink it (the module constant is the default).
+        self._swap_init_timeout_sec: float = SWAP_INIT_TIMEOUT_SEC
         self._sink_payment_timeout_sec: float = SINK_PAYMENT_TIMEOUT_SEC
         # wallet -> payment_hash hexes of stuck swaps we have already logged as
         # having aged out of the freeze, so the escape is logged once per swap (not
@@ -2442,13 +2518,55 @@ class LiquidityPlugin(BasePlugin):
             out.append(dataclasses.replace(o, reliability_penalty_pct=penalty))
         return out
 
+    def _aged_consecutive_faults(self, stats: Dict) -> int:
+        """The stored escalation counter with elapsed quiet time already forgiven:
+        one fault level per half-life, floored at 0.
+
+        This exists because the decay was previously applied to the penalty's
+        *magnitude* but not to its *exponent*, so the escalation had unbounded
+        memory: a provider with 3 old faults that went quiet for a month and then
+        faulted once jumped straight back to ``base·2^3`` (4% at the defaults),
+        having been judged on history the penalty function itself had already
+        forgiven down to zero.
+
+        One level per half-life is not an arbitrary rate -- it is the rate the
+        penalty function already uses, made explicit. Its two terms collapse:
+
+            base · 2^(n-1) · 0.5^(age/H)  ==  base · 2^((n-1) - age/H)
+
+        i.e. a half-life of silence is already worth exactly one fault level.
+        Subtracting whole elapsed half-lives from the counter at record time
+        therefore makes escalation agree with decay instead of contradicting it,
+        and needs no new tuning knob.
+
+        Deliberately applied on WRITE only, never on read. The stored counter
+        keeps meaning "levels as of ``last_fault_ts``", so the read path (the
+        penalty, the Providers tab) still applies the smooth fractional decay
+        against that timestamp; decaying on read as well would count the same
+        quiet time twice.
+        """
+        prev = int(stats.get("consecutive_faults", 0) or 0)
+        if prev <= 0:
+            return 0
+        last = float(stats.get("last_fault_ts", 0.0) or 0.0)
+        halflife = self._reliability_params()["halflife_sec"]
+        if last <= 0.0 or halflife <= 0.0:
+            # No timestamp to measure from, or decay switched off: leave the
+            # counter alone rather than inventing an age for it.
+            return prev
+        levels = int(max(0.0, time.time() - last) // halflife)
+        return max(0, prev - levels)
+
     def _record_provider_fault(self, wallet: 'Abstract_Wallet', npub: str, reason: str,
                                *, soft: bool = False) -> None:
         """Record a provider reliability fault.
 
         A normal (hard) fault escalates: it increments ``consecutive_faults``, so
         the decaying penalty doubles with each one -- the right response to a
-        provider we can pin real misbehaviour on (e.g. it went unreachable).
+        provider we can pin real misbehaviour on (e.g. it went unreachable). It
+        increments the counter as *aged* (:meth:`_aged_consecutive_faults`), not
+        as stored, so quiet time forgives escalation at the same rate it forgives
+        the penalty's magnitude.
 
         A *soft* fault is for an ambiguous signal we cannot cleanly attribute --
         chiefly a swap-creation ``SwapServerError``, which the server masks as a
@@ -2463,11 +2581,12 @@ class LiquidityPlugin(BasePlugin):
             return  # single-provider / URL mode has no per-provider identity
         data = self._load_reliability(wallet)
         s = data.get(npub, {})
+        prev = self._aged_consecutive_faults(s)
         if soft:
             # Floor at one decaying level; never escalate on repeats.
-            s["consecutive_faults"] = max(int(s.get("consecutive_faults", 0)), 1)
+            s["consecutive_faults"] = max(prev, 1)
         else:
-            s["consecutive_faults"] = int(s.get("consecutive_faults", 0)) + 1
+            s["consecutive_faults"] = prev + 1
         s["fault_count"] = int(s.get("fault_count", 0)) + 1
         s["last_fault_ts"] = time.time()
         s["last_reason"] = reason
@@ -2494,6 +2613,53 @@ class LiquidityPlugin(BasePlugin):
         if had_faults:
             self.logger.info(f"provider {npub[:12]}… recovered after {had_faults} fault(s)")
         self.on_log_changed(wallet)
+
+    def _prune_reliability_store(self, wallet: 'Abstract_Wallet') -> None:
+        """Drop provider-reliability rows that have gone idle and carry no penalty.
+
+        A row qualifies only when BOTH hold:
+
+          * neither a fault nor a success in ``RELIABILITY_ROW_MAX_IDLE_SEC``, and
+          * its current decayed penalty is negligible
+            (``RELIABILITY_PRUNE_MIN_PENALTY_PCT``).
+
+        The second condition is what makes this safe rather than merely tidy: an
+        operator running a very long half-life still has a real penalty on an old
+        fault, and pruning the row would silently pardon the provider. Idle *and*
+        unpenalised, on the other hand, is a row that holds nothing the ranking
+        can read -- only the lifetime ``fault_count`` / ``success_count`` display,
+        which is not worth unbounded growth as a nostr provider set churns.
+
+        The penalty is evaluated with reliability tracking forced ON, so that
+        temporarily disabling the feature (which makes every penalty read 0)
+        cannot turn this into a wipe of every penalised provider's history.
+
+        Runs on the tick, next to pending-swap reconciliation. Writes only when
+        something was actually removed.
+        """
+        data = self._load_reliability(wallet)
+        if not data:
+            return
+        params = dict(self._reliability_params())
+        params["enabled"] = True
+        now = time.time()
+        keep: Dict[str, Dict] = {}
+        for npub, stats in data.items():
+            last_active = max(float(stats.get("last_fault_ts", 0.0) or 0.0),
+                              float(stats.get("last_success_ts", 0.0) or 0.0))
+            idle = now - last_active > RELIABILITY_ROW_MAX_IDLE_SEC
+            penalty = self._provider_penalty(wallet, npub, stats, params, now)
+            if idle and penalty < RELIABILITY_PRUNE_MIN_PENALTY_PCT:
+                continue
+            keep[npub] = stats
+        if len(keep) == len(data):
+            return
+        dropped = len(data) - len(keep)
+        self.logger.info(
+            f"pruned {dropped} idle provider reliability row(s) "
+            f"(no activity in {int(RELIABILITY_ROW_MAX_IDLE_SEC // 86400)} days "
+            f"and no remaining penalty)")
+        self._save_reliability(wallet, keep)
 
     def clear_provider_reliability(self, wallet: 'Abstract_Wallet',
                                    npub: Optional[str] = None) -> None:
@@ -2832,6 +2998,25 @@ class LiquidityPlugin(BasePlugin):
                 self._accrue_dev_fee(
                     wallet, int(info.get("fee_basis_sat", 0) or 0),
                     source=f"swap {ph_hex[:10]}…")
+                del data[ph_hex]
+                changed = True
+            elif now - started_ts > PENDING_SWAP_MAX_AGE_SEC:
+                # Too old to attribute to anybody: drop it UNRESOLVED. See
+                # PENDING_SWAP_MAX_AGE_SEC -- the branches below would read a
+                # months-dead event as fresh evidence and charge a full-strength
+                # fault for it, stamped with today's date. Deliberately placed
+                # after the funded/redeemed check above, since a confirmed
+                # delivery is still a delivery however late we notice it (and the
+                # dev fee for it is still owed).
+                #
+                # A record with no usable started_ts (0.0, only reachable through
+                # a corrupted store) lands here too, which is the right home for
+                # it: previously it aged past every timeout instantly and faulted
+                # its provider on the very first tick.
+                self.logger.info(
+                    f"dropping pending-swap record {ph_hex[:10]}… unresolved: "
+                    f"{int((now - started_ts) // 86400)} days old, too stale to "
+                    f"attribute to a provider or a peer")
                 del data[ph_hex]
                 changed = True
             elif self._ln_payment_failed(wallet, ph_hex):
@@ -3781,8 +3966,9 @@ class LiquidityPlugin(BasePlugin):
 
         The failure is quiet and it blames the wrong party: the swap is accepted,
         never funded, and reconciliation later records a stuck-swap fault against
-        a provider that did nothing wrong (repeat faults de-prioritise, then ban
-        it).
+        a provider that did nothing wrong, sinking it in the ranking (providers
+        are only ever de-prioritised, never banned -- the auto-ban threshold
+        applies to channel peers alone).
 
         Rather than try to re-derive Electrum's per-HTLC commitment cost -- which
         is version-specific and would silently drift -- we simply stop sizing
@@ -4395,6 +4581,10 @@ class LiquidityPlugin(BasePlugin):
                 # penalties folded into this tick's offers are up to date.
                 self._set_status(wallet, "reconciling pending swaps")
                 self._reconcile_pending_swaps(wallet)
+                # Housekeeping on the reliability store: drop rows that have been
+                # idle long enough to hold no information the ranking can use, so
+                # a churning provider set cannot grow the wallet file forever.
+                self._prune_reliability_store(wallet)
                 # Pay out any dev fee that has accrued past the batch threshold
                 # (runs as a guarded background task; never blocks this tick).
                 self._maybe_pay_dev_fee(wallet)
@@ -4845,6 +5035,28 @@ class LiquidityPlugin(BasePlugin):
         # Wall-clock budget for the whole cascade, checked between attempts only.
         deadline = now + SWAP_CASCADE_DEADLINE_SEC
         total = len(attempts)
+        # Reachability faults are collected here and adjudicated after the loop,
+        # so our own relay outage cannot hard-fault every provider we tried.
+        faults = _CascadeFaults()
+        try:
+            await self._run_swap_cascade(
+                wallet, action, attempts, session, state, deadline, total, faults)
+        finally:
+            # In a finally so a failure partway through the cascade still commits
+            # (or discards) what was already buffered, rather than silently losing
+            # the reachability evidence collected up to that point.
+            self._commit_cascade_faults(wallet, action, faults)
+
+    async def _run_swap_cascade(
+            self, wallet: 'Abstract_Wallet', action: ReverseSwapAction,
+            attempts: List[Tuple[ProviderAttempt, Optional['SwapOffer']]],
+            session: 'AsyncContextManager[Any]', state: Optional[Dict],
+            deadline: float, total: int, faults: '_CascadeFaults') -> None:
+        """Walk the ranked providers under one transport session, stopping as soon
+        as an attempt commits funds or the cascade's wall-clock budget runs out.
+        Split out of ``_reverse_swap`` only so the buffered reachability faults can
+        be adjudicated in a ``finally`` around the whole walk."""
+        sm = wallet.lnworker.swap_manager
         async with session as tr:
             for index, (attempt, offer) in enumerate(attempts, start=1):
                 if time.monotonic() >= deadline:
@@ -4861,7 +5073,7 @@ class LiquidityPlugin(BasePlugin):
                     break
                 outcome = await self._attempt_reverse_swap(
                     wallet, action, attempt, offer, sm, tr, state,
-                    index=index, total=total)
+                    index=index, total=total, faults=faults)
                 if outcome is not _SwapAttempt.NEXT:
                     break
                 if index < total:
@@ -4869,12 +5081,45 @@ class LiquidityPlugin(BasePlugin):
                         f"failing over to the next provider for {action.short_id} "
                         f"({index + 1} of {total})")
 
+    def _commit_cascade_faults(self, wallet: 'Abstract_Wallet',
+                               action: ReverseSwapAction,
+                               faults: '_CascadeFaults') -> None:
+        """Adjudicate a finished cascade's buffered reachability faults.
+
+        Writes one hard fault per unreachable provider, UNLESS the failure was
+        common-mode -- at least two providers timed out and not one got past
+        ``is_initialized`` -- in which case the evidence points at our own nostr
+        transport and no provider is charged. See :class:`_CascadeFaults`.
+
+        The suppressed case is recorded as a diagnostic event rather than silently
+        dropped, because "we could not reach any provider" is exactly the sort of
+        local fault an operator needs to see in order to fix it.
+        """
+        if not faults.init_timeouts:
+            return
+        if faults.is_common_mode:
+            count = len(faults.init_timeouts)
+            self.logger.warning(
+                f"none of {count} provider(s) for {action.short_id} responded: "
+                f"treating this as OUR transport being unreachable, not as "
+                f"{count} provider faults; no reliability faults recorded")
+            self._diag_event(
+                wallet, category="error", kind="swap",
+                reason="provider reachability faults suppressed (common-mode failure)",
+                detail=(f"{count} provider(s) timed out waiting for terms and none "
+                        f"responded; the nostr transport is the likely cause"))
+            return
+        for npub in faults.init_timeouts:
+            self._record_provider_fault(wallet, npub, SWAP_UNREACHABLE_REASON)
+
     async def _attempt_reverse_swap(self, wallet: 'Abstract_Wallet',
                                     action: ReverseSwapAction,
                                     attempt: ProviderAttempt,
                                     offer: Optional['SwapOffer'],
                                     sm: Any, tr: Any, state: Optional[Dict],
-                                    *, index: int, total: int) -> '_SwapAttempt':
+                                    *, index: int, total: int,
+                                    faults: Optional['_CascadeFaults'] = None
+                                    ) -> '_SwapAttempt':
         """One provider's attempt at the swap. Returns what the cascade should do
         next -- see :class:`_SwapAttempt`.
 
@@ -4883,6 +5128,10 @@ class LiquidityPlugin(BasePlugin):
         returning NEXT from them risks no funds. The one ambiguous arm is the
         coarse timeout backstop, which can fire either side of that line; it is
         resolved by asking whether a swap object actually appeared.
+
+        ``faults`` is the cascade's shared reachability buffer (see
+        :class:`_CascadeFaults`); when it is None -- a direct call, as in the unit
+        tests -- an unreachable provider is faulted immediately, as before.
         """
         from electrum.util import UserFacingException
         from electrum.submarine_swaps import SwapServerError
@@ -4911,13 +5160,24 @@ class LiquidityPlugin(BasePlugin):
             # sm.is_initialized, which the wait below depends on.
             sm.update_pairs(offer.pairs)
         try:
-            await asyncio.wait_for(sm.is_initialized.wait(), timeout=15)
+            await asyncio.wait_for(sm.is_initialized.wait(),
+                                   timeout=self._swap_init_timeout_sec)
         except asyncio.TimeoutError:
-            # Unreachable provider is a reliability fault (timeout signal).
+            # An unreachable provider is a reliability fault -- but only if we can
+            # show the transport itself was working, which one attempt cannot. So
+            # the fault goes into the cascade's buffer and is adjudicated once the
+            # cascade has finished (see _CascadeFaults / _commit_cascade_faults).
             self.logger.warning(
                 f"swap provider {provider_label[:20]}… not reachable; skipping it")
-            self._record_provider_fault(wallet, npub, "not reachable (init timeout)")
+            if faults is None:
+                self._record_provider_fault(wallet, npub, SWAP_UNREACHABLE_REASON)
+            elif npub:
+                faults.init_timeouts.append(npub)
             return _SwapAttempt.NEXT
+        if faults is not None:
+            # This provider's terms arrived, so the transport is up: any timeout
+            # elsewhere in this cascade is about that provider, not about us.
+            faults.reached_init = True
         lightning_amount_sat = attempt.amount_sat
         expected_onchain_sat = sm.get_recv_amount(lightning_amount_sat, is_reverse=True)
         # get_recv_amount() returns None when this amount isn't swappable with

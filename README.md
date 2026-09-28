@@ -517,6 +517,17 @@ providers**, **Channel partners** and **Advanced**):
   swaps, failed opens, force-closes) that feed the decaying reliability penalties
   used to rank providers and channel partners.
 
+  A provider's penalty fades on its own: it halves every
+  `reliability_halflife_hours` since the last fault, and the *escalation* fades
+  at the same rate — one doubling forgiven per elapsed half-life — so a provider
+  that stops failing climbs all the way back rather than resuming where it left
+  off months later. A success clears it outright. Provider faults only ever
+  re-order the try list; unlike channel partners, a provider is never auto-banned.
+  Two stores behind this are bounded at 90 days: an unresolved pending-swap
+  record older than that is dropped *unresolved* rather than blamed on anybody,
+  and a provider row with no fault, no success and no remaining penalty for that
+  long is dropped.
+
 Expanding a row (the disclosure triangle) shows the **state behind the
 decision**: on-chain spendable, channel counts (active / pending), in-flight
 swaps, provider economics, the thresholds in force, and every channel's

@@ -76,6 +76,7 @@ def _plugin() -> LiquidityPlugin:
     p._last_offers = {}
     p._swap_cooldown_until = {}
     p._reverse_swap_timeout_sec = 0.05     # shrink so a stall trips at once
+    p._swap_init_timeout_sec = 0.01        # ditto for the wait on advertised terms
     p.config = SimpleNamespace()           # getattr defaults kick in
     return p
 

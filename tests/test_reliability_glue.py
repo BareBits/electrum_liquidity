@@ -57,6 +57,9 @@ def _plugin() -> LiquidityPlugin:
     p._last_offers = {}
     p._swap_cooldown_until = {}
     p._reverse_swap_timeout_sec = 30.0
+    # Per-provider wait for advertised terms; shrunk so an unreachable
+    # provider trips the init timeout instantly instead of in 15s.
+    p._swap_init_timeout_sec = 0.01
     p.config = SimpleNamespace()  # getattr defaults kick in
     return p
 
@@ -332,6 +335,199 @@ def test_soft_fault_logs_soft_prefix() -> None:
     log = w.db.get("inbound_liquidity_decision_log", [])
     fault_entries = [e for e in log if e.get("category") == "fault"]
     assert fault_entries and fault_entries[-1]["reason"].startswith("soft fault: ")
+
+
+# --- escalation ages out at the same rate as the penalty -------------------
+# The penalty's two terms collapse to base * 2^((n-1) - age/H), so a half-life of
+# silence is already worth exactly one fault level. Escalation now agrees: the
+# counter is incremented as AGED, not as stored. Previously it had unbounded
+# memory, so a provider forgiven down to a zero penalty still resumed at
+# base * 2^(old faults).
+def _backdate(p, w, npub: str, seconds: float) -> None:
+    data = p._load_reliability(w)
+    data[npub]["last_fault_ts"] = time.time() - seconds
+    p._save_reliability(w, data)
+
+
+HALFLIFE_SEC = 6 * 3600     # the shipped default
+
+
+def test_quiet_half_life_forgives_one_escalation_level() -> None:
+    p, w = _plugin(), _FakeWallet()
+    for _ in range(3):
+        p._record_provider_fault(w, NPUB, "x")
+    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 3
+    # Two quiet half-lives forgive two levels, so the next fault lands at 3-2+1.
+    _backdate(p, w, NPUB, 2 * HALFLIFE_SEC)
+    p._record_provider_fault(w, NPUB, "y")
+    stats = p._load_reliability(w)[NPUB]
+    assert stats["consecutive_faults"] == 2
+    assert stats["fault_count"] == 4              # lifetime tally is untouched
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_long_quiet_period_resets_escalation_to_the_base_level() -> None:
+    p, w = _plugin(), _FakeWallet()
+    for _ in range(3):
+        p._record_provider_fault(w, NPUB, "x")
+    # A month of silence at a 6h half-life is ~120 half-lives: fully forgiven, so
+    # a returning provider starts over at ONE level (0.5%), not 0.5 * 2^3 = 4%.
+    _backdate(p, w, NPUB, 30 * 86400)
+    p._record_provider_fault(w, NPUB, "y")
+    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 1
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_aging_does_not_forgive_faults_inside_one_half_life() -> None:
+    # Bursts still compound: the whole point of escalation is to punish a
+    # provider failing repeatedly *now*.
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "x")
+    _backdate(p, w, NPUB, HALFLIFE_SEC * 0.9)     # not yet a whole level
+    p._record_provider_fault(w, NPUB, "y")
+    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 2
+
+
+def test_soft_fault_after_a_quiet_period_does_not_resurrect_escalation() -> None:
+    # A soft fault floors at one level. Applied to the AGED counter, so a long
+    # quiet spell leaves a soft fault at exactly the base penalty rather than
+    # re-pinning whatever escalation the provider used to carry.
+    p, w = _plugin(), _FakeWallet()
+    for _ in range(4):
+        p._record_provider_fault(w, NPUB, "x")
+    _backdate(p, w, NPUB, 30 * 86400)
+    p._record_provider_fault(w, NPUB, "transient", soft=True)
+    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 1
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_aging_is_not_applied_on_read() -> None:
+    # The stored counter means "levels as of last_fault_ts"; the read path applies
+    # the smooth fractional decay against that timestamp. Decaying on read too
+    # would count the same quiet time twice.
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "x")
+    p._record_provider_fault(w, NPUB, "y")        # 2 levels -> 1.0% fresh
+    _backdate(p, w, NPUB, HALFLIFE_SEC)
+    rows = p.provider_reliability_rows(w)
+    assert rows[NPUB]["consecutive_faults"] == 2                     # unchanged
+    assert rows[NPUB]["penalty_pct"] == pytest.approx(0.5, abs=1e-3)  # 1.0 halved
+
+
+def test_aging_is_skipped_when_decay_is_disabled() -> None:
+    # halflife_hours = 0 switches decay off; with no decay there is nothing to
+    # forgive, so escalation must keep compounding.
+    p, w = _plugin(), _FakeWallet()
+    p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=0.0)
+    p._record_provider_fault(w, NPUB, "x")
+    _backdate(p, w, NPUB, 365 * 86400)
+    p._record_provider_fault(w, NPUB, "y")
+    assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 2
+
+
+# --- store housekeeping ----------------------------------------------------
+def test_prune_drops_idle_unpenalised_rows() -> None:
+    p, w = _plugin(), _FakeWallet()
+    now = time.time()
+    p._save_reliability(w, {
+        # Idle for well over the 90-day bound, and decayed to nothing: goes.
+        "stale": {"consecutive_faults": 2, "fault_count": 2,
+                  "last_fault_ts": now - 200 * 86400},
+        # Same age, but its last contact was a SUCCESS: still idle, still goes.
+        "stale-ok": {"success_count": 5, "last_success_ts": now - 200 * 86400},
+        # Recent fault: stays.
+        "fresh": {"consecutive_faults": 1, "fault_count": 1, "last_fault_ts": now},
+        # Old fault but a recent success, so not idle: stays.
+        "active": {"consecutive_faults": 0, "fault_count": 1, "success_count": 1,
+                   "last_fault_ts": now - 200 * 86400, "last_success_ts": now - 60},
+    })
+    p._prune_reliability_store(w)
+    assert set(p._load_reliability(w)) == {"fresh", "active"}
+
+
+def test_prune_keeps_an_idle_row_that_still_carries_a_penalty() -> None:
+    # A very long half-life means a 100-day-old fault is still penalised. Pruning
+    # it would silently pardon the provider, so idleness alone is not enough.
+    p, w = _plugin(), _FakeWallet()
+    p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0)
+    p._save_reliability(w, {
+        NPUB: {"consecutive_faults": 3, "fault_count": 3,
+               "last_fault_ts": time.time() - 100 * 86400},
+    })
+    assert p.provider_reliability_rows(w)[NPUB]["penalty_pct"] > 0.001   # premise
+    p._prune_reliability_store(w)
+    assert NPUB in p._load_reliability(w)
+
+
+def test_prune_is_not_a_wipe_when_reliability_is_switched_off() -> None:
+    # With the feature disabled every penalty reads 0. The prune must not take
+    # that as licence to delete a provider's live history.
+    p, w = _plugin(), _FakeWallet()
+    p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_ENABLED=False,
+                               INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0)
+    p._save_reliability(w, {
+        NPUB: {"consecutive_faults": 3, "fault_count": 3,
+               "last_fault_ts": time.time() - 100 * 86400},
+    })
+    p._prune_reliability_store(w)
+    assert NPUB in p._load_reliability(w)
+
+
+def test_prune_does_not_write_when_nothing_is_dropped() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._record_provider_fault(w, NPUB, "x")
+    saves_before = w.saved
+    p._prune_reliability_store(w)
+    assert w.saved == saves_before          # no pointless wallet write
+    assert NPUB in p._load_reliability(w)
+
+
+def test_prune_of_an_empty_store_is_a_noop() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p._prune_reliability_store(w)
+    assert w.saved == 0
+
+
+def test_reconcile_drops_ancient_pending_swap_without_blaming_anyone() -> None:
+    # 90+ days unresolved means reconciliation never ran on it (automation off, or
+    # the wallet closed for months). The swap manager has long since dropped an
+    # unfunded swap, so the stuck branch would read a months-dead event as a fresh
+    # full-strength fault, stamped today. Drop it unresolved instead.
+    p = _plugin()
+    w = _reconcile_wallet(None)              # sm.get_swap knows nothing about it
+    w.db.put(PENDING_SWAPS_DB_KEY,
+             {"abcd": {"npub": NPUB, "node_id": "peer", "started_ts": time.time() - 91 * 86400}})
+    p._record_peer_fault = lambda *a, **k: pytest.fail("peer must not be faulted")
+    p._reconcile_pending_swaps(w)
+    assert p._load_reliability(w) == {}      # no provider fault
+    assert p._load_pending_swaps(w) == {}    # and the record is gone
+
+
+def test_reconcile_drops_pending_swap_with_no_start_timestamp() -> None:
+    # Only reachable through a corrupted store. It used to age past every timeout
+    # instantly and fault its provider on the very first tick.
+    p = _plugin()
+    w = _reconcile_wallet(None)
+    w.db.put(PENDING_SWAPS_DB_KEY, {"abcd": {"npub": NPUB}})   # no started_ts
+    p._reconcile_pending_swaps(w)
+    assert p._load_reliability(w) == {}
+    assert p._load_pending_swaps(w) == {}
+
+
+def test_reconcile_still_credits_an_ancient_swap_that_did_fund() -> None:
+    # Age does not invalidate a confirmed delivery, and the dev fee for it is
+    # still owed -- so the funded check must sit ahead of the age bound.
+    p = _plugin()
+    w = _reconcile_wallet(SimpleNamespace(is_redeemed=True, funding_txid="txid"))
+    fees: List[int] = []
+    p._accrue_dev_fee = lambda wallet, amount_sat, source=None: fees.append(amount_sat)
+    w.db.put(PENDING_SWAPS_DB_KEY,
+             {"abcd": {"npub": NPUB, "started_ts": time.time() - 200 * 86400,
+                       "fee_basis_sat": 1234}})
+    p._reconcile_pending_swaps(w)
+    assert p._load_reliability(w)[NPUB]["success_count"] == 1
+    assert fees == [1234]
+    assert p._load_pending_swaps(w) == {}
 
 
 # --- _chan_unsettled_is_swap ----------------------------------------------

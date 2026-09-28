@@ -53,6 +53,9 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p._last_offers = {}
     p._swap_cooldown_until = {}
     p._reverse_swap_timeout_sec = 5.0
+    # Per-provider wait for advertised terms; shrunk so an unreachable
+    # provider trips the init timeout instantly instead of in 15s.
+    p._swap_init_timeout_sec = 0.01
     cfg = dict(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
@@ -229,24 +232,113 @@ def test_pre_payment_failure_fails_over_to_next_provider(failure, expect_fault) 
 
 def test_unreachable_provider_fails_over() -> None:
     """A provider whose pairs never initialise is skipped without ever issuing an
-    RPC, and the cascade moves on."""
+    RPC, and the cascade moves on.
+
+    Whether that skip also *faults* the provider is a separate question, decided
+    after the cascade by ``_commit_cascade_faults`` -- see the common-mode tests
+    below. Here only the walk itself is asserted."""
     sm = _SM({})
     sm.is_initialized = asyncio.Event()           # never set -> init timeout
-    real_wait_for = asyncio.wait_for
-
-    async def _fast_wait_for(aw, timeout):
-        # Only the 15s is_initialized wait is shortened; leave others alone.
-        return await real_wait_for(aw, 0.01 if timeout == 15 else timeout)
-
     p = _plugin()
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(asyncio, "wait_for", _fast_wait_for)
-        _run(p, sm, _action())
-    # Both attempts time out on init; both are faulted, neither reaches the RPC.
+    _run(p, sm, _action())
+    # Both attempts time out on init; neither ever reaches the RPC.
     assert sm.attempts == []
-    assert [n for n, _r, _k in p.faults] == [A, B]
+
+
+# --- reachability faults: provider at fault vs. our transport at fault -----
+# An is_initialized timeout is reached over OUR nostr transport, so one such
+# timeout cannot distinguish "this provider is gone" from "our relay is down".
+# The cascade supplies the missing observation: if nobody responded, the common
+# factor is us. See _CascadeFaults.
+def test_whole_cascade_unreachable_faults_nobody() -> None:
+    """Every provider timed out and none responded -> our transport is the likely
+    cause, so NO provider is charged. This is the regression that used to land a
+    hard, escalating fault on every provider in the cascade on each local
+    outage."""
+    sm = _SM({})
+    sm.is_initialized = asyncio.Event()           # never set -> all time out
+    p = _plugin()
+    _run(p, sm, _action(chosen=A, alternates=(B, C)))
+    assert sm.attempts == []
+    assert p.faults == []                         # nobody blamed for our outage
+    # ...but the operator can still see it happened.
+    assert any("common-mode" in d.get("reason", "") for d in p.diags), p.diags
+
+
+def test_unreachable_providers_are_faulted_when_one_responded() -> None:
+    """A provider that responded proves the transport works, so the timeouts in
+    that same cascade are real evidence about their own providers."""
+    # A and C never initialise; B does, and completes the swap.
+    reachable_for = {B}
+    real_event = asyncio.Event()
+    real_event.set()
+    never = asyncio.Event()
+
+    sm = _SM({})
+
+    class _Pairs(SimpleNamespace):
+        pass
+
+    # is_initialized is read per attempt, after update_pairs() has told us which
+    # provider is current -- mirroring the real transport, where the event is set
+    # once that provider's terms arrive.
+    def _current_event():
+        return real_event if sm._current in reachable_for else never
+    type(sm).is_initialized = property(lambda self: _current_event())
+    try:
+        p = _plugin()
+        _run(p, sm, _action(chosen=A, alternates=(B, C)))
+        # A timed out, B ran and succeeded, so the cascade stopped before C.
+        assert [n for n, _amt in sm.attempts] == [B]
+        assert p.successes == [B]
+        assert [n for n, _r, _k in p.faults] == [A]
+        assert "not reachable" in p.faults[0][1]
+        assert p.faults[0][2].get("soft") in (None, False)   # escalating
+        assert not any("common-mode" in d.get("reason", "") for d in p.diags)
+    finally:
+        del type(sm).is_initialized
+
+
+def test_single_unreachable_provider_is_still_faulted() -> None:
+    """One attempt is one sample: it proves nothing either way about the
+    transport, so the pre-existing behaviour stands and the provider is faulted.
+    Without this, a wallet with a single configured provider would never record a
+    reachability fault again."""
+    sm = _SM({})
+    sm.is_initialized = asyncio.Event()           # never set
+    p = _plugin()
+    _run(p, sm, _action(chosen=A, alternates=()))
+    assert [n for n, _r, _k in p.faults] == [A]
     assert "not reachable" in p.faults[0][1]
+    assert not any("common-mode" in d.get("reason", "") for d in p.diags)
+
+
+def test_reachability_faults_are_committed_even_if_the_cascade_raises() -> None:
+    """The buffer is adjudicated in a ``finally``, so evidence collected before an
+    unexpected failure is not silently lost."""
+    boom = RuntimeError("transport exploded")
+    sm = _SM({})
+    # A times out on init (buffered); B then reaches the RPC, which blows up in a
+    # way no arm catches -- get_recv_amount raising is outside every handler.
+    reachable_for = {B}
+    real_event = asyncio.Event()
+    real_event.set()
+    never = asyncio.Event()
+    type(sm).is_initialized = property(
+        lambda self: real_event if sm._current in reachable_for else never)
+
+    def _explode(amt, *, is_reverse):
+        raise boom
+    sm.get_recv_amount = _explode
+    try:
+        p = _plugin()
+        with pytest.raises(RuntimeError):
+            _run(p, sm, _action(chosen=A, alternates=(B,)))
+        # B reached init, so A's buffered timeout is real evidence and is written
+        # despite the cascade dying afterwards.
+        assert [n for n, _r, _k in p.faults] == [A]
+    finally:
+        del type(sm).is_initialized
 
 
 def test_unswappable_amount_fails_over() -> None:
