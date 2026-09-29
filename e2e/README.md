@@ -53,6 +53,7 @@ python run.py --no-gui            # headless (both daemons; no GUI)
 python run.py --exit-when-ready   # smoke: bring up, confirm readiness, tear down
 python run.py --no-gui --second-provider   # two competing swap providers
 python run.py --no-gui --gossip --channels 1   # real channel graph + a routed hop
+python run.py --no-gui --deep-hop --channels 1 # 4 nodes; the middle one won't forward
 ```
 
 Endpoints/nodeids/channels/swap-npub are written to `.run/ready.json`.
@@ -78,6 +79,7 @@ RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q -s
 | `test_liquidity_sink_e2e` | the plugin drains a channel by **paying a Lightning address**, halving the amount until one routes, and honours "disable submarine swaps" (`--gossip`) |
 | `test_sink_goal_gate_e2e` | with the liquidity goal **unmet** the plugin reverse-swaps and leaves a configured sink alone; once it is **met** the same config pays the sink instead — and unticking the switch pays it either way |
 | `test_goal_buffer_e2e` | the liquidity-goal **buffer** on a real wallet: the balance the send warning is measured against agrees with the running daemon, the buffer splits real on-chain/Lightning balances without losing a satoshi, the warning fires at exactly the real threshold, and Electrum's real Balance dialog grows the blue slice |
+| `test_ln_failure_hop_attribution_e2e` | a swap payment that dies **past** the first hop does not fault the channel peer, while one the peer reports itself still does (`--deep-hop`) |
 | `test_rig_unit`, `test_lnurl_stub` | fast rig-plumbing checks (no services launched) |
 
 ### Gossip mode (`--gossip`)
@@ -111,6 +113,59 @@ Two rig-specific wrinkles it handles, both chicken-and-egg problems:
 Bring-up ends with a small **probe payment** client → partner2. Counting
 channel_db rows only proves the topology is known; the probe proves it is
 routable, and fails loudly during bring-up rather than mid-test.
+
+### Deep-hop mode (`--deep-hop`, implies `--gossip`)
+
+Off by default. It adds a **fourth** node one hop beyond partner2, and — once the
+gossip graph is built and probed — stops partner2 forwarding:
+
+```
+client --[chans]--> partner --[hop]--> partner2 --[deep hop]--> partner3
+                      ^                   ^                        ^
+                 our channel          REFUSES to             cheapest swap
+                    peer               forward                 provider
+```
+
+partner3 undercuts every provider on fee (0.05%), so the plugin plans its swap
+against it — forcing the Lightning leg across partner2, which answers a relay
+request it will not serve with `OnionRoutingFailure(PERMANENT_CHANNEL_FAILURE)`.
+That is a real onion error encrypted with partner2's own shared secret, so the
+client decodes a `sender_idx` of **1**: a failure one hop *past* its channel peer.
+
+Refusing to forward is the mechanism because **capacity cannot be**. A swapserver
+advertises `max_forward = num_sats_can_receive()`, so the largest swap partner3
+will accept is by construction the most partner2 could still have forwarded to it
+— the two are the same number, and a starved hop would never actually fail. (And
+a private inbound channel cannot side-step it either:
+`calc_routing_hints_for_invoice` puts a routing hint in the invoice for *every*
+receiving channel, so the payer would simply route around the hop under test.)
+
+**The timing is the whole trick.** partner2 cannot be configured to refuse from
+the start, because forwarding and gossip are welded together: Electrum signals
+`GOSSIP_QUERIES_OPT` only when both are on, and `LNGossip` hangs up on a peer
+that does not offer it —
+
+```
+Disconnecting: GracefulDisconnect('remote does not support GOSSIP_QUERIES_REQ')
+```
+
+— so such a node never pushes its `channel_update`, the client never learns the
+policy for `partner2 → partner3`, and every payment dies as `NoPathFound` before
+an HTLC exists. No onion error, nothing to attribute. (Observed exactly that: a
+graph of 3 channels and 3 policies, all pointing the wrong way.) So the rig brings
+partner2 up forwarding normally, waits for the graph and the probe, then flips
+`lightning_forward_payments` off over RPC — `_maybe_forward_htlc` re-reads it on
+every HTLC, so no restart is needed and the collected gossip survives.
+
+Two further details:
+
+* The client's gossip node is seeded with **partner2 and partner3** as well as
+  partner, so the forward-direction policy across each hop actually arrives. The
+  graph wait expects one extra policy in this mode for that reason.
+* The first hop is opened **roomy** here (0.02 BTC forwardable, against gossip
+  mode's 0.003) so our own channel peer is never the binding constraint — with
+  the tight default a ~750k swap fails at the partner and the test proves the
+  opposite of what it means to.
 
 > On the rig's small (0.02 BTC) channels a reverse swap's effective all-in cost
 > is several percent (a fixed ~45k-sat prepayment dominates), so at the default

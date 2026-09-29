@@ -39,6 +39,9 @@ class Endpoints:
     # so Endpoints stays a fixed shape; simply unused when the flag is off.
     ln_listen_partner2: int = 0
     swapserver_port2: int = 0
+    # Fourth node (``--deep-hop`` only), one hop beyond partner2.
+    ln_listen_partner3: int = 0
+    swapserver_port3: int = 0
 
     @property
     def nostr_relay_url(self) -> str:
@@ -303,9 +306,13 @@ PARTNER = ElectrumInstance("partner", paths.PARTNER_DATADIR, paths.PARTNER_WALLE
 # Second swap provider; only brought up under ``--second-provider``.
 PARTNER2 = ElectrumInstance("partner2", paths.PARTNER2_DATADIR,
                             paths.PARTNER2_WALLET_NAME)
+# Fourth node; only brought up under ``--deep-hop``. Reached ONLY through
+# partner2, so a payment to it traverses two forwarding nodes.
+PARTNER3 = ElectrumInstance("partner3", paths.PARTNER3_DATADIR,
+                            paths.PARTNER3_WALLET_NAME)
 
 # Every instance that runs a swapserver, i.e. advertises swap offers on nostr.
-PROVIDERS: tuple[ElectrumInstance, ...] = (PARTNER, PARTNER2)
+PROVIDERS: tuple[ElectrumInstance, ...] = (PARTNER, PARTNER2, PARTNER3)
 
 
 def wallet_path(inst: ElectrumInstance) -> str:
@@ -336,7 +343,8 @@ def electrum_cli(*args: str, inst: ElectrumInstance, offline: bool = False,
     return result.stdout.strip()
 
 
-def _common_config_pairs(ep: Endpoints, *, gossip: bool = False) -> list[tuple[str, str]]:
+def _common_config_pairs(ep: Endpoints, *, gossip: bool = False,
+                         forwarding: Optional[bool] = None) -> list[tuple[str, str]]:
     """Config shared by both wallets.
 
     * ``server``/``oneserver``/``auto_connect=false`` pin Electrum to our
@@ -365,9 +373,14 @@ def _common_config_pairs(ep: Endpoints, *, gossip: bool = False) -> list[tuple[s
     public (announced) channel without it ("Cannot create public channels"), and
     an intermediate node will not forward an HTLC for anyone else without it.
     Gossip alone would give us a graph nobody would route over.
+
+    Note this is a START-UP setting only. ``--deep-hop`` needs one node to stop
+    forwarding, but it cannot ask for it here: see :func:`disable_forwarding`.
     """
-    forwarding = [("lightning_forward_payments", "true")] if gossip else []
-    return forwarding + [
+    forward_on = gossip if forwarding is None else forwarding
+    forwarding_pairs = ([("lightning_forward_payments",
+                          "true" if forward_on else "false")] if gossip else [])
+    return forwarding_pairs + [
         ("server", ep.electrum_server),
         ("oneserver", "true"),
         ("auto_connect", "false"),
@@ -440,6 +453,42 @@ def set_client_channel_peer(connect_str: str) -> None:
                  inst=CLIENT, offline=True)
 
 
+def disable_forwarding(inst: ElectrumInstance) -> None:
+    """Stop a RUNNING node from relaying HTLCs, so a payment through it dies with
+    an onion error of its own making.
+
+    ``_maybe_forward_htlc`` answers a relay it will not serve with
+    ``OnionRoutingFailure(PERMANENT_CHANNEL_FAILURE)`` -- a real onion error
+    encrypted with that node's shared secret, so the payer decodes a
+    ``sender_idx`` pointing squarely at it. That is deterministic in a way
+    starving the hop of capacity can never be: a swapserver advertises
+    ``max_forward = num_sats_can_receive()``, so the largest payment the node
+    behind the hop will accept is by construction the most the hop could still
+    have forwarded.
+
+    Why at RUNTIME rather than in the start-up config, which would be simpler:
+    the two cannot coexist at start-up. Electrum signals ``GOSSIP_QUERIES_OPT``
+    only when forwarding AND gossip are both on (lnworker), and ``LNGossip``
+    hangs up on a peer that does not offer it --
+
+        Disconnecting: GracefulDisconnect('remote does not support GOSSIP_QUERIES_REQ')
+
+    -- so a node configured this way from the start is dropped by the client's
+    gossip node before it can push its own ``channel_update``. The client then
+    never learns the policy for the forward direction across that node's channel,
+    every payment through it dies as ``NoPathFound`` before an HTLC exists, and
+    there is no onion error to attribute at all. (Observed exactly that: a graph
+    of 3 channels and 3 policies, all pointing the wrong way.)
+
+    Flipping it after the graph is built sidesteps the whole problem.
+    ``_maybe_forward_htlc`` reads ``EXPERIMENTAL_LN_FORWARD_PAYMENTS`` from the
+    live config on every HTLC, and ``setconfig`` on a running daemon mutates that
+    same object -- so no restart is needed, and the gossip already collected
+    stays collected.
+    """
+    electrum_cli("setconfig", "lightning_forward_payments", "false", inst=inst)
+
+
 def set_gossip_seed_peers(inst: ElectrumInstance,
                           peers: list[tuple[str, int, str]]) -> None:
     """Seed a node's ``lightning_peers`` so its gossip node has somebody to ask.
@@ -498,6 +547,15 @@ def partner_lightning_invoice(sat: int, *, memo: str = "electrum_liquidity dev f
     return lightning_invoice(sat, inst=PARTNER, memo=memo)
 
 
+def partner3_lightning_invoice(sat: int,
+                               *, memo: str = "electrum_liquidity deep hop") -> str:
+    """Mint a bolt11 invoice for ``sat`` from the FOURTH node. Reaching it means
+    client -> partner -> partner2 -> partner3, so any failure partner2 reports
+    carries a ``sender_idx`` of 1: past our channel peer, which is the whole
+    point of ``--deep-hop``."""
+    return lightning_invoice(sat, inst=PARTNER3, memo=memo)
+
+
 def partner2_lightning_invoice(sat: int,
                                *, memo: str = "electrum_liquidity sink") -> str:
     """Mint a bolt11 invoice for ``sat`` from the SECOND provider's daemon. The
@@ -507,32 +565,48 @@ def partner2_lightning_invoice(sat: int,
     return lightning_invoice(sat, inst=PARTNER2, memo=memo)
 
 
-# Advertised swap fee per provider, in millionths. PARTNER2 deliberately
-# undercuts PARTNER so the plugin's cheapest-first ranking always picks PARTNER2
-# — which is what lets a failover test control WHICH provider is tried first.
+# Advertised swap fee per provider, in millionths. Each one undercuts the last,
+# so the plugin's cheapest-first ranking picks the FURTHEST node away -- which is
+# what lets a test control which provider is tried first, and (in --deep-hop)
+# force the swap's Lightning leg across two forwarding nodes.
 PARTNER_FEE_MILLIONTHS: int = 5000     # 0.5%
-PARTNER2_FEE_MILLIONTHS: int = 1000    # 0.1% -- always ranked ahead of PARTNER
+PARTNER2_FEE_MILLIONTHS: int = 1000    # 0.1% -- ranked ahead of PARTNER
+PARTNER3_FEE_MILLIONTHS: int = 500     # 0.05% -- ranked ahead of both
+
+
+def _provider_ports(ep: Endpoints, inst: ElectrumInstance) -> tuple[int, int]:
+    """``(lightning_listen_port, swapserver_port)`` for one provider."""
+    return {
+        PARTNER: (ep.ln_listen_partner, ep.swapserver_port),
+        PARTNER2: (ep.ln_listen_partner2, ep.swapserver_port2),
+        PARTNER3: (ep.ln_listen_partner3, ep.swapserver_port3),
+    }[inst]
+
+
+PROVIDER_FEE_MILLIONTHS: dict[ElectrumInstance, int] = {
+    PARTNER: PARTNER_FEE_MILLIONTHS,
+    PARTNER2: PARTNER2_FEE_MILLIONTHS,
+    PARTNER3: PARTNER3_FEE_MILLIONTHS,
+}
 
 
 def _partner_config_pairs(ep: Endpoints,
                           inst: ElectrumInstance = PARTNER,
-                          *, gossip: bool = False) -> list[tuple[str, str]]:
+                          *, gossip: bool = False,
+                          forwarding: Optional[bool] = None) -> list[tuple[str, str]]:
     """Swap-provider extras: enable the (cmdline-only) swapserver plugin, give it
     an HTTP port, and advertise LN<->onchain swaps at its configured rate."""
-    second = inst is PARTNER2
-    return _common_config_pairs(ep, gossip=gossip) + [
-        ("lightning_listen",
-         f"127.0.0.1:{ep.ln_listen_partner2 if second else ep.ln_listen_partner}"),
+    ln_port, swap_port = _provider_ports(ep, inst)
+    return _common_config_pairs(ep, gossip=gossip, forwarding=forwarding) + [
+        ("lightning_listen", f"127.0.0.1:{ln_port}"),
         ("plugins.swapserver.enabled", "true"),
-        ("plugins.swapserver.port",
-         str(ep.swapserver_port2 if second else ep.swapserver_port)),
-        ("plugins.swapserver.fee_millionths",
-         str(PARTNER2_FEE_MILLIONTHS if second else PARTNER_FEE_MILLIONTHS)),
+        ("plugins.swapserver.port", str(swap_port)),
+        ("plugins.swapserver.fee_millionths", str(PROVIDER_FEE_MILLIONTHS[inst])),
     ]
 
 
 def setup_wallet(ep: Endpoints, inst: ElectrumInstance, *,
-                 gossip: bool = False) -> str:
+                 gossip: bool = False, forwarding: Optional[bool] = None) -> str:
     """Create a fresh (unencrypted) wallet offline, write config, return a
     funding address."""
     Path(wallet_path(inst)).parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +618,8 @@ def setup_wallet(ep: Endpoints, inst: ElectrumInstance, *,
     except json.JSONDecodeError:
         pass
 
-    pairs = (_partner_config_pairs(ep, inst, gossip=gossip) if inst in PROVIDERS
+    pairs = (_partner_config_pairs(ep, inst, gossip=gossip, forwarding=forwarding)
+             if inst in PROVIDERS
              else _client_config_pairs(ep, gossip=gossip))
     for key, value in pairs:
         electrum_cli("setconfig", key, value, inst=inst, offline=True)

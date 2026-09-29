@@ -19,8 +19,10 @@ from rig.services import (  # noqa: E402
     CLIENT,
     PARTNER,
     PARTNER2,
+    PARTNER3,
     PARTNER_FEE_MILLIONTHS,
     PARTNER2_FEE_MILLIONTHS,
+    PROVIDER_FEE_MILLIONTHS,
     PROVIDERS,
     Endpoints,
     _client_config_pairs,
@@ -34,6 +36,7 @@ def _endpoints() -> Endpoints:
         btc_rpc=18001, btc_p2p=18002, fulcrum_tcp=18003, fulcrum_admin=18004,
         nostr=18005, ln_listen_client=18006, ln_listen_partner=18007,
         swapserver_port=18008, ln_listen_partner2=18009, swapserver_port2=18010,
+        ln_listen_partner3=18011, swapserver_port3=18012,
     )
 
 
@@ -114,11 +117,23 @@ def test_partner_config_still_defaults_to_the_first_provider():
     assert dict(_partner_config_pairs(ep)) == dict(_partner_config_pairs(ep, PARTNER))
 
 
-def test_both_providers_run_a_swapserver_and_are_distinct():
-    assert PROVIDERS == (PARTNER, PARTNER2)
-    assert PARTNER2.datadir != PARTNER.datadir
-    assert PARTNER2.wallet_name != PARTNER.wallet_name
+def test_every_provider_runs_a_swapserver_and_is_distinct():
+    assert PROVIDERS == (PARTNER, PARTNER2, PARTNER3)
+    datadirs = [p.datadir for p in PROVIDERS]
+    wallets = [p.wallet_name for p in PROVIDERS]
+    assert len(set(datadirs)) == len(datadirs)
+    assert len(set(wallets)) == len(wallets)
     assert wallet_path(PARTNER2).endswith("regtest/wallets/electrum_liqtest_swap_partner2")
+    assert wallet_path(PARTNER3).endswith("regtest/wallets/electrum_liqtest_swap_partner3")
+
+
+def test_providers_undercut_each_other_in_order():
+    """Ranking is cheapest-first, so the fee ladder is what decides WHICH
+    provider a test's swap is planned against -- partner3 being cheapest is the
+    only reason a deep-hop swap crosses partner2 at all."""
+    assert (PROVIDER_FEE_MILLIONTHS[PARTNER3]
+            < PROVIDER_FEE_MILLIONTHS[PARTNER2]
+            < PROVIDER_FEE_MILLIONTHS[PARTNER])
 
 
 def test_second_provider_is_off_by_default():
@@ -127,6 +142,36 @@ def test_second_provider_is_off_by_default():
     import run as run_mod  # noqa: PLC0415 -- rig entrypoint, imported lazily
     assert run_mod.parse_args(["--no-gui"]).second_provider is False
     assert run_mod.parse_args(["--no-gui", "--second-provider"]).second_provider is True
+
+
+def test_deep_hop_is_off_by_default_and_implies_gossip():
+    """It costs a fourth daemon and another announced channel, so it must be
+    opt-in -- and it cannot work without the real channel graph, so asking for
+    one must bring the other."""
+    import run as run_mod  # noqa: PLC0415 -- rig entrypoint, imported lazily
+    plain = run_mod.parse_args(["--no-gui"])
+    assert plain.deep_hop is False
+    assert plain.gossip is False
+    deep = run_mod.parse_args(["--no-gui", "--deep-hop"])
+    assert deep.deep_hop is True
+    assert deep.gossip is True, "deep-hop needs announced channels to route over"
+
+
+def test_every_node_starts_up_forwarding_in_gossip_mode():
+    """Including partner2, which deep-hop mode later stops.
+
+    It cannot be configured to refuse from the start: Electrum only signals
+    GOSSIP_QUERIES_OPT when forwarding and gossip are both on, and LNGossip hangs
+    up on a peer that does not offer it -- so such a node never pushes its
+    channel_update, the client never learns the forward policy across its
+    channel, and payments die as NoPathFound with no onion error to attribute.
+    The rig flips it at RUNTIME instead, once the graph is built.
+    """
+    ep = _endpoints()
+    for inst in (PARTNER, PARTNER2, PARTNER3):
+        pairs = dict(_partner_config_pairs(ep, inst, gossip=True))
+        assert pairs["lightning_forward_payments"] == "true"
+        assert pairs["use_gossip"] == "true"
 
 
 # -- wallet paths / instances ----------------------------------------------

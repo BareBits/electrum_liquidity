@@ -252,6 +252,14 @@ SWAP_INIT_TIMEOUT_SEC = 15.0
 # ``_commit_cascade_faults``.
 SWAP_UNREACHABLE_REASON = "not reachable (init timeout)"
 
+# The reason string recorded against a channel PEER whose first hop failed our
+# reverse-swap payment. It names the hop deliberately: the old wording, a bare
+# "reverse-swap Lightning payment failed", was charged for any failed payment
+# whatever and read as if the plugin blamed partners for swap trouble generally.
+# It is now only ever written when the onion error came from the peer itself --
+# see ``_ln_failure_attribution``.
+PEER_LN_FAILURE_REASON = "reverse-swap Lightning payment failed at this peer (first hop)"
+
 # How long to keep waiting for a reverse swap's mining-fee PREPAYMENT to resolve
 # once its main payment has finished, before giving up on knowing the answer.
 #
@@ -422,6 +430,44 @@ class _SwapAttempt(Enum):
     # ``_unfunded_swap_outcome`` resolves it into one of the others by waiting
     # (see PREPAY_RESOLVE_WAIT_SEC); it must never reach the cascade loop.
     PREPAY_PENDING = auto()
+
+
+# Who a failed reverse-swap Lightning payment is evidence against, decided from
+# the ``sender_idx`` Electrum decodes out of the onion error (the index into the
+# route of the node that REPORTED the failure). ``route[0].node_id`` is the node
+# at the far end of our own channel -- lnworker looks the peer up by exactly that
+# (``get_peer_by_pubkey(shi.route[0].node_id)``) -- and that holds for trampoline
+# payments too, because ``create_trampoline_route`` builds hop 0 as
+# ``my_pubkey -> my_trampoline``, the trampoline we are directly connected to.
+#
+# So sender_idx == 0 means OUR channel peer reported the error. That covers both
+# "our channel to it would not carry the HTLC" and "it refused to forward onward",
+# which are both the peer declining to move our money and both worth ranking on.
+# sender_idx >= 1 means a node further out failed and our peer forwarded fine.
+class _LnFailureAttribution(Enum):
+    NOT_FAILED = auto()        # the payment has not definitively failed (yet)
+    # It failed, but no attempt carries a decodable sender_idx -- an undecodable
+    # onion error, or update_fail_malformed_htlc, where Electrum itself gives up
+    # on attribution ("well... who to penalise now?"). We cannot name a culprit.
+    UNATTRIBUTABLE = auto()
+    PEER = auto()              # every decodable failure was reported by our peer
+    DOWNSTREAM = auto()        # at least one came from deeper in the route
+    # Hop 0 on a ONE-hop route: the erring node is simultaneously our channel peer
+    # and the payment's destination, i.e. the swap provider's own Lightning node.
+    # That is the provider rejecting our payment, not a partner failing to route
+    # it, and ``_charge_payment_failure`` has already charged the provider a soft
+    # fault for it -- so charging the peer store too would demote one node twice
+    # for one event.
+    PEER_IS_DESTINATION = auto()
+
+    @property
+    def is_resolved(self) -> bool:
+        """Whether this conclusion settles a pending-swap record on its own. The
+        two that do not -- not failed, and failed with nothing decodable -- leave
+        the record for the stuck-timeout arm to deal with."""
+        return self in (_LnFailureAttribution.PEER,
+                        _LnFailureAttribution.DOWNSTREAM,
+                        _LnFailureAttribution.PEER_IS_DESTINATION)
 
 
 class _CascadeFaults:
@@ -3122,11 +3168,68 @@ class LiquidityPlugin(BasePlugin):
         # Route attempts were logged and none is in flight: we gave up.
         return bool(getattr(lnworker, "logs", {}).get(payment_hash_hex))
 
+    def _ln_failure_attribution(self, wallet: 'Abstract_Wallet',
+                                payment_hash_hex: str) -> _LnFailureAttribution:
+        """Who a failed reverse-swap Lightning payment is evidence against.
+
+        "Our payment failed" on its own does NOT prove our channel peer misbehaved:
+        the HTLC may have died several hops out, where the peer forwarded it
+        perfectly well. Electrum already decodes the culprit for us -- it decrypts
+        the onion error and records ``HtlcLog.sender_idx``, the route index of the
+        node that reported the failure -- so read that rather than blaming whoever
+        happened to be at the near end of the route.
+
+        One payment leaves a LIST of HtlcLogs (one per retry and per MPP shard),
+        so the verdicts have to be aggregated. The peer is charged only when the
+        evidence is unanimous: at least one decodable failure, and every decodable
+        failure reported by the peer. A single downstream failure in the set
+        pardons it -- a peer that carried even one shard out into the network is
+        demonstrably forwarding, and a soft fault is not worth a wrong call.
+
+        Attempts with no decodable ``sender_idx`` are not counted either way: they
+        are silent, not exculpatory. If they are ALL that we have, the answer is
+        UNATTRIBUTABLE and the caller leaves the record alone.
+        """
+        if not self._ln_payment_failed(wallet, payment_hash_hex):
+            return _LnFailureAttribution.NOT_FAILED
+        lnworker = getattr(wallet, "lnworker", None)
+        logs = getattr(lnworker, "logs", None) or {}
+        hops: List[int] = []
+        route_lens: List[int] = []
+        for entry in logs.get(payment_hash_hex, ()) or ():
+            # A successful shard of an overall-failed payment is not evidence
+            # against anyone, so only failed attempts are read.
+            if getattr(entry, "success", False):
+                continue
+            sender_idx = getattr(entry, "sender_idx", None)
+            route = getattr(entry, "route", None) or ()
+            if sender_idx is None or not route:
+                continue
+            try:
+                hops.append(int(sender_idx))
+            except (TypeError, ValueError):
+                continue  # unusable; treat as silent, like a missing sender_idx
+            route_lens.append(len(route))
+        if not hops:
+            return _LnFailureAttribution.UNATTRIBUTABLE
+        if any(h != 0 for h in hops):
+            return _LnFailureAttribution.DOWNSTREAM
+        # Unanimously hop 0. If every such attempt was a single-hop route, the
+        # node that reported the error is also the payment's destination -- the
+        # swap provider itself, already charged by ``_charge_payment_failure``.
+        # One multi-hop attempt is enough to show the peer failing as a FORWARDER,
+        # which is a genuine partner-quality signal, so any of those decides it.
+        if all(n <= 1 for n in route_lens):
+            return _LnFailureAttribution.PEER_IS_DESTINATION
+        return _LnFailureAttribution.PEER
+
     def _reconcile_pending_swaps(self, wallet: 'Abstract_Wallet') -> None:
         """Resolve tracked reverse swaps against the swap manager's state:
-        funded/redeemed => the provider delivered (success); no funding within
-        the stuck-timeout => the provider left it stuck (fault). Idempotent: each
-        tracked swap is recorded once and then dropped."""
+        funded/redeemed => the provider delivered (success); our payment failed at
+        the first hop => the channel peer's fault; our payment failed further out
+        (or against the provider's own node) => nobody's fault, just closed; no
+        funding within the stuck-timeout => the provider left it stuck (fault).
+        Idempotent: each tracked swap is recorded once and then dropped."""
         data = self._load_pending_swaps(wallet)
         if not data:
             return
@@ -3139,6 +3242,12 @@ class LiquidityPlugin(BasePlugin):
             npub = info.get("npub", "")
             node_id = info.get("node_id", "")
             started_ts = float(info.get("started_ts", 0.0) or 0.0)
+            # Computed up front rather than inside the chain below because the
+            # two inconclusive verdicts must fall THROUGH to the stuck-timeout
+            # arm, which an ``elif`` that had already consumed the branch could
+            # not do. Pure reads of lnworker state, so hoisting them is free of
+            # side effects and the branch ORDER below is unchanged.
+            attribution = self._ln_failure_attribution(wallet, ph_hex)
             swap = None
             try:
                 swap = sm.get_swap(bytes.fromhex(ph_hex))
@@ -3175,16 +3284,47 @@ class LiquidityPlugin(BasePlugin):
                     f"attribute to a provider or a peer")
                 del data[ph_hex]
                 changed = True
-            elif self._ln_payment_failed(wallet, ph_hex):
-                # Our Lightning payment failed before any funding: the channel
-                # peer couldn't route it. Charge the *peer*, not the provider --
-                # the provider never got the chance to (mis)behave. Resolves at
-                # once, without waiting out the provider stuck timeout.
-                self._record_peer_fault(
-                    wallet, node_id, "reverse-swap Lightning payment failed", hard=False)
+            elif attribution.is_resolved:
+                # Our Lightning payment failed before any funding, and the onion
+                # error says WHO failed it. The provider never got the chance to
+                # (mis)behave either way, so it is never charged from here; all
+                # three arms resolve at once, without waiting out its stuck
+                # timeout. Only the first is a fault.
+                if attribution is _LnFailureAttribution.PEER:
+                    self._record_peer_fault(
+                        wallet, node_id, PEER_LN_FAILURE_REASON, hard=False)
+                elif attribution is _LnFailureAttribution.DOWNSTREAM:
+                    # Our peer forwarded it; a node further out killed it. Nobody
+                    # we rank is implicated, so the record is simply closed.
+                    self.logger.info(
+                        f"swap {ph_hex[:10]}… : Lightning payment failed beyond "
+                        f"our channel peer, so peer {node_id[:12]}… is not faulted")
+                    self._diag_event(
+                        wallet, category="swap", kind="attribution", source=node_id,
+                        reason="peer fault suppressed (failure was downstream)",
+                        detail=("the onion error was reported by a node past the "
+                                "first hop, so our channel peer forwarded the HTLC"))
+                else:  # PEER_IS_DESTINATION
+                    self.logger.info(
+                        f"swap {ph_hex[:10]}… : Lightning payment was rejected by "
+                        f"the provider's own node, which is also our peer "
+                        f"{node_id[:12]}…; not faulted twice")
+                    self._diag_event(
+                        wallet, category="swap", kind="attribution", source=node_id,
+                        reason="peer fault suppressed (peer is the swap provider)",
+                        detail=("the erring node was the payment destination on a "
+                                "single-hop route, already charged as a provider "
+                                "soft fault"))
                 del data[ph_hex]
                 changed = True
             elif now - started_ts > params["stuck_timeout_sec"]:
+                # Reached either because nothing was ever attempted, or because a
+                # payment failed UNATTRIBUTABLY -- no decodable sender_idx on any
+                # attempt, so there is no evidence naming the peer and the record
+                # falls through to here rather than guessing. The swap still never
+                # funded, which is the provider's side of the bargain, so the
+                # provider is charged exactly as it was before this attribution
+                # existed.
                 self._record_provider_fault(
                     wallet, npub,
                     f"stuck: no on-chain funding within "
