@@ -105,6 +105,9 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p.declines = []      # (DeclineRecord, state)
     p._log_decline = lambda wallet, decline, state: \
         p.declines.append((decline, state))
+    # Real one-slot dedupe, not a stub: a channel whose swaps keep failing is
+    # re-evaluated every cooldown, and one row per cycle would flood the log.
+    p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
     return p
 
@@ -1044,3 +1047,70 @@ def test_attempt_rungs_refuses_a_reduction_that_does_not_shrink() -> None:
             ProviderAttempt(npub=A, amount_sat=400_000, all_in_cost_pct=0.4,
                             reduced_amount_sat=bad,
                             reduced_all_in_cost_pct=0.45)) == [(400_000, 0.4)]
+
+
+# --- the executor's own declines are de-duplicated ------------------------
+# A channel whose swaps keep failing is re-evaluated every SWAP_COOLDOWN_SEC. One
+# decline row per cycle would push real history out of the 2000-entry decision log
+# within days -- the same flood the engine's declines are already protected from,
+# except _filter_new_declines cannot help here: it is rebuilt from the engine's own
+# output every tick, so a row written straight from the executor would be discarded
+# from that set and then re-logged forever.
+def _run_unfunded_cascade(p, ln_payment: str = "inflight") -> None:
+    sm = _SM({A: _accept_without_funding})
+    _run(p, sm, _action(alternates=()), ln_payment=ln_payment)
+    p._swap_cooldown_until.clear()          # next cycle
+
+
+def test_an_identical_consecutive_executor_decline_is_not_relogged() -> None:
+    p = _plugin()
+    for _ in range(4):
+        _run_unfunded_cascade(p)
+    assert len(p.declines) == 1, \
+        f"a steadily-failing channel logged {len(p.declines)} rows, not 1"
+
+
+def test_a_failure_after_a_success_is_logged_afresh() -> None:
+    """The dedupe must not swallow a recurrence: once the channel has actually
+    completed a swap, the next failure is news."""
+    p = _plugin()
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 1
+
+    # A funded swap on the same channel.
+    sm = _SM({A: "txid-ok"})
+    _run(p, sm, _action(alternates=()), ln_payment="failed")
+    p._swap_cooldown_until.clear()
+    assert p.successes == [A]
+
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 2, "the post-success failure was swallowed as a repeat"
+
+
+def test_the_dedupe_is_per_channel() -> None:
+    """Two channels failing must both be reported; the slot is per channel, not one
+    global slot that they would take turns evicting."""
+    p = _plugin()
+    for channel_id, short_id in (("aa" * 32, "1x1x1"), ("bb" * 32, "2x2x2")):
+        sm = _SM({A: _accept_without_funding})
+        action = ReverseSwapAction(
+            channel_id=channel_id, short_id=short_id,
+            lightning_amount_sat=400_000, reason="drain", provider_npub=A)
+        asyncio.run(p._reverse_swap(_wallet(sm, "inflight"), action, state={},
+                                    transport=_transport([A])))
+    assert len(p.declines) == 2
+    assert {d.short_id for d, _s in p.declines} == {"1x1x1", "2x2x2"}
+
+
+def test_a_different_failure_reason_is_logged() -> None:
+    """The slot holds a signature, not a boolean: a channel that starts failing for
+    a different reason must say so."""
+    p = _plugin()
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 1
+    first = p.declines[0][0].reason
+    # Same channel, different amount -> different reason text.
+    sm = _SM({A: _accept_without_funding})
+    _run(p, sm, _action(alternates=(), amount=250_000), ln_payment="inflight")
+    assert len(p.declines) == 2
+    assert p.declines[1][0].reason != first

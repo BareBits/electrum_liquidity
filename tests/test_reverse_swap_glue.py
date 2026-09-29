@@ -76,6 +76,9 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p.declines = []      # (DeclineRecord, state)
     p._log_decline = lambda wallet, decline, state: \
         p.declines.append((decline, state))
+    # Real one-slot dedupe, not a stub: a channel whose swaps keep failing is
+    # re-evaluated every cooldown, and one row per cycle would flood the log.
+    p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
     return p
 

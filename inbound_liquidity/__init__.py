@@ -1331,6 +1331,14 @@ class LiquidityPlugin(BasePlugin):
         # tick that declines for the same reasons every event does not flood the
         # log with identical rows (only newly-appearing declines add a row).
         self._last_decline_sigs: Dict['Abstract_Wallet', set] = {}
+        # channel_id -> signature of the last decline the EXECUTOR wrote itself for
+        # that channel (as opposed to one the engine planned). One slot per channel,
+        # for the same anti-flood reason as above; kept separately because the set
+        # above is rebuilt from the engine's output every tick and would discard it.
+        # Keyed by channel like ``_swap_cooldown_until``, its closest analogue -- this
+        # is per-channel swap-executor state, and a funding outpoint is unique.
+        # See _log_decline_once.
+        self._last_exec_decline_sig: Dict[str, tuple] = {}
         # wallet -> last set of providers discovered on nostr, so the Providers
         # settings tab has something to show between/without live transports.
         self._last_offers: Dict['Abstract_Wallet', List[ProviderOffer]] = {}
@@ -5616,6 +5624,9 @@ class LiquidityPlugin(BasePlugin):
             # them.
             self._record_provider_success(wallet, npub)
             self._accrue_dev_fee(wallet, expected_onchain_sat, source=action.short_id)
+            # This channel just worked, so forget whatever failure we last recorded
+            # for it: a recurrence after a success is news, not a repeat.
+            self._last_exec_decline_sig.pop(action.channel_id, None)
             self.logger.info(f"reverse swap funding txid: {funding_txid}")
             self._log_action(
                 wallet, kind="swap", amount_sat=lightning_amount_sat,
@@ -5695,7 +5706,7 @@ class LiquidityPlugin(BasePlugin):
             f"reverse swap via {provider_label[:20]}… produced no funding and may "
             f"have committed funds on {action.short_id}; not trying anyone else "
             f"for this channel now")
-        self._log_decline(
+        self._log_decline_once(
             wallet,
             DeclineRecord(
                 kind="swap", channel_id=action.channel_id, short_id=action.short_id,
@@ -6804,6 +6815,34 @@ class LiquidityPlugin(BasePlugin):
         previous = self._last_decline_sigs.get(wallet, set())
         self._last_decline_sigs[wallet] = current
         return [d for d in declines if self._decline_sig(d) not in previous]
+
+    def _log_decline_once(self, wallet: 'Abstract_Wallet', decline: 'DeclineRecord',
+                          state: Optional[Dict]) -> None:
+        """Log a decline the executor raised itself, skipping an identical
+        consecutive one.
+
+        The engine's declines are de-duplicated for it by
+        :meth:`_filter_new_declines`, which is tick-level and rebuilt from the
+        engine's own output each pass -- so a decline written straight from the
+        executor cannot join that set without being wiped by the next tick. It still
+        needs the same treatment, for the same reason: a channel whose swaps keep
+        failing is re-evaluated every SWAP_COOLDOWN_SEC, and one entry per cycle
+        would push real history out of the 2000-entry log within days.
+
+        So the executor keeps its own one-slot memory per channel. It is cleared as
+        soon as that channel does complete a swap, so a failure that recurs *after*
+        something actually happened is recorded afresh rather than swallowed as
+        "same as last time".
+        """
+        sig = self._decline_sig(decline)
+        key = decline.channel_id
+        if self._last_exec_decline_sig.get(key) == sig:
+            self.logger.debug(
+                f"not re-logging an identical consecutive decline for "
+                f"{decline.short_id}: {decline.reason}")
+            return
+        self._last_exec_decline_sig[key] = sig
+        self._log_decline(wallet, decline, state)
 
     def _log_decline(self, wallet: 'Abstract_Wallet', decline: 'DeclineRecord',
                      state: Optional[Dict]) -> None:

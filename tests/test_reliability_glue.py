@@ -64,6 +64,8 @@ def _plugin() -> LiquidityPlugin:
     # failover gate decides; shrunk so no test sits through the real 150s.
     p._prepay_resolve_wait_sec = 0.05
     p._prepay_poll_interval_sec = 0.01
+    # One-slot per-channel dedupe for declines the executor writes itself.
+    p._last_exec_decline_sig = {}
     p.config = SimpleNamespace()  # getattr defaults kick in
     return p
 
