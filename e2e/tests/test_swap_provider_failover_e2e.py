@@ -453,11 +453,28 @@ def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):
         assert re.search(r"funding txid [0-9a-f]{64}", detail), \
             f"a swap action carries no real funding txid: {detail!r}"
 
-    # The failures are recorded -- as declines, which is where "we acted and it did
-    # not complete" belongs.
-    declines = [e for e in _decision_log()
-                if e.get("category") == "decline" and e.get("kind") == "swap"]
-    assert any("did not complete" in (d.get("reason") or "") for d in declines) or \
-        not any(e.get("category") == "decline" for e in _decision_log()), \
-        ("a swap failed without being recorded anywhere the user can see: "
-         f"{[d.get('reason') for d in declines]}")
+    # ... and the failure is still recorded somewhere the user can see. WHICH view
+    # depends on the arm, and the distinction is deliberate:
+    #
+    #   * a failed Lightning PAYMENT (this test's trigger) charges the provider a
+    #     soft reliability fault and moves on -- Faults, not Declines, because the
+    #     thing worth recording is the evidence about that provider;
+    #   * a swap that may have COMMITTED funds stops the cascade and writes a
+    #     "did not complete" decline, because there the useful fact is that the
+    #     channel is being left alone.
+    #
+    # So this asserts the fault, not a decline. An earlier version of this test
+    # demanded the decline and failed here against a real rig -- the assertion, not
+    # the behaviour, was wrong.
+    assert _wait_until(
+        lambda: any(int(s.get("fault_count", 0)) > 0
+                    for s in _reliability().values()),
+        rig=rig, timeout=240), \
+        (f"a swap failed its payment without being recorded anywhere the user can "
+         f"see: reliability={_reliability()}")
+
+    # And nothing in the decision log claims this channel was drained.
+    for entry in _decision_log():
+        if entry.get("category") == "action" and entry.get("kind") == "swap":
+            assert "funding txid None" not in (entry.get("detail") or ""), \
+                f"an unfunded swap reached the Actions view: {entry}"

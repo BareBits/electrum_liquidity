@@ -1114,3 +1114,49 @@ def test_a_different_failure_reason_is_logged() -> None:
     _run(p, sm, _action(alternates=(), amount=250_000), ln_payment="inflight")
     assert len(p.declines) == 2
     assert p.declines[1][0].reason != first
+
+
+def test_a_provider_is_faulted_even_if_its_reduced_rung_is_refused() -> None:
+    """The fault for a failed payment must survive the reduced rung ending for a
+    reason that never reaches a payment.
+
+    Charging it from "the last rung" looked equivalent and was not: here rung 1's
+    payment fails (no fault yet, because a rung remains) and rung 2 is turned away by
+    the provider's own bounds before any payment exists (``get_recv_amount`` -> None,
+    which is not a fault). The provider then escaped the fault for the payment that
+    HAD failed, stayed top-ranked on an unchanged ranking, and got picked again next
+    cycle -- exactly the wedge the cascade exists to break.
+    """
+    def _recv(npub, amt):
+        return None if amt < 400_000 else amt - 500     # reduced rung unswappable
+
+    sm = _SM({A: _accept_without_funding}, recv_amount=_recv)
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    # Only the full-size rung ever reached the provider.
+    assert sm.attempts == [(A, 400_000)]
+    assert [(n, kw) for n, _r, kw in p.faults] == [(A, {"soft": True})], \
+        "the provider escaped its fault because the reduced rung was refused"
+
+
+def test_the_payment_failure_fault_is_charged_once_per_provider() -> None:
+    """Two rungs failing is one observation, and each provider is charged separately
+    -- so a two-provider cascade with both payments failing is exactly two faults."""
+    sm = _SM({A: _accept_without_funding, B: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (A, 360_000),
+                           (B, 400_000), (B, 360_000)]
+    assert [n for n, _r, _kw in p.faults] == [A, B]
+    assert all(kw == {"soft": True} for _n, _r, kw in p.faults)
+
+
+def test_no_payment_failure_fault_when_the_payment_never_failed() -> None:
+    """The flag must not leak across providers: a provider that merely rejected
+    createswap gets its own (different) fault and nothing from this path."""
+    sm = _SM({A: SwapServerError()})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    reasons = [r for _n, r, _kw in p.faults]
+    assert reasons == ["swap rejected (likely transient capacity)"]
+    assert "reverse-swap Lightning payment failed" not in reasons

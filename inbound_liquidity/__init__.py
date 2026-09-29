@@ -5258,15 +5258,19 @@ class LiquidityPlugin(BasePlugin):
                     break
                 rungs = self._attempt_rungs(attempt)
                 stop = False
+                # Whether any rung for THIS provider died with a failed Lightning
+                # payment. The soft fault for that is charged once, below, when the
+                # provider is finished with -- see _charge_payment_failure.
+                payment_failed = False
                 for rung, (rung_amount, rung_cost) in enumerate(rungs, start=1):
                     is_last_rung = rung == len(rungs)
                     outcome = await self._attempt_reverse_swap(
                         wallet, action, attempt, offer, sm, tr, state,
                         index=index, total=total, faults=faults,
-                        amount_sat=rung_amount, all_in_cost_pct=rung_cost,
-                        is_last_rung=is_last_rung)
+                        amount_sat=rung_amount, all_in_cost_pct=rung_cost)
                     if outcome is _SwapAttempt.PAYMENT_FAILED:
                         # Safe to retry: nothing is committed on this channel.
+                        payment_failed = True
                         if not is_last_rung:
                             # `rungs[rung]` is the NEXT rung: `rung` is 1-based here,
                             # so it indexes one past the current entry.
@@ -5284,12 +5288,43 @@ class LiquidityPlugin(BasePlugin):
                         # channel again.
                         stop = True
                     break
+                if payment_failed:
+                    self._charge_payment_failure(wallet, action, attempt.npub)
                 if stop:
                     break
                 if index < total:
                     self.logger.info(
                         f"failing over to the next provider for {action.short_id} "
                         f"({index + 1} of {total})")
+
+    def _charge_payment_failure(self, wallet: 'Abstract_Wallet',
+                                action: ReverseSwapAction, npub: str) -> None:
+        """Charge one provider a soft fault for having failed its Lightning payment.
+
+        Called once per PROVIDER, from the cascade, after its rungs are exhausted --
+        not from the attempt that observed the failure. Two reasons it lives here:
+
+        * two rungs failing is ONE observation about that provider, and charging both
+          would sink it at double rate for a fault it may not even own;
+        * charging it from the attempt means charging it only on the rung that
+          happens to be last, and a rung can end for reasons that never reach that
+          point -- a reduced retry refused by the provider's own bounds returns
+          before any payment exists. The provider then escaped the fault for the
+          payment that HAD failed, stayed top-ranked, and got picked again next
+          cycle: precisely the wedge the cascade exists to break.
+
+        Soft, because attribution is genuinely ambiguous: our own peer being unable
+        to route it, and the provider being offline or out of inbound, look identical
+        from here. A signal this ambiguous should weigh on the ranking, not escalate
+        anyone toward a ban.
+
+        Only the PROVIDER is charged. The peer's share belongs to
+        ``_reconcile_pending_swaps``, which sees this same swap on a later tick and
+        recognises its failed payment; charging the peer here as well would count one
+        failure twice against it.
+        """
+        self._record_provider_fault(
+            wallet, npub, "reverse-swap Lightning payment failed", soft=True)
 
     @staticmethod
     def _attempt_rungs(attempt: ProviderAttempt) -> List[Tuple[int, Optional[float]]]:
@@ -5352,7 +5387,6 @@ class LiquidityPlugin(BasePlugin):
                                     faults: Optional['_CascadeFaults'] = None,
                                     amount_sat: Optional[int] = None,
                                     all_in_cost_pct: Optional[float] = None,
-                                    is_last_rung: bool = True,
                                     ) -> '_SwapAttempt':
         """One provider's attempt at the swap. Returns what the cascade should do
         next -- see :class:`_SwapAttempt`.
@@ -5374,10 +5408,10 @@ class LiquidityPlugin(BasePlugin):
         tests, and the legacy single-attempt path -- is unaffected. The amount is
         still never computed here; both figures come from the engine.
 
-        ``is_last_rung`` says whether this is the final rung this provider gets, and
-        governs one thing only: whether a failed Lightning payment charges the
-        provider a reliability fault. Two rungs failing is one observation about
-        that provider, not two.
+        Note what this does NOT do: charge the provider for a failed Lightning
+        payment. That fault belongs to the provider rather than to one attempt, so the
+        cascade charges it once after the provider's rungs are exhausted (see
+        ``_charge_payment_failure``).
         """
         from electrum.util import UserFacingException
         from electrum.submarine_swaps import SwapServerError
@@ -5661,30 +5695,13 @@ class LiquidityPlugin(BasePlugin):
             # channel, so retrying -- smaller here, or with another provider -- is
             # safe. This is exactly what the cascade exists for.
             #
-            # Both sides are at fault here, but only the PROVIDER is charged
-            # from this arm. The peer side is already owned by
-            # ``_reconcile_pending_swaps``, which sees this very swap on the
-            # next tick, recognises the failed payment and charges the peer
-            # then; doing it here as well would count one failure twice
-            # against the same peer. The provider had no such path -- that
-            # branch resolves and drops the record without ever faulting it --
-            # so this is the only place the provider's share can land.
-            #
-            # Soft, because attribution is genuinely ambiguous: our peer could
-            # not route it, and the provider being offline or out of inbound
-            # would look identical from here. A signal this ambiguous should
-            # weigh on the ranking, not escalate anyone toward a ban.
-            #
-            # Charged once per PROVIDER, not once per rung: the reduced retry is
-            # another sample of the same failure, and counting it twice would sink a
-            # provider at double rate for a fault it may not even own. The diag
-            # event fires per rung, because there the detail is the point.
+            # The provider's reliability fault is NOT charged here: it is charged
+            # once per provider by the cascade, once that provider's rungs are done
+            # (see ``_charge_payment_failure``, which explains why). The diag event
+            # does fire per rung, because there the per-attempt detail is the point.
             self.logger.warning(
                 f"reverse swap via {provider_label[:20]}… produced no funding: "
                 f"the Lightning payment failed (no funds committed)")
-            if is_last_rung:
-                self._record_provider_fault(
-                    wallet, npub, "reverse-swap Lightning payment failed", soft=True)
             self._diag_event(
                 wallet, category="error", kind="swap",
                 reason="reverse-swap Lightning payment failed", source=npub,
