@@ -85,14 +85,42 @@ prepayment) and both have to fit. Opening a channel funds with the **maximum
 minus the on-chain reserve**, with the mining fee deducted so the transaction is
 feasible.
 
-If that swap **fails**, the plugin does not give up on the cycle: it walks the
-other eligible providers in cost order (up to 3 attempts in total, within a 500
-second budget) and retries with each in turn, so one unreachable or unwilling
-provider no longer costs you a whole 3-minute channel cooldown. Every provider
-in the cascade must still pass the `max_swap_fee_pct` gate on its **own** real
-all-in cost — a failover is never an excuse to overpay — and because providers
+If that swap **fails**, the plugin does not give up on the cycle: it walks **every**
+eligible provider in cost order and retries with each in turn, so one unreachable
+or unwilling provider no longer costs you a whole 3-minute channel cooldown. Every
+provider in the cascade must still pass the `max_swap_fee_pct` gate on its **own**
+real all-in cost — a failover is never an excuse to overpay — and because providers
 advertise different capacities, each retry is sized to what *that* provider will
 actually host.
+
+There is no cap on how many providers get tried; the bound is a wall-clock budget,
+derived from how many the cascade actually plans to walk so that no provider it
+ranked is ever silently dropped. The trade-off is worth stating plainly: on a wallet
+that has discovered many providers, a channel where every one of them fails can hold
+that wallet's evaluation lock for a long time — tens of minutes in the worst case —
+and nothing else for that wallet (offline-peer auto-close, stuck-swap
+reconciliation, other channels' drains) runs meanwhile. Realistic failures are far
+shorter, and every attempt is logged as it happens. Anything the budget does not
+reach is retried next cycle, by which time the failed providers have sunk in the
+ranking.
+
+Each provider also gets **one retry at 90% of the amount** before the cascade moves
+on, and only when its *Lightning payment* is what failed. A payment can fail simply
+because no single route carries the full amount — the size is chosen from what
+Electrum says it can send, which is not the same question as whether the network can
+route it — so a slightly smaller swap is often the thing that works. That retry is
+re-checked against your cost ceiling first, and frequently refused: shrinking a swap
+makes it *dearer* as a percentage, because the provider's mining fee and the on-chain
+claim fee do not shrink with it. Failures of any other kind (a provider that
+declined, rejected, cheated, or never answered) go straight to the next provider —
+they would answer the same way at any size.
+
+The mining-fee **prepayment** gets special handling, because it is what used to make
+this whole cascade unreachable. Electrum issues it as a separate fire-and-forget
+payment and returns from the swap as soon as the *main* payment finishes, so the
+prepayment's HTLC is usually still live at that moment — and the cascade must never
+fail over while any HTLC for the swap is live. The plugin now *waits* for it
+(bounded), rather than treating "not resolved yet" as "funds may be committed".
 
 The cascade stops immediately, and never retries, once funds may have moved.
 Electrum's pre-payment checks (cost sanity, the provider's `createswap` reply,
@@ -508,11 +536,15 @@ providers**, **Channel partners** and **Advanced**):
 
 - **Actions** — each executed open / reverse swap, with the amount and
   abbreviated source → destination (e.g. `on-chain → 02b2a9…6501`, or
-  `117x1x0 → on-chain`).
-- **Declines** — decisions *not* to act: freeze events and "near misses" (a swap
-  over its trigger that was blocked by cost/provider-min/inactivity, or an open
-  blocked at max-channels / the funding floor). Consecutive identical declines
-  are de-duplicated so a steady frozen state logs once, not every tick.
+  `117x1x0 → on-chain`). A reverse swap appears here **only once it has a real
+  on-chain funding txid**: a swap whose Lightning payment failed did not happen,
+  and is a decline.
+- **Declines** — decisions *not* to act, and actions that did not complete: freeze
+  events, "near misses" (a swap over its trigger that was blocked by
+  cost/provider-min/inactivity, or an open blocked at max-channels / the funding
+  floor), and a reverse swap that was attempted but produced no funding.
+  Consecutive identical declines are de-duplicated so a steady frozen state logs
+  once, not every tick.
 - **Faults** — provider and channel-peer faults (timeouts, RPC errors, stuck
   swaps, failed opens, force-closes) that feed the decaying reliability penalties
   used to rank providers and channel partners.
@@ -560,8 +592,14 @@ a reduced verbosity).
 
 The buffer is **memory only** — nothing is written to disk, and it is cleared
 when Electrum restarts; "Save to file…" is the deliberate way to keep a copy.
-**Clear** discards the captured lines only and never touches your decision log.
 For persistent on-disk records, enable **Write diagnostic log files** instead.
+
+**Clear** empties the view — *both* halves of it. Captured log lines are discarded
+from memory; decision-log entries are only **hidden here**, never deleted. They stay
+in your wallet file, stay visible in the **Actions / Declines / Faults** views, and
+come back in this view when you reopen the wallet. The summary line under the view
+says how many are hidden, so an emptied view never reads as lost data. New lines
+keep arriving as they happen — Clear is not a mute button.
 
 ### Why is there no channel partner?
 
@@ -675,6 +713,15 @@ manager.
 Betas are cut on the **`beta`** branch — the same commits as `main` plus its
 version-bump commit, so a build can go out ahead of a final release without
 moving `main`'s version. CI runs on both branches.
+
+**The beta channel keeps only the newest build.** Once a `-beta.*` tag is
+published, the workflow deletes every older `-beta.*` release and its tag, so the
+Releases page never offers a stale beta zip to hand-install. The prune is scoped
+to that channel: real releases are untouched (they are not pre-releases), and a
+pre-release from any other channel — `v0.4.0-rc.1` — neither triggers it nor gets
+swept up. Pruning runs after the new release is published, so a failed publish
+leaves the existing betas in place. The retired tags' commits stay reachable from
+the `beta` branch.
 
 > A user who installs `v0.4.0-beta.1` is **not** notified when the final
 > `v0.4.0` ships: `parse_version` reads a numeric prefix, so the two compare

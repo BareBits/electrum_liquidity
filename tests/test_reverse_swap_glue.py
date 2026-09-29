@@ -47,6 +47,10 @@ def _plugin(**config_over) -> LiquidityPlugin:
     # Per-provider wait for advertised terms; shrunk so an unreachable
     # provider trips the init timeout instantly instead of in 15s.
     p._swap_init_timeout_sec = 0.01
+    # Bounded wait for a swap's mining-fee prepayment to resolve before the
+    # failover gate decides; shrunk so no test sits through the real 150s.
+    p._prepay_resolve_wait_sec = 0.05
+    p._prepay_poll_interval_sec = 0.01
     cfg = dict(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
@@ -66,6 +70,15 @@ def _plugin(**config_over) -> LiquidityPlugin:
         p.tracked.append((npub, exp))
     p._diag_event = lambda wallet, **kw: p.diags.append(kw)
     p._log_action = lambda wallet, **kw: p.logged.append(kw)
+    # A swap that did not fund is a DECLINE, never an action -- see
+    # _attempt_reverse_swap's unfunded arms. Captured separately so a test
+    # can tell the two apart.
+    p.declines = []      # (DeclineRecord, state)
+    p._log_decline = lambda wallet, decline, state: \
+        p.declines.append((decline, state))
+    # Real one-slot dedupe, not a stub: a channel whose swaps keep failing is
+    # re-evaluated every cooldown, and one row per cycle would flood the log.
+    p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
     return p
 
@@ -237,7 +250,53 @@ def test_unfunded_swap_of_unknown_cause_is_tracked() -> None:
     _run(p, _wallet(_sm(_rs)), _action(), _transport())
     assert p.successes == [] and p.dev_fees == []
     assert p.tracked == [(NPUB, 399_500)]    # queued for reconciliation
+
+
+def test_an_unfunded_swap_is_never_logged_as_an_action() -> None:
+    """A swap that produced no funding must not appear in the Actions view.
+
+    It used to. The "possibly committed" branch fell through into the same
+    ``_log_action`` + ``on_action_done`` the funded path uses, so a swap whose
+    Lightning payment had just failed was announced as "Reverse swap 399,500 sat
+    from 1x1x1" with `funding txid None` buried in its detail -- indistinguishable,
+    where the user actually looks, from a swap that worked. Observed live: an
+    Actions entry timestamped the same second the payment gave up after 29 route
+    attempts.
+
+    A decline instead: we acted, it did not complete, and that is what the
+    Declines view is for.
+    """
+    async def _rs(**kw):
+        return None
+    p = _plugin()
+    done: list = []
+    p.on_action_done = lambda wallet, msg: done.append(msg)
+    _run(p, _wallet(_sm(_rs)), _action(), _transport())
+    assert p.logged == [], "an unfunded swap was logged as a completed action"
+    assert done == [], "an unfunded swap raised a success notification"
+    assert len(p.declines) == 1
+    decline, _state = p.declines[0]
+    assert decline.kind == "swap"
+    assert decline.short_id == "1x1x1"
+    assert decline.amount_sat == 400_000
+    assert "did not complete" in decline.reason
+    # And the reason says WHY nothing more will happen to this channel now.
+    assert "no on-chain funding" in decline.reason
+
+
+def test_a_funded_swap_is_still_logged_as_an_action() -> None:
+    """The other side of that boundary: a real funding txid is exactly what makes
+    a swap an action, and must keep doing so."""
+    async def _rs(**kw):
+        return "deadbeef"
+    p = _plugin()
+    done: list = []
+    p.on_action_done = lambda wallet, msg: done.append(msg)
+    _run(p, _wallet(_sm(_rs)), _action(), _transport())
     assert len(p.logged) == 1
+    assert p.declines == []
+    assert len(done) == 1
+    assert "deadbeef" in (p.logged[0].get("detail") or "")
 
 
 # --- payment is pinned to the target channel ------------------------------

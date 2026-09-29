@@ -932,7 +932,23 @@ def test_log_tab_renders_a_multiline_record_as_one_indented_event(qapp):
     assert lines[1].startswith(" ") and lines[2].startswith(" ")
 
 
-def test_log_tab_clear_drops_capture_but_not_the_decision_log(qapp):
+def _click_clear(state) -> None:
+    for button in state.log_tab.findChildren(QPushButton):
+        if button.text() == "Clear":
+            button.click()
+            return
+    pytest.fail("no Clear button on the Log tab")           # pragma: no cover
+
+
+def test_log_tab_clear_empties_the_whole_view(qapp):
+    """"Clear" means the view is empty -- BOTH halves.
+
+    It used to clear only the captured ring. The decision half is re-read from
+    wallet.db on every refresh, so it cannot be cleared by forgetting anything and
+    every DECISION row stayed on screen; with Electrum's Lightning capture on, the
+    ring also refilled within one 500ms refresh. Between them the button looked
+    broken, which is exactly how it was reported.
+    """
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     now = time.time()
@@ -944,18 +960,92 @@ def test_log_tab_clear_drops_capture_but_not_the_decision_log(qapp):
     _capture(p, logging.INFO, "captured line", ts=now)
     state.refresh_log()
     assert "captured line" in _log_text(state)
+    assert "new capacity" in _log_text(state)
 
-    for button in state.log_tab.findChildren(QPushButton):
-        if button.text() == "Clear":
-            button.click()
-            break
-    else:                                                   # pragma: no cover
-        pytest.fail("no Clear button on the Log tab")
+    _click_clear(state)
 
-    text = _log_text(state)
-    assert "captured line" not in text
-    assert "new capacity" in text                           # persisted log untouched
+    assert _log_text(state) == ""
     assert len(p.log_buffer.snapshot()) == 0
+
+
+def test_log_tab_clear_deletes_nothing_from_the_wallet(qapp):
+    """The decision log is only HIDDEN. It is the plugin's audit trail, so "clear
+    the view" must not be a way to destroy it -- it stays in wallet.db, stays in
+    the Actions / Declines / Faults views, and comes back here when the tab is
+    rebuilt (reopening the wallet)."""
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    _seed_log(wallet, [
+        {"ts": now, "category": "action", "kind": "open", "reason": "new capacity"},
+    ])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    state.refresh_log()
+    _click_clear(state)
+    assert _log_text(state) == ""
+
+    # Still on disk, and still visible everywhere else.
+    assert len(p.get_decision_log(wallet)) == 1
+    assert p.get_decision_log(wallet)[0]["reason"] == "new capacity"
+    # A freshly built tab has no watermark, so the entry is back.
+    p._tabs.clear()
+    p._add_liquidity_tab(window, wallet)
+    rebuilt = p._tabs[wallet]
+    rebuilt.refresh_log()
+    assert "new capacity" in _log_text(rebuilt)
+
+
+def test_log_tab_clear_says_how_much_it_hid(qapp):
+    """A view that silently empties reads as data loss. The summary names the
+    hidden count and says the entries are kept."""
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    _seed_log(wallet, [
+        {"ts": now, "category": "action", "kind": "open", "reason": "first"},
+        {"ts": now, "category": "decline", "kind": "swap", "reason": "second"},
+    ])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    state.refresh_log()
+    _click_clear(state)
+
+    labels = [w.text() for w in state.log_tab.findChildren(QLabel)]
+    summary = next(t for t in labels if "lines shown" in t)
+    assert "2 earlier decision entries hidden by Clear (still kept)" in summary
+
+
+def test_log_tab_clear_still_shows_what_happens_next(qapp):
+    """Clear is not a mute button. It hides what came before; anything logged after
+    it must appear, or the tab would look dead after one click."""
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    now = time.time()
+    ancient = {"ts": now, "category": "action", "kind": "open",
+               "reason": "ancient-entry"}
+    _seed_log(wallet, [ancient])
+    p._add_liquidity_tab(window, wallet)
+    state = p._tabs[wallet]
+    _capture(p, logging.INFO, "before-clear-line", ts=now)
+    state.refresh_log()
+    _click_clear(state)
+    assert _log_text(state) == ""
+
+    # Both halves resume. The pre-Clear decision entry is kept in the db alongside
+    # the new one, so it is the watermark -- not a rewrite -- hiding it.
+    later = now + 5
+    _capture(p, logging.INFO, "after-clear-line", ts=later)
+    _seed_log(wallet, [ancient,
+                       {"ts": later, "category": "action", "kind": "swap",
+                        "reason": "brand-new-entry"}])
+    state.refresh_log()
+    text = _log_text(state)
+    assert "after-clear-line" in text
+    assert "brand-new-entry" in text
+    assert "before-clear-line" not in text
+    assert "ancient-entry" not in text
+    assert len(p.get_decision_log(wallet)) == 2          # both still on disk
 
 
 def test_log_tab_summary_reports_the_ring_state(qapp):

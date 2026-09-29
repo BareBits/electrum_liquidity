@@ -294,3 +294,52 @@ def test_breakdown_names_the_one_channel_per_peer_guard(rig):
     detail = str(decline.get("detail") or "")
     assert "already have a channel with" in detail, detail
     assert "strict mode" in detail, detail
+
+
+def test_every_live_decision_entry_carries_a_usable_timestamp(rig):
+    """The Log tab's "Clear" hides everything at or before the moment it was
+    clicked, which means it is only correct if every decision entry the LIVE plugin
+    writes carries a sane ``ts``.
+
+    An entry with no usable ``ts`` reads as epoch 0, so Clear would hide it forever;
+    one with a ``ts`` in the future would survive a Clear it should not. Neither is
+    visible to the offscreen-Qt tests in ``tests/test_qt_tab.py``, which hand-build
+    their entries -- only a live plugin writing into a real ``wallet.db`` can show
+    that the field is actually there, on every category it emits.
+
+    (The widget behaviour itself -- the watermark, the summary's hidden count, the
+    fact that nothing is deleted -- is covered by those Qt tests, per this module's
+    docstring. What is under test here is the data they assume.)
+    """
+    _quiet_config()
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
+
+    # Wait for the live plugin to have written something to judge.
+    assert _wait_until(lambda: len(_decision_log()) >= 1, rig=rig, timeout=300), \
+        "the live plugin wrote no decision-log entries to judge"
+
+    entries = _decision_log()
+    now = time.time()
+    for entry in entries:
+        raw = entry.get("ts")
+        assert raw is not None, f"decision entry has no ts at all: {entry}"
+        ts = float(raw)
+        # Epoch 0 / negative would be hidden by any Clear, forever.
+        assert ts > 1_600_000_000, \
+            f"decision entry ts {ts} is not a plausible epoch: {entry}"
+        # A future ts would survive a Clear it should not. Allow generous slack for
+        # clock jitter between the daemon and this process.
+        assert ts < now + 300, \
+            f"decision entry ts {ts} is in the future (now {now}): {entry}"
+
+    # And the watermark rule itself, applied to this real data: a cut taken now
+    # hides all of it, while a cut taken before the oldest entry hides none.
+    oldest = min(float(e["ts"]) for e in entries)
+    assert all(float(e["ts"]) <= now for e in entries)
+    assert not any(float(e["ts"]) <= oldest - 1 for e in entries)
+
+    # Every category the plugin emits into the decision log must satisfy the above,
+    # not just whichever one happened to appear first. Recorded rather than asserted
+    # because which categories occur depends on what the rig did this run.
+    seen = sorted({str(e.get("category")) for e in entries})
+    print(f"decision-log categories checked for usable timestamps: {seen}")
