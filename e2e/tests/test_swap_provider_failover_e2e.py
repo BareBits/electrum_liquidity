@@ -306,17 +306,36 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         rig=rig, timeout=600), \
         "the failed payment never advanced the cascade to the next provider"
 
-    # 2b) And the wait actually happened -- i.e. we got here by resolving the
-    #     prepayment, not by a lucky cycle where it had already settled. Only one
-    #     of the two log lines is required, because which one appears depends on
-    #     whether the prepayment was still live at the moment the gate first asked.
+    # 2b) The prepayment gate must never be the reason a cascade stopped.
+    #
+    #     Asserted as a NEGATIVE, deliberately. Whether the gate is exercised at all
+    #     depends on rig timing that this test cannot pin: the rig's providers are
+    #     direct channel peers, so their prepayment sometimes resolves before the gate
+    #     first asks (nothing to wait for) and sometimes after it (a real wait). An
+    #     earlier version of this assertion demanded the wait happen every run and was
+    #     flaky for exactly that reason -- the rig cannot reproduce mainnet's timing on
+    #     demand, and pretending otherwise would be a test that lies about its
+    #     coverage. The four gate outcomes are pinned precisely, with the timing under
+    #     control, in tests/test_swap_provider_failover_glue.py.
+    #
+    #     What IS invariant is that the wait must not expire: if it does, the gate
+    #     answered "possibly committed" and stopped a cascade that should have
+    #     continued -- the original bug, back again, just slower.
     log_text = _client_log_text()
-    assert ("waiting up to" in log_text and "prepayment" in log_text) or \
-        "mining-fee prepayment resolved" in log_text, \
-        ("the prepayment gate was never exercised; if Electrum stopped sending a "
-         "minerFeeInvoice this test no longer covers what it claims to")
     assert "prepayment still in flight after" not in log_text, \
-        "the prepayment wait expired -- the budget is too small for the real timing"
+        ("the prepayment wait expired and the cascade stopped -- the budget is too "
+         "small for real timing, or the prepayment is not resolving at all")
+
+    # When the gate DID have to wait (observed live: an 11s wait on this rig), it must
+    # have resolved into a decision rather than timing out. Recorded either way, so a
+    # run where the timing never produced a wait is not a failure.
+    if "waiting up to" in log_text and "prepayment" in log_text:
+        assert "mining-fee prepayment resolved" in log_text, \
+            "the gate started waiting for the prepayment and never got an answer"
+        print("prepayment gate exercised: the wait happened and resolved")
+    else:
+        print("prepayment gate not exercised this run (prepayment resolved before "
+              "the gate asked); see the glue tests for its four outcomes")
 
     # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
     assert _wait_until(
