@@ -19,6 +19,10 @@ REAL open channels.
   4. Electrum's real Wallet Balance dialog, built offscreen against that same
      real wallet, actually grows the blue slice and its legend row -- the whole
      monkeypatch path end to end, on a real balance rather than a fake list.
+  5. The dialog's "Show liquidity goal" checkbox puts Electrum's own chart back
+     when unticked, and the choice round-trips through a REAL SimpleConfig under
+     the documented key -- the one thing the fake pref in the unit tests cannot
+     prove.
 
 The wallet is opened from a COPY of the live wallet file. The rig's daemon holds
 the original open and is still writing to it; loading it a second time in this
@@ -386,15 +390,19 @@ def test_real_balance_dialog_grows_the_buffer_slice(rig, live_wallet):
             # Qt.GlobalColor and QColor is not hashable.
             return next(a for _n, c, a in piechart._list if c == color)
 
-        assert _amount_of(qt_mod.COLOR_GOAL_BUFFER) == GOAL_SAT
+        # The rig's wallet holds more than the goal on-chain, so the goal is
+        # covered by the on-chain rail alone and the Lightning wedge is left off.
+        assert _amount_of(qt_mod.COLOR_GOAL_BUFFER_ONCHAIN) == GOAL_SAT
+        assert all(c != qt_mod.COLOR_GOAL_BUFFER_LIGHTNING
+                   for _n, c, _a in piechart._list)
         assert _amount_of(COLOR_CONFIRMED) == int(bal.confirmed) - GOAL_SAT
         # The whole balance is still on the chart -- the slice was split off the
         # on-chain wedge, not added on top of it.
         assert sum(a for _n, _c, a in piechart._list) == int(bal.total())
 
         labels = [c.text() for c in dialog.findChildren(QLabel)]
-        assert any("Liquidity goal buffer" in t for t in labels)
-        assert any(lw.color == qt_mod.COLOR_GOAL_BUFFER
+        assert any("Liquidity goal buffer (on-chain)" in t for t in labels)
+        assert any(lw.color == qt_mod.COLOR_GOAL_BUFFER_ONCHAIN
                    for lw in dialog.findChildren(LegendWidget))
 
         # The legend has to follow the wedges. Electrum builds those rows
@@ -412,8 +420,78 @@ def test_real_balance_dialog_grows_the_buffer_slice(rig, live_wallet):
         expected_onchain = live_wallet.config.format_amount_and_units(
             int(bal.confirmed) - GOAL_SAT)
         assert rows["On-chain:"] == expected_onchain
-        assert rows["Liquidity goal buffer:"] == \
+        assert rows["Liquidity goal buffer (on-chain):"] == \
             live_wallet.config.format_amount_and_units(GOAL_SAT)
         dialog.deleteLater()
     finally:
         qt_mod._set_buffer_provider(None)
+
+
+# --- 5. the checkbox, through the real SimpleConfig -----------------------
+def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_wallet):
+    """Unticking "Show liquidity goal" on the real dialog has to put Electrum's
+    own chart back AND survive as a real ConfigVar write -- a checkbox that
+    forgets itself is worse than no checkbox.
+
+    The unit tests drive this against a fake pref object; what is proved here is
+    that the value lands in a real ``SimpleConfig`` under the documented key and
+    reads back out of it.
+    """
+    if _ELECTRUM_IMPORT_ERROR is not None:
+        pytest.skip(f"Electrum's Qt GUI is unavailable: {_ELECTRUM_IMPORT_ERROR!r}")
+    from PyQt6.QtWidgets import QApplication, QCheckBox, QWidget
+    from electrum.gui.qt.balance_dialog import (
+        COLOR_CONFIRMED, BalanceDialog, PieChartWidget,
+    )
+    from electrum.plugins.inbound_liquidity import qt as qt_mod  # type: ignore
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    # The Qt subclass, not LiquidityPlugin: the checkbox's getter/setter are the
+    # GUI half of the plugin. Both only touch ``self.config``.
+    p = object.__new__(qt_mod.Plugin)
+    p.logger = logging.getLogger("e2e.inbound_liquidity.goal_buffer.checkbox")
+    p.config = live_wallet.config
+    p.wallets = {live_wallet: object()}
+    p.config.INBOUND_LIQUIDITY_GOAL_SAT = GOAL_SAT
+    # Ships on, so an untouched install shows the goal.
+    assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True
+    assert qt_mod._patch_balance_dialog() is True
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+    qt_mod._set_goal_visibility(qt_mod._GoalVisibility(
+        p.show_goal_in_piechart, p.set_show_goal_in_piechart))
+    try:
+        bal = live_wallet.get_balances_for_piechart()
+        parent = QWidget()
+        parent.config = live_wallet.config
+        parent.fx = None
+        parent.wallet = live_wallet
+        dialog = BalanceDialog(parent, wallet=live_wallet)
+
+        piechart = dialog.findChild(PieChartWidget)
+        boxes = dialog.findChildren(QCheckBox)
+        assert len(boxes) == 1
+        box = boxes[0]
+        assert box.isChecked() is True
+
+        box.setChecked(False)
+        # Electrum's own chart is back: no goal wedges, full on-chain balance.
+        assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+                   for _n, c, _a in piechart._list)
+        assert next(a for _n, c, a in piechart._list
+                    if c == COLOR_CONFIRMED) == int(bal.confirmed)
+        # ...and the choice is on the real config, under the documented key.
+        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is False
+        assert p.config.get('plugins.inbound_liquidity.show_goal_in_piechart') is False
+        assert p.show_goal_in_piechart() is False
+
+        box.setChecked(True)
+        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True
+        assert next(a for _n, c, a in piechart._list
+                    if c == qt_mod.COLOR_GOAL_BUFFER_ONCHAIN) == GOAL_SAT
+        dialog.deleteLater()
+    finally:
+        qt_mod._set_buffer_provider(None)
+        qt_mod._set_goal_visibility(None)
+        p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = True

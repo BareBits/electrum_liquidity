@@ -79,6 +79,14 @@ def test_liquidity_goal_default() -> None:
     assert isinstance(default, int)
 
 
+def test_the_goal_ships_visible_on_the_balance_chart() -> None:
+    """Display-only, but still pinned: the slices are how a user finds out that
+    part of their balance is spoken for, and an install that hid them by default
+    would reserve the sats silently."""
+    default = SimpleConfig.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART.get_default_value()
+    assert default is True
+
+
 def test_liquidity_goal_ships_enabled() -> None:
     # 0 would disable the rule entirely; the shipped value must not be that.
     assert SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value() > 0

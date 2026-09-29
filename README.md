@@ -56,6 +56,7 @@ ceilings, diagnostics, etc.).
 | `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
 | `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. Also sets the **buffer** reserved on the balance pie chart and warned about in the Send tab. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) and [The liquidity goal buffer](#the-liquidity-goal-buffer) | `100_000` |
+| `show_goal_in_piechart` | Wallet → Balance | **Show liquidity goal** — draw the goal as its own slices (on-chain and, when needed, Lightning) on both balance pie charts. Untick for Electrum's stock chart. Display only: it changes nothing about what is reserved or about the Send tab's warning. See [The liquidity goal buffer](#the-liquidity-goal-buffer) | `true` |
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
@@ -325,18 +326,28 @@ bar and the big one in Wallet → Balance — grows a blue **Liquidity goal buff
 slice, taken out of the on-chain slice first:
 
 ```
-100 sat on-chain, 10 sat goal   ->   90 sat On-chain  +  10 sat Liquidity goal buffer
+100 sat on-chain, 10 sat goal
+   ->  90 sat On-chain  +  10 sat Liquidity goal buffer (on-chain)
 ```
 
 When on-chain cannot cover the whole goal, the remainder spills into the Lightning
 slice — which is the case that matters most, because a wallet mid-build-out has
 most of its balance in channels and would otherwise see the reserve silently shrink
-to whatever happened to be sitting on-chain:
+to whatever happened to be sitting on-chain. The goal then shows as **two** slices,
+a light blue one for the part held on-chain and a deep blue one for the part still
+in Lightning, so the chart says not just how much is spoken for but which rail is
+currently holding it — an on-chain wedge is sats that can fund a channel open
+today, a Lightning wedge is sats that would have to be swapped out first:
 
 ```
 30k on-chain, 500k Lightning, 100k goal
-   ->  0 On-chain  +  430k Lightning  +  100k Liquidity goal buffer
+   ->  0 On-chain  +  430k Lightning
+       +  30k Liquidity goal buffer (on-chain)
+       +  70k Liquidity goal buffer (Lightning)
 ```
+
+When on-chain covers the goal on its own — the ordinary case — the Lightning wedge
+and its legend row are left off entirely rather than drawn at zero.
 
 The frozen slices are never touched — frozen coins cannot fund a channel open, and
 a channel frozen for sending is balance you have already set aside. The chart's
@@ -346,6 +357,14 @@ rows still add up to your balance. If the whole balance is smaller than the goal
 the buffer is simply the whole balance — and an on-chain balance entirely absorbed
 into it reads `On-chain: 0`, which is the useful thing to say rather than hiding
 the row.
+
+**Turning the slices off.** The Wallet → Balance dialog carries a **Show liquidity
+goal** checkbox, on by default. Untick it and both charts — the dialog's and the
+status bar's — go back to the pie Electrum ships, with the full on-chain and
+Lightning slices and no goal rows. The choice is remembered
+(`show_goal_in_piechart`). It is a **display setting only**: it changes nothing
+about what the plugin reserves, and the Send tab's warning below is unaffected.
+The checkbox only appears when there is a goal to show in the first place.
 
 **On the Send tab.** Type an amount larger than `total balance − goal` and an
 inline warning appears under the Amount field:

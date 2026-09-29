@@ -1006,6 +1006,18 @@ SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT = ConfigVar(
     short_desc=lambda: _("Liquidity goal"),
     long_desc=lambda: _("Automatically close small channels and re-open bigger channels "
                         "if we have sufficient funds to reach this goal"))
+SimpleConfig.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = ConfigVar(
+    'plugins.inbound_liquidity.show_goal_in_piechart', default=True, type_=bool,
+    plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Show the liquidity goal on the balance chart"),
+    long_desc=lambda: _("On by default. Splits the sats reserved for the liquidity goal "
+                        "out of the balance pie chart -- in the status bar and in the "
+                        "Wallet Balance dialog -- as their own slices, one for the part "
+                        "held on-chain and one for the part still in Lightning. Turn it "
+                        "off to see Electrum's own chart instead. This is a display "
+                        "setting only: it changes nothing about what the plugin reserves "
+                        "or about the Send tab's warning. It is toggled from the "
+                        "checkbox on the Wallet Balance dialog."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.max_swap_fee_pct', default=0.9, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
