@@ -1008,3 +1008,39 @@ def test_the_reduced_rung_uses_the_reduced_amount_for_costs_and_fees() -> None:
     assert len(p.logged) == 1
     assert p.logged[0]["amount_sat"] == 360_000
     assert "reduced size" in p.logged[0]["detail"]
+
+
+def test_the_chosen_provider_inherits_the_actions_reduced_rung() -> None:
+    """The engine puts the chosen provider's figures on the ACTION, not on a
+    ProviderAttempt, so the executor synthesises one for it. That synthesis has to
+    carry the reduced rung across -- otherwise the best-ranked provider, the one
+    tried first and most likely to be the right answer, would be the only one that
+    never got its smaller retry."""
+    p = _plugin()
+    action = _reduced_action(chosen=A, alternates=())
+    attempts = p._resolve_swap_attempts(action, _transport([A]))
+    assert len(attempts) == 1
+    attempt, _offer = attempts[0]
+    assert attempt.npub == A
+    assert attempt.amount_sat == action.lightning_amount_sat
+    assert attempt.reduced_amount_sat == action.reduced_amount_sat
+    assert attempt.reduced_all_in_cost_pct == action.reduced_all_in_cost_pct
+    # ... and the rung list built from it has both sizes, in order.
+    assert p._attempt_rungs(attempt) == [
+        (action.lightning_amount_sat, None),
+        (action.reduced_amount_sat, action.reduced_all_in_cost_pct)]
+
+
+def test_attempt_rungs_is_a_single_rung_without_a_reduction() -> None:
+    assert LiquidityPlugin._attempt_rungs(
+        ProviderAttempt(npub=A, amount_sat=400_000, all_in_cost_pct=0.4)) == [
+            (400_000, 0.4)]
+
+
+def test_attempt_rungs_refuses_a_reduction_that_does_not_shrink() -> None:
+    """Defensive: a bad action must not buy a rung that re-runs the same payment."""
+    for bad in (400_000, 500_000, 0, None):
+        assert LiquidityPlugin._attempt_rungs(
+            ProviderAttempt(npub=A, amount_sat=400_000, all_in_cost_pct=0.4,
+                            reduced_amount_sat=bad,
+                            reduced_all_in_cost_pct=0.45)) == [(400_000, 0.4)]

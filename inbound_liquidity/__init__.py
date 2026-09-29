@@ -5127,8 +5127,16 @@ class LiquidityPlugin(BasePlugin):
         In legacy/URL mode (empty npub) there is one attempt with no offer: the
         swap manager already points at the configured provider.
         """
-        planned = [ProviderAttempt(npub=action.provider_npub,
-                                   amount_sat=action.lightning_amount_sat)]
+        # The chosen provider has no ProviderAttempt of its own (the engine puts its
+        # figures on the action), so synthesise one -- carrying the action's reduced
+        # rung across, so that from here on every attempt in the list is uniform and
+        # nothing downstream has to special-case "the first one".
+        # ``all_in_cost_pct`` stays None: the action's reason already states it.
+        planned = [ProviderAttempt(
+            npub=action.provider_npub,
+            amount_sat=action.lightning_amount_sat,
+            reduced_amount_sat=action.reduced_amount_sat,
+            reduced_all_in_cost_pct=action.reduced_all_in_cost_pct)]
         planned.extend(action.alternates)
         out: List[Tuple[ProviderAttempt, Optional['SwapOffer']]] = []
         for attempt in planned:
@@ -5240,7 +5248,7 @@ class LiquidityPlugin(BasePlugin):
                         source=attempt.npub,
                         detail=f"{remaining} provider(s) untried after {index - 1} attempt(s)")
                     break
-                rungs = self._attempt_rungs(action, attempt, index)
+                rungs = self._attempt_rungs(attempt)
                 stop = False
                 for rung, (rung_amount, rung_cost) in enumerate(rungs, start=1):
                     is_last_rung = rung == len(rungs)
@@ -5252,11 +5260,15 @@ class LiquidityPlugin(BasePlugin):
                     if outcome is _SwapAttempt.PAYMENT_FAILED:
                         # Safe to retry: nothing is committed on this channel.
                         if not is_last_rung:
+                            # `rungs[rung]` is the NEXT rung: `rung` is 1-based here,
+                            # so it indexes one past the current entry.
                             nxt, nxt_cost = rungs[rung]
+                            cost_note = ("" if nxt_cost is None
+                                         else f" (all-in cost {nxt_cost:.3f}%)")
                             self.logger.info(
                                 f"the Lightning payment for {rung_amount} sat failed; "
-                                f"retrying the same provider at {nxt} sat "
-                                f"(all-in cost {nxt_cost:.3f}%) before failing over")
+                                f"retrying the same provider at {nxt} sat"
+                                f"{cost_note} before failing over")
                         continue
                     if outcome is not _SwapAttempt.NEXT:
                         # COMMITTED or ABORT: the cascade is over, either because a
@@ -5271,28 +5283,25 @@ class LiquidityPlugin(BasePlugin):
                         f"failing over to the next provider for {action.short_id} "
                         f"({index + 1} of {total})")
 
-    def _attempt_rungs(self, action: ReverseSwapAction, attempt: ProviderAttempt,
-                       index: int) -> List[Tuple[int, Optional[float]]]:
+    @staticmethod
+    def _attempt_rungs(attempt: ProviderAttempt) -> List[Tuple[int, Optional[float]]]:
         """The ``(amount_sat, all_in_cost_pct)`` rungs to try for one provider: its
         planned size, then the engine's single reduced size when there is one.
 
-        Both figures come from the engine -- ``ProviderAttempt`` for a failover, and
-        the action itself for the chosen provider, whose attempt the executor
-        synthesises without cost fields (see ``_resolve_swap_attempts``). Nothing
-        here computes a size or a cost; a reduced rung that the cost ceiling or the
-        provider's minimum ruled out simply is not present.
+        Every figure comes from the engine -- ``_resolve_swap_attempts`` makes sure
+        the chosen provider's attempt carries the action's reduced rung too, so there
+        is no special case here. Nothing computes a size or a cost; a reduced rung
+        that the cost ceiling or the provider's minimum ruled out simply is not
+        present.
+
+        The final ``<`` is defensive, not expected: a "reduction" that did not
+        actually shrink would spend a rung re-running the identical payment.
         """
         rungs: List[Tuple[int, Optional[float]]] = [
             (attempt.amount_sat, attempt.all_in_cost_pct)]
-        if index == 1 and attempt.all_in_cost_pct is None:
-            # The chosen provider: its costs live on the action, not the attempt.
-            reduced, reduced_cost = (action.reduced_amount_sat,
-                                     action.reduced_all_in_cost_pct)
-        else:
-            reduced, reduced_cost = (attempt.reduced_amount_sat,
-                                     attempt.reduced_all_in_cost_pct)
+        reduced = attempt.reduced_amount_sat
         if reduced and 0 < reduced < attempt.amount_sat:
-            rungs.append((reduced, reduced_cost))
+            rungs.append((reduced, attempt.reduced_all_in_cost_pct))
         return rungs
 
     def _commit_cascade_faults(self, wallet: 'Abstract_Wallet',
@@ -5911,6 +5920,15 @@ class LiquidityPlugin(BasePlugin):
                     f"mining-fee prepayment resolved; failover gate says "
                     f"{verdict.name}")
                 return verdict
+        # One last ask. The loop's final check lands somewhere before the deadline,
+        # so without this a prepayment that resolved in the remaining sliver would be
+        # reported as "never resolved" -- and cost a cascade for nothing.
+        verdict = self._unfunded_swap_verdict(wallet, sm, tracked)
+        if verdict is not _SwapAttempt.PREPAY_PENDING:
+            self.logger.info(
+                f"mining-fee prepayment resolved as the wait expired; failover gate "
+                f"says {verdict.name}")
+            return verdict
         self.logger.warning(
             f"mining-fee prepayment still in flight after {budget:.0f}s; treating "
             f"this channel as possibly committed and not failing over")
