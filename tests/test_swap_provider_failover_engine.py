@@ -12,11 +12,12 @@ swap, not the same swap re-addressed. No Electrum import required.
 from __future__ import annotations
 
 from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
-    MAX_SWAP_PROVIDER_ATTEMPTS,
     ProviderAttempt,
     ReverseSwapAction,
+    SWAP_REDUCTION_FACTOR,
     evaluate,
     rank_providers,
+    reduced_attempt_amount,
     select_provider,
     swap_cost_sat,
 )
@@ -122,13 +123,20 @@ def test_action_carries_ranked_alternates_excluding_the_chosen() -> None:
     assert all(isinstance(a, ProviderAttempt) for a in act.alternates)
 
 
-def test_alternates_are_capped_to_the_attempt_budget() -> None:
-    # Six eligible providers, but the cascade may only make
-    # MAX_SWAP_PROVIDER_ATTEMPTS attempts in total (chosen + alternates).
+def test_alternates_are_not_capped() -> None:
+    """Every provider that passed the cost gate is offered as a failover.
+
+    This used to be truncated to a three-attempt budget, which left ranked,
+    already-vetted providers untried while the channel sat over its trigger for a
+    whole SWAP_COOLDOWN_SEC. The bound is now purely temporal and lives in the
+    executor (``swap_cascade_deadline_sec``), so the engine hands over the full
+    ranking and lets the wall clock decide how far down it gets.
+    """
     offers = [make_offer(f"npub{i}", pct=0.1 + i * 0.05) for i in range(6)]
     act = _swap_actions(evaluate(make_snapshot(offers), make_config()))[0]
-    assert len(act.alternates) == MAX_SWAP_PROVIDER_ATTEMPTS - 1
-    assert [a.npub for a in act.alternates] == ["npub1", "npub2"]
+    assert act.provider_npub == "npub0"
+    assert [a.npub for a in act.alternates] == [
+        "npub1", "npub2", "npub3", "npub4", "npub5"]
 
 
 def test_each_alternate_carries_its_own_amount_and_cost() -> None:
@@ -196,3 +204,102 @@ def test_only_the_chosen_provider_is_charged_capacity() -> None:
     assert actions[0].alternates[0].npub == "npubB"      # was a mere contingency
     assert actions[1].provider_npub == "npubB"
     assert actions[1].lightning_amount_sat == 900_000
+
+
+# --- the single reduced retry ---------------------------------------------
+# A provider whose Lightning payment failed gets one more try at a slightly
+# smaller amount, because a payment can fail for want of a single route carrying
+# the full size and succeed just below it. Observed on mainnet: 95,468 sat out of
+# a 109,921 sat channel failed 29 route attempts in a row, every failure a
+# TEMPORARY_CHANNEL_FAILURE or UNKNOWN_NEXT_PEER from somewhere downstream.
+#
+# The reason this needs testing rather than just doing is the direction of the
+# cost curve: shrinking a swap makes it MORE expensive as a percentage, because
+# the provider's mining fee and our claim fee do not shrink with it. So the rung
+# walks toward the user's ceiling and must be re-gated against it, every time.
+def test_reduced_amount_is_the_configured_fraction() -> None:
+    offer = make_offer("npub", pct=0.2, lo=20_000)
+    reduced = reduced_attempt_amount(offer, 900_000, 0, make_config())
+    assert reduced is not None
+    amount, cost_pct = reduced
+    assert amount == int(900_000 * SWAP_REDUCTION_FACTOR)
+    # Pure percentage fee, no fixed fees: the cost does not move at all here.
+    assert round(cost_pct, 3) == 0.2
+
+
+def test_reduced_amount_costs_more_when_fees_are_fixed() -> None:
+    """The whole reason the rung is re-gated. Same provider, smaller swap, higher
+    all-in percentage -- because 315 sat of mining fee is 315 sat either way."""
+    offer = make_offer("npub", pct=0.39, mining=315, lo=20_000)
+    full = swap_cost_sat(0.39, 315, 315, 95_468) / 95_468 * 100.0
+    reduced = reduced_attempt_amount(offer, 95_468, 315, make_config(max_swap_fee_pct=1.2))
+    assert reduced is not None
+    amount, cost_pct = reduced
+    assert amount == 85_921
+    assert cost_pct > full                      # smaller swap, dearer swap
+    assert round(full, 3) == 1.051              # the figures from the live log
+    assert round(cost_pct, 3) == 1.124
+
+
+def test_reduced_amount_refused_when_it_breaches_the_ceiling() -> None:
+    """One step further along that same curve and the ceiling bites: 77,328 sat
+    costs 1.205% against a 1.2% ceiling, so no retry is offered. The user's cost
+    limit is not negotiable just because a payment failed."""
+    offer = make_offer("npub", pct=0.39, mining=315, lo=20_000)
+    cfg = make_config(max_swap_fee_pct=1.2)
+    assert reduced_attempt_amount(offer, 85_921, 315, cfg) is None
+    # Sanity: it is the ceiling doing this, not the arithmetic falling over.
+    assert round(swap_cost_sat(0.39, 315, 315, 77_328) / 77_328 * 100.0, 3) == 1.205
+    assert reduced_attempt_amount(offer, 85_921, 315,
+                                  make_config(max_swap_fee_pct=1.3)) is not None
+
+
+def test_reduced_amount_refused_below_the_provider_minimum() -> None:
+    """A reduced rung the provider would reject outright is not a retry, it is a
+    wasted round trip."""
+    offer = make_offer("npub", pct=0.2, lo=100_000)
+    assert reduced_attempt_amount(offer, 900_000, 0, make_config()) is not None
+    assert reduced_attempt_amount(offer, 105_000, 0, make_config()) is None
+
+
+def test_reduced_amount_refused_when_it_would_not_shrink() -> None:
+    """Degenerate sizes must not produce a 'retry' at the same amount (which would
+    burn a rung re-running the identical payment) or at zero."""
+    offer = make_offer("npub", pct=0.2, lo=0)
+    assert reduced_attempt_amount(offer, 0, 0, make_config()) is None
+    assert reduced_attempt_amount(offer, 1, 0, make_config()) is None
+
+
+def test_action_and_alternates_carry_their_own_reduced_rung() -> None:
+    """Every provider is priced independently -- a reduction that clears one
+    provider's economics need not clear another's -- so the rung rides on the
+    action (for the chosen provider) and on each alternate, never recomputed by
+    the executor."""
+    offers = [make_offer("cheap", pct=0.2), make_offer("dear", pct=0.55)]
+    act = _swap_actions(evaluate(make_snapshot(offers), make_config()))[0]
+    assert act.provider_npub == "cheap"
+    assert act.reduced_amount_sat == int(act.lightning_amount_sat
+                                         * SWAP_REDUCTION_FACTOR)
+    assert act.reduced_all_in_cost_pct is not None
+    alt = act.alternates[0]
+    assert alt.npub == "dear"
+    assert alt.reduced_amount_sat == int(alt.amount_sat * SWAP_REDUCTION_FACTOR)
+    assert alt.reduced_all_in_cost_pct is not None
+
+
+def test_a_provider_near_the_ceiling_gets_no_reduced_rung() -> None:
+    """The gate is per provider: the cheap one can afford to shrink, the one
+    already scraping the ceiling cannot, and both facts reach the executor on the
+    same action."""
+    cfg = make_config(max_swap_fee_pct=0.6)
+    # 'tight' passes at full size (0.594%) but not once its 850 sat mining fee is
+    # spread over 810,000 instead of 900,000 (0.605%); 'cheap' has room either way.
+    offers = [make_offer("cheap", pct=0.1),
+              make_offer("tight", pct=0.5, mining=850)]
+    act = _swap_actions(evaluate(make_snapshot(offers), cfg))[0]
+    assert act.provider_npub == "cheap"
+    assert act.reduced_amount_sat is not None
+    tight = next(a for a in act.alternates if a.npub == "tight")
+    assert tight.all_in_cost_pct is not None and tight.all_in_cost_pct <= 0.6
+    assert tight.reduced_amount_sat is None
+    assert tight.reduced_all_in_cost_pct is None

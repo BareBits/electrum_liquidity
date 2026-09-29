@@ -12,10 +12,18 @@ Covered here:
   * failover on each pre-payment failure class (unreachable, unswappable amount,
     provider decline, SwapServerError, cheat marker, too-close locktime);
   * NO failover once funds may be committed -- the safety-critical case;
+  * the mining-fee PREPAYMENT, which is what used to make the whole cascade
+    unreachable: Electrum returns from ``reverse_swap`` while that HTLC is still
+    live, and reading "not resolved yet" as "may be committed" stopped every
+    cascade at its first provider. The gate now waits for it, bounded;
+  * the single reduced retry: a provider whose PAYMENT failed is tried once more at
+    the engine's smaller size (if that size still clears the cost ceiling) before we
+    move on, and is faulted once for the pair rather than once per rung;
   * abort (no failover) on provider-independent our-side conditions and on
     unrecognised errors;
   * the cascade stops at the first success, and honours its wall-clock deadline;
   * per-attempt sizing/targeting: each provider gets ITS amount and ITS pairs;
+  * a swap that never funded is a DECLINE, never an action;
   * cooldown is armed once for the whole cascade, and not at all if every
     candidate had vanished.
 
@@ -38,6 +46,7 @@ from electrum.util import UserFacingException  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     SWAP_COOLDOWN_SEC,
     LiquidityPlugin,
+    _CascadeFaults,
 )
 from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore  # noqa: E402
     ProviderAttempt,
@@ -56,6 +65,10 @@ def _plugin(**config_over) -> LiquidityPlugin:
     # Per-provider wait for advertised terms; shrunk so an unreachable
     # provider trips the init timeout instantly instead of in 15s.
     p._swap_init_timeout_sec = 0.01
+    # Bounded wait for a swap's mining-fee prepayment to resolve before the
+    # failover gate decides; shrunk so no test sits through the real 150s.
+    p._prepay_resolve_wait_sec = 0.05
+    p._prepay_poll_interval_sec = 0.01
     cfg = dict(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
@@ -86,6 +99,15 @@ def _plugin(**config_over) -> LiquidityPlugin:
     p._track_new_swaps = _track
     p._diag_event = lambda wallet, **kw: p.diags.append(kw)
     p._log_action = lambda wallet, **kw: p.logged.append(kw)
+    # A swap that did not fund is a DECLINE, never an action -- see
+    # _attempt_reverse_swap's unfunded arms. Captured separately so a test
+    # can tell the two apart.
+    p.declines = []      # (DeclineRecord, state)
+    p._log_decline = lambda wallet, decline, state: \
+        p.declines.append((decline, state))
+    # Real one-slot dedupe, not a stub: a channel whose swaps keep failing is
+    # re-evaluated every cooldown, and one row per cycle would flood the log.
+    p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
     return p
 
@@ -405,7 +427,13 @@ def test_timeout_before_any_swap_exists_does_fail_over() -> None:
 # race -- so None overwhelmingly means "the Lightning payment failed", not
 # "accepted, funding pending". Which one it is decides whether we may fail over.
 async def _accept_without_funding(sm, **kw):
-    sm._swaps["ff" * 32] = SimpleNamespace(prepay_hash=None)  # add_reverse_swap ran
+    # A DISTINCT payment hash per call, as Electrum's reverse_swap gives (it mints a
+    # fresh preimage each time). Reusing one key made the executor's
+    # "swaps that appeared during OUR call" diff come back empty on a second
+    # attempt, which reads as "no swap object" -- a fake-only artefact that would
+    # mask the rung walk.
+    key = f"{len(sm._swaps):02x}" + "ff" * 31
+    sm._swaps[key] = SimpleNamespace(prepay_hash=None)         # add_reverse_swap ran
     return None                                                # ... no funding txid
 
 
@@ -447,7 +475,11 @@ def test_failed_payment_softly_faults_the_provider_exactly_once() -> None:
 
 def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
     """The safety-critical half. An HTLC may still be live, so draining this
-    channel again through another provider could pay out twice."""
+    channel again through another provider could pay out twice.
+
+    Note this is the MAIN payment in flight, which is the one that means "possibly
+    committed" and is never waited on -- only a live prepayment gets the bounded
+    wait (see the prepay tests below)."""
     sm = _SM({A: _accept_without_funding})
     p = _plugin()
     _run(p, sm, _action(alternates=(B,)), ln_payment="inflight")
@@ -455,7 +487,10 @@ def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
     assert p.tracked == [(A, 399_500)]
     assert p.successes == [] and p.dev_fees == []
     assert p.faults == [] and p.peer_faults == []
-    assert len(p.logged) == 1
+    # Recorded, but as a decline -- nothing funded, so nothing is an action.
+    assert p.logged == []
+    assert len(p.declines) == 1
+    assert "did not complete" in p.declines[0][0].reason
 
 
 def test_unfunded_swap_with_no_route_to_the_provider_fails_over() -> None:
@@ -485,51 +520,151 @@ def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
     assert p.successes == [] and p.dev_fees == []
 
 
-def test_the_cascade_deadline_lets_every_ranked_provider_start() -> None:
-    """The deadline is checked before each attempt, and an attempt in progress
-    runs to its own backstop -- so the LAST provider is only reached at
-    (cap - 1) * backstop. A deadline below that silently drops a failover the
-    engine had already ranked and vetted, which is what a flat 500s used to do
-    with a cap of 3 and a 300s backstop.
+def test_the_cascade_deadline_reaches_every_ranked_provider() -> None:
+    """The deadline is checked before each attempt, and an attempt in progress runs
+    to its own backstop -- so the LAST rung is only reached at
+    (rungs - 1) * per-rung cost. A budget below that silently drops a failover the
+    engine had already ranked and vetted, which is what a flat 500s used to do with
+    three providers and a 300s backstop.
 
-    Pinned as an invariant rather than a value so the cap and the backstop can be
-    retuned without quietly reintroducing the gap."""
+    Pinned as an invariant over the derivation, at every provider count, so the
+    backstops and the rung count can be retuned without reintroducing the gap. It
+    has to be a derivation now rather than a constant: the provider cap is gone, so
+    there is no fixed number for a constant to have been sized against.
+    """
     from electrum.plugins.inbound_liquidity import (  # type: ignore
-        REVERSE_SWAP_TIMEOUT_SEC, SWAP_CASCADE_DEADLINE_SEC)
-    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
-        MAX_SWAP_PROVIDER_ATTEMPTS)
-    latest_start = (MAX_SWAP_PROVIDER_ATTEMPTS - 1) * REVERSE_SWAP_TIMEOUT_SEC
-    assert SWAP_CASCADE_DEADLINE_SEC > latest_start, (
-        f"cascade deadline {SWAP_CASCADE_DEADLINE_SEC}s cannot reach provider "
-        f"{MAX_SWAP_PROVIDER_ATTEMPTS}, which starts at {latest_start}s")
+        PREPAY_RESOLVE_WAIT_SEC, REVERSE_SWAP_TIMEOUT_SEC,
+        swap_cascade_deadline_sec)
+    per_rung = REVERSE_SWAP_TIMEOUT_SEC + PREPAY_RESOLVE_WAIT_SEC
+    for providers in (1, 2, 3, 7, 25):
+        budget = swap_cascade_deadline_sec(providers)
+        # Two rungs per provider: the planned amount and its reduced retry.
+        latest_start = (providers * 2 - 1) * per_rung
+        assert budget > latest_start, (
+            f"a {providers}-provider cascade budgets {budget}s, which cannot reach "
+            f"its last rung at {latest_start}s")
+    # Monotonic in the provider count: adding a provider must never shrink the
+    # budget (which would drop a provider that used to be reachable).
+    budgets = [swap_cascade_deadline_sec(n) for n in range(1, 10)]
+    assert budgets == sorted(budgets)
+    # A degenerate count still yields a usable budget rather than zero.
+    assert swap_cascade_deadline_sec(0) > 0
 
 
-def test_a_live_prepay_htlc_blocks_failover() -> None:
-    """The minerFeeInvoice is a separate fire-and-forget payment. Its HTLC is
-    still something committed on this channel, so it must gate failover even when
-    the main invoice has definitively failed.
+# --- the mining-fee prepayment, and why failover used to be unreachable ---
+# Electrum's reverse_swap fires the minerFeeInvoice with asyncio.ensure_future and
+# then races ONLY the main payment against funding detection, so it returns while
+# the prepayment's HTLC is typically still live. The failover gate must not fail
+# over with a live HTLC -- but treating "not resolved yet" as "may be committed"
+# meant the gate said COMMITTED on essentially every failed swap, and no cascade
+# ever reached its second provider.
+#
+# Observed on mainnet: main payment gave up at 16:45:27 ('Giving up after 29
+# attempts'), prepayment MPP_TIMEOUTed at 16:45:30, and two ranked failover
+# providers were never tried. Three seconds of patience was the whole difference.
+_PREPAY = bytes.fromhex("ab" * 32)
 
-    Deliberately conservative: the prepay is small (2x mining fee) and unpinned,
-    so it does not itself risk draining the target channel twice -- but holding
-    the cascade while ANY HTLC for the swap is live is the chosen trade, at the
-    cost of deferring that channel to the next cycle. Observed live: a main
-    payment that fails instantly for want of a route returns while its prepay is
-    still in flight, and the cascade stops there."""
-    prepay = bytes.fromhex("ab" * 32)
 
-    async def _accept_with_live_prepay(sm, **kw):
-        sm._swaps["ff" * 32] = SimpleNamespace(prepay_hash=prepay)
-        return None
+async def _accept_with_prepay(sm, **kw):
+    key = f"{len(sm._swaps):02x}" + "ff" * 31       # distinct per call, as in Electrum
+    sm._swaps[key] = SimpleNamespace(prepay_hash=_PREPAY, funding_txid=None)
+    return None
 
-    sm = _SM({A: _accept_with_live_prepay})
-    p = _plugin()
+
+def _prepay_wallet(sm, inflight_calls: int):
+    """A wallet whose prepayment reads as in flight for the first
+    ``inflight_calls`` polls and resolved (failed) afterwards. The main invoice is
+    failed throughout."""
     wallet = _wallet(sm, "failed")
-    # Main invoice: failed. Prepay: still in flight.
-    wallet.lnworker.get_payments = lambda *, status=None: (
-        {prepay} if status == "inflight" else set())
+    calls = {"n": 0}
+
+    def get_payments(*, status=None):
+        if status != "inflight":
+            return set()
+        calls["n"] += 1
+        return {_PREPAY} if calls["n"] <= inflight_calls else set()
+
+    wallet.lnworker.get_payments = get_payments
+    return wallet, calls
+
+
+def test_a_resolving_prepay_htlc_no_longer_blocks_failover() -> None:
+    """The fix. The prepayment is live when the gate is first asked and resolves a
+    moment later, so the cascade waits and then does exactly what it exists for."""
+    sm = _SM({A: _accept_with_prepay})
+    p = _plugin()
+    wallet, calls = _prepay_wallet(sm, inflight_calls=2)
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
-    assert [n for n, _amt in sm.attempts] == [A]       # B never tried
+    assert [n for n, _amt in sm.attempts] == [A, B]     # B WAS tried
+    assert p.successes == [B]
+    assert calls["n"] > 2, "the gate never re-asked after the first live reading"
+
+
+def test_a_live_prepay_htlc_still_blocks_failover_while_it_stays_live() -> None:
+    """The safety property is unchanged: a prepayment that never resolves within
+    the budget still stops the cascade. Waiting replaced guessing; it did not
+    replace the guarantee."""
+    sm = _SM({A: _accept_with_prepay})
+    p = _plugin()
+    wallet, _calls = _prepay_wallet(sm, inflight_calls=10_000)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]        # B never tried
+    assert p.successes == []
+    assert any("prepayment did not resolve in time" in (d.get("reason") or "")
+               for d in p.diags)
+
+
+def test_the_prepay_wait_is_bounded() -> None:
+    """It must not be able to hold the evaluation lock indefinitely on a prepayment
+    that never resolves."""
+    sm = _SM({A: _accept_with_prepay})
+    p = _plugin()
+    p._prepay_resolve_wait_sec = 0.2
+    p._prepay_poll_interval_sec = 0.01
+    wallet, _calls = _prepay_wallet(sm, inflight_calls=10_000)
+    started = time.monotonic()
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    elapsed = time.monotonic() - started
+    assert 0.2 <= elapsed < 3.0, f"prepay wait took {elapsed:.2f}s"
+
+
+def test_a_swap_that_funds_during_the_prepay_wait_stops_the_cascade() -> None:
+    """The provider funded while we were waiting, so the swap is alive and this
+    channel is emphatically not free. Must not wait out the prepayment and then
+    fail over into a second drain."""
+    sm = _SM({A: _accept_with_prepay})
+    p = _plugin()
+    wallet, _calls = _prepay_wallet(sm, inflight_calls=10_000)
+    original = sm._swaps
+
+    def _fund_on_second_poll(*, status=None):
+        if status != "inflight":
+            return set()
+        # Funding appears while the prepayment is still live.
+        for swap in sm._swaps.values():
+            swap.funding_txid = "deadbeef"
+        return {_PREPAY}
+
+    wallet.lnworker.get_payments = _fund_on_second_poll
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert original is sm._swaps
+    assert [n for n, _amt in sm.attempts] == [A]        # B never tried
+    assert p.successes == []
+
+
+def test_a_settled_prepay_stops_the_cascade() -> None:
+    """A prepayment the provider actually fulfilled is evidence the swap is live:
+    the provider only settles it once the main payment's MPP set has arrived."""
+    sm = _SM({A: _accept_with_prepay})
+    p = _plugin()
+    wallet = _wallet(sm, "paid")                        # PR_PAID for every hash
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]
     assert p.successes == []
 
 
@@ -612,23 +747,61 @@ def test_transport_is_retargeted_for_each_attempt() -> None:
 
 
 # --- deadline -------------------------------------------------------------
-def test_cascade_deadline_stops_before_starting_another_attempt(monkeypatch) -> None:
+def _run_cascade_with_deadline(p, sm, action, deadline: float, npubs) -> None:
+    """Drive ``_run_swap_cascade`` with a deadline we choose outright.
+
+    The budget ``_reverse_swap`` derives is, by construction, at least what all its
+    rungs can spend (see swap_cascade_deadline_sec), so no well-behaved attempt can
+    ever exhaust it -- which is the design intent and also why the deadline cannot
+    be tripped through the public entry point. The loop's between-attempts check is
+    still worth pinning, so it is exercised with the deadline supplied directly.
+    """
+    from contextlib import nullcontext
+    attempts = [(ProviderAttempt(npub=n, amount_sat=400_000, all_in_cost_pct=0.4),
+                 SimpleNamespace(server_pubkey="ab" * 32,
+                                 pairs=SimpleNamespace(npub=n)))
+                for n in npubs]
+    wallet = _wallet(sm, "failed")
+    asyncio.run(p._run_swap_cascade(
+        wallet, action, attempts, nullcontext(_transport(npubs)), {},
+        deadline, len(attempts), _CascadeFaults(), deadline_sec=1.0))
+
+
+def test_cascade_deadline_stops_before_starting_another_attempt() -> None:
     """The deadline is checked BETWEEN attempts -- never mid-attempt, since
-    aborting a swap whose payment may be in flight is exactly what we avoid."""
-    import electrum.plugins.inbound_liquidity as mod
-    monkeypatch.setattr(mod, "SWAP_CASCADE_DEADLINE_SEC", 0.05)
+    aborting a swap whose payment may be in flight is exactly what we avoid.
+
+    So A runs to completion despite outliving the deadline, and B and C -- which
+    had not started -- are left for the next cycle.
+    """
     slow = SwapServerError()
 
     async def _slow_fail(sm, **kw):
-        await asyncio.sleep(0.2)                      # outlives the deadline
+        await asyncio.sleep(0.05)                     # outlives the deadline
         raise slow
 
     sm = _SM({A: _slow_fail})
     p = _plugin()
-    _run(p, sm, _action(chosen=A, alternates=(B, C)))
-    # A ran to completion (not cut short); B and C were never started.
+    _run_cascade_with_deadline(
+        p, sm, _action(chosen=A, alternates=(B, C)),
+        deadline=time.monotonic() + 0.01, npubs=[A, B, C])
     assert [n for n, _amt in sm.attempts] == [A]
     assert p.successes == []
+    deadline_diags = [d for d in p.diags
+                      if d.get("reason") == "swap provider cascade deadline reached"]
+    assert len(deadline_diags) == 1
+    # It says how much was left undone, so a recurring deadline is diagnosable.
+    assert "2 provider(s) untried" in deadline_diags[0]["detail"]
+
+
+def test_an_expired_deadline_starts_nothing_at_all() -> None:
+    """The check comes before the first attempt too, not just between them."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run_cascade_with_deadline(
+        p, sm, _action(chosen=A, alternates=(B,)),
+        deadline=time.monotonic() - 1.0, npubs=[A, B])
+    assert sm.attempts == []
     assert any(d.get("reason") == "swap provider cascade deadline reached"
                for d in p.diags)
 
@@ -688,3 +861,302 @@ def test_legacy_mode_with_nothing_configured_skips() -> None:
     _run(p, sm, _action(chosen="", alternates=()), transport=_transport([]))
     assert sm.attempts == []
     assert p._swap_cooldown_until == {}
+
+
+# --- the single reduced retry ---------------------------------------------
+# A provider whose Lightning PAYMENT failed gets one more try at the engine's
+# reduced size before we move on, because a payment can fail for want of a single
+# route carrying the full amount and succeed just below it. The mainnet log that
+# prompted this shows 95,468 sat failing 29 route attempts in a row, every failure
+# a TEMPORARY_CHANNEL_FAILURE or UNKNOWN_NEXT_PEER from downstream -- nothing that
+# says anything about the provider, and nothing a different provider alone fixes.
+#
+# Only the payment-failed arm earns the retry. A provider that declined, rejected,
+# cheated or never answered would answer the same way at any size.
+def _reduced_action(chosen: str = A, alternates=(B,), amount: int = 400_000,
+                    reduced: Optional[int] = 360_000,
+                    alt_reduced: Optional[int] = 360_000) -> ReverseSwapAction:
+    return ReverseSwapAction(
+        channel_id="aa" * 32, short_id="1x1x1",
+        lightning_amount_sat=amount, reason="drain",
+        provider_npub=chosen,
+        reduced_amount_sat=reduced,
+        reduced_all_in_cost_pct=0.45 if reduced else None,
+        alternates=tuple(ProviderAttempt(npub=n, amount_sat=amount,
+                                         all_in_cost_pct=0.4,
+                                         reduced_amount_sat=alt_reduced,
+                                         reduced_all_in_cost_pct=0.45)
+                         for n in alternates))
+
+
+def test_a_failed_payment_retries_the_same_provider_smaller_first() -> None:
+    """Full size, then reduced size, THEN the next provider -- not straight to the
+    next provider."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (A, 360_000), (B, 400_000)]
+    assert p.successes == [B]
+
+
+def test_the_reduced_rung_can_be_the_one_that_works() -> None:
+    """The point of the whole mechanism: the provider was fine, the size was not."""
+    async def _fail_big_succeed_small(sm, **kw):
+        if kw["lightning_amount_sat"] > 380_000:
+            # A swap object DID appear (add_reverse_swap ran) and then the payment
+            # failed -- that is what makes this the retryable arm rather than the
+            # "no swap object, cannot tell" one.
+            return await _accept_without_funding(sm, **kw)
+        return "txid-small"
+
+    sm = _SM({A: _fail_big_succeed_small})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (A, 360_000)]
+    assert p.successes == [A]               # same provider, smaller swap
+    assert [n for n, _amt in sm.attempts if n == B] == []   # B never needed
+
+
+def test_no_reduced_rung_when_the_engine_priced_none() -> None:
+    """The cost ceiling is the engine's call. When it refused to price a reduction
+    -- because a smaller swap would breach max_swap_fee_pct -- the executor must not
+    invent one."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,), reduced=None, alt_reduced=None),
+         ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (B, 400_000)]
+    assert p.successes == [B]
+
+
+def test_every_provider_gets_its_own_reduced_rung() -> None:
+    """Per provider, reset to full each time: each provider is priced independently,
+    so each is entitled to its own full-then-reduced pair."""
+    sm = _SM({A: _accept_without_funding, B: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B, C)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (A, 360_000),
+                           (B, 400_000), (B, 360_000),
+                           (C, 400_000)]
+    assert p.successes == [C]
+
+
+def test_a_failed_payment_faults_the_provider_once_not_once_per_rung() -> None:
+    """Two rungs failing is one observation about that provider. Charging both
+    would sink a provider at double rate for a fault it may well not own -- the
+    mainnet case was our own peer being unable to route."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert [(n, kw) for n, _r, kw in p.faults] == [(A, {"soft": True})]
+    # The diag events, though, are per rung: there the detail is the point.
+    payment_diags = [d for d in p.diags
+                     if d.get("reason") == "reverse-swap Lightning payment failed"]
+    assert len(payment_diags) == 2
+    assert "400000 sat" in payment_diags[0]["detail"]
+    assert "360000 sat" in payment_diags[1]["detail"]
+    assert "reduced size" in payment_diags[1]["detail"]
+
+
+def test_a_rejected_provider_gets_no_reduced_rung() -> None:
+    """A capacity rejection is that provider's own verdict; a smaller swap is if
+    anything less attractive to it. Straight to the next provider."""
+    sm = _SM({A: SwapServerError()})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (B, 400_000)]
+
+
+def test_an_unreachable_provider_gets_no_reduced_rung() -> None:
+    """It never answered. Asking it again, smaller, is a wasted round trip."""
+    sm = _SM({A: _accept_without_funding})
+    sm.is_initialized = asyncio.Event()      # never set -> init timeout
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    assert sm.attempts == []
+
+
+def test_a_possibly_committed_swap_gets_no_reduced_rung() -> None:
+    """The safety rule outranks the retry: an HTLC may be live, so this channel is
+    not touched again -- at any size."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="inflight")
+    assert sm.attempts == [(A, 400_000)]
+    assert p.successes == []
+
+
+def test_a_reduced_rung_is_skipped_if_it_would_not_shrink() -> None:
+    """Defensive: a reduced amount that is not actually smaller would burn a rung
+    re-running the identical payment."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(), reduced=400_000), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000)]
+
+
+def test_the_reduced_rung_uses_the_reduced_amount_for_costs_and_fees() -> None:
+    """The dev fee and the expected on-chain amount must follow the rung that
+    actually ran, not the size originally planned."""
+    async def _fail_big_succeed_small(sm, **kw):
+        if kw["lightning_amount_sat"] > 380_000:
+            return await _accept_without_funding(sm, **kw)
+        return "txid-small"
+
+    sm = _SM({A: _fail_big_succeed_small})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    # get_recv_amount subtracts 500, so the fee accrues on 360_000 - 500.
+    assert p.dev_fees == [(359_500, "1x1x1")]
+    assert len(p.logged) == 1
+    assert p.logged[0]["amount_sat"] == 360_000
+    assert "reduced size" in p.logged[0]["detail"]
+
+
+def test_the_chosen_provider_inherits_the_actions_reduced_rung() -> None:
+    """The engine puts the chosen provider's figures on the ACTION, not on a
+    ProviderAttempt, so the executor synthesises one for it. That synthesis has to
+    carry the reduced rung across -- otherwise the best-ranked provider, the one
+    tried first and most likely to be the right answer, would be the only one that
+    never got its smaller retry."""
+    p = _plugin()
+    action = _reduced_action(chosen=A, alternates=())
+    attempts = p._resolve_swap_attempts(action, _transport([A]))
+    assert len(attempts) == 1
+    attempt, _offer = attempts[0]
+    assert attempt.npub == A
+    assert attempt.amount_sat == action.lightning_amount_sat
+    assert attempt.reduced_amount_sat == action.reduced_amount_sat
+    assert attempt.reduced_all_in_cost_pct == action.reduced_all_in_cost_pct
+    # ... and the rung list built from it has both sizes, in order.
+    assert p._attempt_rungs(attempt) == [
+        (action.lightning_amount_sat, None),
+        (action.reduced_amount_sat, action.reduced_all_in_cost_pct)]
+
+
+def test_attempt_rungs_is_a_single_rung_without_a_reduction() -> None:
+    assert LiquidityPlugin._attempt_rungs(
+        ProviderAttempt(npub=A, amount_sat=400_000, all_in_cost_pct=0.4)) == [
+            (400_000, 0.4)]
+
+
+def test_attempt_rungs_refuses_a_reduction_that_does_not_shrink() -> None:
+    """Defensive: a bad action must not buy a rung that re-runs the same payment."""
+    for bad in (400_000, 500_000, 0, None):
+        assert LiquidityPlugin._attempt_rungs(
+            ProviderAttempt(npub=A, amount_sat=400_000, all_in_cost_pct=0.4,
+                            reduced_amount_sat=bad,
+                            reduced_all_in_cost_pct=0.45)) == [(400_000, 0.4)]
+
+
+# --- the executor's own declines are de-duplicated ------------------------
+# A channel whose swaps keep failing is re-evaluated every SWAP_COOLDOWN_SEC. One
+# decline row per cycle would push real history out of the 2000-entry decision log
+# within days -- the same flood the engine's declines are already protected from,
+# except _filter_new_declines cannot help here: it is rebuilt from the engine's own
+# output every tick, so a row written straight from the executor would be discarded
+# from that set and then re-logged forever.
+def _run_unfunded_cascade(p, ln_payment: str = "inflight") -> None:
+    sm = _SM({A: _accept_without_funding})
+    _run(p, sm, _action(alternates=()), ln_payment=ln_payment)
+    p._swap_cooldown_until.clear()          # next cycle
+
+
+def test_an_identical_consecutive_executor_decline_is_not_relogged() -> None:
+    p = _plugin()
+    for _ in range(4):
+        _run_unfunded_cascade(p)
+    assert len(p.declines) == 1, \
+        f"a steadily-failing channel logged {len(p.declines)} rows, not 1"
+
+
+def test_a_failure_after_a_success_is_logged_afresh() -> None:
+    """The dedupe must not swallow a recurrence: once the channel has actually
+    completed a swap, the next failure is news."""
+    p = _plugin()
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 1
+
+    # A funded swap on the same channel.
+    sm = _SM({A: "txid-ok"})
+    _run(p, sm, _action(alternates=()), ln_payment="failed")
+    p._swap_cooldown_until.clear()
+    assert p.successes == [A]
+
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 2, "the post-success failure was swallowed as a repeat"
+
+
+def test_the_dedupe_is_per_channel() -> None:
+    """Two channels failing must both be reported; the slot is per channel, not one
+    global slot that they would take turns evicting."""
+    p = _plugin()
+    for channel_id, short_id in (("aa" * 32, "1x1x1"), ("bb" * 32, "2x2x2")):
+        sm = _SM({A: _accept_without_funding})
+        action = ReverseSwapAction(
+            channel_id=channel_id, short_id=short_id,
+            lightning_amount_sat=400_000, reason="drain", provider_npub=A)
+        asyncio.run(p._reverse_swap(_wallet(sm, "inflight"), action, state={},
+                                    transport=_transport([A])))
+    assert len(p.declines) == 2
+    assert {d.short_id for d, _s in p.declines} == {"1x1x1", "2x2x2"}
+
+
+def test_a_different_failure_reason_is_logged() -> None:
+    """The slot holds a signature, not a boolean: a channel that starts failing for
+    a different reason must say so."""
+    p = _plugin()
+    _run_unfunded_cascade(p)
+    assert len(p.declines) == 1
+    first = p.declines[0][0].reason
+    # Same channel, different amount -> different reason text.
+    sm = _SM({A: _accept_without_funding})
+    _run(p, sm, _action(alternates=(), amount=250_000), ln_payment="inflight")
+    assert len(p.declines) == 2
+    assert p.declines[1][0].reason != first
+
+
+def test_a_provider_is_faulted_even_if_its_reduced_rung_is_refused() -> None:
+    """The fault for a failed payment must survive the reduced rung ending for a
+    reason that never reaches a payment.
+
+    Charging it from "the last rung" looked equivalent and was not: here rung 1's
+    payment fails (no fault yet, because a rung remains) and rung 2 is turned away by
+    the provider's own bounds before any payment exists (``get_recv_amount`` -> None,
+    which is not a fault). The provider then escaped the fault for the payment that
+    HAD failed, stayed top-ranked on an unchanged ranking, and got picked again next
+    cycle -- exactly the wedge the cascade exists to break.
+    """
+    def _recv(npub, amt):
+        return None if amt < 400_000 else amt - 500     # reduced rung unswappable
+
+    sm = _SM({A: _accept_without_funding}, recv_amount=_recv)
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    # Only the full-size rung ever reached the provider.
+    assert sm.attempts == [(A, 400_000)]
+    assert [(n, kw) for n, _r, kw in p.faults] == [(A, {"soft": True})], \
+        "the provider escaped its fault because the reduced rung was refused"
+
+
+def test_the_payment_failure_fault_is_charged_once_per_provider() -> None:
+    """Two rungs failing is one observation, and each provider is charged separately
+    -- so a two-provider cascade with both payments failing is exactly two faults."""
+    sm = _SM({A: _accept_without_funding, B: _accept_without_funding})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
+    assert sm.attempts == [(A, 400_000), (A, 360_000),
+                           (B, 400_000), (B, 360_000)]
+    assert [n for n, _r, _kw in p.faults] == [A, B]
+    assert all(kw == {"soft": True} for _n, _r, kw in p.faults)
+
+
+def test_no_payment_failure_fault_when_the_payment_never_failed() -> None:
+    """The flag must not leak across providers: a provider that merely rejected
+    createswap gets its own (different) fault and nothing from this path."""
+    sm = _SM({A: SwapServerError()})
+    p = _plugin()
+    _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
+    reasons = [r for _n, r, _kw in p.faults]
+    assert reasons == ["swap rejected (likely transient capacity)"]
+    assert "reverse-swap Lightning payment failed" not in reasons

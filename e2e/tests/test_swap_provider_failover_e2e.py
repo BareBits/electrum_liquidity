@@ -27,6 +27,22 @@ provider accepted, funding is pending" and ended the cascade with nothing done.
 That one needs no sabotage -- the rig's topology already pins a swap's Lightning
 leg to a channel from which the cheapest provider is unroutable.
 
+That same test now also pins the reason the cascade still went nowhere in
+practice: the mining-fee PREPAYMENT. Electrum fires the minerFeeInvoice
+fire-and-forget and races only the main payment against funding detection, so
+``reverse_swap`` returns while the prepayment's HTLC is still live -- and the
+failover gate, which must not fail over with a live HTLC, read that as "funds may
+be committed" and stopped. Because the provider only fulfils the prepayment once
+the main payment's MPP set arrives too, a dead main payment dooms it, so it was
+live essentially every time. Note this rig hid the bug for a long while: its
+providers are direct channel peers, so their prepayments resolve fast enough that
+the old code sometimes got past the gate anyway.
+
+Two further tests cover the rest of the fix: a provider whose payment failed is
+retried once at 90% of the amount before we move on (a swap sized to what Electrum
+can SEND is not necessarily one the graph can ROUTE), and a swap that never funded
+is never written to the decision log as a completed action.
+
 Heavy and slow (~8-12 min each); needs the electrum venv + docker. Function-scoped
 rig (wipes .run, kills any previous rig), so it must NOT run while a manual
 run.py rig is up. Gated behind RUN_RIG_E2E=1.
@@ -37,6 +53,7 @@ Run:  RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest \
 from __future__ import annotations
 
 import glob
+import re
 import json
 import os
 import sys
@@ -188,7 +205,7 @@ def test_dead_provider_is_skipped_and_the_swap_completes_via_the_next_one(rig):
     #    attempt index on any swap that was not the first one tried.
     action = _swap_actions()[0]
     detail = action.get("detail", "")
-    assert "attempt 2 of" in detail, \
+    assert "provider 2 of" in detail, \
         f"swap did not come from a failover attempt; detail was: {detail!r}"
 
     # 3) The dead provider was tried and faulted; the swap went to the other one.
@@ -272,20 +289,57 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         ("the unfunded swap was never classified as a failed payment; the "
          "executor most likely scored it as accepted and stopped the cascade")
 
-    # 2) ... and the cascade actually advanced on that classification.
-    #    Waited for rather than asserted outright: a given attempt only advances
-    #    if it HAS a ranked failover left (capacity budgeting often leaves one
-    #    provider) and if the swap's prepayment HTLC -- unpinned and
-    #    fire-and-forget -- has already resolved, since a live one deliberately
-    #    holds the cascade. Neither is true every cycle, so give the wallet a few.
+    # 2) ... and the cascade actually advanced on that classification, in the SAME
+    #    attempt rather than some later cycle.
+    #
+    #    This is where the prepayment used to stop everything. Electrum fires the
+    #    minerFeeInvoice fire-and-forget and races only the MAIN payment against
+    #    funding detection, so reverse_swap returns while the prepayment's HTLC is
+    #    still live -- and the failover gate read that as "funds may be committed"
+    #    and stopped. Since the provider only fulfils the prepayment once the main
+    #    payment's MPP set arrives too, a dead main payment dooms it, so it was
+    #    live essentially every time and the cascade essentially never advanced.
+    #    The gate now waits for it (bounded), which is why this is a plain wait for
+    #    the failover rather than "give the wallet a few cycles and hope".
     assert _wait_until(
         lambda: "failing over to the next provider" in _client_log_text(),
         rig=rig, timeout=600), \
         "the failed payment never advanced the cascade to the next provider"
 
+    # 2b) The prepayment gate must never be the reason a cascade stopped.
+    #
+    #     Asserted as a NEGATIVE, deliberately. Whether the gate is exercised at all
+    #     depends on rig timing that this test cannot pin: the rig's providers are
+    #     direct channel peers, so their prepayment sometimes resolves before the gate
+    #     first asks (nothing to wait for) and sometimes after it (a real wait). An
+    #     earlier version of this assertion demanded the wait happen every run and was
+    #     flaky for exactly that reason -- the rig cannot reproduce mainnet's timing on
+    #     demand, and pretending otherwise would be a test that lies about its
+    #     coverage. The four gate outcomes are pinned precisely, with the timing under
+    #     control, in tests/test_swap_provider_failover_glue.py.
+    #
+    #     What IS invariant is that the wait must not expire: if it does, the gate
+    #     answered "possibly committed" and stopped a cascade that should have
+    #     continued -- the original bug, back again, just slower.
+    log_text = _client_log_text()
+    assert "prepayment still in flight after" not in log_text, \
+        ("the prepayment wait expired and the cascade stopped -- the budget is too "
+         "small for real timing, or the prepayment is not resolving at all")
+
+    # When the gate DID have to wait (observed live: an 11s wait on this rig), it must
+    # have resolved into a decision rather than timing out. Recorded either way, so a
+    # run where the timing never produced a wait is not a failure.
+    if "waiting up to" in log_text and "prepayment" in log_text:
+        assert "mining-fee prepayment resolved" in log_text, \
+            "the gate started waiting for the prepayment and never got an answer"
+        print("prepayment gate exercised: the wait happened and resolved")
+    else:
+        print("prepayment gate not exercised this run (prepayment resolved before "
+              "the gate asked); see the glue tests for its four outcomes")
+
     # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
     assert _wait_until(
-        lambda: any("attempt 2 of" in a.get("detail", "") for a in _swap_actions()),
+        lambda: any("provider 2 of" in a.get("detail", "") for a in _swap_actions()),
         rig=rig, timeout=480), \
         (f"no swap completed via a failover attempt; swap actions were: "
          f"{[a.get('detail') for a in _swap_actions()]}")
@@ -322,3 +376,124 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
     assert _wait_until(lambda: _max_inbound() > baseline_inbound + 100_000,
                        rig=rig, timeout=300), \
         f"inbound liquidity did not increase (max remote_balance={_max_inbound()})"
+
+
+def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
+    """Before failing over, a provider whose Lightning payment failed is tried once
+    more at 90% of the amount.
+
+    This is the other half of why swaps were not completing. Sizing already asks
+    Electrum what it can send (``num_sats_can_send`` minus a fee-reserve headroom),
+    but "can I afford to send this" and "does the graph have a route for this" are
+    different questions. On mainnet a 95,468 sat swap out of a 109,921 sat channel
+    failed 29 route attempts in a row -- every failure a TEMPORARY_CHANNEL_FAILURE or
+    UNKNOWN_NEXT_PEER from downstream, several reported by our own channel peer,
+    which simply could not forward that much onward. No provider choice fixes that;
+    a smaller amount can.
+
+    Asserted on the log rather than on an outcome, because whether the smaller rung
+    SUCCEEDS depends on the rig's liquidity at that moment -- what must hold is that
+    it is attempted, at the right size, before the cascade moves on. The rig's
+    permissive 10% fee ceiling (see _arm_swap_config) guarantees the reduced amount
+    still clears the cost gate, so a rung is always priced here; the refusal case is
+    unit-tested, where the arithmetic can be pinned exactly.
+    """
+    assert rig.partner2_nodeid, "rig did not bring up a second provider"
+
+    _arm_swap_config()
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")   # arm last
+
+    # Wait for a payment failure -- the only arm that earns a reduced retry.
+    assert _wait_until(
+        lambda: "the Lightning payment failed (no funds committed)"
+                in _client_log_text(), rig=rig, timeout=600), \
+        "no swap reached the failed-payment arm, so no reduced retry was possible"
+
+    # The retry is announced with both sizes, so a log reader can see the step.
+    assert _wait_until(
+        lambda: "retrying the same provider at" in _client_log_text(),
+        rig=rig, timeout=420), \
+        ("the failed payment went straight to the next provider without trying a "
+         "smaller size first")
+
+    # And the smaller attempt really ran, labelled as such.
+    assert _wait_until(
+        lambda: "reduced size" in _client_log_text(), rig=rig, timeout=420), \
+        "the reduced rung was announced but never attempted"
+
+    # The reduced amount is the engine's 10% step off whatever was planned, never a
+    # number the executor invented. Recover both from the log and check the ratio.
+    m = re.search(r"the Lightning payment for (\d+) sat failed; "
+                  r"retrying the same provider at (\d+) sat", _client_log_text())
+    assert m, "could not read the full and reduced sizes out of the log"
+    full, reduced = int(m.group(1)), int(m.group(2))
+    assert reduced == int(full * 0.9), \
+        f"reduced size {reduced} is not 90% of {full}"
+
+    # One observation, one fault: the pair of rungs must not charge the provider
+    # twice. (Which provider is faulted depends on ranking, so this checks the
+    # count per provider rather than naming one.)
+    assert _wait_until(
+        lambda: any(int(s.get("fault_count", 0)) > 0
+                    for s in _reliability().values()),
+        rig=rig, timeout=240), f"no provider fault recorded: {_reliability()}"
+    per_provider = [int(s.get("fault_count", 0)) for s in _reliability().values()]
+    failures = _client_log_text().count(
+        "produced no funding: the Lightning payment failed")
+    assert max(per_provider) < failures or failures <= 1, (
+        f"a provider was faulted once per rung rather than once per provider: "
+        f"fault counts {per_provider} against {failures} rung failures")
+
+
+def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):
+    """A swap that produced no on-chain funding must never appear in Actions.
+
+    It used to: the "possibly committed" branch fell through into the same
+    ``_log_action`` the funded path uses, so a swap whose Lightning payment had just
+    failed was written to the decision log as a completed drain with
+    ``funding txid None`` in its detail. In the Actions view -- where the user looks
+    to see whether anything worked -- that is indistinguishable from a swap that
+    did work, which is precisely the confusion that made "no swaps are completing"
+    hard to see.
+    """
+    _arm_swap_config()
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
+
+    assert _wait_until(
+        lambda: "the Lightning payment failed (no funds committed)"
+                in _client_log_text(), rig=rig, timeout=600), \
+        "no swap failed its Lightning payment, so there is nothing to check"
+
+    # Every swap ACTION carries a real funding txid. None of them says "None".
+    for action in _swap_actions():
+        detail = action.get("detail", "")
+        assert "funding txid None" not in detail, \
+            f"an unfunded swap was logged as a completed action: {detail!r}"
+        assert re.search(r"funding txid [0-9a-f]{64}", detail), \
+            f"a swap action carries no real funding txid: {detail!r}"
+
+    # ... and the failure is still recorded somewhere the user can see. WHICH view
+    # depends on the arm, and the distinction is deliberate:
+    #
+    #   * a failed Lightning PAYMENT (this test's trigger) charges the provider a
+    #     soft reliability fault and moves on -- Faults, not Declines, because the
+    #     thing worth recording is the evidence about that provider;
+    #   * a swap that may have COMMITTED funds stops the cascade and writes a
+    #     "did not complete" decline, because there the useful fact is that the
+    #     channel is being left alone.
+    #
+    # So this asserts the fault, not a decline. An earlier version of this test
+    # demanded the decline and failed here against a real rig -- the assertion, not
+    # the behaviour, was wrong.
+    assert _wait_until(
+        lambda: any(int(s.get("fault_count", 0)) > 0
+                    for s in _reliability().values()),
+        rig=rig, timeout=240), \
+        (f"a swap failed its payment without being recorded anywhere the user can "
+         f"see: reliability={_reliability()}")
+
+    # And nothing in the decision log claims this channel was drained.
+    for entry in _decision_log():
+        if entry.get("category") == "action" and entry.get("kind") == "swap":
+            assert "funding txid None" not in (entry.get("detail") or ""), \
+                f"an unfunded swap reached the Actions view: {entry}"
