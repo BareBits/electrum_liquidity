@@ -77,6 +77,10 @@ def _plugin() -> LiquidityPlugin:
     p._swap_cooldown_until = {}
     p._reverse_swap_timeout_sec = 0.05     # shrink so a stall trips at once
     p._swap_init_timeout_sec = 0.01        # ditto for the wait on advertised terms
+    # Bounded wait for a swap's mining-fee prepayment to resolve before the
+    # failover gate decides; shrunk so no test sits through the real 150s.
+    p._prepay_resolve_wait_sec = 0.05
+    p._prepay_poll_interval_sec = 0.01
     p.config = SimpleNamespace()           # getattr defaults kick in
     return p
 

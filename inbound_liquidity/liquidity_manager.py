@@ -1455,13 +1455,73 @@ class OpenChannelAction:
     reason: str
 
 
-# How many providers one swap decision may try in a single cycle (the chosen
-# provider plus its failovers). Each attempt costs a provider round-trip and, in
-# the worst case, a full REVERSE_SWAP_TIMEOUT_SEC backstop, all while holding the
-# per-wallet evaluation lock -- so the cascade is capped rather than walking every
-# discovered provider. Providers left untried are simply retried next cycle, by
-# which time the failed ones have sunk in the ranking.
-MAX_SWAP_PROVIDER_ATTEMPTS = 3
+# One swap decision walks EVERY provider that passes the cost gate, best first,
+# until one commits. There is deliberately no cap: a capped cascade left ranked,
+# vetted providers untried while a channel stayed stuck over its trigger, and the
+# retry-next-cycle consolation costs a full SWAP_COOLDOWN_SEC per channel.
+#
+# The bound is therefore purely temporal -- the executor's per-cascade deadline,
+# which it derives from how many attempts it actually plans to make (see
+# ``swap_cascade_deadline_sec``). The cost of that choice is real and is accepted
+# knowingly: a wallet that has discovered many providers can hold the per-wallet
+# evaluation lock for a long time on a channel where every provider fails, and
+# nothing else for that wallet (offline-peer autoclose, stuck-swap reconciliation,
+# other channels' drains) runs meanwhile.
+
+# The single size reduction a failing provider is offered before we move on.
+# A big Lightning payment can fail where a smaller one succeeds -- no single route
+# carries the amount -- so a provider whose PAYMENT failed is worth one more try at
+# a slightly smaller size. 10% because the reduction is nearly free in
+# liquidity terms but meaningfully easier to route.
+#
+# It is NOT a ladder. Every satoshi taken off the amount makes the swap
+# proportionally MORE expensive -- the provider's mining fee and our on-chain
+# claim fee are fixed -- so each rung walks toward the cost ceiling the user set.
+# One rung, re-checked against that ceiling, is the whole mechanism (see
+# ``reduced_attempt_amount``).
+SWAP_REDUCTION_FACTOR = 0.9
+
+
+def reduced_attempt_amount(offer: 'ProviderOffer', amount_sat: int,
+                           claim_fee_sat: int, config: 'LiquidityConfig',
+                           *, factor: float = SWAP_REDUCTION_FACTOR
+                           ) -> Optional[Tuple[int, float]]:
+    """The smaller amount to retry ``offer`` with, and its all-in cost percentage
+    -- or None if no such retry is allowed.
+
+    Refused when the reduced amount would break any rule the full-size attempt had
+    to satisfy:
+
+      * it drops below this provider's advertised minimum, or to nothing at all;
+      * its all-in cost exceeds ``config.max_swap_fee_pct``. This is the rule that
+        actually bites. The percentage fee scales with the amount but the mining
+        and claim fees do not, so shrinking a swap RAISES its cost as a
+        percentage. Worked example, at 0.39% + 315 sat mining + 315 sat claim
+        against a 1.2% ceiling: 95,468 sat costs 1.051% and passes, 85,921 sat
+        costs 1.124% and still passes, 77,328 sat costs 1.205% and is refused.
+
+    Returns ``(amount, cost_pct)`` so the caller never recomputes the arithmetic,
+    matching :func:`rank_providers`' contract with the executor.
+    """
+    reduced = int(amount_sat * factor)
+    if reduced <= 0 or reduced < offer.min_amount_sat or reduced >= amount_sat:
+        return None
+    cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
+                             claim_fee_sat, reduced) / reduced * 100.0
+    if cost_pct > config.max_swap_fee_pct:
+        return None
+    return reduced, cost_pct
+
+
+def _reduced_fields(offer: 'ProviderOffer', amount_sat: int, claim_fee_sat: int,
+                    config: 'LiquidityConfig') -> Dict[str, object]:
+    """:func:`reduced_attempt_amount` as the two :class:`ProviderAttempt` kwargs,
+    so a construction site does not have to unpack an Optional tuple inline."""
+    reduced = reduced_attempt_amount(offer, amount_sat, claim_fee_sat, config)
+    if reduced is None:
+        return {"reduced_amount_sat": None, "reduced_all_in_cost_pct": None}
+    amount, cost_pct = reduced
+    return {"reduced_amount_sat": amount, "reduced_all_in_cost_pct": cost_pct}
 
 
 @dataclass(frozen=True)
@@ -1475,10 +1535,18 @@ class ProviderAttempt:
 
     ``all_in_cost_pct`` is None only for the attempt the executor synthesises for
     the *chosen* provider, whose cost the action already states in its reason.
+
+    ``reduced_amount_sat`` / ``reduced_all_in_cost_pct`` are the one smaller retry
+    this provider gets if its Lightning payment fails (see
+    :func:`reduced_attempt_amount`), or None when the cost ceiling or the
+    provider's minimum rules it out. Precomputed here for the same reason as
+    ``amount_sat``: sizing a swap is the engine's job.
     """
     npub: str
     amount_sat: int
     all_in_cost_pct: Optional[float] = None
+    reduced_amount_sat: Optional[int] = None
+    reduced_all_in_cost_pct: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -1493,9 +1561,16 @@ class ReverseSwapAction:
     # Ranked failover providers, best first, to try if the chosen one fails
     # WITHOUT committing funds. Empty in legacy/URL mode (only one provider
     # exists) and whenever no other provider passed the cost gate. Never includes
-    # the chosen provider itself, and is already capped to leave at most
-    # MAX_SWAP_PROVIDER_ATTEMPTS total attempts.
+    # the chosen provider itself, and uncapped -- everything in it passed the cost
+    # gate, and the executor's wall-clock deadline is what bounds the walk.
     alternates: Tuple[ProviderAttempt, ...] = ()
+    # The chosen provider's own one-step reduced retry, on the same terms as an
+    # alternate's (see ProviderAttempt / reduced_attempt_amount). None when the
+    # cost ceiling or the provider's minimum rules it out. Legacy/URL mode gets one
+    # too: _build_legacy_offers carries that provider's real fees, so the reduction
+    # can be priced against the same ceiling as any other.
+    reduced_amount_sat: Optional[int] = None
+    reduced_all_in_cost_pct: Optional[float] = None
 
 
 # --- liquidity sink -------------------------------------------------------
@@ -2183,12 +2258,15 @@ def _plan_reverse_swap(
             reason=(f"channel {chan.short_id} swap of {amount} all-in cost "
                     f"{cost_pct:.3f}% > ceiling {config.max_swap_fee_pct}% "
                     f"(cheapest of {len(eligible)} provider(s)); skipping"))
-    # Failover order: the rest of the ranking, capped so the whole cascade
-    # stays within MAX_SWAP_PROVIDER_ATTEMPTS attempts.
+    # Failover order: the whole rest of the ranking, uncapped. Every entry here
+    # already passed the cost gate, so dropping any of them would be discarding a
+    # vetted way to drain this channel; the executor's wall-clock deadline is what
+    # bounds the walk. Each carries its own one-step reduced retry.
     alternates = tuple(
         ProviderAttempt(npub=s.offer.npub, amount_sat=s.amount_sat,
-                        all_in_cost_pct=s.all_in_cost_pct)
-        for s in ranked[1:MAX_SWAP_PROVIDER_ATTEMPTS])
+                        all_in_cost_pct=s.all_in_cost_pct,
+                        **_reduced_fields(s.offer, s.amount_sat, claim_fee, config))
+        for s in ranked[1:])
     amount = selection.amount_sat
     cost_pct = selection.all_in_cost_pct
     provider_desc = (f"provider {selection.offer.npub[:12]}…"
@@ -2204,6 +2282,7 @@ def _plan_reverse_swap(
         lightning_amount_sat=amount,
         provider_npub=selection.offer.npub,
         alternates=alternates,
+        **_reduced_fields(selection.offer, amount, claim_fee, config),
         reason=(
             f"channel {chan.short_id} local {chan.local_sat} over "
             f"{trigger} trigger; swapping {amount} via {provider_desc} "

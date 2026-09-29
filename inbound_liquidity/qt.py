@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -1043,20 +1043,46 @@ class Plugin(LiquidityPlugin):
         return "\n".join([head + lines[0]] + [pad + line for line in lines[1:]])
 
     def _merged_log_rows(self, wallet: 'Abstract_Wallet', *, min_level: int,
-                         needle: str) -> List[str]:
+                         needle: str, since_ts: float = 0.0) -> Tuple[List[str], int]:
         """The Log tab's content: captured logging plus this wallet's decision
-        log, in one chronological, filtered list.
+        log, in one chronological, filtered list. Returns ``(rows, hidden)``.
 
         The captured half is process-global (a Python logger has no idea which
         wallet it is talking about), the decision half is per wallet -- which is
         exactly right: the decisions are this wallet's, the surrounding evidence
         is whatever the plugin was doing at the time.
+
+        ``since_ts`` is the tab's "Clear" watermark: rows at or before it are
+        dropped from the VIEW only. It is applied to both halves, because "Clear"
+        has to mean the whole view went empty -- clearing the ring alone left every
+        decision row on screen (they are re-read from ``wallet.db`` on each
+        refresh, so they cannot be cleared by forgetting anything) and read as a
+        button that did nothing.
+
+        ``hidden`` counts the decision entries the watermark suppressed, so the
+        summary line can say the audit trail was hidden rather than destroyed.
+        Captured lines are not counted: ``on_clear`` also empties the ring, so
+        there is nothing left of them to have a count of.
+
+        Note a decision entry carrying no usable ``ts`` reads as epoch 0 and so
+        sorts -- and hides -- as the oldest thing there is. That is the same
+        ordering the merge has always given it; the watermark just makes it
+        visible.
         """
         rows: List[tuple] = []
+        hidden = 0
         for line in self.log_buffer.snapshot(min_level=min_level):
+            if line.ts <= since_ts:
+                continue
             rows.append((line.ts, self._fmt_log_row(
                 line.ts, line.level_name, line.source, line.message)))
         for entry in self.get_decision_log(wallet):
+            if float(entry.get("ts") or 0.0) <= since_ts:
+                # Counted before the level filter on purpose: this is "how much of
+                # your decision log is hidden right now", not "how much of it
+                # would this level have shown".
+                hidden += 1
+                continue
             if self._decision_level(entry) < min_level:
                 continue
             source = f"decision/{entry.get('category', '')}"
@@ -1074,7 +1100,7 @@ class Plugin(LiquidityPlugin):
         if needle:
             folded = needle.casefold()
             out = [text for text in out if folded in text.casefold()]
-        return out
+        return out, hidden
 
     def _build_log_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Log sub-tab. Returns (widget, refresh_fn)."""
@@ -1206,8 +1232,11 @@ class Plugin(LiquidityPlugin):
         copy_btn = QPushButton(_("Copy"))
         save_btn = QPushButton(_("Save to file…"))
         clear_btn = QPushButton(_("Clear"))
-        clear_btn.setToolTip(_("Discard the captured log lines held in memory. Your decision "
-                               "log (Actions / Declines / Faults) is not affected."))
+        clear_btn.setToolTip(_("Empty this view. Captured log lines are discarded from memory; "
+                               "earlier decision-log entries are only hidden here — nothing is "
+                               "deleted, they stay in Actions / Declines / Faults and come back "
+                               "in this view when the wallet is reopened. New lines keep "
+                               "arriving as they happen."))
         btn_row = QHBoxLayout()
         btn_row.addWidget(summary, 1)
         btn_row.addWidget(feedback)
@@ -1216,15 +1245,24 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(clear_btn)
         v.addLayout(btn_row)
 
+        # The "Clear" watermark: rows at or before this epoch are hidden from this
+        # view. Deliberately per-tab closure state and NOT persisted -- "Clear" is
+        # a thing you did to a window, not a preference, so reopening the wallet
+        # gives the decision half back (the only copy of it, in wallet.db, is never
+        # touched). Part of `seen` below so the watermark is itself a render input.
+        watermark = {"since": 0.0}
+
         # Cheap change-detection: re-render only when the ring moved, the decision
         # log grew, or the user changed a filter. `-1` forces the first render.
-        seen = {"revision": -1, "decisions": -1, "level": None, "needle": None}
+        seen = {"revision": -1, "decisions": -1, "level": None, "needle": None,
+                "since": None}
 
-        def _current_rows() -> List[str]:
+        def _current_rows() -> Tuple[List[str], int]:
             return self._merged_log_rows(
                 wallet,
                 min_level=int(level_combo.currentData() or 0),
-                needle=filter_edit.text().strip())
+                needle=filter_edit.text().strip(),
+                since_ts=watermark["since"])
 
         def refresh(force: bool = False) -> None:
             try:
@@ -1232,21 +1270,30 @@ class Plugin(LiquidityPlugin):
                 decisions = len(self.get_decision_log(wallet))
                 level = level_combo.currentData()
                 needle = filter_edit.text().strip()
-                if not force and (revision, decisions, level, needle) == (
-                        seen["revision"], seen["decisions"], seen["level"], seen["needle"]):
+                since = watermark["since"]
+                if not force and (revision, decisions, level, needle, since) == (
+                        seen["revision"], seen["decisions"], seen["level"],
+                        seen["needle"], seen["since"]):
                     return
                 seen.update(revision=revision, decisions=decisions,
-                            level=level, needle=needle)
-                rows = _current_rows()
+                            level=level, needle=needle, since=since)
+                rows, hidden = _current_rows()
                 bar = view.verticalScrollBar()
                 at_bottom = follow_cb.isChecked()
                 previous = bar.value()
                 view.setPlainText("\n".join(rows))
                 bar.setValue(bar.maximum() if at_bottom else min(previous, bar.maximum()))
                 stats = self.log_buffer.stats()
-                summary.setText(_("{} lines shown · {} captured (limit {}) · {} dropped").format(
+                text = _("{} lines shown · {} captured (limit {}) · {} dropped").format(
                     f"{len(rows):,}", f"{stats['count']:,}",
-                    f"{stats['max_lines']:,}", f"{stats['dropped']:,}"))
+                    f"{stats['max_lines']:,}", f"{stats['dropped']:,}")
+                if hidden:
+                    # Say it plainly: those entries still exist. A count with no
+                    # explanation would read as data loss.
+                    text += _(" · {} earlier decision entr{} hidden by Clear "
+                              "(still kept)").format(
+                        f"{hidden:,}", "y" if hidden == 1 else "ies")
+                summary.setText(text)
             except RuntimeError:
                 # Widgets deleted underneath us (tab torn down mid-timer).
                 pass
@@ -1294,8 +1341,22 @@ class Plugin(LiquidityPlugin):
             feedback.setText(_("Saved to {}").format(path))
 
         def on_clear() -> None:
+            """Empty the view.
+
+            Two different mechanisms, because the two halves are different kinds of
+            thing. The captured ring is ours and memory-only, so it is genuinely
+            discarded (the tooltip promises that). The decision log lives in
+            wallet.db and is re-read on every refresh, so it cannot be "cleared" at
+            all -- it is hidden behind the watermark instead, which is what keeps
+            this button non-destructive.
+
+            The watermark is taken AFTER clearing the ring so that a record landing
+            between the two lines is hidden rather than left stranded on screen.
+            """
             self.log_buffer.clear()
-            feedback.setText("")
+            watermark["since"] = time.time()
+            feedback.setStyleSheet("color: gray;")
+            feedback.setText(_("View cleared."))
             refresh(force=True)
 
         copy_btn.clicked.connect(on_copy)

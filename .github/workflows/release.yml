@@ -128,3 +128,50 @@ jobs:
             --generate-notes \
             ${prerelease} \
             --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. Install by importing the attached zip into Electrum's plugin manager."
+
+      - name: Delete previous beta releases
+        # Publishing a beta retires every older one, so the beta channel holds
+        # exactly one installable build: the newest. Betas are installed by hand
+        # from this page, and a list of stale zips is a list of ways to install
+        # the wrong thing.
+        #
+        # Narrow on both axes, deliberately:
+        #   * only a -beta.* tag prunes, and only -beta.* releases are pruned, so
+        #     a future channel (v0.4.0-rc.1) is neither a trigger nor a victim;
+        #   * the `isPrerelease` filter is a second, independent guard -- a real
+        #     v0.4.0 is not a pre-release and so cannot be reached here even if
+        #     the name test were ever loosened.
+        # The tag goes with the release (--cleanup-tag); the commits it pointed
+        # at stay reachable from the beta branch.
+        #
+        # Ordered after the publish above on purpose: if creating the new release
+        # fails, the job stops here and the old betas are still installable.
+        if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-beta.')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # gh applies --jq itself, so this is the tag names of pre-releases
+          # only. Assigned rather than piped into the loop so that a failing
+          # `gh release list` fails the step instead of quietly pruning nothing.
+          # The limit is far above any plausible release count; it exists only
+          # because gh paginates.
+          prereleases="$(gh release list --limit 1000 \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName')"
+          if [ -z "${prereleases}" ]; then
+            echo "no pre-releases found; nothing to prune"
+            exit 0
+          fi
+          for tag in ${prereleases}; do
+            if [ "${tag}" = "${GITHUB_REF_NAME}" ]; then
+              echo "keeping ${tag} (just published)"
+              continue
+            fi
+            case "${tag}" in
+              *-beta.*) ;;
+              *) echo "keeping ${tag} (not a -beta.* build)"; continue ;;
+            esac
+            echo "deleting previous beta ${tag}"
+            gh release delete "${tag}" --yes --cleanup-tag
+          done
