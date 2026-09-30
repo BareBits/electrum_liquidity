@@ -631,6 +631,7 @@ class Rig:
         self.sink_stub = stub
         log(f"LNURL liquidity-sink stub up at {stub.base_url} "
             f"(address {stub.lightning_address}; invoices minted by partner2)")
+        self._log_if_rebound(stub, "sink-stub")
 
     def _bring_up_lnurl_stub(self) -> None:
         """Start the local LNURL-pay endpoint the dev fee is paid to, trust its
@@ -648,6 +649,15 @@ class Rig:
         self.lnurl_stub = stub
         log(f"LNURL dev-fee stub up at {stub.base_url} "
             f"(payout address {stub.lightning_address})")
+        self._log_if_rebound(stub, "lnurl-stub")
+
+    @staticmethod
+    def _log_if_rebound(stub: LnurlPayStub, label: str) -> None:
+        """Note a stub that had to move off the port allocate() announced, so the
+        two log lines can be reconciled without guessing."""
+        if stub.rebound_from is not None:
+            log(f"  note: {label} port {stub.rebound_from} was taken by then; "
+                f"rebound to {stub.port}")
 
     def _bring_up_partner(self) -> None:
         log("starting headless swap-partner Electrum daemon ...")

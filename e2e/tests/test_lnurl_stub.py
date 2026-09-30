@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import ssl
 import sys
 import urllib.request
@@ -114,6 +115,51 @@ def test_two_stubs_do_not_evict_each_others_certs(tmp_path) -> None:
     finally:
         a.stop()
         b.stop()
+
+
+def test_taken_port_is_rebound_and_still_serves(tmp_path) -> None:
+    # The rig picks the stub's port at allocation time but starts the stub
+    # minutes later, after the whole stack is up -- and the port comes from the
+    # ephemeral range every outbound connection on the box draws from. So it can
+    # be taken by then, which once failed a rig mid-suite on EADDRINUSE. Losing
+    # the race must cost the stub its port, not the run.
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen(1)
+    taken = squatter.getsockname()[1]
+    s = LnurlPayStub(taken, _fake_invoice, cert_dir=tmp_path / "cert")
+    try:
+        s.start()
+        assert s.rebound_from == taken, \
+            "stub did not record that it had to move off the requested port"
+        assert s.port != taken
+        # The whole identity follows the move -- otherwise the client would be
+        # pointed at a port nothing is listening on.
+        assert s.base_url.endswith(f":{s.port}")
+        assert s.lightning_address.endswith(f"@127.0.0.1:{s.port}")
+        # And it is a working endpoint on the new port, not just a bound socket.
+        ca = tmp_path / "cacert.pem"
+        ca.write_text("")
+        s.trust_in_certifi(ca)
+        got = _tls_get(f"{s.base_url}/.well-known/lnurlp/{s.username}", ca)
+        assert got["tag"] == "payRequest"
+    finally:
+        s.stop()
+        squatter.close()
+
+
+def test_free_port_is_used_as_given(tmp_path) -> None:
+    # The fallback must not fire when the requested port is available: the rig
+    # logs that port at allocation time, and a stub that moved anyway would make
+    # its own log line misleading.
+    want = ports.free_port()
+    s = LnurlPayStub(want, _fake_invoice, cert_dir=tmp_path / "cert")
+    try:
+        s.start()
+        assert s.port == want
+        assert s.rebound_from is None
+    finally:
+        s.stop()
 
 
 def test_untrusted_cert_is_rejected(stub, tmp_path) -> None:

@@ -103,6 +103,33 @@ def _actions(kind: str) -> List[Dict]:
             if e.get("category") == "action" and e.get("kind") == kind]
 
 
+def _swaps_decided_with_goal_met() -> List[Dict]:
+    """Swap actions the engine decided while the liquidity goal was MET.
+
+    Every action entry carries the state it was decided on, including the config
+    in force and the goal verdict computed from it. That is what makes the phase
+    a swap belongs to a property of the swap itself rather than of when the test
+    happened to look: disarming automation does not interrupt an evaluation
+    already in flight, so a swap decided in phase A (goal unmet) can still be
+    logged after phase B has been configured. Counting swaps across that seam
+    blames phase B for phase A's work; reading each swap's own verdict does not.
+
+    A missing verdict is an error rather than a "no": this returns the evidence
+    for a negative assertion, so a renamed state key must fail the test loudly
+    instead of making it vacuously green forever.
+    """
+    out: List[Dict] = []
+    for entry in _actions("swap"):
+        config = (entry.get("state") or {}).get("config") or {}
+        verdict = config.get("liquidity_goal_met")
+        assert isinstance(verdict, bool), (
+            "swap action records no liquidity_goal_met verdict, so the phase it "
+            "was decided in cannot be read: " + json.dumps(config))
+        if verdict:
+            out.append(entry)
+    return out
+
+
 def _declines() -> List[str]:
     return [str(e.get("reason") or "") for e in _decision_log()
             if e.get("category") == "decline"]
@@ -224,7 +251,14 @@ def test_sink_waits_for_the_goal_then_takes_over(rig):
     # Same sink, same triggers; the only change is that the wallet now holds its
     # full complement of channels, so on-chain balance can no longer buy a better
     # one and there is nothing left to build.
-    swaps_before = len(_actions("swap"))
+    # Phase A's swaps are identified by their own recorded verdict, not by a
+    # count taken here -- see _swaps_decided_with_goal_met. Checked now as well as
+    # at the end, so "the goal was unmet in phase A" is established before phase B
+    # can muddy it.
+    premature = _swaps_decided_with_goal_met()
+    assert not premature, (
+        "a phase-A swap was decided with the goal already met; the max_channels=3 "
+        "staging did not leave the goal unmet: " + json.dumps(premature[:1]))
     assert _max_local() > TRIGGER_SAT, (
         f"precondition: no channel is still over the {TRIGGER_SAT} sat trigger "
         f"for phase B to drain (max local {_max_local()})")
@@ -251,10 +285,14 @@ def test_sink_waits_for_the_goal_then_takes_over(rig):
         f"(max remote_balance={_max_inbound()}, baseline={baseline_inbound})")
 
     # 6) The sink was PREFERRED, not merely permitted: with the goal met the
-    #    plugin drains through it rather than swapping again.
-    assert len(_actions("swap")) == swaps_before, (
-        "a further reverse swap ran after the goal was met, instead of the sink: "
-        + json.dumps(_actions("swap")[swaps_before:]))
+    #    plugin drains through it rather than swapping again. Each swap is
+    #    attributed by the verdict it was decided under, so a phase-A swap that
+    #    lands late is credited to phase A -- while a swap the engine really did
+    #    choose over an open sink is caught exactly as before.
+    late_swaps = _swaps_decided_with_goal_met()
+    assert not late_swaps, (
+        "a reverse swap ran with the liquidity goal met, instead of the sink: "
+        + json.dumps(late_swaps[:2]))
 
 
 def test_unticking_the_switch_uses_the_sink_before_the_goal(rig):
