@@ -1,5 +1,7 @@
 # Inbound Liquidity Manager — Electrum plugin
 
+An Electrum plugin for merchants that helps you make sure you ALWAYS have enough inbound liquidity to accept payments.
+
 > ## ⚠️ AS-IS SOFTWARE — DO NOT USE WITH SIGNIFICANT FUNDS ⚠️
 >
 > This moves
@@ -11,6 +13,14 @@
 An Electrum plugin that automatically manages **inbound Lightning liquidity** by
 opening channels and performing **submarine (reverse) swaps**, on top of
 Electrum's existing Nostr submarine-swap extension.
+
+This plugin works, the main rough edges are around swap payments failing due to Electrum struggling to find routes for larger payments. This doesn't cause funds loss, but means funds may sit in channels instead of being swapped back to on-chain for the purposes of provisioning inbound liquidity. This is an issue with Electrum, not the plugin. The longer the wallet is running, the more it learns about route reliability and the more likely payments are to go through.
+
+**If you are having trouble getting swaps to complete reliably** use a liquidity sink instead, any LNURL/Lightning address will work.
+
+You may wish to combine this plugin with our self-custody, open source e-commerce/point-of-sale software called [BareBits](https://github.com/BareBits/cashupayserver) and our [CLINK Plugin](https://github.com/BareBits/electrum_clink) to accept payments without NAT punching/opening a port.
+
+Want to earn yield on your BTC and help other Bitcoin users who need swaps? Run a swapserver using [this Electrum plugin](https://github.com/nothing-stops-this-train/electrum_swapgui).
 
 ## What it does
 
