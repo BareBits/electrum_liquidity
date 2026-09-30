@@ -140,11 +140,12 @@ class _Wallet:
         return []
 
 
-def _reserve_plugin(reserve, cap=10 ** 9) -> LiquidityPlugin:
+def _reserve_plugin(reserve, cap=10 ** 9, max_size=0) -> LiquidityPlugin:
     return _plugin(
         INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT=reserve,
         FEE_POLICY="feerate:1000",
         LIGHTNING_MAX_FUNDING_SAT=cap,
+        INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=max_size,
     )
 
 
@@ -174,3 +175,117 @@ def test_max_funding_returns_none_on_not_enough_funds():
     p = _reserve_plugin(reserve=10_000)
 
     assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) is None
+
+
+# --- the max-channel-size ceiling ----------------------------------------
+# The plugin's own ceiling on a single channel, applied here alongside
+# Electrum's LIGHTNING_MAX_FUNDING_SAT. This is where the ceiling reaches the
+# funds: the engine's amount is a gross intent, but THIS number is what
+# open_channel_with_peer is actually called with.
+def test_max_funding_capped_by_the_max_channel_size():
+    lnw = _Lnworker(max_fundable=5_000_000)
+    p = _reserve_plugin(reserve=10_000, max_size=1_000_000)
+
+    assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) == 1_000_000
+
+
+def test_a_max_channel_size_above_the_balance_is_inert():
+    lnw = _Lnworker(max_fundable=500_000)
+    p = _reserve_plugin(reserve=10_000, max_size=1_000_000)
+
+    assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) == 490_000
+
+
+def test_zero_max_channel_size_does_not_zero_the_funding():
+    # 0 means "no ceiling". A three-way min() would read it as "fund nothing",
+    # which would silently stop the plugin opening channels at all.
+    lnw = _Lnworker(max_fundable=500_000)
+    p = _reserve_plugin(reserve=10_000, max_size=0)
+
+    assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) == 490_000
+
+
+def test_the_lower_of_the_two_ceilings_wins():
+    """Ours is a preference; Electrum's is a limit that would reject the open
+    outright. Neither may be used to escape the other, so each is checked as the
+    binding one in turn."""
+    lnw = _Lnworker(max_fundable=5_000_000)
+    # Electrum's is lower.
+    p = _reserve_plugin(reserve=10_000, cap=600_000, max_size=1_000_000)
+    assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) == 600_000
+    # Ours is lower.
+    p = _reserve_plugin(reserve=10_000, cap=2_000_000, max_size=1_000_000)
+    assert p._max_funding_minus_reserve(_Wallet(lnw), b"\x02" * 33) == 1_000_000
+
+
+def test_max_channel_size_reader_survives_a_hand_edited_config():
+    """Read on every tick, so a garbage value must answer rather than abort the
+    evaluation -- and it must fall back to the SHIPPED ceiling, not to 0: 0 means
+    "no ceiling", and silently returning to unbounded channel sizes is the one
+    answer a user who set this setting definitely did not want."""
+    from electrum.plugins.inbound_liquidity import DEFAULT_MAX_CHANNEL_SIZE_SAT  # noqa
+    assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT="nonsense") \
+        ._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+    assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=None) \
+        ._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+    # Missing entirely (a config predating the setting) reads as the default too.
+    assert _plugin()._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+    # A negative value is clamped to "off" rather than becoming a negative amount.
+    assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=-1)._max_channel_size_sat() == 0
+
+
+def test_read_config_passes_the_ceiling_to_the_engine():
+    """The engine's dataclass default is 0 (off) so pure tests keep pre-feature
+    behaviour; the live path must therefore pass the user's value explicitly, or
+    the ceiling would be silently inert in production."""
+    p = _plugin(
+        INBOUND_LIQUIDITY_AUTOMATION_ENABLED=True,
+        INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=60_000,
+        INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT=10_000,
+        INBOUND_LIQUIDITY_MAX_CHANNELS=2,
+        INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=777_000,
+        INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT=0.9,
+        INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT=25.0,
+        INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT=25_000,
+        INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT=0,
+        INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY=True,
+        INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY=5,
+        INBOUND_LIQUIDITY_GOAL_SAT=100_000,
+        INBOUND_LIQUIDITY_PREFERRED_NPUBS="",
+        INBOUND_LIQUIDITY_BANNED_NPUBS="",
+        INBOUND_LIQUIDITY_SINK_ADDRESS="",
+        INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS=False,
+        INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL=True,
+    )
+    assert p.read_config().max_channel_size_sat == 777_000
+
+
+# --- effective_min_funding_sat -------------------------------------------
+# Backs the settings-tab validation: a ceiling below the floor in force can never
+# be satisfied, and the floor tracks min_onchain_to_open_sat.
+def test_effective_floor_follows_the_configured_min_onchain(restore_floor):
+    _reset_to_stock(200_000)
+    p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=50_000)
+    assert p.effective_min_funding_sat() == 50_000
+
+
+def test_effective_floor_never_exceeds_the_stock_floor(restore_floor):
+    _reset_to_stock(200_000)
+    p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=1_000_000)
+    assert p.effective_min_funding_sat() == 200_000
+
+
+def test_effective_floor_accepts_an_unsaved_override(restore_floor):
+    """The settings tab validates the values being applied in this click, so it
+    has to be able to ask what the floor WOULD be for a typed-but-unsaved
+    min-on-chain."""
+    _reset_to_stock(200_000)
+    p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=150_000)
+    assert p.effective_min_funding_sat(30_000) == 30_000
+    assert p.effective_min_funding_sat(500_000) == 200_000
+
+
+def test_effective_floor_survives_a_hand_edited_min_onchain(restore_floor):
+    _reset_to_stock(200_000)
+    p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT="rubbish")
+    assert p.effective_min_funding_sat() == 200_000

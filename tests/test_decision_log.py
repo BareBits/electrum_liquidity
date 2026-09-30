@@ -114,6 +114,20 @@ def test_state_dict_is_json_plain_and_complete() -> None:
     assert state["channels"][0]["short_id"] == "117x1x0"
 
 
+def test_state_dict_records_the_max_channel_size_ceiling() -> None:
+    """The ceiling is the answer to "why is this channel smaller than my balance?",
+    so it has to be in the expand view of the very decision it sized. Without it a
+    capped open's amount is unexplainable from the log alone."""
+    from dataclasses import replace
+    p = _make_plugin()
+    state = p._state_dict(_snapshot(), replace(_config(), max_channel_size_sat=750_000))
+    assert state["config"]["max_channel_size_sat"] == 750_000
+    # And "off" is recorded as 0 rather than omitted -- an absent key would read as
+    # an older build rather than as a deliberately disabled ceiling.
+    off = p._state_dict(_snapshot(), replace(_config(), max_channel_size_sat=0))
+    assert off["config"]["max_channel_size_sat"] == 0
+
+
 # --- action logging + persistence ----------------------------------------
 def test_log_action_persists_and_abbreviates() -> None:
     p = _make_plugin()

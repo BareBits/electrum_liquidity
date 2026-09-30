@@ -70,6 +70,15 @@ GOAL_SAT = 1_500_000
 # What the replacement is allowed to be funded with. Above the goal, so the
 # channel that refills the freed slot actually satisfies it.
 BIG_FUND_SAT = 1_800_000
+# The plugin's own max-channel-size ceiling, held ABOVE everything else here so it
+# is armed but never the binding constraint. It has to be set explicitly: the
+# SHIPPED ceiling (1_000_000) is below GOAL_SAT, which the replacement rule
+# correctly refuses to act on -- a channel reopened at the ceiling would still be
+# under the goal, so closing one would only churn it. Leaving the ceiling at its
+# default would therefore turn this whole test into an assertion about the churn
+# guard instead of about the replacement rule. See test_max_channel_size_e2e for
+# the ceiling's own coverage.
+MAX_CHANNEL_SIZE_SAT = 2_000_000
 
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
@@ -193,6 +202,7 @@ def _base_config() -> None:
     _setcfg("plugins.inbound_liquidity.auto_remediate_stuck_open", "false")
     _setcfg("plugins.inbound_liquidity.dev_fee_pct", "0")
     _setcfg("plugins.inbound_liquidity.max_closes_per_day", "5")
+    _setcfg("plugins.inbound_liquidity.max_channel_size_sat", str(MAX_CHANNEL_SIZE_SAT))
     _setcfg("plugins.inbound_liquidity.diag_log_enabled", "true")
 
 

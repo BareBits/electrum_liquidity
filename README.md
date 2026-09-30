@@ -31,7 +31,10 @@ liquidity (remote-side channel balance). This plugin keeps it topped up:
   [The liquidity sink](#the-liquidity-sink) and
   [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met).
 - **Opening a channel** (funded from on-chain coins) creates new capacity; once
-  its local balance is drained out, that capacity becomes pure inbound.
+  its local balance is drained out, that capacity becomes pure inbound. Each open
+  is funded with the maximum available on-chain balance, bounded by
+  `max_channel_size_sat` — so a large balance builds several channels of a sane
+  size rather than one very large one with a single peer.
 
 It also keeps the goal in front of you rather than only in its own tab: the
 balance pie chart grows a blue **liquidity goal buffer** slice, and the Send tab
@@ -55,6 +58,7 @@ ceilings, diagnostics, etc.).
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
 | `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
+| `max_channel_size_sat` | Settings | **Max channel size** — never fund a single channel with more than this. The plugin opens channels with the maximum available on-chain balance, so without a ceiling a wallet holding significant on-chain funds would commit all of it to one very large channel with a single peer; with one, a large balance is spread over several channels of a sane size, up to `max_channels`. Applies to **new opens only** — a channel already larger than this is never closed for being oversized. Must be at least `liquidity_goal_sat` (a channel below the goal would be replaced as soon as it was opened — the settings tab refuses to save such a pair, and the engine declines rather than churning if a config is hand-edited into that state) and at least the channel-funding floor. Capped in turn by Electrum's own `lightning_max_funding_sat`, whichever is lower. `0` = no ceiling. Ships at 10× the default liquidity goal | `1_000_000` |
 | `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. Also sets the **buffer** reserved on the balance pie chart and warned about in the Send tab. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) and [The liquidity goal buffer](#the-liquidity-goal-buffer) | `100_000` |
 | `show_goal_in_piechart` | Wallet → Balance | **Show liquidity goal** — draw the goal as its own slices (on-chain and, when needed, Lightning) on both balance pie charts. Untick for Electrum's stock chart. Display only: it changes nothing about what is reserved or about the Send tab's warning. See [The liquidity goal buffer](#the-liquidity-goal-buffer) | `true` |
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
@@ -309,8 +313,9 @@ hold:
 1. a goal is configured (`liquidity_goal_sat`, `0` = off);
 2. we are **at** `max_channels` — below it a bigger channel can simply be opened
    alongside, so closing anything would be gratuitous;
-3. on-chain spendable minus `onchain_reserve_sat` could fund a channel that
-   actually **reaches** the goal (and clears the funding floor);
+3. what a new channel would be funded with — on-chain spendable minus
+   `onchain_reserve_sat`, **capped by `max_channel_size_sat`** — could fund a
+   channel that actually **reaches** the goal (and clears the funding floor);
 4. the channel was **opened by the plugin** — a channel you opened by hand is
    never closed by this rule, whatever `manage_plugin_opened_only` is set to;
 5. its **capacity** is below the goal;
@@ -328,6 +333,17 @@ available to reopen to; if none is, it logs a decline and leaves the channel
 alone rather than losing its inbound for nothing. (The closing channel's own peer
 is exempted from the one-channel-per-peer guard for that check — it is about to
 be freed by this very close.)
+
+Condition 3 carries `max_channel_size_sat` for a reason of its own. A ceiling
+*below* the goal would make every replacement undersized by construction: the
+plugin would close a channel, reopen it at the ceiling — still under the goal —
+and close it again on the next tick, paying a mining fee every round. Because the
+close rule and the open rule size a channel through the same function, that state
+simply produces no close at all, plus a decline naming the conflict. (The Settings
+tab refuses to save a ceiling below the goal in the first place; the engine's guard
+is there for a hand-edited config.) Note that while it holds, the goal can never
+be met, so a `defer_sink_until_goal` sink stays deferred — which the decline
+also says.
 
 Condition 6 is what stops the rule churning: the plugin funds its channels with
 no push, so a freshly opened channel has local == capacity and is over the
