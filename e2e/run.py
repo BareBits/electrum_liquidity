@@ -44,10 +44,13 @@ from rig.services import (
     CLIENT,
     PARTNER,
     PARTNER2,
+    PARTNER3,
     PARTNER_FEE_MILLIONTHS,
     PARTNER2_FEE_MILLIONTHS,
+    PARTNER3_FEE_MILLIONTHS,
     Endpoints,
     bitcoin_cli,
+    disable_forwarding,
     discover_swap_provider,
     ensure_miner_wallet,
     electrum_cli,
@@ -105,6 +108,36 @@ SWAP_FEE_FRACTION = 0.005           # 0.5%
 # succeed and there is nothing left for halving to fix.
 GOSSIP_HOP_CHANNEL_BTC = 0.006      # 600_000 sat capacity
 GOSSIP_HOP_PUSH_BTC = 0.003         # 300_000 sat pushed -> that much forwardable
+
+# --- deep-hop mode (--deep-hop, implies --gossip) -------------------------
+# The PARTNER2 <-> PARTNER3 channel, which puts a SECOND forwarding node between
+# the client and a swap provider: client -> partner -> partner2 -> partner3.
+#
+# It is opened BY PARTNER3, not partner2, and that is load-bearing. Deep-hop mode
+# runs partner2 with ``lightning_forward_payments=false`` so it refuses to relay
+# and answers with a real onion error of its own (see _common_config_pairs), and
+# ``channel_establishment_flow`` will not let a node with forwarding off OPEN an
+# announced channel -- only accept one.
+#
+# Capacity is NOT the mechanism here, so this channel is simply balanced. Starving
+# it could not work: a swapserver advertises max_forward = num_sats_can_receive(),
+# so the largest swap partner3 will accept is by construction the most partner2
+# could still have forwarded to it.
+DEEP_HOP_CHANNEL_BTC = 0.02         # 2_000_000 sat, balanced 50/50
+# In deep-hop mode the FIRST hop (partner -> partner2) must be able to carry the
+# whole swap, or the payment dies at our own channel peer and the test proves the
+# opposite of what it means to. The gossip-mode default is deliberately tiny
+# (0.003 BTC forwardable) so the liquidity sink's halving ladder has something to
+# fail against -- and a swap planned against partner3 is ~750k sat, which that hop
+# cannot forward. Observed exactly once as a peer fault where a downstream
+# suppression was expected. Sized well clear of partner3's advertised ceiling
+# (~790k, itself bounded by DEEP_HOP_PUSH_BTC below).
+DEEP_HOP_FIRST_HOP_BTC = 0.03       # 3_000_000 sat capacity
+DEEP_HOP_FIRST_HOP_PUSH_BTC = 0.02  # 2_000_000 sat forwardable by the partner
+# What partner3 pushes to partner2 on that channel. It is partner3's INBOUND, and
+# therefore the ceiling its swapserver advertises -- so it must be comfortably
+# above the swap the plugin will plan, or partner3 is never ranked at all.
+DEEP_HOP_PUSH_BTC = 0.01            # 1_000_000 sat -> partner3 can receive ~1M
 # A tiny payment made during bring-up to PROVE the graph can actually be routed
 # over. Small enough not to meaningfully move the balances a test then reasons
 # about (a third of a percent of the hop's forwardable balance).
@@ -138,6 +171,9 @@ class Rig:
         self.sink_stub: Optional[LnurlPayStub] = None
         self.sink_stub_port: Optional[int] = None
         self.hop_channel: Optional[dict] = None
+        self.partner3_address: Optional[str] = None
+        self.partner3_nodeid: Optional[str] = None
+        self.deep_hop_channel: Optional[dict] = None
         self._stop = threading.Event()
         self._miner: Optional[threading.Thread] = None
 
@@ -148,6 +184,13 @@ class Rig:
         ``--gossip`` wants it as a routing DESTINATION, deliberately WITHOUT a
         client channel, so reaching it requires a real multi-hop route."""
         return bool(self.args.second_provider or self.args.gossip)
+
+    @property
+    def needs_partner3(self) -> bool:
+        """Whether the FOURTH node is required. Only ``--deep-hop`` wants it: a
+        provider two forwarding nodes away, so a failed payment can carry a
+        ``sender_idx`` that is not our channel peer's."""
+        return bool(self.args.deep_hop)
 
     # -- lifecycle ----------------------------------------------------------
     def preflight(self) -> None:
@@ -162,13 +205,15 @@ class Rig:
     def allocate(self) -> None:
         (btc_rpc, btc_p2p, fulcrum_tcp, fulcrum_admin, nostr,
          ln_client, ln_partner, swapserver,
-         ln_partner2, swapserver2) = ports.free_ports(10)
+         ln_partner2, swapserver2,
+         ln_partner3, swapserver3) = ports.free_ports(12)
         self.ep = Endpoints(
             btc_rpc=btc_rpc, btc_p2p=btc_p2p,
             fulcrum_tcp=fulcrum_tcp, fulcrum_admin=fulcrum_admin,
             nostr=nostr, ln_listen_client=ln_client,
             ln_listen_partner=ln_partner, swapserver_port=swapserver,
             ln_listen_partner2=ln_partner2, swapserver_port2=swapserver2,
+            ln_listen_partner3=ln_partner3, swapserver_port3=swapserver3,
         )
         log(f"ports: bitcoind-rpc={btc_rpc} p2p={btc_p2p}  "
             f"fulcrum-tcp={fulcrum_tcp} admin={fulcrum_admin}")
@@ -176,6 +221,8 @@ class Rig:
             f"swapserver={swapserver}")
         if self.needs_partner2:
             log(f"ports: ln-partner2={ln_partner2} swapserver2={swapserver2}")
+        if self.needs_partner3:
+            log(f"ports: ln-partner3={ln_partner3} swapserver3={swapserver3}")
         # A separate free port for the local LNURL-pay stub (dev-fee payout target).
         self.lnurl_stub_port = ports.free_port()
         log(f"ports: lnurl-stub={self.lnurl_stub_port}")
@@ -213,14 +260,26 @@ class Rig:
         if self.needs_partner2:
             log("creating SECOND swap-provider wallet "
                 "(electrum_liqtest_swap_partner2) + config ...")
+            # Note partner2 comes up FORWARDING NORMALLY even in deep-hop mode.
+            # It is the node that must refuse to relay, but it cannot be
+            # configured that way from the start without falling out of the
+            # gossip network -- see services.disable_forwarding. The flip happens
+            # once the graph is built.
             self.partner2_address = setup_wallet(ep, PARTNER2, gossip=self.args.gossip)
             log(f"  partner2 funding address: {self.partner2_address}")
+
+        if self.needs_partner3:
+            log("creating FOURTH wallet (electrum_liqtest_swap_partner3) + config ...")
+            self.partner3_address = setup_wallet(ep, PARTNER3, gossip=self.args.gossip)
+            log(f"  partner3 funding address: {self.partner3_address}")
 
         log(f"funding each wallet with {self.args.funding} BTC ...")
         self._fund_wallet(self.client_address)
         self._fund_wallet(self.partner_address)
         if self.needs_partner2:
             self._fund_wallet(self.partner2_address)
+        if self.needs_partner3:
+            self._fund_wallet(self.partner3_address)
         mine(ep, self.miner_address, 6)   # confirm funding
 
         log("starting Fulcrum ...")
@@ -239,6 +298,8 @@ class Rig:
         self._bring_up_partner()
         if self.needs_partner2:
             self._bring_up_partner2()
+        if self.needs_partner3:
+            self._bring_up_partner3()
         peer = self.partner_nodeid
         log(f"pointing liquidity plugin preferred partner at partner: {peer[:24]}...")
         set_client_channel_peer(peer)
@@ -275,6 +336,10 @@ class Rig:
             p2bal = wait_onchain_funds(PARTNER2, min_btc=self.args.funding * 0.9,
                                        mine_cb=mine_cb, log=log)
             log(f"  partner2 {p2bal} BTC confirmed")
+        if self.needs_partner3:
+            p3bal = wait_onchain_funds(PARTNER3, min_btc=self.args.funding * 0.9,
+                                       mine_cb=mine_cb, log=log)
+            log(f"  partner3 {p3bal} BTC confirmed")
 
         log("opening Lightning channels (client -> partner) ...")
         self.channels = open_channels(
@@ -321,9 +386,12 @@ class Rig:
         try:
             self.swap_npub, self.swap_offer = discover_swap_provider(
                 CLIENT, expected_fee_fraction=SWAP_FEE_FRACTION, log=log,
-                # Both swapservers must be on the relay before a failover test
-                # can rely on which one the plugin ranks first.
-                min_providers=2 if self.args.second_provider else 1)
+                # Every swapserver must be on the relay before a test can rely on
+                # which one the plugin ranks first: two for a failover test,
+                # three in deep-hop mode (where the CHEAPEST, partner3, is the
+                # one the swap has to be planned against).
+                min_providers=(3 if self.args.deep_hop
+                               else 2 if self.args.second_provider else 1))
         except TimeoutError as exc:
             # Non-fatal: the core rig (chain, server, relay, channels) is up; the
             # client can still be pointed at the partner manually. Surface it.
@@ -385,8 +453,38 @@ class Rig:
         """
         assert self.ep is not None and self.partner_nodeid
         pubkey = self.partner_nodeid.split("@")[0]
-        set_gossip_seed_peers(CLIENT, [("127.0.0.1", self.ep.ln_listen_partner, pubkey)])
+        seeds = [("127.0.0.1", self.ep.ln_listen_partner, pubkey)]
+        if self.needs_partner3:
+            # Partner alone is not enough here. Routing needs a POLICY per
+            # direction, and the one that matters for the deep hop is
+            # partner2 -> partner3, which only partner2 advertises; partner3
+            # advertises the direction pointing back at us, which no route out of
+            # this wallet traverses.
+            #
+            # Learned the hard way: seeded with partner alone the graph held three
+            # channels and three policies, all of them pointing the wrong way
+            # across the deep hop, and every swap payment to partner3 died as
+            # NoPathFound before an HTLC was ever sent -- no onion error, nothing
+            # to attribute, and the test could not run. This is also why partner2
+            # must still be forwarding at this point: LNGossip hangs up on a peer
+            # that does not offer GOSSIP_QUERIES (see services.disable_forwarding).
+            assert self.partner3_nodeid and self.partner2_nodeid
+            for name, port, nodeid in (
+                    ("partner2", self.ep.ln_listen_partner2, self.partner2_nodeid),
+                    ("partner3", self.ep.ln_listen_partner3, self.partner3_nodeid)):
+                pk = nodeid.split("@")[0]
+                seeds.append(("127.0.0.1", port, pk))
+                log(f"seeded client gossip peer -> {name} {pk[:16]}...")
+        set_gossip_seed_peers(CLIENT, seeds)
         log(f"seeded client gossip peer -> partner {pubkey[:16]}...")
+
+    def _first_hop_push_btc(self) -> float:
+        """How much the partner can forward toward partner2. Deep-hop mode wants
+        this roomy (the failure under study is partner2's, further on); plain
+        gossip mode wants it tight (the sink's halving ladder must have something
+        to fail against)."""
+        return (DEEP_HOP_FIRST_HOP_PUSH_BTC if self.args.deep_hop
+                else GOSSIP_HOP_PUSH_BTC)
 
     def _open_forwarding_hop(self) -> None:
         """Open the announced, deliberately under-funded PARTNER -> PARTNER2
@@ -397,19 +495,27 @@ class Rig:
         holds on this hop. That is what lets a large payment fail on real
         capacity while a smaller one settles, which is the only honest way to
         exercise the liquidity sink's halving retry end to end.
+
+        Deep-hop mode wants the opposite of "limited" HERE: the failure it studies
+        belongs to partner2, one hop further on, so this hop must be roomy enough
+        that our own channel peer never becomes the binding constraint.
         """
         assert self.ep is not None
         ep = self.ep
+        capacity = (DEEP_HOP_FIRST_HOP_BTC if self.args.deep_hop
+                    else GOSSIP_HOP_CHANNEL_BTC)
+        push = self._first_hop_push_btc()
         existing = len(json.loads(electrum_cli("list_channels", inst=PARTNER)))
         log(f"opening forwarding hop (partner -> partner2, "
-            f"{GOSSIP_HOP_CHANNEL_BTC} BTC, push {GOSSIP_HOP_PUSH_BTC}) ...")
+            f"{capacity} BTC, push {push}"
+            f"{' -- roomy, deep-hop mode' if self.args.deep_hop else ''}) ...")
         hop = open_channels(
             ep,
             opener=PARTNER, peer=PARTNER2,
             peer_listen_port=ep.ln_listen_partner2,
             num_channels=1,
-            capacity_btc=GOSSIP_HOP_CHANNEL_BTC,
-            push_btc=GOSSIP_HOP_PUSH_BTC,
+            capacity_btc=capacity,
+            push_btc=push,
             public=True,
             mine_cb=lambda n: mine(ep, self.miner_address, n),
             log=log,
@@ -419,6 +525,9 @@ class Rig:
             (c for c in hop if c.get("short_channel_id")
              and c not in self.channels), hop[-1] if hop else None)
         log(f"  forwarding hop OPEN ({len(hop)} partner channel(s) in total)")
+
+        if self.args.deep_hop:
+            self._open_deep_hop()
 
         # A channel is only announced once its funding tx is 6 deep, and only
         # routable once its POLICIES have propagated. Bury everything, then wait
@@ -439,13 +548,19 @@ class Rig:
         # channels, so the graph lands in seconds instead.
         self._restart_client_for_gossip()
 
-        expected_channels = self.args.channels + 1
+        expected_channels = self.args.channels + 1 + (1 if self.args.deep_hop else 0)
+        # One policy per channel is the baseline (see wait_gossip_graph: only the
+        # directions pointing AWAY from us ever arrive). Deep-hop mode needs one
+        # more than that -- partner2's own update for partner2 -> partner3, the
+        # forward direction across the deep hop, without which the path-finder
+        # knows the channel exists but will not route over it.
+        expected_policies = expected_channels + (1 if self.args.deep_hop else 0)
         log(f"waiting for the client's gossip graph "
-            f"({expected_channels} channels, {expected_channels} policies) ...")
+            f"({expected_channels} channels, {expected_policies} policies) ...")
         wait_gossip_graph(
             CLIENT,
             min_channels=expected_channels,
-            min_policies=expected_channels,
+            min_policies=expected_policies,
             mine_cb=lambda n: mine(ep, self.miner_address, n),
             log=log,
             # Headless this resolves in seconds (we just reconnected); under the
@@ -455,6 +570,50 @@ class Rig:
         # Knowing the topology is not the same as being able to route over it.
         probe_routed_payment(payer=CLIENT, payee=PARTNER2,
                              amount_sat=GOSSIP_PROBE_SAT, log=log)
+
+        if self.args.deep_hop:
+            # Only NOW, with the graph collected and proven routable, does
+            # partner2 stop relaying. Doing it any earlier costs us the gossip
+            # (see services.disable_forwarding); doing it here leaves the route
+            # to partner3 intact on paper and fails it at partner2 in practice,
+            # which is exactly the shape the attribution test needs.
+            log("disabling forwarding on partner2 (deep-hop mode): "
+                "routes through it stay findable, but HTLCs now fail there")
+            disable_forwarding(PARTNER2)
+
+    def _open_deep_hop(self) -> None:
+        """Open the announced PARTNER3 -> PARTNER2 channel that puts a second
+        forwarding node between the client and a swap provider.
+
+        Opened FROM PARTNER3, so the direction never depends on partner2's
+        forwarding state: ``channel_establishment_flow`` raises "Cannot create
+        public channels" for a node with forwarding off, and though partner2 is
+        still forwarding at this point in bring-up, opening from the far side
+        keeps this correct if that ever changes.
+
+        The push goes to PARTNER2 because it is partner3's INBOUND, and a
+        swapserver advertises ``max_forward = num_sats_can_receive()``: push too
+        little and partner3 advertises a ceiling below the swap the plugin wants,
+        is never ranked, and the whole path is never exercised.
+        """
+        assert self.ep is not None
+        existing = len(json.loads(electrum_cli("list_channels", inst=PARTNER3)))
+        log(f"opening deep hop (partner3 -> partner2, {DEEP_HOP_CHANNEL_BTC} BTC, "
+            f"push {DEEP_HOP_PUSH_BTC}) ...")
+        deep = open_channels(
+            self.ep,
+            opener=PARTNER3, peer=PARTNER2,
+            peer_listen_port=self.ep.ln_listen_partner2,
+            num_channels=1,
+            capacity_btc=DEEP_HOP_CHANNEL_BTC,
+            push_btc=DEEP_HOP_PUSH_BTC,
+            public=True,
+            mine_cb=lambda n: mine(self.ep, self.miner_address, n),
+            log=log,
+            already_open=existing,
+        )
+        self.deep_hop_channel = deep[-1] if deep else None
+        log(f"  deep hop OPEN ({len(deep)} partner3 channel(s) in total)")
 
     def _bring_up_sink_stub(self) -> None:
         """Gossip mode only: a second LNURL-pay endpoint that mints its invoices
@@ -472,6 +631,7 @@ class Rig:
         self.sink_stub = stub
         log(f"LNURL liquidity-sink stub up at {stub.base_url} "
             f"(address {stub.lightning_address}; invoices minted by partner2)")
+        self._log_if_rebound(stub, "sink-stub")
 
     def _bring_up_lnurl_stub(self) -> None:
         """Start the local LNURL-pay endpoint the dev fee is paid to, trust its
@@ -489,6 +649,15 @@ class Rig:
         self.lnurl_stub = stub
         log(f"LNURL dev-fee stub up at {stub.base_url} "
             f"(payout address {stub.lightning_address})")
+        self._log_if_rebound(stub, "lnurl-stub")
+
+    @staticmethod
+    def _log_if_rebound(stub: LnurlPayStub, label: str) -> None:
+        """Note a stub that had to move off the port allocate() announced, so the
+        two log lines can be reconciled without guessing."""
+        if stub.rebound_from is not None:
+            log(f"  note: {label} port {stub.rebound_from} was taken by then; "
+                f"rebound to {stub.port}")
 
     def _bring_up_partner(self) -> None:
         log("starting headless swap-partner Electrum daemon ...")
@@ -513,6 +682,22 @@ class Rig:
             f"balance {bal}); swapserver advertising at "
             f"{PARTNER2_FEE_MILLIONTHS / 10000:.2f}% (undercuts partner)")
 
+    def _bring_up_partner3(self) -> None:
+        """Fourth node: a swap provider reachable only THROUGH partner2.
+
+        It undercuts every other provider on fee, so the plugin's cheapest-first
+        ranking plans its swap against this one -- which is what forces the swap's
+        Lightning leg onto the two-forwarder path and lets the failure land
+        somewhere other than our own channel peer."""
+        log("starting headless FOURTH Electrum daemon (deep-hop provider) ...")
+        start_electrum_daemon_ready(self.pm, PARTNER3, log=log)
+        wait_electrum_ready(PARTNER3)
+        self.partner3_nodeid = wait_lightning_ready(PARTNER3)
+        bal = wallet_balance(PARTNER3)
+        log(f"deep-hop provider online (nodeid {self.partner3_nodeid[:16]}..., "
+            f"balance {bal}); swapserver advertising at "
+            f"{PARTNER3_FEE_MILLIONTHS / 10000:.2f}% (undercuts everyone)")
+
     def _summary(self) -> None:
         assert self.ep is not None
         ep = self.ep
@@ -526,6 +711,8 @@ class Rig:
         log(f"  partner wallet    : {paths.PARTNER_WALLET_NAME}  (dir {PARTNER.datadir})")
         if self.needs_partner2:
             log(f"  partner2 wallet   : {paths.PARTNER2_WALLET_NAME}  (dir {PARTNER2.datadir})")
+        if self.needs_partner3:
+            log(f"  partner3 wallet   : {paths.PARTNER3_WALLET_NAME}  (dir {PARTNER3.datadir})")
         log(f"  channels open     : {len(self.channels)} x {self.args.channel_btc} BTC (50/50)")
         log(f"  swap provider npub: {self.swap_npub}")
         log(f"  swap offer        : {json.dumps(self.swap_offer)}")
@@ -536,7 +723,13 @@ class Rig:
             log(f"  liquidity sink    : {self.sink_stub.lightning_address} "
                 f"(local LNURL stub; invoices minted by partner2, 2 hops away)")
             log(f"  forwarding hop    : partner -> partner2, "
-                f"{GOSSIP_HOP_PUSH_BTC} BTC forwardable (gossip mode)")
+                f"{self._first_hop_push_btc()} BTC forwardable (gossip mode)")
+        if self.needs_partner3:
+            log(f"  deep hop          : partner3 -> partner2, "
+                f"{DEEP_HOP_CHANNEL_BTC} BTC (partner2 REFUSES to forward)")
+            log(f"  deep-hop provider : partner3 at "
+                f"{PARTNER3_FEE_MILLIONTHS / 10000:.2f}%, reachable only through "
+                f"partner2 -> its swap payments fail at sender_idx 1")
         log(bar)
         log("Drive a wallet, e.g.:")
         log(f"  {paths.ELECTRUM_BIN} --regtest --dir {CLIENT.datadir} "
@@ -570,6 +763,8 @@ class Rig:
         stop_daemon(PARTNER)
         if self.needs_partner2:
             stop_daemon(PARTNER2)
+        if self.needs_partner3:
+            stop_daemon(PARTNER3)
         self.pm.shutdown()
         log("all rig processes stopped")
 
@@ -603,13 +798,20 @@ class Rig:
                 self.lnurl_stub.lightning_address if self.lnurl_stub else None),
             "dev_fee_lnurl_stub_url": (
                 self.lnurl_stub.base_url if self.lnurl_stub else None),
+            "partner3_wallet": (paths.PARTNER3_WALLET_NAME
+                                if self.needs_partner3 else None),
+            "partner3_datadir": (str(PARTNER3.datadir)
+                                 if self.needs_partner3 else None),
+            "partner3_nodeid": self.partner3_nodeid,
             "gossip": bool(self.args.gossip),
+            "deep_hop": bool(self.args.deep_hop),
+            "deep_hop_channel": self.deep_hop_channel,
             "liquidity_sink_address": (
                 self.sink_stub.lightning_address if self.sink_stub else None),
             "liquidity_sink_stub_url": (
                 self.sink_stub.base_url if self.sink_stub else None),
             "forwarding_hop_push_sat": (
-                int(GOSSIP_HOP_PUSH_BTC * 1e8) if self.args.gossip else None),
+                int(self._first_hop_push_btc() * 1e8) if self.args.gossip else None),
             "blocks": self.args.blocks,
         }
         paths.READY_FILE.write_text(json.dumps(payload, indent=2))
@@ -646,6 +848,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                              "LNURL stub minting from it. Off by default: it "
                              "changes the topology the other suites assert "
                              "against and slows bring-up with graph sync")
+    parser.add_argument("--deep-hop", action="store_true",
+                        help="implies --gossip. Bring up a FOURTH node "
+                             "(partner3) one hop beyond partner2, undercutting "
+                             "every other provider on fee, and run partner2 with "
+                             "forwarding DISABLED so it refuses to relay and "
+                             "answers with an onion error of its own. That makes "
+                             "a swap's Lightning payment fail at a node which is "
+                             "NOT the client's channel peer -- the only way to "
+                             "prove the plugin does not fault the peer for it. "
+                             "Off by default: a fourth daemon and another "
+                             "announced channel to bury cost bring-up time")
     parser.add_argument("--no-gui", dest="gui", action="store_false",
                         help="run the client wallet headless too (no Qt GUI)")
     parser.add_argument("--display", default=None,
@@ -654,7 +867,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         help="also write the JSON readiness file here")
     parser.add_argument("--exit-when-ready", action="store_true",
                         help="bring everything up, signal readiness, then tear down (smoke test)")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # --deep-hop is a strictly deeper --gossip: it needs the real channel graph
+    # (a route of more than one hop cannot be built in trampoline mode) and the
+    # partner->partner2 hop it extends. Implied rather than required so callers
+    # cannot get a half-configured rig by forgetting one of the two.
+    if args.deep_hop:
+        args.gossip = True
+    return args
 
 
 def _ensure_marked() -> None:

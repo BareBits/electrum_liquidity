@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field, replace
-from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 # Electrum's hard floor for funding a new channel (lnutil.MIN_FUNDING_SAT).
 # Mirrored here so the engine stays import-free; asserted against the real value
@@ -983,6 +983,32 @@ class ChannelSnapshot:
     # any non-populating caller keep the "manage every channel" behaviour when the
     # scope switch is off (where the flag is irrelevant anyway).
     is_plugin_opened: bool = True
+    # Whether Electrum will refuse to SEND over this channel
+    # (``lnchannel.Channel.is_frozen_for_sending``).
+    #
+    # Draining a channel means sending over it, so this has to be honoured here
+    # rather than left to Electrum -- because Electrum never gets asked. Both drain
+    # paths (a reverse swap's Lightning leg and a liquidity-sink payment) pin the
+    # payment to one channel via ``pay_invoice(channels=[chan])``, and that argument
+    # REPLACES the candidate set inside ``lnworker.create_routes_for_payment`` --
+    # the very list comprehension that applies this filter. Nothing downstream
+    # re-checks (``suggest_payment_splits`` only reads balances and HTLC slots), so
+    # a pinned payment is pushed down a channel unpinned routing would have
+    # excluded, and fails after burning the full payment timeout. Declining is the
+    # only place the refusal still bites.
+    #
+    # Defaults False so the pure tests and any non-populating caller keep prior
+    # behaviour ("nothing is frozen").
+    is_frozen_for_sending: bool = False
+    # WHY Electrum refuses, when it does -- True if the user froze this channel
+    # themselves. Carried separately because ``is_frozen_for_sending`` is not only
+    # about the user's switch: under trampoline routing (no gossip) it is also True
+    # for any channel whose peer does not advertise trampoline forwarding, which
+    # the user did not choose and cannot fix by unfreezing. Telling them "you have
+    # frozen this" when they have not would be a worse failure than saying nothing,
+    # so the two get different decline reasons. Meaningless unless
+    # ``is_frozen_for_sending`` is set.
+    frozen_by_user: bool = False
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1142,15 @@ def should_auto_ban(hard_fault_count: int, threshold: int) -> bool:
     return threshold > 0 and hard_fault_count >= threshold
 
 
+# Floor on a single reverse swap, in sat. Small swaps are a bad deal in ways the
+# percentage ceiling cannot see: the on-chain claim costs the same block space
+# whatever the amount, and the UTXO it creates may be worth less than it will one
+# day cost to spend. 25,000 sat is the shipped default and the dataclass default,
+# deliberately the same -- unlike the older switches here, this rule is not
+# preserving any pre-feature behaviour, so there is no reason for them to differ.
+DEFAULT_MIN_SWAP_SAT: int = 25_000
+
+
 @dataclass(frozen=True)
 class LiquidityConfig:
     """User-tunable thresholds. Every field maps 1:1 to a plugin ConfigVar."""
@@ -1133,6 +1168,18 @@ class LiquidityConfig:
     # and never at all once the floor covers the whole spendable balance). 0 (the
     # default) preserves the original "drain everything" behaviour.
     min_outbound_sat: int = 0
+    # Floor (sat) on any single reverse swap. No rung below this is ever planned
+    # or attempted, however cheap it prices.
+    #
+    # This is a separate rule from ``max_swap_fee_pct``, not a restatement of it.
+    # The ceiling asks "is this swap worth its cost?", which a cheap provider can
+    # answer yes to at an absurdly small size; this asks "is a swap this small
+    # worth doing at all?", which is about the on-chain UTXO it creates, the
+    # block space to claim it, and the dust it leaves behind. Both have to pass.
+    #
+    # It composes with the provider's own advertised minimum by taking whichever
+    # is higher -- see :func:`rank_swap_rungs`. 0 disables it.
+    min_swap_sat: int = DEFAULT_MIN_SWAP_SAT
     # Scope switch. When True, the engine only ever reverse-swaps channels the
     # plugin itself opened (``ChannelSnapshot.is_plugin_opened``); channels the
     # user opened by hand are left entirely alone (their outbound is never
@@ -1219,6 +1266,26 @@ class LiquidityConfig:
     # by pure tests and non-populating callers, where it keeps the pre-feature
     # "the sink always wins" behaviour they were written against.
     defer_sink_until_goal: bool = False
+    # --- maximum channel size --------------------------------------------
+    # Ceiling (sat) on how much a SINGLE channel open may be funded with. The
+    # open rule funds "everything on-chain bar the reserve", which on a wallet
+    # holding significant on-chain funds means one absurdly large channel: the
+    # whole balance committed to a single peer, in a single 2-of-2, for as long
+    # as that channel lives. This bounds it, so a large balance builds several
+    # channels of a sane size (up to ``max_channels``) instead of one giant one.
+    #
+    # Applied to the gross intent in :func:`_decide_channel_open` AND to the
+    # "could we fund a real replacement?" gate in
+    # :func:`_decide_undersized_closes` -- see :func:`channel_funding_sat` for
+    # why both matter. The glue applies the same ceiling to the actual funding
+    # amount it computes from a trial max-spend tx.
+    #
+    # 0 (this dataclass's default) disables the ceiling, leaving the pre-feature
+    # "fund with everything" behaviour that pure tests and non-populating callers
+    # were written against. The SHIPPED default is
+    # ``DEFAULT_MAX_CHANNEL_SIZE_SAT`` (10x the shipped liquidity goal);
+    # ``read_config`` always passes the user's value explicitly.
+    max_channel_size_sat: int = 0
 
 
 @dataclass(frozen=True)
@@ -1347,11 +1414,138 @@ def _offer_available_sat(offer: ProviderOffer,
     return max(0, offer.max_reverse_sat - int(consumed.get(offer.npub, 0)))
 
 
+# The descending ladder of sizes each provider is offered for one channel's swap.
+#
+# A big Lightning payment fails for reasons a smaller one does not: the whole
+# amount must traverse ONE contiguous path when the wallet has a single funded
+# channel (no channel to split across means no MPP), and every hop on that path
+# must hold that much outbound at that moment. Observed failure mode: ~90% of a
+# wallet's only channel, single-part, dying 3-4 hops out on TEMPORARY_CHANNEL_FAILURE
+# against 36 distinct mid-route channels in 15 minutes -- none of which had a
+# policy limit anywhere near the amount. They were simply dry at that size.
+#
+# 1.0 is the planned amount; the rest are genuinely different payments with
+# materially different routability. The gap from 0.9 to 0.5 is deliberate --
+# 0.9 is the cheap "maybe it was marginal" probe, and anything between 0.9 and
+# 0.5 is close enough to 0.9 to fail the same way while costing another rung.
+#
+# NB: shrinking RAISES all-in cost as a percentage (the mining and claim fees are
+# fixed), so the deeper rungs are progressively more likely to be filtered out by
+# ``config.max_swap_fee_pct``. That ceiling -- not this tuple -- is what really
+# decides how far down the ladder a given wallet can go; see
+# :func:`rank_swap_rungs`.
+SWAP_LADDER_FACTORS: Tuple[float, ...] = (1.0, 0.9, 0.5, 0.3)
+
+
+def swap_ladder_amounts(desired_sat: int, *,
+                        factors: Sequence[float] = SWAP_LADDER_FACTORS
+                        ) -> Tuple[int, ...]:
+    """The descending, deduplicated ladder of swap sizes to consider.
+
+    Deduplicated because rounding can collapse two factors onto the same integer
+    on small amounts, and a repeated size would spend a whole cascade rung
+    re-running an identical payment.
+
+    Factors outside ``(0, 1]`` are ignored rather than raising: the tuple is
+    user-reachable via config in principle, and a nonsense entry should cost that
+    rung, not the whole swap. That test also rejects NaN (every comparison with
+    NaN is False), which would otherwise reach ``int()`` and raise.
+    """
+    out: List[int] = []
+    for factor in factors:
+        if not (0.0 < factor <= 1.0):
+            continue
+        amount = int(desired_sat * factor)
+        if amount > 0 and amount not in out:
+            out.append(amount)
+    out.sort(reverse=True)
+    return tuple(out)
+
+
+def rank_swap_rungs(offers: Sequence[ProviderOffer], desired_amount_sat: int,
+                    claim_fee_sat: int, config: LiquidityConfig,
+                    consumed: Optional[Mapping[str, int]] = None, *,
+                    factors: Sequence[float] = SWAP_LADDER_FACTORS
+                    ) -> List[ProviderSelection]:
+    """Every (provider, ladder size) pair that clears the cost gate, cheapest
+    cost-per-sat-of-inbound-liquidity first.
+
+    This is the whole prioritisation: one flat list of concrete swaps to attempt,
+    walked in order until one commits. A rung is a provider AND an amount, because
+    those are not separable -- the same provider at a different size is a
+    materially different swap, with its own cost and its own chance of routing.
+
+    Ordering is by cost per sat of inbound liquidity, which is exactly
+    ``all_in_cost_pct``: a reverse swap of ``a`` sat buys ``a`` sat of inbound, so
+    ``swap_cost_sat(a) / a`` IS the per-sat price. Since that equals
+    ``percentage_fee + fixed_fees/a``, it falls strictly as ``a`` grows -- so a
+    provider's own rungs always appear largest-cheapest first, while a cheap
+    provider's smaller rung can still outrank an expensive provider's full size.
+    That interleaving is the point: the list is ordered by what the swap costs,
+    not by a provider-then-size hierarchy.
+
+    Filtering, per rung, is exactly what the single-size path always applied:
+    the provider's advertised minimum, its remaining capacity (see ``consumed``),
+    and the real all-in cost against ``config.max_swap_fee_pct``. Because the
+    percentage is fixed but the per-sat share of the mining and claim fees grows
+    as the amount shrinks, the ceiling truncates the ladder from the bottom --
+    which is the intended relationship, not a limitation: a user who wants smaller
+    (more routable) swaps to be reachable raises the ceiling, and the smallest
+    rung that can ever pass is ``fixed_fees / (ceiling - percentage_fee)``.
+
+    Deduplicated on ``(npub, amount)``. Clamping a rung to a provider's remaining
+    capacity can collapse several ladder entries onto one amount -- a provider
+    capped at 57k offers the same 57k for a 95k channel's 1.0 and 0.9 rungs -- and
+    without this that provider would be tried repeatedly with an identical swap.
+
+    The result is uncapped on purpose, matching the failover list it replaces:
+    every entry passed the cost gate, so dropping one discards a vetted way to
+    drain this channel. The executor's wall-clock deadline bounds the walk.
+    """
+    eligible = eligible_providers(offers, config)
+    ranked: List[ProviderSelection] = []
+    seen: Set[Tuple[str, int]] = set()
+    # Descending, so that when two rungs tie on rank cost the larger (more
+    # capital-efficient) one is inserted first and the stable sort keeps it there.
+    for ladder_amount in swap_ladder_amounts(desired_amount_sat, factors=factors):
+        for offer in eligible:
+            amount = min(ladder_amount, _offer_available_sat(offer, consumed))
+            # The provider's own advertised minimum and the user's floor are both
+            # hard: whichever is higher wins. The user's is checked here rather
+            # than only at the top of the ladder because the LADDER is what
+            # generates small amounts -- a 0.3 rung of a comfortable swap is
+            # exactly the case this floor exists to stop.
+            if amount <= 0 or amount < max(offer.min_amount_sat, config.min_swap_sat):
+                continue
+            key = (offer.npub, amount)
+            if key in seen:
+                continue
+            cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
+                                     claim_fee_sat, amount) / amount * 100.0
+            # The gate is on the REAL cost; the reliability penalty only reorders.
+            if cost_pct > config.max_swap_fee_pct:
+                continue
+            seen.add(key)
+            ranked.append(ProviderSelection(
+                offer=offer, amount_sat=amount, all_in_cost_pct=cost_pct,
+                rank_cost_pct=cost_pct + max(0.0, offer.reliability_penalty_pct)))
+    # Lower rank cost wins; on a tie prefer higher PoW (negate for ascending sort).
+    # Python's sort is stable, so rungs that tie on both keys keep the insertion
+    # order above: larger sizes first, then provider discovery order.
+    ranked.sort(key=lambda s: (s.rank_cost_pct, -s.offer.pow_bits))
+    return ranked
+
+
 def rank_providers(offers: Sequence[ProviderOffer], desired_amount_sat: int,
                    claim_fee_sat: int, config: LiquidityConfig,
                    consumed: Optional[Mapping[str, int]] = None) -> List[ProviderSelection]:
     """Every eligible provider that can host a swap of up to ``desired_amount_sat``
     and passes the cost gate, best first.
+
+    The single-size view of :func:`rank_swap_rungs` -- one full-size rung per
+    provider, no ladder. Kept as its own name because "rank the providers" is what
+    several callers actually want (the channel-open costing, the decline reasons);
+    the swap executor wants the ladder and calls ``rank_swap_rungs`` directly.
 
     Each provider would swap ``min(desired, its remaining capacity)`` (and must
     clear its own minimum). Only providers whose *real* all-in cost passes the
@@ -1360,35 +1554,16 @@ def rank_providers(offers: Sequence[ProviderOffer], desired_amount_sat: int,
     ones -- soft de-prioritisation, never an outright exclusion); ties break in
     favour of the higher proof-of-work (more established) provider.
 
-    The head of this list is the provider to try first; the tail is the failover
-    order the executor walks when an attempt fails without committing funds (see
-    ``ReverseSwapAction.alternates``). Note that each entry carries its OWN
-    ``amount_sat``: providers advertise different capacities, so a failover is a
-    differently-sized swap, not merely the same swap re-addressed.
+    Note that each entry carries its OWN ``amount_sat``: providers advertise
+    different capacities, so a failover is a differently-sized swap, not merely
+    the same swap re-addressed.
 
     ``consumed`` (npub -> sat) lets a caller draining several channels in one pass
     subtract capacity already committed to each provider, so the engine never
     plans two swaps that together exceed a provider's advertised ``max_forward``.
     """
-    ranked: List[ProviderSelection] = []
-    for offer in eligible_providers(offers, config):
-        amount = min(desired_amount_sat, _offer_available_sat(offer, consumed))
-        if amount <= 0 or amount < offer.min_amount_sat:
-            continue
-        cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
-                                 claim_fee_sat, amount) / amount * 100.0
-        # The gate is on the REAL cost; the reliability penalty only reorders.
-        if cost_pct > config.max_swap_fee_pct:
-            continue
-        rank_cost_pct = cost_pct + max(0.0, offer.reliability_penalty_pct)
-        ranked.append(ProviderSelection(offer=offer, amount_sat=amount,
-                                        all_in_cost_pct=cost_pct,
-                                        rank_cost_pct=rank_cost_pct))
-    # Lower rank cost wins; on a tie prefer higher PoW (negate for ascending sort).
-    # Python's sort is stable, so providers that tie on both keys keep discovery
-    # order -- matching the first-wins behaviour this replaced.
-    ranked.sort(key=lambda s: (s.rank_cost_pct, -s.offer.pow_bits))
-    return ranked
+    return rank_swap_rungs(offers, desired_amount_sat, claim_fee_sat, config,
+                           consumed, factors=(1.0,))
 
 
 def select_provider(offers: Sequence[ProviderOffer], desired_amount_sat: int,
@@ -1419,7 +1594,7 @@ def cheapest_hosting_cost(offers: Sequence[ProviderOffer], desired_amount_sat: i
     best: Optional[Tuple[int, float]] = None
     for offer in eligible_providers(offers, config):
         amount = min(desired_amount_sat, _offer_available_sat(offer, consumed))
-        if amount <= 0 or amount < offer.min_amount_sat:
+        if amount <= 0 or amount < max(offer.min_amount_sat, config.min_swap_sat):
             continue
         cost_pct = swap_cost_sat(offer.percentage_fee, offer.mining_fee_sat,
                                  claim_fee_sat, amount) / amount * 100.0
@@ -1814,6 +1989,37 @@ def decide(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> List[Action]
     return list(evaluate(snapshot, config).actions)
 
 
+def channel_funding_sat(snapshot: LiquiditySnapshot,
+                        config: LiquidityConfig) -> int:
+    """How much a new channel would be funded with: everything on-chain bar the
+    reserve, capped by ``max_channel_size_sat``.
+
+    The single source of truth for channel sizing in this engine, used by BOTH
+    :func:`_decide_channel_open` (where it is the amount to open with) and
+    :func:`_decide_undersized_closes` (where it is the "could a replacement
+    actually reach the goal?" test). They have to agree, and applying the ceiling
+    in one but not the other would be worse than not having it at all: a cap
+    below the liquidity goal would let the close rule fire on funds the open rule
+    was never going to spend, reopen at the cap -- still under the goal -- and
+    close the same channel again on the next tick, burning a mining fee every
+    round. Sharing this function makes that churn loop unrepresentable.
+
+    The result is deliberately NOT floored at 0: a negative answer means the
+    reserve exceeds the balance, and callers already test it against the funding
+    floor, which no negative number can clear.
+
+    This is the engine's GROSS intent. The glue recomputes the real amount from a
+    trial max-spend transaction (so the funding tx's mining fee is deducted at
+    the live fee policy) and applies the same ceiling there -- see
+    ``_max_funding_minus_reserve`` in ``__init__.py``.
+    """
+    available = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    cap = max(0, int(config.max_channel_size_sat))
+    if cap <= 0:
+        return available      # ceiling disabled
+    return min(available, cap)
+
+
 def _decide_channel_open(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
 ) -> Tuple[Optional[OpenChannelAction], Optional[DeclineRecord]]:
@@ -1835,11 +2041,32 @@ def _decide_channel_open(
     # for funds", not a near miss, so it is not logged as a decline.
     if snapshot.onchain_spendable_sat < config.min_onchain_to_open_sat:
         return None, None
-    # Rule: open with the maximum amount, leaving `onchain_reserve_sat` on-chain.
-    funding_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    # Misconfiguration guard, checked before the arithmetic below so its decline
+    # names the real cause. A ceiling under the funding floor can never be
+    # satisfied, so the plugin would sit permanently inert while every other rule
+    # said it was ready to open -- and the generic "below funding floor" decline
+    # underneath would blame the reserve for it. Only reachable from a
+    # hand-edited config: the settings tab refuses to save such a value.
+    cap = max(0, int(config.max_channel_size_sat))
+    if 0 < cap < MIN_FUNDING_SAT:
+        return None, DeclineRecord(
+            kind="open",
+            reason=(
+                f"max channel size {cap} is below the {MIN_FUNDING_SAT} sat "
+                f"channel-funding floor, so no channel can ever be opened; "
+                f"raise it (or the min-on-chain-to-open setting, which lowers "
+                f"the floor)"
+            ),
+            amount_sat=cap,
+        )
+    # Rule: open with the maximum amount, leaving `onchain_reserve_sat` on-chain,
+    # and never more than `max_channel_size_sat`.
+    funding_sat = channel_funding_sat(snapshot, config)
     if funding_sat < MIN_FUNDING_SAT:
         # We passed the min-to-open gate but cannot clear Electrum's funding
-        # floor after the reserve -- a genuine near miss worth recording.
+        # floor after the reserve -- a genuine near miss worth recording. The cap
+        # cannot be what put us here: it was cleared against the same floor
+        # above, so `funding_sat` is short of the floor only when the balance is.
         return None, DeclineRecord(
             kind="open",
             reason=(
@@ -1862,6 +2089,11 @@ def _decide_channel_open(
             ),
             amount_sat=funding_sat,
         )
+    # When the ceiling is what set the size, say so: otherwise the decision log
+    # records a channel visibly smaller than the balance with no explanation, and
+    # the leftover on-chain (which the next tick spends on another channel) reads
+    # as the plugin having failed to use the funds.
+    capped = 0 < cap <= snapshot.onchain_spendable_sat - config.onchain_reserve_sat
     return (
         OpenChannelAction(
             funding_sat=funding_sat,
@@ -1869,6 +2101,8 @@ def _decide_channel_open(
                 f"on-chain spendable {snapshot.onchain_spendable_sat} >= "
                 f"min {config.min_onchain_to_open_sat} and "
                 f"{len(snapshot.channels)} < {config.max_channels} channels"
+                + (f"; funding capped at the {cap} sat max channel size"
+                   if capped else "")
             ),
         ),
         None,
@@ -2073,9 +2307,12 @@ def _decide_undersized_closes(
       1. a liquidity goal is configured (0 = rule disabled);
       2. we are AT the channel ceiling -- below it, a bigger channel can simply
          be opened alongside, so closing anything would be gratuitous;
-      3. on-chain spendable minus the reserve can fund a channel that reaches the
-         goal (and clears the funding floor) -- so the replacement is real, not
-         hypothetical;
+      3. what a new channel would be funded with (:func:`channel_funding_sat` --
+         on-chain spendable minus the reserve, capped by ``max_channel_size_sat``)
+         reaches the goal and clears the funding floor -- so the replacement is
+         real, not hypothetical. The cap belongs in this test: a ceiling below the
+         goal makes every replacement undersized by construction, and closing on
+         funds the open rule will not spend would churn the same channel forever;
       4. the channel was opened by the plugin -- a channel the user opened by
          hand is never closed by this rule, whatever the scope switch says;
       5. its capacity is below the goal -- it is the thing holding us back;
@@ -2091,31 +2328,61 @@ def _decide_undersized_closes(
          belongs to the offline auto-close watchdog, which has uptime evidence to
          justify the expense.
 
-    Declines are recorded only for a genuine near miss: gates 1-3 passed (we are
-    blocked, with the funds to fix it) and at least one channel is undersized,
-    but nothing cleared the remaining gates.
+    Declines are recorded only for a genuine near miss: at least one channel is
+    undersized and either gates 1-3 passed (we are blocked, with the funds to fix
+    it) but nothing cleared the remaining gates, or gate 3 failed *because of the
+    max-channel-size ceiling* rather than for want of funds -- a state no amount
+    of waiting resolves, so it has to be said out loud.
     """
     if config.liquidity_goal_sat <= 0:
         return None, []
     if len(snapshot.channels) < config.max_channels:
         return None, []
-    # What a replacement channel would actually be funded with -- mirrors
-    # _decide_channel_open, so "we could fund it" here means the same arithmetic
-    # that will run when the open is decided.
-    funding_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    # Gate 5 is tested before gate 3 so that gate 3's declines only ever fire when
+    # there is actually something to replace. Both are pure predicates on the same
+    # snapshot, so the order does not change which channel (if any) is chosen.
+    undersized = [c for c in snapshot.channels
+                  if c.is_plugin_opened and c.capacity_sat < config.liquidity_goal_sat]
+    if not undersized:
+        return None, []
+
+    # What a replacement channel would actually be funded with -- shared with
+    # _decide_channel_open via channel_funding_sat, so "we could fund it" here
+    # means exactly the arithmetic that will run when the open is decided.
+    funding_sat = channel_funding_sat(snapshot, config)
     # The replacement must both REACH THE GOAL (else the close buys nothing) and
     # clear Electrum's funding floor (else it cannot be opened at all). The floor
     # is the module global, which the glue lowers to the user's
     # min_onchain_to_open_sat at startup -- so this tracks the effective floor.
     required_sat = max(config.liquidity_goal_sat, MIN_FUNDING_SAT)
     if funding_sat < required_sat:
-        # Simply waiting for funds; not a near miss, so nothing is logged (the
-        # same treatment _decide_channel_open gives its min-on-chain gate).
-        return None, []
-
-    undersized = [c for c in snapshot.channels
-                  if c.is_plugin_opened and c.capacity_sat < config.liquidity_goal_sat]
-    if not undersized:
+        # Distinguish the two ways of being short, because they need opposite
+        # responses from the user. Out of funds: just wait, and (as with
+        # _decide_channel_open's min-on-chain gate) log nothing. Capped below what
+        # a replacement must reach: waiting will never help -- the funds are
+        # already there and the ceiling is throwing them away -- so this is a
+        # near miss, and a silent one would leave a wallet stuck with no
+        # explanation anywhere. Only reachable from a hand-edited config; the
+        # settings tab refuses to save a ceiling below the goal.
+        cap = max(0, int(config.max_channel_size_sat))
+        uncapped_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+        if 0 < cap < required_sat <= uncapped_sat:
+            return None, [DeclineRecord(
+                kind="close",
+                amount_sat=cap,
+                reason=(
+                    f"max channel size {cap} is below the "
+                    f"{config.liquidity_goal_sat} sat liquidity goal, so replacing "
+                    f"an undersized channel would only reopen another one; not "
+                    f"closing anything until the two agree"
+                ),
+                detail=(
+                    f"{uncapped_sat} sat available but capped to {cap}; "
+                    f"{len(undersized)} undersized channel(s); the goal also "
+                    f"cannot be reached while this holds, which keeps the "
+                    f"liquidity sink deferred if that setting is on"
+                ),
+            )]
         return None, []
 
     # One replacement at a time, across ticks as well as within one. A channel we
@@ -2219,7 +2486,22 @@ def _plan_reverse_swap(
             kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
             reason=(f"channel {chan.short_id} over {trigger} trigger but "
                     f"{why}; skipping"))
-    ranked = rank_providers(offers, desired, claim_fee, config, consumed)
+    # The user's floor, checked before anything is priced. Not folded into the
+    # generic "below provider minimum" arm below because the two are different
+    # facts with different fixes: one is the provider's rule and the user can
+    # switch providers, the other is the user's own and only they can lower it.
+    # A decline that names the wrong one sends them to the wrong setting.
+    if desired < config.min_swap_sat:
+        return None, DeclineRecord(
+            kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+            amount_sat=desired,
+            reason=(f"channel {chan.short_id} over {trigger} trigger but its "
+                    f"{desired} sat swap is below your {config.min_swap_sat} sat "
+                    f"minimum swap size; skipping"))
+    # The ladder, not just the providers: every (provider, size) pair that clears
+    # the gate, cheapest cost-per-sat first. The head is the swap to make; the
+    # tail is the ordered list of concrete alternatives the executor walks.
+    ranked = rank_swap_rungs(offers, desired, claim_fee, config, consumed)
     selection = ranked[0] if ranked else None
     if selection is None:
         # No eligible provider both hosts the amount AND passes the cost gate,
@@ -2246,6 +2528,18 @@ def _plan_reverse_swap(
                             f"next cycle"))
             min_amount = min((o.min_amount_sat for o in eligible), default=0)
             amount = min(desired, max((o.max_reverse_sat for o in eligible), default=desired))
+            # ``desired`` already cleared the user's floor above, but the amount a
+            # provider can actually host may not: capacity clamping can push a
+            # viable swap back under it. Name whichever bound really bit, because
+            # they send the user to different places -- their own setting, or a
+            # different provider.
+            if amount < config.min_swap_sat:
+                return None, DeclineRecord(
+                    kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                    amount_sat=amount,
+                    reason=(f"channel {chan.short_id} swap amount {amount} "
+                            f"(capped by provider capacity) is below your "
+                            f"{config.min_swap_sat} sat minimum swap size; skipping"))
             return None, DeclineRecord(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
                 amount_sat=amount,
@@ -2258,14 +2552,20 @@ def _plan_reverse_swap(
             reason=(f"channel {chan.short_id} swap of {amount} all-in cost "
                     f"{cost_pct:.3f}% > ceiling {config.max_swap_fee_pct}% "
                     f"(cheapest of {len(eligible)} provider(s)); skipping"))
-    # Failover order: the whole rest of the ranking, uncapped. Every entry here
+    # Fallback order: the whole rest of the ladder, uncapped. Every entry here
     # already passed the cost gate, so dropping any of them would be discarding a
     # vetted way to drain this channel; the executor's wall-clock deadline is what
-    # bounds the walk. Each carries its own one-step reduced retry.
+    # bounds the walk.
+    #
+    # Each entry is a COMPLETE swap (provider + amount + its own cost), so no
+    # entry carries a reduced retry of its own any more: a smaller size is not a
+    # sub-step of a rung, it is its own rung, priced and ordered against every
+    # other. That is why ``reduced_amount_sat`` is left unset below -- the ladder
+    # subsumes it, and populating both would nest a 0.9x retry inside a rung that
+    # is already 0.5x of the planned amount.
     alternates = tuple(
         ProviderAttempt(npub=s.offer.npub, amount_sat=s.amount_sat,
-                        all_in_cost_pct=s.all_in_cost_pct,
-                        **_reduced_fields(s.offer, s.amount_sat, claim_fee, config))
+                        all_in_cost_pct=s.all_in_cost_pct)
         for s in ranked[1:])
     amount = selection.amount_sat
     cost_pct = selection.all_in_cost_pct
@@ -2282,13 +2582,12 @@ def _plan_reverse_swap(
         lightning_amount_sat=amount,
         provider_npub=selection.offer.npub,
         alternates=alternates,
-        **_reduced_fields(selection.offer, amount, claim_fee, config),
         reason=(
             f"channel {chan.short_id} local {chan.local_sat} over "
             f"{trigger} trigger; swapping {amount} via {provider_desc} "
             f"(all-in cost {cost_pct:.3f}% <= {config.max_swap_fee_pct}%{rank_note}, "
             f"best of {len(eligible)} eligible)"
-            + (f", {len(alternates)} failover provider(s) ready"
+            + (f", {len(alternates)} fallback rung(s) ready"
                if alternates else "")),
     ), None
 
@@ -2345,6 +2644,32 @@ def _decide_reverse_swaps(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
                 reason=(f"channel {chan.short_id} over {trigger} trigger but not "
                         f"active (peer offline / not yet OPEN); skipping"),
+            ))
+            continue
+        # Rule: never drain a channel Electrum will not SEND over.
+        #
+        # Draining is sending, so this is a refusal we have to respect -- and one we
+        # have to respect HERE, because Electrum is never asked. Both drain paths
+        # pin the payment with ``pay_invoice(channels=[chan])``, and that argument
+        # REPLACES the candidate set inside ``lnworker.create_routes_for_payment``,
+        # which is exactly where the ``is_frozen_for_sending`` filter sits. A pinned
+        # payment is therefore forced down a channel unpinned routing would have
+        # excluded, where it burns the full payment timeout and fails.
+        #
+        # The two causes get different reasons because only one of them is the
+        # user's doing and only one of them is theirs to undo.
+        if chan.is_frozen_for_sending:
+            reason = (
+                (f"channel {chan.short_id} over {trigger} trigger but you have "
+                 f"frozen it for sending; leaving its outbound untouched")
+                if chan.frozen_by_user else
+                (f"channel {chan.short_id} over {trigger} trigger but Electrum "
+                 f"will not send over it: its peer does not advertise trampoline "
+                 f"routing and channel gossip is off, so no payment can be routed "
+                 f"through this channel at all"))
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                reason=reason,
             ))
             continue
         # Rule: don't add an HTLC to a channel that still has unsettled HTLCs.

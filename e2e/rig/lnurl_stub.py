@@ -24,6 +24,7 @@ each invoice is entirely adequate.
 from __future__ import annotations
 
 import datetime
+import errno
 import http.server
 import json
 import ssl
@@ -121,6 +122,10 @@ class LnurlPayStub:
         self._key_path = cert_dir / "lnurl_stub_key.pem"
         self._httpd: Optional[http.server.ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        # Set when the requested port turned out to be taken and the kernel gave
+        # us another one instead (see _bind). Logged by the rig so a run whose
+        # stub moved is still traceable from its own output.
+        self.rebound_from: Optional[int] = None
 
     @property
     def lightning_address(self) -> str:
@@ -135,7 +140,7 @@ class LnurlPayStub:
         _generate_self_signed_cert(self._cert_path, self._key_path,
                                    label=self.username)
         handler = self._make_handler()
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), handler)
+        httpd = self._bind(handler)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(self._cert_path), keyfile=str(self._key_path))
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
@@ -143,6 +148,34 @@ class LnurlPayStub:
         self._thread = threading.Thread(
             target=httpd.serve_forever, name="lnurl-stub", daemon=True)
         self._thread.start()
+
+    def _bind(self, handler: type[http.server.BaseHTTPRequestHandler],
+              ) -> http.server.ThreadingHTTPServer:
+        """Bind the requested port, falling back to a kernel-assigned one.
+
+        The rig picks this port at allocation time but starts the stub minutes
+        later, once the whole stack is up. The port comes from the ephemeral
+        range -- the same range every outbound connection on the box draws from --
+        so by the time we bind it, something else may legitimately hold it. That
+        killed a rig once already (``EADDRINUSE`` on the 43rd rig of a suite run),
+        and it is nothing to do with what the rig is testing.
+
+        So treat the requested port as a preference, not a requirement: on
+        ``EADDRINUSE`` rebind with port 0 and let the kernel hand us one that is
+        free *now*, which closes the race window entirely rather than narrowing
+        it. Everything that reads the port (``base_url``, ``lightning_address``,
+        the cert trust, the client's configured payout address) is read after
+        ``start()``, so they all follow the move. Any other ``OSError`` is a real
+        fault and still raised.
+        """
+        try:
+            return http.server.ThreadingHTTPServer(("127.0.0.1", self.port), handler)
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.rebound_from, self.port = self.port, httpd.server_address[1]
+        return httpd
 
     def stop(self) -> None:
         if self._httpd is not None:
@@ -188,7 +221,7 @@ class LnurlPayStub:
             ["text/identifier", self.lightning_address],
         ])
 
-    def _make_handler(self):
+    def _make_handler(self) -> type[http.server.BaseHTTPRequestHandler]:
         stub = self
 
         class Handler(http.server.BaseHTTPRequestHandler):

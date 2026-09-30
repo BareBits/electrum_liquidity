@@ -28,15 +28,27 @@ That one needs no sabotage -- the rig's topology already pins a swap's Lightning
 leg to a channel from which the cheapest provider is unroutable.
 
 That same test now also pins the reason the cascade still went nowhere in
-practice: the mining-fee PREPAYMENT. Electrum fires the minerFeeInvoice
-fire-and-forget and races only the main payment against funding detection, so
-``reverse_swap`` returns while the prepayment's HTLC is still live -- and the
-failover gate, which must not fail over with a live HTLC, read that as "funds may
-be committed" and stopped. Because the provider only fulfils the prepayment once
-the main payment's MPP set arrives too, a dead main payment dooms it, so it was
-live essentially every time. Note this rig hid the bug for a long while: its
-providers are direct channel peers, so their prepayments resolve fast enough that
-the old code sometimes got past the gate anyway.
+practice: at the instant ``reverse_swap`` returns, BOTH of a swap's HTLCs are
+typically still unresolved, and the failover gate -- which must not fail over with
+a live HTLC -- read "unresolved" as "committed" and stopped.
+
+The mining-fee PREPAYMENT was the first leg found to do this: Electrum fires the
+minerFeeInvoice fire-and-forget and races only the main payment against funding
+detection, so ``reverse_swap`` returns without ever looking at it, and because the
+provider only fulfils it once the main payment's MPP set arrives too, a dead main
+payment dooms it -- so it was live essentially every time.
+
+The MAIN payment does the same thing for its own reason, and was left strict when
+the prepayment was fixed: ``pay_to_node`` raises PaymentFailure the moment it
+passes PAYMENT_TIMEOUT or runs out of attempts, while its ``finally`` deliberately
+leaves unresolved HTLCs alone, so what it already sent sits in the channel until
+the far end fails it back. Observed on mainnet as two rungs of one provider
+failing ~126s apart: the first read as "nothing committed" and correctly retried
+smaller, the second as "may have committed funds", ending the cascade with four
+ranked providers untried.
+
+Note this rig hid both for a long while: its providers are direct channel peers,
+so HTLCs resolve fast enough that the old code sometimes got past the gate anyway.
 
 Two further tests cover the rest of the fix: a provider whose payment failed is
 retried once at 90% of the amount before we move on (a swap sized to what Electrum
@@ -292,50 +304,67 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
     # 2) ... and the cascade actually advanced on that classification, in the SAME
     #    attempt rather than some later cycle.
     #
-    #    This is where the prepayment used to stop everything. Electrum fires the
-    #    minerFeeInvoice fire-and-forget and races only the MAIN payment against
-    #    funding detection, so reverse_swap returns while the prepayment's HTLC is
-    #    still live -- and the failover gate read that as "funds may be committed"
-    #    and stopped. Since the provider only fulfils the prepayment once the main
-    #    payment's MPP set arrives too, a dead main payment dooms it, so it was
-    #    live essentially every time and the cascade essentially never advanced.
-    #    The gate now waits for it (bounded), which is why this is a plain wait for
-    #    the failover rather than "give the wallet a few cycles and hope".
+    #    This is where an unresolved HTLC used to stop everything -- first the
+    #    mining-fee prepayment, which reverse_swap never waits for, and then (once
+    #    that leg was given patience) the MAIN payment, whose HTLCs sit in the
+    #    channel until the far end fails them back. Either one, read at the instant
+    #    reverse_swap returns, said "funds may be committed" and ended the cascade,
+    #    so it essentially never advanced. The gate now waits for both (bounded),
+    #    which is why this is a plain wait for the failover rather than "give the
+    #    wallet a few cycles and hope".
     assert _wait_until(
         lambda: "failing over to the next provider" in _client_log_text(),
         rig=rig, timeout=600), \
         "the failed payment never advanced the cascade to the next provider"
 
-    # 2b) The prepayment gate must never be the reason a cascade stopped.
+    # 2b) The HTLC-resolution gate must never be the reason a cascade stopped.
     #
-    #     Asserted as a NEGATIVE, deliberately. Whether the gate is exercised at all
+    #     The gate covers BOTH of a swap's HTLCs. The prepayment was the first leg
+    #     to be given patience; the MAIN payment was left strict and went on
+    #     killing cascades for the same reason -- pay_to_node raises PaymentFailure
+    #     while the HTLCs it already sent are unresolved, and get_payments(
+    #     status='inflight') reads live channel state, so it keeps naming them
+    #     until the far end fails them back. Observed on mainnet as two rungs of
+    #     one provider failing ~126s apart: the first read as "nothing committed"
+    #     and retried smaller, the second as "may have committed funds", ending
+    #     the cascade with four ranked providers untried.
+    #
+    #     Asserted as a NEGATIVE, deliberately. Whether the gate has to wait at all
     #     depends on rig timing that this test cannot pin: the rig's providers are
-    #     direct channel peers, so their prepayment sometimes resolves before the gate
-    #     first asks (nothing to wait for) and sometimes after it (a real wait). An
+    #     direct channel peers, so HTLCs sometimes resolve before the gate first
+    #     asks (nothing to wait for) and sometimes after it (a real wait). An
     #     earlier version of this assertion demanded the wait happen every run and was
     #     flaky for exactly that reason -- the rig cannot reproduce mainnet's timing on
     #     demand, and pretending otherwise would be a test that lies about its
-    #     coverage. The four gate outcomes are pinned precisely, with the timing under
+    #     coverage. The gate's outcomes are pinned precisely, with the timing under
     #     control, in tests/test_swap_provider_failover_glue.py.
     #
     #     What IS invariant is that the wait must not expire: if it does, the gate
     #     answered "possibly committed" and stopped a cascade that should have
     #     continued -- the original bug, back again, just slower.
     log_text = _client_log_text()
-    assert "prepayment still in flight after" not in log_text, \
-        ("the prepayment wait expired and the cascade stopped -- the budget is too "
-         "small for real timing, or the prepayment is not resolving at all")
+    assert "still has an HTLC in flight after" not in log_text, \
+        ("the HTLC-resolution wait expired and the cascade stopped -- the budget "
+         "is too small for real timing, or the HTLCs are not resolving at all")
+
+    # 2c) However the gate answered, it must SAY why. Every COMMITTED verdict ends
+    #     a cascade with providers untried, and the gate used to reach it in
+    #     silence -- a live main HTLC, a settled prepayment and a failed lookup
+    #     were indistinguishable in the log, which is what made the mainnet
+    #     occurrence take a source re-read to diagnose rather than a log read.
+    assert "failover gate:" in log_text, \
+        "the failover gate reached a verdict without recording its reason"
 
     # When the gate DID have to wait (observed live: an 11s wait on this rig), it must
     # have resolved into a decision rather than timing out. Recorded either way, so a
     # run where the timing never produced a wait is not a failure.
-    if "waiting up to" in log_text and "prepayment" in log_text:
-        assert "mining-fee prepayment resolved" in log_text, \
-            "the gate started waiting for the prepayment and never got an answer"
-        print("prepayment gate exercised: the wait happened and resolved")
+    if "waiting up to" in log_text and "HTLC in flight" in log_text:
+        assert "swap HTLCs resolved" in log_text, \
+            "the gate started waiting for the HTLCs and never got an answer"
+        print("HTLC gate exercised: the wait happened and resolved")
     else:
-        print("prepayment gate not exercised this run (prepayment resolved before "
-              "the gate asked); see the glue tests for its four outcomes")
+        print("HTLC gate not exercised this run (the HTLCs resolved before the "
+              "gate asked); see the glue tests for its outcomes")
 
     # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
     assert _wait_until(
@@ -355,6 +384,53 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
          "changed shape and the match silently stopped firing")
     assert "may have changed shape" not in _client_log_text(), \
         "the reaper ran but matched nothing -- upstream shape has changed"
+
+    # 3c) Every swap the cascade created is ON DISK, not merely in memory.
+    #
+    #     add_reverse_swap stores the privkey, preimage and redeem script -- all of
+    #     what is needed to ever claim the funding output -- into the
+    #     `submarine_swaps` StoredDict. A StoredDict only reaches the wallet file
+    #     on an explicit db.write(), and the LAST one Electrum performs is inside
+    #     wallet.stop(). So a swap created after that point would exist only in
+    #     memory, and a process ending there could never claim it. The executor
+    #     therefore flushes the moment a swap object exists.
+    #
+    #     Asserted against the real file (not the running daemon's memory) and
+    #     against a real StoredDict + JsonDB, because that is the part the unit
+    #     tests fake.
+    on_disk = _wallet_db().get("submarine_swaps", {}) or {}
+    assert on_disk, \
+        ("no swap reached the wallet file; the flush after add_reverse_swap is "
+         "not firing, and a swap created during shutdown would be unclaimable")
+    assert any(s.get("privkey") and s.get("preimage") for s in on_disk.values()), \
+        f"a swap was persisted without its claim secrets: {list(on_disk)}"
+
+    # 3d) The shutdown gate is inert while nothing is closing. It is checked
+    #     between every rung and every provider, so a gate that misfired would
+    #     silently truncate ordinary cascades -- the same symptom it exists to
+    #     fix, from the opposite direction.
+    assert "stopping the swap cascade" not in _client_log_text(), \
+        "the shutdown gate fired on a wallet that is not closing"
+
+    # 3e) The send-freeze gate is inert on channels Electrum is perfectly happy to
+    #     send over.
+    #
+    #     Asserted here because this is the gate's real regression risk. It reads
+    #     Channel.is_frozen_for_sending, which under trampoline routing (what these
+    #     Electrum-to-Electrum channels use) is True not only for a user freeze but
+    #     for any peer without trampoline support. If that read were wrong -- or if
+    #     the rig's peers stopped advertising trampoline forwarding -- the plugin
+    #     would decline EVERY channel and quietly stop draining anything, which no
+    #     amount of faked channel objects in the glue tests would catch.
+    #
+    #     The positive cases (both decline reasons, and the defensive read) are
+    #     covered against the real build_snapshot in tests/test_build_snapshot_glue.py;
+    #     there is no CLI to freeze a channel, so they cannot be driven from here.
+    log_text = _client_log_text()
+    for phrase in ("frozen it for sending", "does not advertise trampoline routing"):
+        assert phrase not in log_text, \
+            (f"the send-freeze gate declined a usable rig channel ({phrase!r}); "
+             f"the plugin would drain nothing at all in this state")
 
     # 4) Both sides end up faulted, from two different places. The executor
     #    charges the PROVIDER as it fails over (softly -- attribution is
@@ -379,8 +455,7 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
 
 
 def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
-    """Before failing over, a provider whose Lightning payment failed is tried once
-    more at 90% of the amount.
+    """A provider whose Lightning payment failed is tried again at a smaller size.
 
     This is the other half of why swaps were not completing. Sizing already asks
     Electrum what it can send (``num_sats_can_send`` minus a fee-reserve headroom),
@@ -393,10 +468,18 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
 
     Asserted on the log rather than on an outcome, because whether the smaller rung
     SUCCEEDS depends on the rig's liquidity at that moment -- what must hold is that
-    it is attempted, at the right size, before the cascade moves on. The rig's
-    permissive 10% fee ceiling (see _arm_swap_config) guarantees the reduced amount
-    still clears the cost gate, so a rung is always priced here; the refusal case is
-    unit-tested, where the arithmetic can be pinned exactly.
+    it is attempted, at a ladder size. The rig's permissive 10% fee ceiling (see
+    _arm_swap_config) guarantees the smaller amounts still clear the cost gate, so
+    the rungs are always priced here; the refusal case is unit-tested, where the
+    arithmetic can be pinned exactly.
+
+    NB what this NO LONGER asserts. Under the size ladder the smaller rung is not
+    bolted onto the provider that just failed -- it is an independent entry in one
+    cost-ordered list, so another provider's full-size swap legitimately runs first
+    whenever it is cheaper per sat. "Smaller size before the next provider" was an
+    artefact of the old providers-outer walk and is not a property worth preserving;
+    what IS still true, and is checked here, is that the same provider is retried
+    smaller somewhere in the walk, at a size off the ladder.
     """
     assert rig.partner2_nodeid, "rig did not bring up a second provider"
 
@@ -409,26 +492,36 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
                 in _client_log_text(), rig=rig, timeout=600), \
         "no swap reached the failed-payment arm, so no reduced retry was possible"
 
-    # The retry is announced with both sizes, so a log reader can see the step.
-    assert _wait_until(
-        lambda: "retrying the same provider at" in _client_log_text(),
-        rig=rig, timeout=420), \
-        ("the failed payment went straight to the next provider without trying a "
-         "smaller size first")
-
-    # And the smaller attempt really ran, labelled as such.
+    # A rung below the planned size really ran, labelled as such.
     assert _wait_until(
         lambda: "reduced size" in _client_log_text(), rig=rig, timeout=420), \
-        "the reduced rung was announced but never attempted"
+        "no rung below the planned size was ever attempted"
 
-    # The reduced amount is the engine's 10% step off whatever was planned, never a
-    # number the executor invented. Recover both from the log and check the ratio.
-    m = re.search(r"the Lightning payment for (\d+) sat failed; "
-                  r"retrying the same provider at (\d+) sat", _client_log_text())
-    assert m, "could not read the full and reduced sizes out of the log"
-    full, reduced = int(m.group(1)), int(m.group(2))
-    assert reduced == int(full * 0.9), \
-        f"reduced size {reduced} is not 90% of {full}"
+    # Recover every attempted rung as (provider, amount) and find a provider that
+    # was tried at more than one size.
+    rungs = re.findall(
+        r"reverse swap via (\S+?)…? \(rung \d+ of \d+(?:, reduced size)?\): (\d+) sat",
+        _client_log_text())
+    by_provider = {}
+    for npub, amount in rungs:
+        by_provider.setdefault(npub, []).append(int(amount))
+    retried = {n: a for n, a in by_provider.items() if len(a) > 1}
+    assert retried, (
+        f"no provider was retried at a second size; rungs seen: {by_provider}")
+
+    # The sizes are the engine's ladder steps off the planned amount, never numbers
+    # the executor invented: each is some SWAP_LADDER_FACTORS fraction of the
+    # largest size that provider was tried at, and they descend.
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        SWAP_LADDER_FACTORS)
+    for npub, amounts in retried.items():
+        assert amounts == sorted(amounts, reverse=True), \
+            f"{npub} rungs are not descending: {amounts}"
+        planned = amounts[0]
+        allowed = {int(planned * f) for f in SWAP_LADDER_FACTORS}
+        assert set(amounts) <= allowed, (
+            f"{npub} was tried at {amounts}, which is not a subset of the ladder "
+            f"{sorted(allowed, reverse=True)} off {planned}")
 
     # One observation, one fault: the pair of rungs must not charge the provider
     # twice. (Which provider is faulted depends on ranking, so this checks the

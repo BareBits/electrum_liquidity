@@ -62,6 +62,12 @@ PARTNER_WALLET_NAME: str = "electrum_liqtest_swap_partner"
 # cost for them.
 PARTNER2_DATADIR: Path = RUN_DIR / "electrum-partner2"
 PARTNER2_WALLET_NAME: str = "electrum_liqtest_swap_partner2"
+# Optional FOURTH node, brought up only with ``--deep-hop``. It sits one hop
+# BEYOND partner2 (client -> partner -> partner2 -> partner3) and exists so a
+# Lightning payment can fail at a node that is NOT our channel peer, which is
+# the only way to prove the plugin does not blame the peer for it.
+PARTNER3_DATADIR: Path = RUN_DIR / "electrum-partner3"
+PARTNER3_WALLET_NAME: str = "electrum_liqtest_swap_partner3"
 
 # ---- Bitcoind miner wallet ------------------------------------------------
 MINER_WALLET: str = "rigminer"

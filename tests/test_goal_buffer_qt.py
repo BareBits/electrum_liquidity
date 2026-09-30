@@ -10,8 +10,11 @@ Two surfaces, neither of which Electrum fully hooks:
 
 The risky parts are covered here: that the wrappers find and rewrite the right
 entries without losing satoshis, that they stay out of the way when there is no
-buffer, that the buffer's blue is not Electrum's frozen-blue, and that the Send
-tab's label tracks the amount box on both rails.
+buffer, that the buffer's blues are not Electrum's frozen-blue, that the goal is
+split across its two rails (with the Lightning wedge left off when on-chain
+covers the whole goal), that the dialog's "Show liquidity goal" checkbox
+restores Electrum's own chart in BOTH pies and remembers the choice, and that
+the Send tab's label tracks the amount box on both rails.
 
 Needs PyQt6 and Electrum's Qt GUI; skipped when either is unavailable."""
 from __future__ import annotations
@@ -30,7 +33,8 @@ pytest.importorskip("electrum.gui.qt.balance_dialog")
 
 from PyQt6.QtCore import pyqtSignal  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout,
+    QWidget,
 )
 
 from electrum.gui.qt.balance_dialog import (  # noqa: E402
@@ -58,14 +62,16 @@ def qapp():
 
 @pytest.fixture(autouse=True)
 def _clean_globals():
-    """The buffer provider and the Send-tab refresher are module globals (the
-    class patches outlive any one wallet), so every test starts from "no plugin
-    loaded" and leaves it that way."""
+    """The buffer provider, the goal-visibility pref and the Send-tab refresher
+    are module globals (the class patches outlive any one wallet), so every test
+    starts from "no plugin loaded" and leaves it that way."""
     qt_mod._set_buffer_provider(None)
     qt_mod._set_send_warning_refresher(None)
+    qt_mod._set_goal_visibility(None)
     yield
     qt_mod._set_buffer_provider(None)
     qt_mod._set_send_warning_refresher(None)
+    qt_mod._set_goal_visibility(None)
 
 
 def _stock_entries(*, confirmed=0, lightning=0, frozen=0, unconfirmed=0,
@@ -85,18 +91,36 @@ def _amount_of(entries, color):
     return next(a for _n, c, a in entries if c == color)
 
 
-# --- the colour -----------------------------------------------------------
-def test_buffer_blue_is_not_electrums_frozen_blue() -> None:
+def _amount_or_none(entries, color):
+    return next((a for _n, c, a in entries if c == color), None)
+
+
+ONCHAIN_BLUE = qt_mod.COLOR_GOAL_BUFFER_ONCHAIN
+LIGHTNING_BLUE = qt_mod.COLOR_GOAL_BUFFER_LIGHTNING
+
+
+# --- the colours ----------------------------------------------------------
+@pytest.mark.parametrize("goal_color", [ONCHAIN_BLUE, LIGHTNING_BLUE])
+def test_buffer_blue_is_not_electrums_frozen_blue(goal_color) -> None:
     """Electrum already spends ColorScheme.BLUE on the Frozen slice. Two blues
     in one pie is two slices the user cannot tell apart."""
-    assert qt_mod.COLOR_GOAL_BUFFER != COLOR_FROZEN
-    assert qt_mod.COLOR_GOAL_BUFFER != COLOR_FROZEN_LIGHTNING
-    assert qt_mod.COLOR_GOAL_BUFFER != COLOR_CONFIRMED
+    assert goal_color != COLOR_FROZEN
+    assert goal_color != COLOR_FROZEN_LIGHTNING
+    assert goal_color != COLOR_CONFIRMED
 
 
-def test_buffer_blue_is_actually_blue() -> None:
-    c = qt_mod.COLOR_GOAL_BUFFER
-    assert c.blue() > c.red() and c.blue() > c.green()
+@pytest.mark.parametrize("goal_color", [ONCHAIN_BLUE, LIGHTNING_BLUE])
+def test_buffer_blue_is_actually_blue(goal_color) -> None:
+    assert goal_color.blue() > goal_color.red()
+    assert goal_color.blue() > goal_color.green()
+
+
+def test_the_two_goal_shades_are_distinguishable() -> None:
+    """The two rails share a hue on purpose -- the goal should read as one blue
+    region -- but they still have to be tellable apart at a glance, so the
+    lightness gap is pinned rather than left to a future colour tweak."""
+    assert ONCHAIN_BLUE != LIGHTNING_BLUE
+    assert ONCHAIN_BLUE.lightness() - LIGHTNING_BLUE.lightness() > 40
 
 
 # --- rewriting the entry list --------------------------------------------
@@ -108,10 +132,27 @@ def test_buffer_slice_comes_out_of_onchain(qapp) -> None:
 
     out = qt_mod._rewrite_piechart_entries(_stock_entries(confirmed=100), w)
     assert _amount_of(out, COLOR_CONFIRMED) == 90
-    assert _amount_of(out, qt_mod.COLOR_GOAL_BUFFER) == 10
+    assert _amount_of(out, ONCHAIN_BLUE) == 10
+
+
+def test_a_goal_covered_on_chain_has_no_lightning_wedge(qapp) -> None:
+    """The ordinary case: on-chain covers the whole goal, so the Lightning
+    portion is not drawn at all. A zero-width wedge is invisible anyway and its
+    legend row would read "0"."""
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=10)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+
+    out = qt_mod._rewrite_piechart_entries(
+        _stock_entries(confirmed=100, lightning=500), w)
+    assert _amount_of(out, ONCHAIN_BLUE) == 10
+    assert _amount_or_none(out, LIGHTNING_BLUE) is None
 
 
 def test_buffer_slice_spills_into_lightning(qapp) -> None:
+    """When on-chain cannot cover the goal the remainder gets its own, darker
+    wedge -- the chart says not just how much is spoken for but which rail is
+    currently holding it."""
     w = _FakeWallet()
     p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=100_000)
     qt_mod._set_buffer_provider(p.goal_buffer_sat)
@@ -120,7 +161,20 @@ def test_buffer_slice_spills_into_lightning(qapp) -> None:
         _stock_entries(confirmed=30_000, lightning=500_000), w)
     assert _amount_of(out, COLOR_CONFIRMED) == 0
     assert _amount_of(out, COLOR_LIGHTNING) == 430_000
-    assert _amount_of(out, qt_mod.COLOR_GOAL_BUFFER) == 100_000
+    assert _amount_of(out, ONCHAIN_BLUE) == 30_000
+    assert _amount_of(out, LIGHTNING_BLUE) == 70_000
+
+
+def test_a_goal_entirely_in_lightning_has_no_onchain_wedge(qapp) -> None:
+    """Nothing on-chain to reserve against, so only the Lightning wedge is
+    drawn."""
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=50_000)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+
+    out = qt_mod._rewrite_piechart_entries(_stock_entries(lightning=500_000), w)
+    assert _amount_or_none(out, ONCHAIN_BLUE) is None
+    assert _amount_of(out, LIGHTNING_BLUE) == 50_000
 
 
 def test_rewrite_conserves_the_total(qapp) -> None:
@@ -162,7 +216,7 @@ def test_buffer_slice_is_appended_last(qapp) -> None:
     stock = _stock_entries(confirmed=500_000)
     out = qt_mod._rewrite_piechart_entries(stock, w)
     assert [c for _n, c, _a in out[:len(stock)]] == [c for _n, c, _a in stock]
-    assert out[-1][1] == qt_mod.COLOR_GOAL_BUFFER
+    assert [c for _n, c, _a in out[len(stock):]] == [ONCHAIN_BLUE]
 
 
 def test_no_plugin_loaded_leaves_the_list_untouched(qapp) -> None:
@@ -300,7 +354,7 @@ def test_status_bar_pie_gains_the_buffer_slice(qapp, monkeypatch) -> None:
     _patched_update_status(window)
 
     assert _amount_of(button._list, COLOR_CONFIRMED) == 90
-    assert _amount_of(button._list, qt_mod.COLOR_GOAL_BUFFER) == 10
+    assert _amount_of(button._list, ONCHAIN_BLUE) == 10
 
 
 def test_repeated_repaints_do_not_compound_the_buffer_slice(qapp) -> None:
@@ -323,9 +377,9 @@ def test_repeated_repaints_do_not_compound_the_buffer_slice(qapp) -> None:
     for _ in range(3):
         _patched_update_status(window)
         assert _amount_of(button._list, COLOR_CONFIRMED) == 90
-        assert _amount_of(button._list, qt_mod.COLOR_GOAL_BUFFER) == 10
+        assert _amount_of(button._list, ONCHAIN_BLUE) == 10
         assert sum(1 for _n, c, _a in button._list
-                   if c == qt_mod.COLOR_GOAL_BUFFER) == 1
+                   if c in qt_mod.COLOR_GOAL_BUFFER_ALL) == 1
         assert sum(a for _n, _c, a in button._list) == 100
 
 
@@ -341,11 +395,11 @@ def test_a_goal_change_still_lands_while_the_list_is_stale(qapp) -> None:
     button = _FakeBalanceButton(_stock_entries(confirmed=100))
     window = _FakeWindow(w, button)
     _patched_update_status(window)
-    assert _amount_of(button._list, qt_mod.COLOR_GOAL_BUFFER) == 10
+    assert _amount_of(button._list, ONCHAIN_BLUE) == 10
 
     p.config.INBOUND_LIQUIDITY_GOAL_SAT = 25
     _patched_update_status(window)
-    assert _amount_of(button._list, qt_mod.COLOR_GOAL_BUFFER) == 25
+    assert _amount_of(button._list, ONCHAIN_BLUE) == 25
     assert _amount_of(button._list, COLOR_CONFIRMED) == 75
 
 
@@ -365,7 +419,8 @@ def test_turning_the_goal_off_restores_the_stock_slices(qapp) -> None:
     p.config.INBOUND_LIQUIDITY_GOAL_SAT = 0
     _patched_update_status(window)
     assert _amount_of(button._list, COLOR_CONFIRMED) == 100
-    assert all(c != qt_mod.COLOR_GOAL_BUFFER for _n, c, _a in button._list)
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in button._list)
 
 
 def test_status_bar_pie_is_not_repainted_when_there_is_no_buffer(qapp) -> None:
@@ -461,12 +516,12 @@ def test_balance_dialog_gains_a_slice_and_a_legend_row(qapp) -> None:
 
     piechart = dialog.findChild(PieChartWidget)
     assert _amount_of(piechart._list, COLOR_CONFIRMED) == 400_000
-    assert _amount_of(piechart._list, qt_mod.COLOR_GOAL_BUFFER) == 100_000
+    assert _amount_of(piechart._list, ONCHAIN_BLUE) == 100_000
 
     labels = [c.text() for c in dialog.findChildren(QLabel)]
     assert any("Liquidity goal buffer" in t for t in labels)
     # Its legend swatch carries the same blue as its wedge.
-    assert any(lw.color == qt_mod.COLOR_GOAL_BUFFER
+    assert any(lw.color == ONCHAIN_BLUE
                for lw in dialog.findChildren(LegendWidget))
     dialog.deleteLater()
 
@@ -500,7 +555,9 @@ def test_balance_dialog_legend_follows_the_wedges(qapp) -> None:
     assert rows["On-chain:"] == "250000 sat"          # 400k - 150k, not 400k
     assert rows["Lightning:"] == "200000 sat"         # on-chain covered it
     assert rows["Frozen:"] == "80000 sat"             # never touched
-    assert rows["Liquidity goal buffer:"] == "150000 sat"
+    assert rows["Liquidity goal buffer (on-chain):"] == "150000 sat"
+    # ...and no Lightning row at all: on-chain covered the whole goal.
+    assert "Liquidity goal buffer (Lightning):" not in rows
     # And the legend still accounts for every satoshi in the wallet.
     total = sum(int(v.split()[0]) for v in rows.values())
     assert total == int(wallet.get_balances_for_piechart().total())
@@ -509,7 +566,10 @@ def test_balance_dialog_legend_follows_the_wedges(qapp) -> None:
 
 def test_balance_dialog_legend_shows_a_fully_reserved_onchain_balance(qapp) -> None:
     """When the buffer eats the whole on-chain balance the row reads 0 rather
-    than vanishing -- "all of it is spoken for" is the useful thing to say."""
+    than vanishing -- "all of it is spoken for" is the useful thing to say.
+
+    This is also the case that splits the goal across both rails: 30k of it is
+    held on-chain, the other 70k is still in channels."""
     qt_mod._patch_balance_dialog()
     wallet = _DialogWallet(_FakePiechartBalance(confirmed=30_000, lightning=500_000))
     p = _glue_plugin(managed=wallet, INBOUND_LIQUIDITY_GOAL_SAT=100_000)
@@ -519,7 +579,11 @@ def test_balance_dialog_legend_shows_a_fully_reserved_onchain_balance(qapp) -> N
     rows = _legend_rows(dialog)
     assert rows["On-chain:"] == "0 sat"
     assert rows["Lightning:"] == "430000 sat"
-    assert rows["Liquidity goal buffer:"] == "100000 sat"
+    assert rows["Liquidity goal buffer (on-chain):"] == "30000 sat"
+    assert rows["Liquidity goal buffer (Lightning):"] == "70000 sat"
+    # Every satoshi still accounted for, across six rows instead of five.
+    total = sum(int(v.split()[0]) for v in rows.values())
+    assert total == int(wallet.get_balances_for_piechart().total())
     dialog.deleteLater()
 
 
@@ -574,10 +638,255 @@ def test_balance_dialog_is_untouched_without_a_buffer(qapp) -> None:
     dialog = BalanceDialog(_dialog_parent(qapp, wallet), wallet=wallet)
 
     piechart = dialog.findChild(PieChartWidget)
-    assert all(c != qt_mod.COLOR_GOAL_BUFFER for _n, c, _a in piechart._list)
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in piechart._list)
     labels = [c.text() for c in dialog.findChildren(QLabel)]
     assert not any("Liquidity goal buffer" in t for t in labels)
     dialog.deleteLater()
+
+
+# --- the "Show liquidity goal" checkbox ----------------------------------
+class _VisibilityPref:
+    """A stand-in for the stored ConfigVar: what the checkbox reads and writes."""
+
+    def __init__(self, show: bool = True) -> None:
+        self.show = show
+        self.writes: List[bool] = []
+
+    def get(self) -> bool:
+        return self.show
+
+    def set(self, show: bool) -> None:
+        self.show = bool(show)
+        self.writes.append(bool(show))
+
+    def install(self) -> '_VisibilityPref':
+        qt_mod._set_goal_visibility(qt_mod._GoalVisibility(self.get, self.set))
+        return self
+
+
+def _checkbox(dialog) -> QCheckBox:
+    boxes = dialog.findChildren(QCheckBox)
+    assert len(boxes) == 1, "expected exactly one checkbox on the Balance dialog"
+    return boxes[0]
+
+
+def _visible_legend_rows(dialog) -> Dict[str, str]:
+    """Only the legend rows actually on screen. ``isVisibleTo`` rather than
+    ``isVisible`` because the dialog itself is never shown in these tests."""
+    grid = dialog.findChild(QGridLayout)
+    rows = {}
+    for row in range(grid.rowCount()):
+        name_item = grid.itemAtPosition(row, 1)
+        amount_item = grid.itemAtPosition(row, 2)
+        if name_item is None or amount_item is None:
+            continue
+        if not name_item.widget().isVisibleTo(dialog):
+            continue
+        rows[name_item.widget().text()] = amount_item.widget().text()
+    return rows
+
+
+def _goal_dialog(qapp, pref: Optional[_VisibilityPref] = None, *,
+                 confirmed=30_000, lightning=500_000, goal=100_000):
+    """A Balance dialog on a wallet whose goal spans both rails."""
+    qt_mod._patch_balance_dialog()
+    wallet = _DialogWallet(_FakePiechartBalance(confirmed=confirmed,
+                                                lightning=lightning))
+    p = _glue_plugin(managed=wallet, INBOUND_LIQUIDITY_GOAL_SAT=goal)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+    if pref is not None:
+        pref.install()
+    return BalanceDialog(_dialog_parent(qapp, wallet), wallet=wallet), wallet
+
+
+def test_the_dialog_carries_a_labelled_checkbox(qapp) -> None:
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref())
+    box = _checkbox(dialog)
+    assert box.text() == "Show liquidity goal"
+    assert box.toolTip()
+    dialog.deleteLater()
+
+
+def test_the_checkbox_starts_from_the_stored_setting(qapp) -> None:
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref(show=True))
+    assert _checkbox(dialog).isChecked() is True
+    dialog.deleteLater()
+
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref(show=False))
+    assert _checkbox(dialog).isChecked() is False
+    dialog.deleteLater()
+
+
+def test_merely_opening_the_dialog_does_not_write_the_setting(qapp) -> None:
+    """Checking the box to match the stored value must not be mistaken for the
+    user making a choice -- that would repaint the status bar (and re-save the
+    setting) every time the dialog is opened."""
+    pref = _VisibilityPref(show=False)
+    dialog, _ = _goal_dialog(qapp, pref)
+    assert pref.writes == []
+    dialog.deleteLater()
+
+
+def test_unchecking_restores_electrums_own_chart(qapp) -> None:
+    """The whole point of the box: unchecked, the dialog is the chart Electrum
+    ships -- full on-chain and Lightning wedges, no goal slices, no goal rows."""
+    dialog, wallet = _goal_dialog(qapp, _VisibilityPref(show=True))
+    _checkbox(dialog).setChecked(False)
+
+    piechart = dialog.findChild(PieChartWidget)
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in piechart._list)
+    assert _amount_of(piechart._list, COLOR_CONFIRMED) == 30_000
+    assert _amount_of(piechart._list, COLOR_LIGHTNING) == 500_000
+
+    rows = _visible_legend_rows(dialog)
+    assert rows["On-chain:"] == "30000 sat"       # the full balance again
+    assert rows["Lightning:"] == "500000 sat"
+    assert not any("Liquidity goal" in name for name in rows)
+    dialog.deleteLater()
+
+
+def test_rechecking_brings_the_goal_slices_back(qapp) -> None:
+    """Off and on again has to land back on the goal view, not on a chart that
+    had the buffer subtracted twice."""
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref(show=True))
+    box = _checkbox(dialog)
+    box.setChecked(False)
+    box.setChecked(True)
+
+    piechart = dialog.findChild(PieChartWidget)
+    assert _amount_of(piechart._list, COLOR_CONFIRMED) == 0
+    assert _amount_of(piechart._list, COLOR_LIGHTNING) == 430_000
+    assert _amount_of(piechart._list, ONCHAIN_BLUE) == 30_000
+    assert _amount_of(piechart._list, LIGHTNING_BLUE) == 70_000
+    rows = _visible_legend_rows(dialog)
+    assert rows["Liquidity goal buffer (on-chain):"] == "30000 sat"
+    assert rows["Liquidity goal buffer (Lightning):"] == "70000 sat"
+    dialog.deleteLater()
+
+
+def test_toggling_persists_the_choice(qapp) -> None:
+    pref = _VisibilityPref(show=True)
+    dialog, _ = _goal_dialog(qapp, pref)
+    box = _checkbox(dialog)
+    box.setChecked(False)
+    assert pref.show is False
+    box.setChecked(True)
+    assert pref.show is True
+    assert pref.writes == [False, True]
+    dialog.deleteLater()
+
+
+def test_toggling_refreshes_the_status_bar_pie(qapp) -> None:
+    """The status-bar pie is painted by a different patch, so the dialog has to
+    push Electrum's own refresh through or the two charts disagree until the
+    next balance change."""
+    pref = _VisibilityPref(show=True)
+    dialog, _ = _goal_dialog(qapp, pref)
+    refreshed: List[int] = []
+    dialog.window.update_status = lambda: refreshed.append(1)
+    _checkbox(dialog).setChecked(False)
+    assert refreshed == [1]
+    dialog.deleteLater()
+
+
+def test_a_window_that_cannot_refresh_does_not_break_the_toggle(qapp) -> None:
+    """A status bar that will not repaint is not a reason to leave the dialog
+    itself showing the wrong chart."""
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref(show=True))
+
+    def _boom():
+        raise RuntimeError("status bar is on fire")
+
+    dialog.window.update_status = _boom
+    _checkbox(dialog).setChecked(False)          # must not raise
+    piechart = dialog.findChild(PieChartWidget)
+    assert _amount_of(piechart._list, COLOR_CONFIRMED) == 30_000
+    dialog.deleteLater()
+
+
+def test_the_checkbox_is_offered_even_while_the_goal_is_hidden(qapp) -> None:
+    """A user who unticked the box last time must have a way back: the box is
+    shown whenever a goal EXISTS, not only when it is being drawn."""
+    dialog, _ = _goal_dialog(qapp, _VisibilityPref(show=False))
+    piechart = dialog.findChild(PieChartWidget)
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in piechart._list)
+    box = _checkbox(dialog)
+    assert box.isChecked() is False
+    box.setChecked(True)
+    assert _amount_of(piechart._list, ONCHAIN_BLUE) == 30_000
+    dialog.deleteLater()
+
+
+def test_no_checkbox_when_there_is_no_goal_to_show(qapp) -> None:
+    """Nothing reserved means nothing to hide; the dialog stays exactly as
+    Electrum built it rather than growing an inert control."""
+    qt_mod._patch_balance_dialog()
+    wallet = _DialogWallet(_FakePiechartBalance(confirmed=500_000))
+    dialog = BalanceDialog(_dialog_parent(qapp, wallet), wallet=wallet)
+    assert dialog.findChildren(QCheckBox) == []
+    dialog.deleteLater()
+
+
+def test_an_unticked_box_keeps_the_status_bar_pie_stock(qapp) -> None:
+    """Both charts follow the one setting, so the small pie in the status bar
+    reverts too."""
+    qt_mod._patch_status_bar_piechart()
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=10)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+    _VisibilityPref(show=False).install()
+
+    button = _FakeBalanceButton(_stock_entries(confirmed=100))
+    _patched_update_status(_FakeWindow(w, button))
+    assert _amount_of(button._list, COLOR_CONFIRMED) == 100
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in button._list)
+    assert button.updates == 0          # nothing changed, so nothing repainted
+
+
+def test_unticking_puts_the_status_bar_slices_back(qapp) -> None:
+    """Not merely "stops adding": a pie already carrying the goal has to get its
+    sats back on the next repaint."""
+    qt_mod._patch_status_bar_piechart()
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=10)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+    pref = _VisibilityPref(show=True).install()
+
+    button = _FakeBalanceButton(_stock_entries(confirmed=100))
+    window = _FakeWindow(w, button)
+    _patched_update_status(window)
+    assert _amount_of(button._list, ONCHAIN_BLUE) == 10
+
+    pref.show = False
+    _patched_update_status(window)
+    assert _amount_of(button._list, COLOR_CONFIRMED) == 100
+    assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL
+               for _n, c, _a in button._list)
+
+
+def test_a_broken_visibility_pref_falls_back_to_showing_the_goal(qapp) -> None:
+    """This is read inside a status-bar repaint. A pref that raises must not take
+    the window down, and the safe answer is the ConfigVar's own default."""
+    class _Boom:
+        def get(self): raise RuntimeError("config is on fire")
+        def set(self, show): raise RuntimeError("config is on fire")
+
+    boom = _Boom()
+    qt_mod._set_goal_visibility(qt_mod._GoalVisibility(boom.get, boom.set))
+    assert qt_mod._goal_is_shown() is True
+    qt_mod._set_goal_shown(False)        # must not raise
+
+
+def test_no_visibility_installed_means_the_goal_is_shown(qapp) -> None:
+    """The ConfigVar ships on, so an unwired module (or a plugin that has not
+    loaded a wallet yet) behaves as a ticked box would."""
+    qt_mod._set_goal_visibility(None)
+    assert qt_mod._goal_is_shown() is True
+    qt_mod._set_goal_shown(False)        # nowhere to write it; must not raise
 
 
 # --- the Send tab warning -------------------------------------------------

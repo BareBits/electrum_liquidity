@@ -102,8 +102,15 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
+        # Every `${{ }}` this step needs is bound here rather than interpolated
+        # into the script below, so the body is pure shell and can be executed
+        # verbatim by test_release_channel against a stub `gh`.
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -eu
           # A tag whose version carries a suffix (v0.4.0-beta.1) is published as
@@ -122,12 +129,46 @@ jobs:
             *)   prerelease="";            kind="release" ;;
           esac
           echo "publishing ${GITHUB_REF_NAME} as a ${kind}"
+
+          # The notes are assembled in a file rather than passed as one --notes
+          # string so the pre-release warning can be real multi-line markdown.
+          #
+          # A pre-release page must say what it is IN ITS BODY. The flag above
+          # keeps a beta out of the update check, but it does nothing for
+          # somebody who has already landed on the Releases page -- and the
+          # "Pre-release" chip GitHub puts beside the title is a grey label that
+          # is easy to miss next to a big green Assets list. These zips are
+          # installed by hand, so the page is the only place the warning can go.
+          notes="$(mktemp)"
+          if [ -n "${prerelease}" ]; then
+            # Heredoc bodies are written at this block's own indentation, which
+            # YAML strips, so the markdown reaches `gh` flush against column 0.
+            # Outdenting them any further would close the block scalar.
+            cat >> "${notes}" <<WARNING
+          > [!WARNING]
+          > ## Unstable build -- do not use this on a wallet holding funds you care about
+          >
+          > This is a **beta**, published so it can be exercised on throwaway or
+          > small-balance wallets. It has not had the testing a numbered release gets.
+          > It moves real money -- it opens channels and pays funds out over Lightning
+          > and on-chain -- and it may be withdrawn or replaced without notice.
+          >
+          > Unless you are deliberately testing this build, install the latest stable
+          > release instead:
+          > ${SERVER_URL}/${REPOSITORY}/releases/latest
+
+          WARNING
+          fi
+          cat >> "${notes}" <<NOTES
+          Inbound Liquidity Manager plugin v${VERSION}. Install by importing the attached zip into Electrum's plugin manager.
+          NOTES
+
           gh release create "${GITHUB_REF_NAME}" \
-            "${{ steps.meta.outputs.zip }}" \
+            "${ZIP}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             ${prerelease} \
-            --notes "Inbound Liquidity Manager plugin v${{ steps.meta.outputs.version }}. Install by importing the attached zip into Electrum's plugin manager."
+            --notes-file "${notes}"
 
       - name: Delete previous beta releases
         # Publishing a beta retires every older one, so the beta channel holds

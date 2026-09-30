@@ -31,7 +31,10 @@ liquidity (remote-side channel balance). This plugin keeps it topped up:
   [The liquidity sink](#the-liquidity-sink) and
   [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met).
 - **Opening a channel** (funded from on-chain coins) creates new capacity; once
-  its local balance is drained out, that capacity becomes pure inbound.
+  its local balance is drained out, that capacity becomes pure inbound. Each open
+  is funded with the maximum available on-chain balance, bounded by
+  `max_channel_size_sat` — so a large balance builds several channels of a sane
+  size rather than one very large one with a single peer.
 
 It also keeps the goal in front of you rather than only in its own tab: the
 balance pie chart grows a blue **liquidity goal buffer** slice, and the Send tab
@@ -55,10 +58,13 @@ ceilings, diagnostics, etc.).
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
 | `min_onchain_to_open_sat` | Settings | Never open a channel while on-chain spendable is below this. When it is below Electrum's stock channel-funding floor `MIN_FUNDING_SAT` (200 000), the plugin lowers that floor to this value at startup — re-asserted every tick so the configured value always wins — so smaller channels can be opened | `60_000` |
 | `max_channels` | Settings | Never hold more than this many channels | `2` |
+| `max_channel_size_sat` | Settings | **Max channel size** — never fund a single channel with more than this. The plugin opens channels with the maximum available on-chain balance, so without a ceiling a wallet holding significant on-chain funds would commit all of it to one very large channel with a single peer; with one, a large balance is spread over several channels of a sane size, up to `max_channels`. Applies to **new opens only** — a channel already larger than this is never closed for being oversized. Must be at least `liquidity_goal_sat` (a channel below the goal would be replaced as soon as it was opened — the settings tab refuses to save such a pair, and the engine declines rather than churning if a config is hand-edited into that state) and at least the channel-funding floor. Capped in turn by Electrum's own `lightning_max_funding_sat`, whichever is lower. `0` = no ceiling. Ships at 10× the default liquidity goal | `1_000_000` |
 | `liquidity_goal_sat` | Settings | **Liquidity goal** — the channel size to aim for. *Automatically close small channels and re-open bigger channels if we have sufficient funds to reach this goal.* Entered in whichever unit you have Electrum set to (BTC / mBTC / bits / sat), with the fiat equivalent alongside when exchange rates are on; stored as sats. `0` turns the rule off. Also sets the **buffer** reserved on the balance pie chart and warned about in the Send tab. See [Replacing undersized channels](#replacing-undersized-channels-the-liquidity-goal) and [The liquidity goal buffer](#the-liquidity-goal-buffer) | `100_000` |
+| `show_goal_in_piechart` | Wallet → Balance | **Show liquidity goal** — draw the goal as its own slices (on-chain and, when needed, Lightning) on both balance pie charts. Untick for Electrum's stock chart. Display only: it changes nothing about what is reserved or about the Send tab's warning. See [The liquidity goal buffer](#the-liquidity-goal-buffer) | `true` |
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
+| `min_swap_sat` | Settings | **Minimum swap size** — never make a reverse swap smaller than this, however cheap it prices. Checked *in addition to* `max_swap_fee_pct`, and applied to every rung of the size ladder, so it is also what stops the ladder descending into swaps too small to be worth their on-chain claim. `0` turns the rule off. See [The size ladder](#the-size-ladder) | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on what the plugin drains from a channel — the on-chain amount received from a reverse swap, or the amount paid to your liquidity sink (0 = off). Paid automatically to a fixed payout address | `0.1` |
 | `sink_address` | Settings | **Liquidity sink** — a Lightning address (`user@domain`), LNURL-pay string or LNURL-pay URL to drain outbound into *instead of* reverse-swapping it on-chain. A payment that fails is retried at half the amount, down to 10 000 sat; if every attempt fails, a reverse swap is used instead. Empty = off (swap only). See [The liquidity sink](#the-liquidity-sink) | `""` (off) |
 | `defer_sink_until_goal` | Settings | **Don't use liquidity sink until inbound liquidity goal is met** — while the wallet is still building its channels, drain by reverse-swapping (the balance comes back as on-chain coins that can fund the next channel) instead of paying it away to the sink. The sink takes over once you hold `max_channels` channels with none of the plugin-opened ones below `liquidity_goal_sat`. On by default. See [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met) | `true` |
@@ -104,23 +110,64 @@ shorter, and every attempt is logged as it happens. Anything the budget does not
 reach is retried next cycle, by which time the failed providers have sunk in the
 ranking.
 
-Each provider also gets **one retry at 90% of the amount** before the cascade moves
-on, and only when its *Lightning payment* is what failed. A payment can fail simply
-because no single route carries the full amount — the size is chosen from what
-Electrum says it can send, which is not the same question as whether the network can
-route it — so a slightly smaller swap is often the thing that works. That retry is
-re-checked against your cost ceiling first, and frequently refused: shrinking a swap
-makes it *dearer* as a percentage, because the provider's mining fee and the on-chain
-claim fee do not shrink with it. Failures of any other kind (a provider that
-declined, rejected, cheated, or never answered) go straight to the next provider —
-they would answer the same way at any size.
+### The size ladder
 
-The mining-fee **prepayment** gets special handling, because it is what used to make
-this whole cascade unreachable. Electrum issues it as a separate fire-and-forget
-payment and returns from the swap as soon as the *main* payment finishes, so the
-prepayment's HTLC is usually still live at that moment — and the cascade must never
-fail over while any HTLC for the swap is live. The plugin now *waits* for it
-(bounded), rather than treating "not resolved yet" as "funds may be committed".
+A swap that fails to route does not usually fail because of *who* you asked — it
+fails because of *how much* you asked for. A large payment must find one contiguous
+path with that much liquidity at every hop, and when the wallet has a single funded
+channel there is nothing to split across, so there is no MPP to fall back on. The
+failure that prompted this was ~90% of a wallet's only channel dying three to four
+hops out against 36 distinct mid-route channels in 15 minutes — none of which had a
+policy limit anywhere near the amount. They were simply dry at that size.
+
+So the plugin does not rank *providers*; it ranks **swaps**. Every eligible provider
+is expanded across a descending size ladder — **100%, 90%, 50% and 30%** of the
+planned amount — every rung is priced on its own, any rung that breaches
+`max_swap_fee_pct`, `min_swap_sat` or that provider's own minimum is dropped, and
+what survives is walked in order of **cost per sat of inbound liquidity** until one
+commits.
+
+Ordering by cost per sat is what makes the two dimensions comparable. A reverse swap
+of *a* sats buys *a* sats of inbound, so the per-sat price is just the all-in cost
+percentage — which means a cheap provider's smaller rung can legitimately outrank an
+expensive provider's full-size swap, and the walk will try it first. Providers and
+sizes are interleaved by price rather than nested one inside the other.
+
+The ceiling and the ladder pull against each other on purpose, and it is worth
+knowing which way. Shrinking a swap makes it **dearer** as a percentage, because the
+provider's mining fee and the on-chain claim fee do not shrink with it. So the lower,
+more routable rungs are the first to breach `max_swap_fee_pct` — your cost ceiling is
+also, in effect, a *routability floor*. The smallest rung that can ever pass is
+`fixed_fees / (ceiling − percentage_fee)`; raising the ceiling is what buys the
+plugin permission to try the sizes that actually route. `min_swap_sat` bounds the
+same ladder from below for a different reason: a small swap still needs a full
+on-chain claim to sweep, so past some size the block space outweighs the liquidity.
+
+The walk stops at the **first** rung that commits funds, even when that rung drained
+less than the plugin planned. There is no "carry on for the remainder" pass — the
+rest is the next evaluation's business, planned from a fresh snapshot of what the
+channel actually holds, rather than from a ladder priced against a balance that has
+since changed.
+
+Only a failed **Lightning payment** earns the descent. Failures of any other kind (a
+provider that declined, rejected, cheated, or never answered) move on to the next
+rung without pretending the size was at fault — they would answer the same way at any
+size. And a provider whose payment fails is faulted **once per cascade**, not once
+per rung: the ladder gives the cheapest providers the most rungs, so charging per
+rung would demote exactly the providers you most want to keep.
+
+
+The swap's **HTLCs** get special handling, because they are what used to make this
+whole cascade unreachable. The cascade must never fail over while any HTLC for the
+swap is live — but at the instant Electrum returns from the swap, both of its
+payments usually still have one, for different reasons. The mining-fee
+**prepayment** is issued as a separate fire-and-forget payment that Electrum never
+waits for. The **main payment** gives up on a timeout while the HTLCs it already
+sent are still sitting in the channel, and they stay there until the far end fails
+them back. Reading either as "funds may be committed" ends the cascade on
+essentially every failed swap. The plugin now *waits* for both (bounded), rather
+than treating "not resolved yet" as "committed" — and logs which one it was
+waiting on, and what it decided, so a cascade that stops short says why.
 
 The cascade stops immediately, and never retries, once funds may have moved.
 Electrum's pre-payment checks (cost sanity, the provider's `createswap` reply,
@@ -133,6 +180,49 @@ also ends the cascade rather than burning attempts on a guaranteed repeat.
 Failures are still recorded against the provider's reliability exactly as
 before, so a repeatedly-failing provider sinks in the ranking and stops being
 tried first.
+
+### Quitting while a swap is running
+
+A reverse swap can have a Lightning payment committed for a couple of minutes
+before any on-chain output exists, and quitting in that window used to be silent
+and unmanaged: the evaluation was a background task nobody cancelled or waited
+for, so it carried on starting new providers while Electrum stopped the wallet
+underneath it.
+
+Closing Electrum now goes through a handshake. If an attempt is in flight you get
+a **warning naming the amount, the channel and how long closing will take**, on
+top of Electrum's own swap warning — which cannot see this window, because it only
+covers swaps whose funding transaction already exists. If you go ahead, the plugin
+**stops cascading immediately** (no further provider is tried, and no smaller
+retry is issued), **waits for the one attempt already running** — behind a
+progress window if it takes more than a moment — and then lets Electrum save and
+exit. An attempt already under way is never interrupted: aborting a swap whose
+payment may be in flight is the one thing worth delaying a shutdown for.
+
+Independently of that handshake, a swap is written to the wallet file **the moment
+it is created**, rather than whenever Electrum next happens to save. That matters
+because the record holds the key and preimage needed to ever claim the swap's
+on-chain output, and it is what protects the cases no handshake can reach — a
+crash, a kill, or a headless daemon, none of which give the plugin a chance to
+run.
+
+### Channels Electrum will not send over
+
+Draining a channel means *sending* over it, so the plugin never drains a channel
+you have **frozen for sending** in Electrum's own Channels tab. This has to be
+enforced by the plugin rather than left to Electrum: both drain paths pin the
+payment to the channel being drained (`pay_invoice(channels=[chan])`), and that
+argument *replaces* Electrum's candidate list — the very list its own
+frozen-for-sending filter builds. A pinned payment would therefore be forced down
+a channel Electrum would otherwise have excluded, and would simply burn the 120s
+payment timeout.
+
+The same check catches a case that is not your doing at all. With channel gossip
+off (the default for Electrum-to-Electrum channels), Electrum also refuses to send
+over any channel whose peer does not advertise **trampoline routing** — so such a
+channel can never be drained, however much outbound it holds. The plugin reports
+that as its own distinct reason rather than claiming you froze it, because it is
+not something unfreezing would fix.
 
 By default the plugin manages **only the channels it opened itself**
 (`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a
@@ -260,8 +350,9 @@ hold:
 1. a goal is configured (`liquidity_goal_sat`, `0` = off);
 2. we are **at** `max_channels` — below it a bigger channel can simply be opened
    alongside, so closing anything would be gratuitous;
-3. on-chain spendable minus `onchain_reserve_sat` could fund a channel that
-   actually **reaches** the goal (and clears the funding floor);
+3. what a new channel would be funded with — on-chain spendable minus
+   `onchain_reserve_sat`, **capped by `max_channel_size_sat`** — could fund a
+   channel that actually **reaches** the goal (and clears the funding floor);
 4. the channel was **opened by the plugin** — a channel you opened by hand is
    never closed by this rule, whatever `manage_plugin_opened_only` is set to;
 5. its **capacity** is below the goal;
@@ -279,6 +370,17 @@ available to reopen to; if none is, it logs a decline and leaves the channel
 alone rather than losing its inbound for nothing. (The closing channel's own peer
 is exempted from the one-channel-per-peer guard for that check — it is about to
 be freed by this very close.)
+
+Condition 3 carries `max_channel_size_sat` for a reason of its own. A ceiling
+*below* the goal would make every replacement undersized by construction: the
+plugin would close a channel, reopen it at the ceiling — still under the goal —
+and close it again on the next tick, paying a mining fee every round. Because the
+close rule and the open rule size a channel through the same function, that state
+simply produces no close at all, plus a decline naming the conflict. (The Settings
+tab refuses to save a ceiling below the goal in the first place; the engine's guard
+is there for a hand-edited config.) Note that while it holds, the goal can never
+be met, so a `defer_sink_until_goal` sink stays deferred — which the decline
+also says.
 
 Condition 6 is what stops the rule churning: the plugin funds its channels with
 no push, so a freshly opened channel has local == capacity and is over the
@@ -325,18 +427,28 @@ bar and the big one in Wallet → Balance — grows a blue **Liquidity goal buff
 slice, taken out of the on-chain slice first:
 
 ```
-100 sat on-chain, 10 sat goal   ->   90 sat On-chain  +  10 sat Liquidity goal buffer
+100 sat on-chain, 10 sat goal
+   ->  90 sat On-chain  +  10 sat Liquidity goal buffer (on-chain)
 ```
 
 When on-chain cannot cover the whole goal, the remainder spills into the Lightning
 slice — which is the case that matters most, because a wallet mid-build-out has
 most of its balance in channels and would otherwise see the reserve silently shrink
-to whatever happened to be sitting on-chain:
+to whatever happened to be sitting on-chain. The goal then shows as **two** slices,
+a light blue one for the part held on-chain and a deep blue one for the part still
+in Lightning, so the chart says not just how much is spoken for but which rail is
+currently holding it — an on-chain wedge is sats that can fund a channel open
+today, a Lightning wedge is sats that would have to be swapped out first:
 
 ```
 30k on-chain, 500k Lightning, 100k goal
-   ->  0 On-chain  +  430k Lightning  +  100k Liquidity goal buffer
+   ->  0 On-chain  +  430k Lightning
+       +  30k Liquidity goal buffer (on-chain)
+       +  70k Liquidity goal buffer (Lightning)
 ```
+
+When on-chain covers the goal on its own — the ordinary case — the Lightning wedge
+and its legend row are left off entirely rather than drawn at zero.
 
 The frozen slices are never touched — frozen coins cannot fund a channel open, and
 a channel frozen for sending is balance you have already set aside. The chart's
@@ -346,6 +458,14 @@ rows still add up to your balance. If the whole balance is smaller than the goal
 the buffer is simply the whole balance — and an on-chain balance entirely absorbed
 into it reads `On-chain: 0`, which is the useful thing to say rather than hiding
 the row.
+
+**Turning the slices off.** The Wallet → Balance dialog carries a **Show liquidity
+goal** checkbox, on by default. Untick it and both charts — the dialog's and the
+status bar's — go back to the pie Electrum ships, with the full on-chain and
+Lightning slices and no goal rows. The choice is remembered
+(`show_goal_in_piechart`). It is a **display setting only**: it changes nothing
+about what the plugin reserves, and the Send tab's warning below is unaffected.
+The checkbox only appears when there is a goal to show in the first place.
 
 **On the Send tab.** Type an amount larger than `total balance − goal` and an
 inline warning appears under the Amount field:

@@ -44,8 +44,8 @@ def _plugin() -> LiquidityPlugin:
     p._swap_init_timeout_sec = 0.01
     # Bounded wait for a swap's mining-fee prepayment to resolve before the
     # failover gate decides; shrunk so no test sits through the real 150s.
-    p._prepay_resolve_wait_sec = 0.05
-    p._prepay_poll_interval_sec = 0.01
+    p._htlc_resolve_wait_sec = 0.05
+    p._htlc_poll_interval_sec = 0.01
     # One-slot per-channel dedupe for declines the executor writes itself.
     p._last_exec_decline_sig = {}
     return p
@@ -191,6 +191,7 @@ def test_read_config_parses_provider_lists() -> None:
         INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT=25.0,
         INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT=25_000,
         INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT=0,
+        INBOUND_LIQUIDITY_MIN_SWAP_SAT=25_000,
         INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY=False,
         INBOUND_LIQUIDITY_PREFERRED_NPUBS="npubA, npubB",
         INBOUND_LIQUIDITY_BANNED_NPUBS="npubC",

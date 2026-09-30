@@ -2,8 +2,13 @@
 the persisted peer fault/success store (soft vs hard faults, decay, clear), the
 auto-ban threshold writing into the banned-partners config, the channel-health
 watchdog (force-close => one hard fault; wedged open => fault + force-close), and
-the reverse-swap attribution fix (a failed Lightning payment faults the *peer*,
-not the provider). Heavy Electrum objects are faked; skipped outside the venv.
+the reverse-swap attribution fix (a Lightning payment that failed AT THE FIRST HOP
+faults the *peer*, not the provider; one that failed further out faults nobody).
+Heavy Electrum objects are faked; skipped outside the venv.
+
+The hop-by-hop matrix behind that last one -- mixed verdicts, undecodable onion
+errors, single-hop routes -- lives in ``test_ln_payment_failure_attribution.py``;
+what is pinned here is that the glue wires it to the two reliability stores.
 """
 from __future__ import annotations
 
@@ -15,8 +20,11 @@ import pytest
 
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
+from electrum.lnutil import HtlcLog  # type: ignore  # noqa: E402
+
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     LiquidityPlugin,
+    PEER_LN_FAILURE_REASON,
     PEER_RELIABILITY_DB_KEY,
     PENDING_SWAPS_DB_KEY,
     _parse_banned_partners,
@@ -24,6 +32,14 @@ from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
 
 NODE_A = "02" + "aa" * 32
 NODE_B = "03" + "bb" * 32
+
+
+def _attempt(sender_idx, *, hops: int = 2) -> HtlcLog:
+    """One failed route attempt as lnworker records it. ``sender_idx`` is the
+    route index of the node that reported the error, so 0 is our channel peer."""
+    route = [SimpleNamespace(node_id=bytes([i + 1]) * 33) for i in range(hops)]
+    return HtlcLog(success=False, amount_msat=100_000, route=route,
+                   sender_idx=sender_idx)
 
 
 class _FakeDB:
@@ -823,21 +839,47 @@ def test_fault_is_logged_to_decision_log() -> None:
 
 
 # --- reverse-swap attribution fix -----------------------------------------
-def test_reconcile_failed_ln_payment_faults_peer_not_provider() -> None:
+def _failed_payment_lnworker(attempts, ph: str):
+    """An lnworker whose payment for ``ph`` has definitively failed, leaving the
+    given route attempts behind in ``logs``."""
     from electrum.invoices import PR_FAILED
-    ph = "ab" * 32
     swap = SimpleNamespace(is_redeemed=False, funding_txid=None)
-    ln = SimpleNamespace(
+    return SimpleNamespace(
         swap_manager=SimpleNamespace(_swaps={}, get_swap=lambda h: swap),
         get_payment_status=lambda h, *, direction: PR_FAILED,
+        inflight_payments=set(),
+        logs={ph: list(attempts)},
     )
-    p, w = _plugin(), _FakeWallet(ln)
+
+
+def test_reconcile_first_hop_failure_faults_peer_not_provider() -> None:
+    ph = "ab" * 32
+    p, w = _plugin(), _FakeWallet(_failed_payment_lnworker([_attempt(0)], ph))
     w.db.put(PENDING_SWAPS_DB_KEY,
              {ph: {"npub": "npubPROV", "node_id": NODE_A, "channel_id": "aa" * 32,
                    "started_ts": time.time()}})
     p._reconcile_pending_swaps(w)
     # Peer charged, provider untouched, tracking cleared.
-    assert p._load_peer_reliability(w)[NODE_A.lower()]["fault_count"] == 1
+    stats = p._load_peer_reliability(w)[NODE_A.lower()]
+    assert stats["fault_count"] == 1
+    assert stats["last_reason"] == PEER_LN_FAILURE_REASON
+    assert stats.get("hard_fault_count", 0) == 0     # soft: cannot reach auto-ban
+    assert p._load_reliability(w) == {}
+    assert p._load_pending_swaps(w) == {}
+
+
+def test_reconcile_downstream_failure_faults_nobody() -> None:
+    """The peer forwarded the HTLC and a node past it reported the error, so the
+    peer store must stay empty -- and the record must still be RESOLVED, so it
+    cannot later age into a provider fault for a failure that was neither
+    party's doing."""
+    ph = "ab" * 32
+    p, w = _plugin(), _FakeWallet(_failed_payment_lnworker([_attempt(1)], ph))
+    w.db.put(PENDING_SWAPS_DB_KEY,
+             {ph: {"npub": "npubPROV", "node_id": NODE_A, "channel_id": "aa" * 32,
+                   "started_ts": time.time()}})
+    p._reconcile_pending_swaps(w)
+    assert p._load_peer_reliability(w) == {}
     assert p._load_reliability(w) == {}
     assert p._load_pending_swaps(w) == {}
 

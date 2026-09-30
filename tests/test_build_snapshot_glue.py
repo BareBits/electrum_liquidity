@@ -49,13 +49,24 @@ class _FakeDB:
 
 class _FakeChan:
     def __init__(self, *, cid: bytes, short: str, capacity: int, local_msat: int,
-                 spendable: int, unsettled_hashes: Optional[List[bytes]] = None) -> None:
+                 spendable: int, unsettled_hashes: Optional[List[bytes]] = None,
+                 frozen_for_sending: Optional[bool] = None,
+                 frozen_in_storage: bool = False) -> None:
         self.channel_id = cid
         self.short_channel_id = short
         self._capacity = capacity
         self._local_msat = local_msat
         self._spendable = spendable
         self._unsettled = unsettled_hashes or []
+        # ``frozen_for_sending=None`` leaves the method off the object entirely,
+        # which is how most of this file's channels behave and what proves the
+        # glue's defensive read degrades to "not frozen" rather than raising.
+        if frozen_for_sending is not None:
+            self.is_frozen_for_sending = lambda: frozen_for_sending
+            # Mirrors Channel.storage, the only place the user's own switch
+            # survives once is_frozen_for_sending() has folded both causes into
+            # one bool.
+            self.storage = {"frozen_for_sending": frozen_in_storage}
         self.hm = SimpleNamespace(
             htlcs=lambda subject: [("dir", SimpleNamespace(payment_hash=ph))
                                    for ph in self._unsettled])
@@ -253,6 +264,67 @@ def test_build_snapshot_marks_plugin_opened_from_persisted_tag() -> None:
     by_short = {c.short_id: c for c in snap.channels}
     assert by_short["107x1x0"].is_plugin_opened is True
     assert by_short["108x1x0"].is_plugin_opened is False
+
+
+# --- channels Electrum will not send over ---------------------------------
+# is_frozen_for_sending is the filter inside lnworker.create_routes_for_payment,
+# and pay_invoice(channels=[chan]) -- which both drain paths use to pin the payment
+# to the channel being drained -- REPLACES the list that filter builds. So the
+# refusal has to be honoured in the snapshot, because it is honoured nowhere else.
+def test_build_snapshot_reads_the_send_freeze() -> None:
+    frozen = _FakeChan(cid=b"\x21" * 32, short="121x1x0", capacity=2_000_000,
+                       local_msat=1_000_000 * 1000, spendable=900_000,
+                       frozen_for_sending=True, frozen_in_storage=True)
+    open_chan = _FakeChan(cid=b"\x22" * 32, short="122x1x0", capacity=2_000_000,
+                          local_msat=1_000_000 * 1000, spendable=900_000,
+                          frozen_for_sending=False)
+    p, w = _plugin(), _wallet([frozen, open_chan], _swap_manager())
+    by_short = {c.short_id: c for c in p.build_snapshot(w, transport=None).channels}
+    assert by_short["121x1x0"].is_frozen_for_sending is True
+    assert by_short["121x1x0"].frozen_by_user is True
+    assert by_short["122x1x0"].is_frozen_for_sending is False
+    assert by_short["122x1x0"].frozen_by_user is False
+
+
+def test_build_snapshot_separates_a_trampoline_refusal_from_a_user_freeze() -> None:
+    """Under trampoline routing, Channel.is_frozen_for_sending also returns True
+    for a peer with no trampoline support -- the stored switch is what tells the
+    two apart, and only the stored one is the user's to undo."""
+    chan = _FakeChan(cid=b"\x23" * 32, short="123x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000,
+                     frozen_for_sending=True, frozen_in_storage=False)
+    p, w = _plugin(), _wallet([chan], _swap_manager())
+    snapshot = p.build_snapshot(w, transport=None)
+    assert snapshot.channels[0].is_frozen_for_sending is True
+    assert snapshot.channels[0].frozen_by_user is False
+    # ... and the engine says so without blaming the user.
+    reasons = " ".join(d.reason for d in evaluate(snapshot, _config()).declines)
+    assert "you have frozen" not in reasons
+    assert "does not advertise trampoline routing" in reasons
+
+
+def test_a_channel_electrum_cannot_send_over_is_not_drained_end_to_end() -> None:
+    """The whole path: real build_snapshot, real engine, no swap action."""
+    chan = _FakeChan(cid=b"\x24" * 32, short="124x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000,
+                     frozen_for_sending=True, frozen_in_storage=True)
+    p, w = _plugin(), _wallet([chan], _swap_manager())
+    result = evaluate(p.build_snapshot(w, transport=None), _config())
+    assert not any(isinstance(a, ReverseSwapAction) for a in result.actions)
+    assert "frozen it for sending" in " ".join(d.reason for d in result.declines)
+
+
+def test_a_channel_object_without_the_method_reads_as_not_frozen() -> None:
+    """Every other channel in this file omits is_frozen_for_sending entirely.
+    That has to degrade to "not frozen" rather than raising, so an upstream rename
+    costs us the gate and nothing else."""
+    chan = _FakeChan(cid=b"\x25" * 32, short="125x1x0", capacity=2_000_000,
+                     local_msat=1_000_000 * 1000, spendable=900_000)
+    assert not hasattr(chan, "is_frozen_for_sending")
+    p, w = _plugin(), _wallet([chan], _swap_manager())
+    snap_chan = p.build_snapshot(w, transport=None).channels[0]
+    assert snap_chan.is_frozen_for_sending is False
+    assert snap_chan.frozen_by_user is False
 
 
 def test_scope_switch_spares_manual_channel_end_to_end() -> None:

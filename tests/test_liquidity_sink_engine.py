@@ -178,13 +178,34 @@ def test_sink_only_declines_when_the_drain_is_below_the_floor() -> None:
 def test_a_sub_floor_drain_still_swaps_when_swaps_are_enabled() -> None:
     # The sink cannot help at this size, but a provider whose minimum is lower
     # still can -- the sink must not suppress the swap it cannot replace.
+    #
+    # min_swap_sat is disabled here on purpose: this is about the SINK floor not
+    # suppressing a swap, and the user's own swap floor (which would block a
+    # 9,000 sat swap by default) is a separate rule with its own tests below.
+    chan = make_channel(capacity_sat=40_000, local_sat=20_000,
+                        spendable_local_sat=9_000)
+    snap = make_snapshot([make_offer("npubA", pct=0.2, lo=1_000)], channels=(chan,))
+    result = evaluate(snap, make_config(liquidity_sink_address=SINK,
+                                        min_swap_sat=0))
+    assert not _sinks(result)
+    [swap] = _swaps(result)
+    assert swap.lightning_amount_sat == 9_000
+
+
+def test_the_swap_floor_blocks_a_sub_floor_drain_the_sink_cannot_take() -> None:
+    """With both floors in force and the drain beneath both, nothing happens --
+    and the decline names the SWAP floor, which is the one the user can change.
+
+    This is the shipped default's behaviour for the case above: a provider
+    willing to take 1,000 sat does not make a 9,000 sat swap a good idea.
+    """
     chan = make_channel(capacity_sat=40_000, local_sat=20_000,
                         spendable_local_sat=9_000)
     snap = make_snapshot([make_offer("npubA", pct=0.2, lo=1_000)], channels=(chan,))
     result = evaluate(snap, make_config(liquidity_sink_address=SINK))
+    assert not _swaps(result)
     assert not _sinks(result)
-    [swap] = _swaps(result)
-    assert swap.lightning_amount_sat == 9_000
+    assert "below your 25000 sat minimum swap size" in _reasons(result)
 
 
 def test_whitespace_only_sink_address_is_treated_as_unset() -> None:
@@ -226,6 +247,17 @@ def test_sink_skips_inactive_channels() -> None:
     result = evaluate(snap, make_config(liquidity_sink_address=SINK))
     assert not result.actions
     assert "not active" in _reasons(result)
+
+
+def test_sink_skips_channels_electrum_will_not_send_over() -> None:
+    """The sink pins its payment to the channel exactly as the swap path does, so
+    the same refusal applies -- a sink payment forced down a frozen channel fails
+    the same way, and the sink has no provider to blame for it."""
+    chan = make_channel(is_frozen_for_sending=True, frozen_by_user=True)
+    snap = make_snapshot([], channels=(chan,))
+    result = evaluate(snap, make_config(liquidity_sink_address=SINK))
+    assert not result.actions
+    assert "frozen it for sending" in _reasons(result)
 
 
 def test_sink_skips_channels_with_unsettled_htlcs() -> None:

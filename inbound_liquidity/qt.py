@@ -31,6 +31,7 @@ from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
+    DEFAULT_MAX_CHANNEL_SIZE_SAT,
     PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
@@ -52,6 +53,18 @@ if TYPE_CHECKING:
 # silently doing nothing is exactly the state this whole gate exists to make
 # visible.
 UNLOCK_PROMPT_COOLDOWN_SEC = 3600.0
+
+
+# How long teardown may block silently before the "finishing a swap" dialog is
+# put up. The overwhelmingly common close has no attempt in flight at all and
+# returns in microseconds; the next most common has one that is nearly done.
+# Flashing a dialog for either would be worse than showing nothing, so the wait
+# starts silent and only becomes visible once it is clearly going to be a wait.
+SHUTDOWN_DIALOG_DELAY_SEC = 2.0
+
+# How often the shutdown wait re-paints and re-checks. Small enough that the
+# countdown looks live, large enough not to spin the GUI thread.
+SHUTDOWN_POLL_INTERVAL_SEC = 0.1
 
 
 # --- Electrum "Channels" tab: a "Managed by" column ------------------------
@@ -130,21 +143,48 @@ def _patch_channels_list_managed_column() -> bool:
 # wallet's plugin alive (and keep reserving against it). A None provider -- the
 # plugin unloaded -- means every patch falls through to stock behaviour.
 
-# The blue asked for. NOT ColorScheme.BLUE, which Electrum already spends on the
-# "Frozen" slice: two blues in one pie is two slices the user cannot tell apart.
-# This is a deliberately lighter, more saturated blue that stays distinct from
-# frozen-blue, from cyan (frozen Lightning) and from green (on-chain) in both
-# Electrum's light and dark themes.
-COLOR_GOAL_BUFFER = QColor(64, 148, 255)
+# The blues asked for. NOT ColorScheme.BLUE, which Electrum already spends on the
+# "Frozen" slice (a pale #8cb3f2): two blues in one pie is two slices the user
+# cannot tell apart. These are a lighter, more saturated blue and a deep blue,
+# both distinct from frozen-blue, from cyan (frozen Lightning) and from green
+# (on-chain) in Electrum's light and dark themes alike.
+#
+# Two shades rather than two unrelated hues because the two wedges are one thing
+# split by where it is held: the goal reads as a single blue region of the pie,
+# and the shade says which rail is backing it.
+COLOR_GOAL_BUFFER_ONCHAIN = QColor(64, 148, 255)
+COLOR_GOAL_BUFFER_LIGHTNING = QColor(20, 80, 180)
 
-def _goal_buffer_label() -> str:
-    """The slice's label, for both the pie entry and the Balance dialog legend.
+# Both goal wedges, for the "is this list one of ours?" checks.
+COLOR_GOAL_BUFFER_ALL = (COLOR_GOAL_BUFFER_ONCHAIN, COLOR_GOAL_BUFFER_LIGHTNING)
+
+
+def _goal_buffer_onchain_label() -> str:
+    """The on-chain goal slice's label, for both the pie entry and the Balance
+    dialog legend.
 
     A function rather than a module constant so the string is translated at the
     moment it is shown -- a constant would bake in whatever language was active
     when this module was first imported.
     """
-    return _("Liquidity goal buffer")
+    return _("Liquidity goal buffer (on-chain)")
+
+
+def _goal_buffer_lightning_label() -> str:
+    """The Lightning goal slice's label. Only ever shown when the goal actually
+    reaches into Lightning -- see :func:`_entries_with_goal_slices`."""
+    return _("Liquidity goal buffer (Lightning)")
+
+
+def _show_goal_checkbox_label() -> str:
+    return _("Show liquidity goal")
+
+
+def _show_goal_checkbox_tooltip() -> str:
+    return _("Split the sats reserved for your liquidity goal out of the balance "
+             "as their own slices, on this chart and in the status bar. "
+             "Unchecked, Electrum's own chart is shown instead.\n\n"
+             "Display only: it changes nothing about what the plugin reserves.")
 
 # Callable[[Abstract_Wallet], int] -- the live plugin's goal_buffer_sat, or None
 # when no plugin is loaded. Set by Plugin.load_wallet, cleared by close_wallet.
@@ -157,6 +197,32 @@ _BUFFER_PROVIDER: Optional[Callable[['Abstract_Wallet'], int]] = None
 _SEND_WARNING_REFRESH: Optional[Callable[[], None]] = None
 
 
+class _GoalVisibility:
+    """Reader and writer for the "show the liquidity goal on the chart"
+    checkbox, which is persisted in ``INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART``.
+
+    One object rather than two module globals so the getter and the setter can
+    never be installed out of step -- a chart that could be read but not written
+    would give the user a checkbox that forgets itself.
+    """
+
+    def __init__(self, get: Callable[[], bool],
+                 set_: Callable[[bool], None]) -> None:
+        self._get = get
+        self._set = set_
+
+    def get(self) -> bool:
+        return bool(self._get())
+
+    def set(self, show: bool) -> None:
+        self._set(bool(show))
+
+
+# Set by Plugin.load_wallet, cleared by close_wallet -- same lifetime, and for
+# the same reason, as _BUFFER_PROVIDER above.
+_GOAL_VISIBILITY: Optional[_GoalVisibility] = None
+
+
 def _set_buffer_provider(provider: Optional[Callable[['Abstract_Wallet'], int]]) -> None:
     global _BUFFER_PROVIDER
     _BUFFER_PROVIDER = provider
@@ -165,6 +231,40 @@ def _set_buffer_provider(provider: Optional[Callable[['Abstract_Wallet'], int]])
 def _set_send_warning_refresher(refresher: Optional[Callable[[], None]]) -> None:
     global _SEND_WARNING_REFRESH
     _SEND_WARNING_REFRESH = refresher
+
+
+def _set_goal_visibility(visibility: Optional[_GoalVisibility]) -> None:
+    global _GOAL_VISIBILITY
+    _GOAL_VISIBILITY = visibility
+
+
+def _goal_is_shown() -> bool:
+    """Whether the goal slices are wanted on the chart right now.
+
+    Defaults to True when nothing is installed or the read fails -- that is the
+    ConfigVar's own default, and it keeps a wallet with no plugin loaded (where
+    the buffer is 0 anyway, so there are no slices to show) behaving exactly as
+    an unchecked box would. Never raises: this runs inside a status-bar repaint.
+    """
+    visibility = _GOAL_VISIBILITY
+    if visibility is None:
+        return True
+    try:
+        return visibility.get()
+    except Exception:
+        return True
+
+
+def _set_goal_shown(show: bool) -> None:
+    """Persist the checkbox. A failure here costs the user the *memory* of their
+    choice, not the choice itself -- the chart is repainted either way."""
+    visibility = _GOAL_VISIBILITY
+    if visibility is None:
+        return
+    try:
+        visibility.set(show)
+    except Exception:
+        pass
 
 
 def _buffer_split_for(wallet: 'Abstract_Wallet', *, onchain_sat: int,
@@ -190,48 +290,113 @@ _STOCK_ENTRIES_ATTR = "_inbound_liquidity_stock_entries"
 
 def _carries_buffer_slice(entries) -> bool:
     """Whether this entry list is one we already rewrote."""
-    return any(color == COLOR_GOAL_BUFFER for _name, color, _amount in entries)
+    return any(color in COLOR_GOAL_BUFFER_ALL for _name, color, _amount in entries)
 
 
-def _rewrite_piechart_entries(entries, wallet: 'Abstract_Wallet'):
-    """Take Electrum's ``[(name, color, amount)]`` pie entries and return a new
-    list with the buffer split out of the On-chain and Lightning slices.
+def _balance_slice_colors():
+    """Electrum's On-chain and Lightning slice colours, or None if its module
+    moved.
 
     Matching is by COLOR, not by the translated slice name: the names are
     user-language strings, so a German Electrum would silently never match. The
     colours are module constants in Electrum's balance_dialog and are what the
     chart is actually keyed on.
 
-    Returns the input unchanged (same object) when there is no buffer to show, so
-    the common case costs one comparison and no allocation.
+    Looked up at call time rather than at import so a failure degrades one
+    repaint to the stock chart instead of breaking the whole plugin's GUI.
     """
     try:
         from electrum.gui.qt.balance_dialog import COLOR_CONFIRMED, COLOR_LIGHTNING
+        return COLOR_CONFIRMED, COLOR_LIGHTNING
     except Exception:
-        return entries
+        return None
+
+
+def _goal_buffer_split(entries, wallet: 'Abstract_Wallet') -> Optional[BufferSplit]:
+    """The buffer split implied by Electrum's ``[(name, color, amount)]`` pie
+    entries, or None when there is no buffer worth drawing.
+
+    Deliberately independent of the checkbox: the Balance dialog has to know a
+    goal EXISTS even while it is hidden, or the checkbox that would unhide it
+    could never be offered -- and a user who unticked it once would have no way
+    back.
+    """
+    colors = _balance_slice_colors()
+    if colors is None:
+        return None
+    color_confirmed, color_lightning = colors
     onchain_sat = 0
     lightning_sat = 0
-    for name, color, amount in entries:
-        if color == COLOR_CONFIRMED:
+    for _name, color, amount in entries:
+        if color == color_confirmed:
             onchain_sat = int(amount)
-        elif color == COLOR_LIGHTNING:
+        elif color == color_lightning:
             lightning_sat = int(amount)
     split = _buffer_split_for(wallet, onchain_sat=onchain_sat,
                               lightning_sat=lightning_sat)
-    if split.total() <= 0:
+    return split if split.total() > 0 else None
+
+
+def _entries_with_goal_slices(entries, split: BufferSplit):
+    """``entries`` with ``split`` carved out of the On-chain and Lightning
+    slices and re-added as its own wedges. Returns the input unchanged (same
+    object) if the slice colours could not be looked up.
+
+    The goal gets TWO wedges, one per rail, so the chart says not just how much
+    is spoken for but where it is currently held -- an on-chain wedge is sats
+    that can fund a channel open today, a Lightning wedge is sats that would
+    have to be swapped out first. The Lightning wedge is omitted entirely when
+    on-chain covers the whole goal, which is the ordinary case: a zero-width
+    wedge is invisible anyway, and its legend row would read "0".
+    """
+    colors = _balance_slice_colors()
+    if colors is None:
         return entries
+    color_confirmed, color_lightning = colors
     out = []
     for name, color, amount in entries:
-        if color == COLOR_CONFIRMED:
+        if color == color_confirmed:
             out.append((name, color, split.onchain_remaining))
-        elif color == COLOR_LIGHTNING:
+        elif color == color_lightning:
             out.append((name, color, split.lightning_remaining))
         else:
             out.append((name, color, amount))
     # Appended last so the existing slices keep the order (and therefore the
-    # start angles) Electrum gave them; the buffer takes the wedge at the end.
-    out.append((_goal_buffer_label(), COLOR_GOAL_BUFFER, split.total()))
+    # start angles) Electrum gave them; the goal takes the wedges at the end.
+    for label, color, amount in _goal_slices(split):
+        out.append((label, color, amount))
     return out
+
+
+def _goal_slices(split: BufferSplit) -> List[Tuple[str, QColor, int]]:
+    """The goal's own ``(label, color, amount)`` entries, on-chain first, with
+    empty rails left out. Shared by the pie and the dialog's legend so the two
+    can never disagree about which rails are on screen."""
+    slices: List[Tuple[str, QColor, int]] = []
+    if split.from_onchain > 0:
+        slices.append((_goal_buffer_onchain_label(), COLOR_GOAL_BUFFER_ONCHAIN,
+                       split.from_onchain))
+    if split.from_lightning > 0:
+        slices.append((_goal_buffer_lightning_label(), COLOR_GOAL_BUFFER_LIGHTNING,
+                       split.from_lightning))
+    return slices
+
+
+def _rewrite_piechart_entries(entries, wallet: 'Abstract_Wallet'):
+    """Take Electrum's ``[(name, color, amount)]`` pie entries and return a new
+    list with the goal buffer split out of the On-chain and Lightning slices.
+
+    Returns the input unchanged (same object) when there is no buffer to show, or
+    when the user has unticked "Show liquidity goal" -- so both the common case
+    and the switched-off case cost no allocation, and the caller's ``is`` check
+    is enough to decide whether anything needs repainting.
+    """
+    if not _goal_is_shown():
+        return entries
+    split = _goal_buffer_split(entries, wallet)
+    if split is None:
+        return entries
+    return _entries_with_goal_slices(entries, split)
 
 
 def _patch_status_bar_piechart() -> bool:
@@ -331,8 +496,117 @@ def _restate_legend_amount(grid: QGridLayout, color, amount_sat: int,
     return False
 
 
+def _add_goal_legend_rows(grid: QGridLayout, split: BufferSplit, config, fx,
+                          ) -> List[List[QWidget]]:
+    """Append one legend row per goal rail and return the rows' widgets, so the
+    checkbox can hide and re-show them without rebuilding the dialog.
+
+    Rows start below every stock row: ``rowCount()`` is the grid's own idea of
+    its extent, so this cannot land on top of an existing legend entry however
+    many of them Electrum decided to show.
+    """
+    try:
+        from electrum.gui.qt.balance_dialog import LegendWidget
+        from electrum.gui.qt.util import AmountLabel
+    except Exception:
+        return []
+    rows: List[List[QWidget]] = []
+    for label, color, amount in _goal_slices(split):
+        row = grid.rowCount()
+        fiat_str = fx.format_amount_and_units(amount) if fx else ''
+        widgets = [
+            LegendWidget(color),
+            QLabel(label + ':'),
+            AmountLabel(config.format_amount_and_units(amount)),
+            AmountLabel(fiat_str),
+        ]
+        grid.addWidget(widgets[0], row, 0)
+        grid.addWidget(widgets[1], row, 1)
+        grid.addWidget(widgets[2], row, 2, alignment=Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(widgets[3], row, 3, alignment=Qt.AlignmentFlag.AlignRight)
+        rows.append(widgets)
+    return rows
+
+
+def _install_goal_view(dialog, wallet: 'Abstract_Wallet') -> bool:
+    """Amend an already-built Wallet Balance dialog with the goal slices and the
+    checkbox that turns them off. Returns whether anything was added.
+
+    The dialog is built in full by Electrum first and only then amended, so
+    nothing about how the chart is computed or painted is duplicated here.
+    """
+    try:
+        from electrum.gui.qt.balance_dialog import PieChartWidget
+    except Exception:
+        return False
+    piechart = dialog.findChild(PieChartWidget)
+    if piechart is None:
+        return False
+    # Electrum's own entries, kept as the reference rendering: unticking the box
+    # has to restore exactly this, and re-ticking it has to re-derive from it
+    # rather than from an already-reduced list.
+    stock = list(getattr(piechart, "_list", None) or [])
+    if not stock:
+        return False
+    # Read regardless of the checkbox: a goal that exists but is hidden still
+    # needs its checkbox on screen, or there would be no way to bring it back.
+    split = _goal_buffer_split(stock, wallet)
+    if split is None:
+        return False
+    grid = dialog.findChild(QGridLayout)
+    if grid is None:
+        return False
+    config = dialog.config
+    fx = getattr(dialog, "fx", None)
+    goal_rows = _add_goal_legend_rows(grid, split, config, fx)
+
+    def render(show: bool) -> None:
+        entries = _entries_with_goal_slices(stock, split) if show else stock
+        piechart.update_list(entries)
+        # The legend rows have to follow the wedges. Electrum builds them
+        # straight from the raw PiechartBalance, so without this the dialog
+        # would show a shrunken on-chain wedge beside a legend still quoting the
+        # full on-chain balance -- and the rows would no longer add up to the
+        # total. Rewritten in place, keyed on the swatch's colour (the labels
+        # are translated). Slicing to len(stock) drops the appended goal wedges,
+        # which have legend rows of their own.
+        for _name, color, amount in entries[:len(stock)]:
+            _restate_legend_amount(grid, color, amount, config, fx)
+        for widgets in goal_rows:
+            for widget in widgets:
+                widget.setVisible(show)
+
+    checkbox = QCheckBox(_show_goal_checkbox_label())
+    checkbox.setToolTip(_show_goal_checkbox_tooltip())
+    # Checked BEFORE the signal is connected: setChecked would otherwise write
+    # the stored setting straight back and repaint the status bar just from
+    # opening the dialog.
+    checkbox.setChecked(_goal_is_shown())
+
+    def on_toggled(show: bool) -> None:
+        _set_goal_shown(show)
+        render(show)
+        # The status-bar pie is a different widget built by a different patch,
+        # and the user asked for one consistent view -- so push it through
+        # Electrum's own refresh rather than reaching into the button.
+        try:
+            dialog.window.update_status()
+        except Exception:
+            pass
+
+    checkbox.toggled.connect(on_toggled)
+    layout = dialog.layout()
+    if layout is not None and hasattr(layout, "insertWidget"):
+        index = layout.indexOf(piechart)
+        layout.insertWidget(index + 1 if index >= 0 else 0, checkbox,
+                            alignment=Qt.AlignmentFlag.AlignHCenter)
+    render(checkbox.isChecked())
+    return True
+
+
 def _patch_balance_dialog() -> bool:
-    """Add the buffer slice (and its legend row) to the Wallet Balance dialog.
+    """Add the goal slices, their legend rows and the show/hide checkbox to the
+    Wallet Balance dialog.
 
     Wraps ``BalanceDialog.__init__``: the dialog builds itself in full, then we
     find the pie widget by type and the legend by layout type and amend both.
@@ -340,10 +614,7 @@ def _patch_balance_dialog() -> bool:
     does not silently put the legend row in the wrong place.
     """
     try:
-        from electrum.gui.qt.balance_dialog import (
-            BalanceDialog, LegendWidget, PieChartWidget,
-        )
-        from electrum.gui.qt.util import AmountLabel
+        from electrum.gui.qt.balance_dialog import BalanceDialog
     except Exception:
         return False
     if getattr(BalanceDialog.__init__, "_inbound_liquidity_patched", False):
@@ -353,41 +624,7 @@ def _patch_balance_dialog() -> bool:
     def __init__(self, parent, *, wallet, **kwargs) -> None:
         orig_init(self, parent, wallet=wallet, **kwargs)
         try:
-            piechart = self.findChild(PieChartWidget)
-            if piechart is None:
-                return
-            entries = getattr(piechart, "_list", None)
-            if not entries:
-                return
-            rewritten = _rewrite_piechart_entries(entries, wallet)
-            if rewritten is entries:
-                return
-            piechart.update_list(rewritten)
-            buffer_sat = rewritten[-1][2]
-            grid = self.findChild(QGridLayout)
-            if grid is None:
-                return
-            # The legend rows have to follow the wedges. Electrum builds them
-            # straight from the raw PiechartBalance, so without this the dialog
-            # shows a shrunken on-chain wedge beside a legend still quoting the
-            # full on-chain balance -- and the rows no longer add up to the
-            # total. Rewritten in place, keyed on the swatch's colour (the
-            # labels are translated).
-            for name, color, amount in rewritten[:-1]:
-                _restate_legend_amount(grid, color, amount, self.config,
-                                       getattr(self, "fx", None))
-            # Below every stock row. rowCount() is the grid's own idea of its
-            # extent, so this cannot land on top of an existing legend entry
-            # however many of them Electrum decided to show.
-            row = grid.rowCount()
-            fiat_str = (self.fx.format_amount_and_units(buffer_sat)
-                        if getattr(self, "fx", None) else '')
-            grid.addWidget(LegendWidget(COLOR_GOAL_BUFFER), row, 0)
-            grid.addWidget(QLabel(_goal_buffer_label() + ':'), row, 1)
-            grid.addWidget(AmountLabel(self.config.format_amount_and_units(buffer_sat)),
-                           row, 2, alignment=Qt.AlignmentFlag.AlignRight)
-            grid.addWidget(AmountLabel(fiat_str), row, 3,
-                           alignment=Qt.AlignmentFlag.AlignRight)
+            _install_goal_view(self, wallet)
         except Exception:
             # An amended legend is a nicety; a dialog that cannot open is not.
             pass
@@ -669,6 +906,8 @@ class Plugin(LiquidityPlugin):
         # BEFORE start_wallet so the first repaint after the wallet becomes
         # managed already carries the slice.
         _set_buffer_provider(self.goal_buffer_sat)
+        _set_goal_visibility(_GoalVisibility(self.show_goal_in_piechart,
+                                             self.set_show_goal_in_piechart))
         _set_send_warning_refresher(self._refresh_send_warnings)
         if not _patch_balance_piechart():
             self.logger.debug("could not add the liquidity-buffer slice to the balance chart")
@@ -681,7 +920,149 @@ class Plugin(LiquidityPlugin):
             window.update_status()
         except Exception:
             self.logger.debug("could not refresh the balance chart after load")
+        self._register_closing_warning(window, wallet)
         self._maybe_prompt_update_opt_in(window, wallet)
+
+    def _register_closing_warning(self, window: 'ElectrumWindow',
+                                  wallet: 'Abstract_Wallet') -> None:
+        """Ask Electrum to warn before closing while we have a swap attempt live.
+
+        Electrum already warns about swaps whose funding tx is on-chain but
+        unconfirmed (``_check_ongoing_submarine_swaps_callback``, which reads
+        ``get_pending_swaps()``). That check cannot see the window this plugin
+        actually creates: a reverse swap whose Lightning payment is committed but
+        whose funding output does not exist yet. The swap is absent from
+        ``get_pending_swaps()`` for the whole of it, so without this the riskiest
+        moment of the whole operation is the one moment the user is told nothing.
+
+        Registration is best-effort and version-tolerant: the hook is a recent
+        addition to Electrum's main window, and a build without it should cost us
+        a debug line, not a wallet that will not load.
+        """
+        register = getattr(window, "register_closing_warning_callback", None)
+        if register is None:
+            self.logger.debug(
+                "this Electrum build has no closing-warning hook; not registering")
+            return
+        try:
+            register(lambda: self._closing_warning(wallet))
+        except Exception:
+            self.logger.debug("could not register the closing warning")
+
+    def _closing_warning(self, wallet: 'Abstract_Wallet') -> Optional[str]:
+        """The warning text while a reverse-swap attempt is in flight, else None.
+
+        Deliberately says what will happen if they go ahead -- we stop cascading,
+        wait for this one attempt, then close -- because the honest answer to "is
+        it safe to quit now?" is "nearly, and here is the bit you are waiting
+        for". Returning None is the normal case and shows no dialog at all.
+        """
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is None:
+            return None
+        return "\n\n".join((
+            _("Inbound Liquidity: a swap is in progress"),
+            _("A reverse swap of {amount} sat from channel {channel} has a "
+              "Lightning payment in flight. Its funds are not at rest: the "
+              "payment is committed but the on-chain output does not exist "
+              "yet.").format(amount=f"{attempt.amount_sat:,}",
+                             channel=attempt.short_id),
+            _("If you close now, no further swap providers will be tried and "
+              "Electrum will wait for this attempt to finish (up to {seconds} "
+              "more seconds) before shutting down.").format(
+                  seconds=int(attempt.remaining_sec())),
+        ))
+
+    def _await_shutdown(self, wallet: 'Abstract_Wallet') -> None:
+        """Wait out the in-flight attempt without freezing the window.
+
+        ``stop_wallet`` runs on the GUI thread (closeEvent -> clean_up ->
+        run_hook('close_wallet')), while the attempt runs on the asyncio loop, so
+        the base class's plain ``Event.wait`` would block Qt's event loop for up
+        to a couple of minutes. To the user that is indistinguishable from a
+        hang, and the reflex it produces -- force-killing Electrum -- is the exact
+        outcome this whole handshake exists to prevent.
+
+        So the wait is driven from here instead: poll the event in short slices,
+        pumping Qt between them, and put up a modal dialog once it is clear this
+        is going to take a moment (see SHUTDOWN_DIALOG_DELAY_SEC). Closing the
+        dialog is not offered: this is the wait the user already agreed to in the
+        closing warning, and its budget is bounded by the attempt's own backstop.
+        """
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is None:
+            return
+        event = self._attempt_done_event(wallet)
+        if event is None:
+            return
+        budget = attempt.remaining_sec()
+        started = time.monotonic()
+        deadline = started + budget
+        dialog: Optional[QWidget] = None
+        label: Optional[QLabel] = None
+        finished = False
+        try:
+            while time.monotonic() < deadline:
+                if event.wait(SHUTDOWN_POLL_INTERVAL_SEC):
+                    finished = True
+                    break
+                waited = time.monotonic() - started
+                if dialog is None and waited >= SHUTDOWN_DIALOG_DELAY_SEC:
+                    dialog, label = self._build_shutdown_dialog(attempt, deadline)
+                if label is not None:
+                    label.setText(self._shutdown_dialog_text(attempt, deadline))
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    # No usable event loop (headless tests, or Qt already torn
+                    # down): keep waiting, just without repainting. The wait is
+                    # what matters; the dialog is a courtesy.
+                    pass
+            else:
+                # The budget ran out. One last non-blocking ask, so an attempt
+                # that finished inside the final slice is not reported as a
+                # timeout it never hit.
+                finished = event.is_set()
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+        self.log_shutdown_wait_outcome(attempt, finished, budget)
+
+    @staticmethod
+    def _shutdown_dialog_text(attempt, deadline: float) -> str:
+        remaining = max(0, int(deadline - time.monotonic()))
+        return "\n".join((
+            _("Finishing a swap of {amount} sat from channel {channel}.").format(
+                amount=f"{attempt.amount_sat:,}", channel=attempt.short_id),
+            _("No further providers will be tried."),
+            _("Closing in up to {seconds}s.").format(seconds=remaining),
+        ))
+
+    def _build_shutdown_dialog(self, attempt, deadline: float,
+                               ) -> Tuple[Optional[QWidget], Optional[QLabel]]:
+        """The "please wait" window, or (None, None) if Qt cannot show one.
+
+        Button-less, and with the title-bar close button removed: there is
+        nothing here for the user to decide. It exists to say "still working, not
+        hung", which is the only question they have at this point. Answers
+        (None, None) rather than raising, because failing to show a progress
+        window is a cosmetic loss while aborting the close path is not.
+        """
+        try:
+            from electrum.gui.qt.util import WindowModalDialog
+            dialog = WindowModalDialog(None, _("Closing Electrum"))
+            layout = QVBoxLayout(dialog)
+            label = QLabel(self._shutdown_dialog_text(attempt, deadline))
+            layout.addWidget(label)
+            dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+            dialog.show()
+            return dialog, label
+        except Exception:
+            self.logger.debug("could not show the shutdown-wait dialog")
+            return None, None
 
     def _maybe_prompt_update_opt_in(self, window: 'ElectrumWindow',
                                     wallet: 'Abstract_Wallet') -> None:
@@ -781,6 +1162,21 @@ class Plugin(LiquidityPlugin):
             _set_send_warning_refresher(None)
         if not self.wallets:
             _set_buffer_provider(None)
+            _set_goal_visibility(None)
+
+    def show_goal_in_piechart(self) -> bool:
+        """Whether the user wants the liquidity-goal slices on the balance chart.
+
+        A display setting, so it is read straight off the config rather than
+        going through ``read_config()`` -- the rules engine has no business
+        knowing about it, and defaulting to True keeps the chart as it was for
+        anyone upgrading.
+        """
+        return bool(getattr(self.config,
+                            'INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART', True))
+
+    def set_show_goal_in_piechart(self, show: bool) -> None:
+        self.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = bool(show)
 
     def requires_settings(self) -> bool:
         # Settings now live in the Liquidity tab rather than a settings dialog.
@@ -1597,17 +1993,30 @@ class Plugin(LiquidityPlugin):
 
         grid = QGridLayout()
         sink_label_text = _("Liquidity sink (Lightning address; blank = off)")
+        # Cross-validated against each other (and against the goal) in on_apply,
+        # which looks the typed values up by label -- so these two are named.
+        min_onchain_label_text = _("Min on-chain to open a channel (sat)")
+        max_size_label_text = _("Max channel size (sat, 0 = no limit)")
         # (label, current value as text, parser, setter) for each tunable kept on
         # the main Settings tab. Power-user knobs (on-chain reserve, reliability
         # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
         # and the feature on/off toggles live on the Advanced sub-tab instead.
         fields = [
-            (_("Min on-chain to open a channel (sat)"),
+            (min_onchain_label_text,
              str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', v)),
             (_("Maximum number of channels"),
              str(c.INBOUND_LIQUIDITY_MAX_CHANNELS), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', v)),
+            # Sits with the other two channel-shape knobs (how many, how big, what
+            # size to aim for) rather than on Advanced: without it the plugin funds
+            # a channel with the whole on-chain balance, so it is a first-order
+            # safety bound, not a tuning knob. Third in the list on purpose --
+            # index 0/1 of the tab's line-edits stay min-on-chain and max-channels.
+            (max_size_label_text,
+             str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
+                         DEFAULT_MAX_CHANNEL_SIZE_SAT)), int,
+             lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT', max(0, int(v)))),
             (_("Max fee to move LN → on-chain (%, all-in)"),
              str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT', v)),
@@ -1633,10 +2042,29 @@ class Plugin(LiquidityPlugin):
              str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''), str,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
+        tooltips = {
+            max_size_label_text: _(
+                "Never fund a single channel with more than this.\n\n"
+                "The plugin opens channels with the maximum available on-chain "
+                "balance, so without a ceiling a wallet holding significant "
+                "on-chain funds would put all of it into one very large channel "
+                "with a single peer. With a ceiling, a large balance is spread "
+                "over several channels of a sane size instead, up to the maximum "
+                "number of channels above.\n\n"
+                "Applies to new opens only: a channel that is already larger than "
+                "this is never closed for being oversized.\n\n"
+                "Must be at least the liquidity goal — a channel below the goal "
+                "would be replaced as soon as it was opened. 0 = no ceiling, "
+                "bounded only by Electrum's own maximum funding amount."),
+        }
         edits = []
         for row, (label, value, parser, setter) in enumerate(fields):
-            grid.addWidget(QLabel(label), row, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(value)
+            if label in tooltips:
+                label_w.setToolTip(tooltips[label])
+                edit.setToolTip(tooltips[label])
+            grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             edits.append((edit, parser, setter, label))
 
@@ -1805,14 +2233,17 @@ class Plugin(LiquidityPlugin):
         def on_apply() -> None:
             # Parse and validate everything before persisting anything.
             parsed = []
+            by_label = {}    # label -> parsed value, for the cross-field checks
             for edit, parser, setter, label in edits:
                 text = edit.text().strip()
                 try:
-                    parsed.append((setter, parser(text) if parser is not str else text))
+                    value = parser(text) if parser is not str else text
                 except ValueError:
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_("Invalid value for: {}").format(label))
                     return
+                parsed.append((setter, value))
+                by_label[label] = value
                 # A sink address that cannot be resolved to an LNURL-pay target is
                 # refused rather than saved: stored but unusable, it would read as
                 # "configured" on this tab while every drain silently fell back to
@@ -1837,6 +2268,43 @@ class Plugin(LiquidityPlugin):
                 return
             parsed.append((lambda v: setattr(c, 'INBOUND_LIQUIDITY_GOAL_SAT', v),
                            int(goal_amount)))
+            # --- max channel size, cross-checked against the rest of the form --
+            # Validated against the values being applied in THIS click, not the
+            # stored ones, so a user raising the goal and the ceiling together is
+            # judged on the pair they actually typed.
+            max_size = int(by_label.get(max_size_label_text, 0))
+            if max_size < 0:
+                status_label.setStyleSheet("color: red;")
+                status_label.setText(_("Value cannot be negative: {}").format(
+                    max_size_label_text))
+                return
+            if max_size > 0:
+                # Below the goal, every channel the plugin opened would be
+                # undersized the moment it existed. The engine declines to act on
+                # that rather than churning, so saving it would leave the plugin
+                # visibly configured and quietly stuck -- refuse it here, where the
+                # user can see both numbers at once.
+                goal_sat = int(goal_amount)
+                if 0 < goal_sat and max_size < goal_sat:
+                    status_label.setStyleSheet("color: red;")
+                    status_label.setText(_(
+                        "Max channel size ({size} sat) is below the liquidity goal "
+                        "({goal} sat): every channel opened would immediately count "
+                        "as undersized. Raise the max channel size or lower the "
+                        "goal.").format(size=max_size, goal=goal_sat))
+                    return
+                # Below the funding floor, no channel can be opened at all. The
+                # floor tracks min-on-chain-to-open, which is also on this form, so
+                # ask what it will be once this click is applied.
+                floor = self.effective_min_funding_sat(
+                    by_label.get(min_onchain_label_text))
+                if max_size < floor:
+                    status_label.setStyleSheet("color: red;")
+                    status_label.setText(_(
+                        "Max channel size ({size} sat) is below the channel-funding "
+                        "floor ({floor} sat): no channel could be opened at all.").format(
+                            size=max_size, floor=floor))
+                    return
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
@@ -2058,6 +2526,9 @@ class Plugin(LiquidityPlugin):
             (_("Keep outbound per channel (sat, 0 = drain all)"),
              'INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT', max(0, int(val)))),
+            (_("Minimum swap size (sat, 0 = no minimum)"),
+             'INBOUND_LIQUIDITY_MIN_SWAP_SAT', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_MIN_SWAP_SAT', max(0, int(val)))),
             (_("Keep decision log for (days, 1–{})").format(MAX_LOG_RETENTION_DAYS),
              'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS', int,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_LOG_RETENTION_DAYS',
@@ -2538,9 +3009,13 @@ class Plugin(LiquidityPlugin):
         c = self.config
         if sync_toggle is not None:
             sync_toggle()
+        # Positional: this list must stay in the same order as the `fields` list
+        # in _build_settings_tab, which is what `edits` was built from.
         values = [
             str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
             str(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
+            str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
+                        DEFAULT_MAX_CHANNEL_SIZE_SAT)),
             str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
