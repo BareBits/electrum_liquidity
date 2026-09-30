@@ -70,6 +70,8 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = 1_000_000
         self.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = 10_000
         self.INBOUND_LIQUIDITY_MAX_CHANNELS = 2
+        # Mirrors the shipped ConfigVar default (10x the shipped liquidity goal).
+        self.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT = 1_000_000
         self.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = 0.6
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = 25.0
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = 25_000
@@ -343,14 +345,14 @@ def test_apply_persists_and_clamps(qapp):
                      if b.text() == "Apply")
 
     # Settings-tab QLineEdit order after the Advanced-tab reorg: 0 min-onchain,
-    # 1 max-channels, 2 max-cost, 3 trigger-%, 4 trigger-sat, 5 dev-fee-%,
-    # 6 liquidity-sink address.
+    # 1 max-channels, 2 max-channel-size, 3 max-cost, 4 trigger-%, 5 trigger-sat,
+    # 6 dev-fee-%, 7 liquidity-sink address.
     # (Automation on/off is the slider, applied immediately and independently of
     # this Apply button. Reserve / log-retention / tuning knobs live on Advanced.)
-    assert len(line_edits) == 7
+    assert len(line_edits) == 8
     line_edits[1].setText("5")              # Maximum number of channels
-    line_edits[5].setText("99")             # dev fee % -> clamped to DEV_FEE_MAX_PCT
-    line_edits[6].setText("  alice@example.com  ")   # sink -> stored trimmed
+    line_edits[6].setText("99")             # dev fee % -> clamped to DEV_FEE_MAX_PCT
+    line_edits[7].setText("  alice@example.com  ")   # sink -> stored trimmed
     apply_btn.click()
 
     assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 5
@@ -358,8 +360,8 @@ def test_apply_persists_and_clamps(qapp):
     assert p.config.INBOUND_LIQUIDITY_DEV_FEE_PCT == DEV_FEE_MAX_PCT
     assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == "alice@example.com"
     # Fields reloaded to the clamped / normalised values.
-    assert line_edits[5].text() == str(DEV_FEE_MAX_PCT)
-    assert line_edits[6].text() == "alice@example.com"
+    assert line_edits[6].text() == str(DEV_FEE_MAX_PCT)
+    assert line_edits[7].text() == "alice@example.com"
 
 
 def test_apply_rejects_invalid_without_persisting(qapp):
@@ -1351,8 +1353,8 @@ def test_buffer_size_rejects_a_non_numeric_entry(qapp):
 
 # --- liquidity sink settings ----------------------------------------------
 def _sink_edit(settings_tab):
-    # Index 6: see the field order pinned in test_apply_persists_and_clamps.
-    return _plain_line_edits(settings_tab)[6]
+    # Index 7: see the field order pinned in test_apply_persists_and_clamps.
+    return _plain_line_edits(settings_tab)[7]
 
 
 def _sink_only_checkbox(settings_tab):

@@ -881,6 +881,19 @@ DEFAULT_MAX_CLOSES_PER_DAY = 5
 # rule only fires when a small channel is actually in the way) and the swap
 # trigger (a channel is only replaceable once the plugin has drained it).
 DEFAULT_LIQUIDITY_GOAL_SAT = 100_000
+# Shipped ceiling on a SINGLE channel's funding amount (sat). The open rule funds
+# with everything on-chain bar the reserve, so without this a wallet holding
+# serious on-chain funds commits the lot to one channel with one peer -- a
+# concentration of counterparty, force-close and routing risk no user asked for by
+# leaving a balance in their wallet.
+#
+# Ten times the shipped liquidity goal: comfortably above the goal (so the two
+# never fight -- see `_decide_undersized_closes`), well clear of Electrum's stock
+# 200_000 sat funding floor, and still leaves room for `max_channels` channels'
+# worth of build-out before a large balance stops being spent. Evaluated once here
+# rather than tracked against the user's live goal, so the ceiling never moves as
+# a side effect of editing an unrelated setting.
+DEFAULT_MAX_CHANNEL_SIZE_SAT = 10 * DEFAULT_LIQUIDITY_GOAL_SAT
 
 
 def format_goal_buffer_warning(buffer_sat: int) -> str:
@@ -1038,6 +1051,21 @@ SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNELS = ConfigVar(
     'plugins.inbound_liquidity.max_channels', default=2, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Maximum number of channels"),
     long_desc=lambda: _("Never hold more than this many channels."))
+SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT = ConfigVar(
+    'plugins.inbound_liquidity.max_channel_size_sat', default=DEFAULT_MAX_CHANNEL_SIZE_SAT,
+    type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Max channel size (sat)"),
+    long_desc=lambda: _("Never fund a single channel with more than this. The plugin opens "
+                        "channels with the maximum available on-chain balance, so without a "
+                        "ceiling a wallet holding significant on-chain funds would commit all "
+                        "of them to one very large channel with a single peer. With a ceiling, "
+                        "a large balance is spread over several channels of a sane size "
+                        "instead, up to the maximum number of channels.\n\n"
+                        "Applies to new channel opens only — a channel already larger than "
+                        "this is never closed for being oversized. Must be at least the "
+                        "liquidity goal, since a channel smaller than the goal would be "
+                        "replaced as soon as it was opened. 0 = no ceiling (bounded only by "
+                        "Electrum's own maximum funding amount)."))
 # Daily action ceilings (rolling 24h) -- a runaway guard that bounds how many
 # fund-spending actions the automation can take per day. Edited from the Advanced
 # sub-tab. 0 disables a ceiling (unlimited). See DAILY_WINDOW_SEC.
@@ -2370,6 +2398,7 @@ class LiquidityPlugin(BasePlugin):
             min_onchain_to_open_sat=int(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
             onchain_reserve_sat=int(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
             max_channels=int(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
+            max_channel_size_sat=self._max_channel_size_sat(),
             max_swap_fee_pct=float(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
@@ -2427,6 +2456,53 @@ class LiquidityPlugin(BasePlugin):
                                       DEFAULT_LIQUIDITY_GOAL_SAT)))
         except (TypeError, ValueError):
             return DEFAULT_LIQUIDITY_GOAL_SAT
+
+    def _max_channel_size_sat(self) -> int:
+        """The configured ceiling on a single channel's funding amount, in sat, or
+        0 for "no ceiling".
+
+        Clamped non-negative, and total in exactly the way
+        :meth:`_liquidity_goal_sat` is: read on every tick, so a hand-edited or
+        missing value must answer rather than abort the whole evaluation. Note the
+        two failure answers differ on purpose -- a garbage value here falls back to
+        the shipped ceiling rather than to 0, because 0 means "no ceiling" and
+        reverting to unbounded channel sizes is the one answer a user who set this
+        setting definitely did not want.
+        """
+        try:
+            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT",
+                                      DEFAULT_MAX_CHANNEL_SIZE_SAT)))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_CHANNEL_SIZE_SAT
+
+    def _stock_funding_floor(self) -> int:
+        """Electrum's own ``MIN_FUNDING_SAT``, as it was before this plugin lowered
+        it. Captured by :meth:`_enforce_min_funding_floor`, which runs at startup
+        and on every tick; the lazy call covers a caller that gets here first (a
+        settings dialog on a wallet the plugin never started)."""
+        if _stock_min_funding_sat is None:
+            self._enforce_min_funding_floor()
+        return int(_stock_min_funding_sat or MIN_FUNDING_SAT)
+
+    def effective_min_funding_sat(self, min_onchain_sat: Optional[int] = None) -> int:
+        """The channel-funding floor in force: Electrum's stock floor, or the
+        configured ``min_onchain_to_open_sat`` when that is lower (the plugin only
+        ever lowers it -- see :meth:`_enforce_min_funding_floor`).
+
+        ``min_onchain_sat`` overrides the stored value, so the settings tab can ask
+        what the floor *would be* for a value the user has typed but not yet
+        applied. Read by the max-channel-size validation: a ceiling below this
+        floor can never be satisfied.
+        """
+        stock = self._stock_funding_floor()
+        if min_onchain_sat is None:
+            min_onchain_sat = getattr(
+                self.config, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', stock)
+        try:
+            configured = int(min_onchain_sat)
+        except (TypeError, ValueError):
+            return stock
+        return max(1, min(stock, configured))
 
     # --- the liquidity-goal buffer (GUI-facing) ---------------------------
     # Read by the Qt layer on every balance repaint and on every keystroke in the
@@ -5552,7 +5628,11 @@ class LiquidityPlugin(BasePlugin):
         """Largest channel we can fund while leaving ~`onchain_reserve_sat` behind.
 
         Builds a trial max-spend funding tx (output value '!') to learn the exact
-        fee at the current fee policy, then subtracts the configured reserve.
+        fee at the current fee policy, then subtracts the configured reserve and
+        applies both ceilings: the user's ``max_channel_size_sat`` and Electrum's
+        own ``LIGHTNING_MAX_FUNDING_SAT``. The lower of the two wins -- ours is a
+        preference, Electrum's is a protocol/config limit that would reject the
+        open outright, so neither may be used to escape the other.
         """
         from electrum.fee_policy import FeePolicy
         from electrum.util import NotEnoughFunds
@@ -5569,8 +5649,13 @@ class LiquidityPlugin(BasePlugin):
         # the recovery OP_RETURN, is 0-valued).
         max_fundable = max((o.value for o in trial.outputs() if isinstance(o.value, int)), default=0)
         funding_sat = max_fundable - reserve
-        cap = int(self.config.LIGHTNING_MAX_FUNDING_SAT)
-        return min(funding_sat, cap)
+        funding_sat = min(funding_sat, int(self.config.LIGHTNING_MAX_FUNDING_SAT))
+        # 0 means "no ceiling", so it must not be allowed to min() the amount to
+        # nothing -- hence the explicit test rather than a three-way min().
+        own_cap = self._max_channel_size_sat()
+        if own_cap > 0:
+            funding_sat = min(funding_sat, own_cap)
+        return funding_sat
 
     def _resolve_swap_attempts(self, action: ReverseSwapAction,
                                transport: Optional['SwapServerTransport'],
@@ -7423,6 +7508,11 @@ class LiquidityPlugin(BasePlugin):
             "opens_last_24h": snapshot.opens_last_24h,
             "config": {
                 "max_channels": config.max_channels,
+                # Next to max_channels, its sibling: together they bound how much of
+                # the wallet the plugin may commit to channels. Dumped because it is
+                # the answer to "why is this channel smaller than my balance?" --
+                # without it, a capped open's size is unexplainable from the log.
+                "max_channel_size_sat": config.max_channel_size_sat,
                 "min_onchain_to_open_sat": config.min_onchain_to_open_sat,
                 "onchain_reserve_sat": config.onchain_reserve_sat,
                 "max_swap_fee_pct": config.max_swap_fee_pct,

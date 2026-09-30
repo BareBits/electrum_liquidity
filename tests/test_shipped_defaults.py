@@ -101,6 +101,65 @@ def test_liquidity_goal_is_reachable_from_the_default_open_floor() -> None:
     assert goal > EXPECTED_MIN_ONCHAIN_TO_OPEN_SAT
 
 
+# The ceiling on a single channel open. Funds-affecting on UPGRADE as well as on a
+# fresh install, and in the safe direction: an existing wallet that would have put
+# its whole on-chain balance into one channel now builds several smaller ones. Ten
+# times the shipped goal.
+EXPECTED_MAX_CHANNEL_SIZE_SAT: int = 1_000_000
+
+
+def test_max_channel_size_default() -> None:
+    default = SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT.get_default_value()
+    assert default == EXPECTED_MAX_CHANNEL_SIZE_SAT
+    assert isinstance(default, int)
+
+
+def test_max_channel_size_ships_active() -> None:
+    """0 would disable the ceiling, putting a wallet's entire on-chain balance
+    into a single channel with a single peer. The whole point is that an untouched
+    install does not do that, so the shipped value must not be 0."""
+    assert SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT.get_default_value() > 0
+
+
+def test_the_shipped_ceiling_is_ten_times_the_shipped_goal() -> None:
+    """The stated relationship, pinned so the two defaults cannot drift apart
+    silently -- the ceiling is only defensible relative to the goal it has to
+    leave room for."""
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        DEFAULT_LIQUIDITY_GOAL_SAT, DEFAULT_MAX_CHANNEL_SIZE_SAT,
+    )
+
+    assert DEFAULT_MAX_CHANNEL_SIZE_SAT == 10 * DEFAULT_LIQUIDITY_GOAL_SAT
+    assert DEFAULT_MAX_CHANNEL_SIZE_SAT == EXPECTED_MAX_CHANNEL_SIZE_SAT
+
+
+def test_the_shipped_ceiling_is_above_the_shipped_goal() -> None:
+    """The constraint the settings tab enforces and the engine declines on: a
+    ceiling below the goal makes every channel the plugin opens undersized by
+    construction, so the shipped pair must never be in that state."""
+    goal = SimpleConfig.INBOUND_LIQUIDITY_GOAL_SAT.get_default_value()
+    assert EXPECTED_MAX_CHANNEL_SIZE_SAT >= goal
+
+
+def test_the_shipped_ceiling_clears_electrums_stock_funding_floor() -> None:
+    """Above the STOCK floor, not merely above the lowered one: the plugin only
+    lowers the floor when min_onchain_to_open_sat is smaller, so a ceiling that
+    relied on the override would make a channel unopenable for anyone who raised
+    that setting."""
+    from electrum.lnutil import MIN_FUNDING_SAT  # type: ignore
+
+    assert EXPECTED_MAX_CHANNEL_SIZE_SAT >= MIN_FUNDING_SAT
+
+
+def test_the_shipped_ceiling_is_below_electrums_own_funding_maximum() -> None:
+    """Otherwise the setting would be decorative -- Electrum's limit would be the
+    only thing bounding a channel, which is the state this feature exists to
+    replace."""
+    from electrum.lnutil import LN_MAX_FUNDING_SAT_LEGACY  # type: ignore
+
+    assert EXPECTED_MAX_CHANNEL_SIZE_SAT < LN_MAX_FUNDING_SAT_LEGACY
+
+
 def test_default_open_floor_is_below_electrums_stock_funding_floor() -> None:
     """The default is only useful if it actually engages the floor override --
     at or above Electrum's stock MIN_FUNDING_SAT the plugin would leave the

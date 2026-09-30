@@ -1245,6 +1245,26 @@ class LiquidityConfig:
     # by pure tests and non-populating callers, where it keeps the pre-feature
     # "the sink always wins" behaviour they were written against.
     defer_sink_until_goal: bool = False
+    # --- maximum channel size --------------------------------------------
+    # Ceiling (sat) on how much a SINGLE channel open may be funded with. The
+    # open rule funds "everything on-chain bar the reserve", which on a wallet
+    # holding significant on-chain funds means one absurdly large channel: the
+    # whole balance committed to a single peer, in a single 2-of-2, for as long
+    # as that channel lives. This bounds it, so a large balance builds several
+    # channels of a sane size (up to ``max_channels``) instead of one giant one.
+    #
+    # Applied to the gross intent in :func:`_decide_channel_open` AND to the
+    # "could we fund a real replacement?" gate in
+    # :func:`_decide_undersized_closes` -- see :func:`channel_funding_sat` for
+    # why both matter. The glue applies the same ceiling to the actual funding
+    # amount it computes from a trial max-spend tx.
+    #
+    # 0 (this dataclass's default) disables the ceiling, leaving the pre-feature
+    # "fund with everything" behaviour that pure tests and non-populating callers
+    # were written against. The SHIPPED default is
+    # ``DEFAULT_MAX_CHANNEL_SIZE_SAT`` (10x the shipped liquidity goal);
+    # ``read_config`` always passes the user's value explicitly.
+    max_channel_size_sat: int = 0
 
 
 @dataclass(frozen=True)
@@ -1840,6 +1860,37 @@ def decide(snapshot: LiquiditySnapshot, config: LiquidityConfig) -> List[Action]
     return list(evaluate(snapshot, config).actions)
 
 
+def channel_funding_sat(snapshot: LiquiditySnapshot,
+                        config: LiquidityConfig) -> int:
+    """How much a new channel would be funded with: everything on-chain bar the
+    reserve, capped by ``max_channel_size_sat``.
+
+    The single source of truth for channel sizing in this engine, used by BOTH
+    :func:`_decide_channel_open` (where it is the amount to open with) and
+    :func:`_decide_undersized_closes` (where it is the "could a replacement
+    actually reach the goal?" test). They have to agree, and applying the ceiling
+    in one but not the other would be worse than not having it at all: a cap
+    below the liquidity goal would let the close rule fire on funds the open rule
+    was never going to spend, reopen at the cap -- still under the goal -- and
+    close the same channel again on the next tick, burning a mining fee every
+    round. Sharing this function makes that churn loop unrepresentable.
+
+    The result is deliberately NOT floored at 0: a negative answer means the
+    reserve exceeds the balance, and callers already test it against the funding
+    floor, which no negative number can clear.
+
+    This is the engine's GROSS intent. The glue recomputes the real amount from a
+    trial max-spend transaction (so the funding tx's mining fee is deducted at
+    the live fee policy) and applies the same ceiling there -- see
+    ``_max_funding_minus_reserve`` in ``__init__.py``.
+    """
+    available = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    cap = max(0, int(config.max_channel_size_sat))
+    if cap <= 0:
+        return available      # ceiling disabled
+    return min(available, cap)
+
+
 def _decide_channel_open(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
 ) -> Tuple[Optional[OpenChannelAction], Optional[DeclineRecord]]:
@@ -1861,11 +1912,32 @@ def _decide_channel_open(
     # for funds", not a near miss, so it is not logged as a decline.
     if snapshot.onchain_spendable_sat < config.min_onchain_to_open_sat:
         return None, None
-    # Rule: open with the maximum amount, leaving `onchain_reserve_sat` on-chain.
-    funding_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    # Misconfiguration guard, checked before the arithmetic below so its decline
+    # names the real cause. A ceiling under the funding floor can never be
+    # satisfied, so the plugin would sit permanently inert while every other rule
+    # said it was ready to open -- and the generic "below funding floor" decline
+    # underneath would blame the reserve for it. Only reachable from a
+    # hand-edited config: the settings tab refuses to save such a value.
+    cap = max(0, int(config.max_channel_size_sat))
+    if 0 < cap < MIN_FUNDING_SAT:
+        return None, DeclineRecord(
+            kind="open",
+            reason=(
+                f"max channel size {cap} is below the {MIN_FUNDING_SAT} sat "
+                f"channel-funding floor, so no channel can ever be opened; "
+                f"raise it (or the min-on-chain-to-open setting, which lowers "
+                f"the floor)"
+            ),
+            amount_sat=cap,
+        )
+    # Rule: open with the maximum amount, leaving `onchain_reserve_sat` on-chain,
+    # and never more than `max_channel_size_sat`.
+    funding_sat = channel_funding_sat(snapshot, config)
     if funding_sat < MIN_FUNDING_SAT:
         # We passed the min-to-open gate but cannot clear Electrum's funding
-        # floor after the reserve -- a genuine near miss worth recording.
+        # floor after the reserve -- a genuine near miss worth recording. The cap
+        # cannot be what put us here: it was cleared against the same floor
+        # above, so `funding_sat` is short of the floor only when the balance is.
         return None, DeclineRecord(
             kind="open",
             reason=(
@@ -1888,6 +1960,11 @@ def _decide_channel_open(
             ),
             amount_sat=funding_sat,
         )
+    # When the ceiling is what set the size, say so: otherwise the decision log
+    # records a channel visibly smaller than the balance with no explanation, and
+    # the leftover on-chain (which the next tick spends on another channel) reads
+    # as the plugin having failed to use the funds.
+    capped = 0 < cap <= snapshot.onchain_spendable_sat - config.onchain_reserve_sat
     return (
         OpenChannelAction(
             funding_sat=funding_sat,
@@ -1895,6 +1972,8 @@ def _decide_channel_open(
                 f"on-chain spendable {snapshot.onchain_spendable_sat} >= "
                 f"min {config.min_onchain_to_open_sat} and "
                 f"{len(snapshot.channels)} < {config.max_channels} channels"
+                + (f"; funding capped at the {cap} sat max channel size"
+                   if capped else "")
             ),
         ),
         None,
@@ -2099,9 +2178,12 @@ def _decide_undersized_closes(
       1. a liquidity goal is configured (0 = rule disabled);
       2. we are AT the channel ceiling -- below it, a bigger channel can simply
          be opened alongside, so closing anything would be gratuitous;
-      3. on-chain spendable minus the reserve can fund a channel that reaches the
-         goal (and clears the funding floor) -- so the replacement is real, not
-         hypothetical;
+      3. what a new channel would be funded with (:func:`channel_funding_sat` --
+         on-chain spendable minus the reserve, capped by ``max_channel_size_sat``)
+         reaches the goal and clears the funding floor -- so the replacement is
+         real, not hypothetical. The cap belongs in this test: a ceiling below the
+         goal makes every replacement undersized by construction, and closing on
+         funds the open rule will not spend would churn the same channel forever;
       4. the channel was opened by the plugin -- a channel the user opened by
          hand is never closed by this rule, whatever the scope switch says;
       5. its capacity is below the goal -- it is the thing holding us back;
@@ -2117,31 +2199,61 @@ def _decide_undersized_closes(
          belongs to the offline auto-close watchdog, which has uptime evidence to
          justify the expense.
 
-    Declines are recorded only for a genuine near miss: gates 1-3 passed (we are
-    blocked, with the funds to fix it) and at least one channel is undersized,
-    but nothing cleared the remaining gates.
+    Declines are recorded only for a genuine near miss: at least one channel is
+    undersized and either gates 1-3 passed (we are blocked, with the funds to fix
+    it) but nothing cleared the remaining gates, or gate 3 failed *because of the
+    max-channel-size ceiling* rather than for want of funds -- a state no amount
+    of waiting resolves, so it has to be said out loud.
     """
     if config.liquidity_goal_sat <= 0:
         return None, []
     if len(snapshot.channels) < config.max_channels:
         return None, []
-    # What a replacement channel would actually be funded with -- mirrors
-    # _decide_channel_open, so "we could fund it" here means the same arithmetic
-    # that will run when the open is decided.
-    funding_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+    # Gate 5 is tested before gate 3 so that gate 3's declines only ever fire when
+    # there is actually something to replace. Both are pure predicates on the same
+    # snapshot, so the order does not change which channel (if any) is chosen.
+    undersized = [c for c in snapshot.channels
+                  if c.is_plugin_opened and c.capacity_sat < config.liquidity_goal_sat]
+    if not undersized:
+        return None, []
+
+    # What a replacement channel would actually be funded with -- shared with
+    # _decide_channel_open via channel_funding_sat, so "we could fund it" here
+    # means exactly the arithmetic that will run when the open is decided.
+    funding_sat = channel_funding_sat(snapshot, config)
     # The replacement must both REACH THE GOAL (else the close buys nothing) and
     # clear Electrum's funding floor (else it cannot be opened at all). The floor
     # is the module global, which the glue lowers to the user's
     # min_onchain_to_open_sat at startup -- so this tracks the effective floor.
     required_sat = max(config.liquidity_goal_sat, MIN_FUNDING_SAT)
     if funding_sat < required_sat:
-        # Simply waiting for funds; not a near miss, so nothing is logged (the
-        # same treatment _decide_channel_open gives its min-on-chain gate).
-        return None, []
-
-    undersized = [c for c in snapshot.channels
-                  if c.is_plugin_opened and c.capacity_sat < config.liquidity_goal_sat]
-    if not undersized:
+        # Distinguish the two ways of being short, because they need opposite
+        # responses from the user. Out of funds: just wait, and (as with
+        # _decide_channel_open's min-on-chain gate) log nothing. Capped below what
+        # a replacement must reach: waiting will never help -- the funds are
+        # already there and the ceiling is throwing them away -- so this is a
+        # near miss, and a silent one would leave a wallet stuck with no
+        # explanation anywhere. Only reachable from a hand-edited config; the
+        # settings tab refuses to save a ceiling below the goal.
+        cap = max(0, int(config.max_channel_size_sat))
+        uncapped_sat = snapshot.onchain_spendable_sat - config.onchain_reserve_sat
+        if 0 < cap < required_sat <= uncapped_sat:
+            return None, [DeclineRecord(
+                kind="close",
+                amount_sat=cap,
+                reason=(
+                    f"max channel size {cap} is below the "
+                    f"{config.liquidity_goal_sat} sat liquidity goal, so replacing "
+                    f"an undersized channel would only reopen another one; not "
+                    f"closing anything until the two agree"
+                ),
+                detail=(
+                    f"{uncapped_sat} sat available but capped to {cap}; "
+                    f"{len(undersized)} undersized channel(s); the goal also "
+                    f"cannot be reached while this holds, which keeps the "
+                    f"liquidity sink deferred if that setting is on"
+                ),
+            )]
         return None, []
 
     # One replacement at a time, across ticks as well as within one. A channel we

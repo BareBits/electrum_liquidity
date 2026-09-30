@@ -31,6 +31,7 @@ from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
+    DEFAULT_MAX_CHANNEL_SIZE_SAT,
     PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
@@ -1992,17 +1993,30 @@ class Plugin(LiquidityPlugin):
 
         grid = QGridLayout()
         sink_label_text = _("Liquidity sink (Lightning address; blank = off)")
+        # Cross-validated against each other (and against the goal) in on_apply,
+        # which looks the typed values up by label -- so these two are named.
+        min_onchain_label_text = _("Min on-chain to open a channel (sat)")
+        max_size_label_text = _("Max channel size (sat, 0 = no limit)")
         # (label, current value as text, parser, setter) for each tunable kept on
         # the main Settings tab. Power-user knobs (on-chain reserve, reliability
         # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
         # and the feature on/off toggles live on the Advanced sub-tab instead.
         fields = [
-            (_("Min on-chain to open a channel (sat)"),
+            (min_onchain_label_text,
              str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', v)),
             (_("Maximum number of channels"),
              str(c.INBOUND_LIQUIDITY_MAX_CHANNELS), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', v)),
+            # Sits with the other two channel-shape knobs (how many, how big, what
+            # size to aim for) rather than on Advanced: without it the plugin funds
+            # a channel with the whole on-chain balance, so it is a first-order
+            # safety bound, not a tuning knob. Third in the list on purpose --
+            # index 0/1 of the tab's line-edits stay min-on-chain and max-channels.
+            (max_size_label_text,
+             str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
+                         DEFAULT_MAX_CHANNEL_SIZE_SAT)), int,
+             lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT', max(0, int(v)))),
             (_("Max fee to move LN → on-chain (%, all-in)"),
              str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT', v)),
@@ -2028,10 +2042,29 @@ class Plugin(LiquidityPlugin):
              str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''), str,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
+        tooltips = {
+            max_size_label_text: _(
+                "Never fund a single channel with more than this.\n\n"
+                "The plugin opens channels with the maximum available on-chain "
+                "balance, so without a ceiling a wallet holding significant "
+                "on-chain funds would put all of it into one very large channel "
+                "with a single peer. With a ceiling, a large balance is spread "
+                "over several channels of a sane size instead, up to the maximum "
+                "number of channels above.\n\n"
+                "Applies to new opens only: a channel that is already larger than "
+                "this is never closed for being oversized.\n\n"
+                "Must be at least the liquidity goal — a channel below the goal "
+                "would be replaced as soon as it was opened. 0 = no ceiling, "
+                "bounded only by Electrum's own maximum funding amount."),
+        }
         edits = []
         for row, (label, value, parser, setter) in enumerate(fields):
-            grid.addWidget(QLabel(label), row, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(value)
+            if label in tooltips:
+                label_w.setToolTip(tooltips[label])
+                edit.setToolTip(tooltips[label])
+            grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             edits.append((edit, parser, setter, label))
 
@@ -2200,14 +2233,17 @@ class Plugin(LiquidityPlugin):
         def on_apply() -> None:
             # Parse and validate everything before persisting anything.
             parsed = []
+            by_label = {}    # label -> parsed value, for the cross-field checks
             for edit, parser, setter, label in edits:
                 text = edit.text().strip()
                 try:
-                    parsed.append((setter, parser(text) if parser is not str else text))
+                    value = parser(text) if parser is not str else text
                 except ValueError:
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_("Invalid value for: {}").format(label))
                     return
+                parsed.append((setter, value))
+                by_label[label] = value
                 # A sink address that cannot be resolved to an LNURL-pay target is
                 # refused rather than saved: stored but unusable, it would read as
                 # "configured" on this tab while every drain silently fell back to
@@ -2232,6 +2268,43 @@ class Plugin(LiquidityPlugin):
                 return
             parsed.append((lambda v: setattr(c, 'INBOUND_LIQUIDITY_GOAL_SAT', v),
                            int(goal_amount)))
+            # --- max channel size, cross-checked against the rest of the form --
+            # Validated against the values being applied in THIS click, not the
+            # stored ones, so a user raising the goal and the ceiling together is
+            # judged on the pair they actually typed.
+            max_size = int(by_label.get(max_size_label_text, 0))
+            if max_size < 0:
+                status_label.setStyleSheet("color: red;")
+                status_label.setText(_("Value cannot be negative: {}").format(
+                    max_size_label_text))
+                return
+            if max_size > 0:
+                # Below the goal, every channel the plugin opened would be
+                # undersized the moment it existed. The engine declines to act on
+                # that rather than churning, so saving it would leave the plugin
+                # visibly configured and quietly stuck -- refuse it here, where the
+                # user can see both numbers at once.
+                goal_sat = int(goal_amount)
+                if 0 < goal_sat and max_size < goal_sat:
+                    status_label.setStyleSheet("color: red;")
+                    status_label.setText(_(
+                        "Max channel size ({size} sat) is below the liquidity goal "
+                        "({goal} sat): every channel opened would immediately count "
+                        "as undersized. Raise the max channel size or lower the "
+                        "goal.").format(size=max_size, goal=goal_sat))
+                    return
+                # Below the funding floor, no channel can be opened at all. The
+                # floor tracks min-on-chain-to-open, which is also on this form, so
+                # ask what it will be once this click is applied.
+                floor = self.effective_min_funding_sat(
+                    by_label.get(min_onchain_label_text))
+                if max_size < floor:
+                    status_label.setStyleSheet("color: red;")
+                    status_label.setText(_(
+                        "Max channel size ({size} sat) is below the channel-funding "
+                        "floor ({floor} sat): no channel could be opened at all.").format(
+                            size=max_size, floor=floor))
+                    return
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
@@ -2933,9 +3006,13 @@ class Plugin(LiquidityPlugin):
         c = self.config
         if sync_toggle is not None:
             sync_toggle()
+        # Positional: this list must stay in the same order as the `fields` list
+        # in _build_settings_tab, which is what `edits` was built from.
         values = [
             str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
             str(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
+            str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
+                        DEFAULT_MAX_CHANNEL_SIZE_SAT)),
             str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
