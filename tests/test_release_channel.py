@@ -143,6 +143,18 @@ _GH_STUB = r"""#!/usr/bin/env bash
 # GH_STUB_PRERELEASES. Every invocation is appended to GH_STUB_LOG verbatim.
 set -eu
 printf '%s\n' "$*" >> "$GH_STUB_LOG"
+if [ "${1:-}" = "release" ] && [ "${2:-}" = "create" ]; then
+  # Stash the body the step assembled, so a test can read what the release page
+  # would actually have said rather than only which flags were passed.
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--notes-file" ]; then
+      cp "$arg" "$GH_STUB_NOTES"
+    fi
+    prev="$arg"
+  done
+  exit 0
+fi
 if [ "${1:-}" = "release" ] && [ "${2:-}" = "list" ]; then
   case "$*" in
     *"select(.isPrerelease)"*) ;;
@@ -195,6 +207,7 @@ def _run_prune(tmp_path: Path, *, tag: str,
         GITHUB_REF_NAME=tag,
         GH_STUB_LOG=str(log),
         GH_STUB_PRERELEASES=str(listing),
+        GH_STUB_NOTES=str(tmp_path / "notes-unused.md"),
         GH_TOKEN="stub-token",
     )
     # `bash -e <file>` is how Actions runs a `run:` block's default shell.
@@ -281,3 +294,125 @@ def test_a_failed_listing_fails_the_step(tmp_path: Path) -> None:
                                listing_readable=False)
     assert result.returncode != 0
     assert _deleted(calls) == []
+
+
+# ---------------------------------------------------------------------------
+# What the release page itself says.
+#
+# --prerelease keeps a beta out of the update check, and nothing more. It does
+# nothing for somebody who has already landed on the Releases page, where the
+# only thing marking the build is a grey "Pre-release" chip beside the title. So
+# the body carries the warning, and it is asserted by running the publish step's
+# shell for real and reading the notes file it handed to `gh`.
+# ---------------------------------------------------------------------------
+
+RELEASE_STEP = "Create GitHub Release"
+
+_SERVER_URL = "https://github.example"
+_REPOSITORY = "BareBits/electrum_liquidity"
+
+
+def _run_release(tmp_path: Path, *, tag: str,
+                 version: str) -> "tuple[subprocess.CompletedProcess[str], List[str], str]":
+    """Run the publish step's shell body with `gh` stubbed out.
+
+    Returns the completed process, the stub's call log, and the release notes
+    body the step assembled.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "gh"
+    stub.write_text(_GH_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+
+    zip_path = tmp_path / f"inbound_liquidity-{version}.zip"
+    zip_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)  # an empty but valid zip
+
+    log = tmp_path / "gh-calls.log"
+    log.write_text("", encoding="utf-8")
+    notes = tmp_path / "published-notes.md"
+
+    script = tmp_path / "publish.sh"
+    script.write_text(_step(RELEASE_STEP)["run"], encoding="utf-8")
+
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{bindir}{os.pathsep}{env['PATH']}",
+        GITHUB_REF_NAME=tag,
+        GH_STUB_LOG=str(log),
+        GH_STUB_NOTES=str(notes),
+        GH_STUB_PRERELEASES=str(tmp_path / "unused.txt"),
+        GH_TOKEN="stub-token",
+        VERSION=version,
+        ZIP=str(zip_path),
+        SERVER_URL=_SERVER_URL,
+        REPOSITORY=_REPOSITORY,
+    )
+    result = subprocess.run(
+        ["bash", "-e", str(script)], env=env, cwd=str(tmp_path),
+        capture_output=True, text=True, timeout=60,
+        preexec_fn=_limit_address_space,
+    )
+    body = notes.read_text(encoding="utf-8") if notes.exists() else ""
+    return result, log.read_text(encoding="utf-8").splitlines() or [], body
+
+
+def test_publish_step_body_needs_no_workflow_interpolation() -> None:
+    """The tests below execute this step's shell verbatim, which is only sound
+    while every `${{ }}` it needs is bound in `env:` instead of substituted into
+    the script. A new interpolation would make them test a different program
+    than CI runs."""
+    step = _step(RELEASE_STEP)
+    assert "${{" not in step["run"], (
+        "the publish step interpolates a workflow expression into its script; "
+        "bind it in the step's env: instead")
+    for name in ("VERSION", "ZIP", "SERVER_URL", "REPOSITORY", "GH_TOKEN"):
+        assert name in step["env"], f"{name} is no longer bound in the step's env"
+
+
+def test_a_beta_page_warns_that_the_build_is_unstable(tmp_path: Path) -> None:
+    """The ask, stated as the operator stated it: a beta page must say the build
+    is unstable and should not be used."""
+    result, calls, body = _run_release(tmp_path, tag="v0.4.0-beta.8",
+                                       version="0.4.0-beta.8")
+    assert result.returncode == 0, result.stderr
+    assert any(c.startswith("release create ") for c in calls), calls
+
+    lowered = body.lower()
+    assert "unstable" in lowered
+    assert "do not use" in lowered
+    # GitHub's own callout syntax, so the warning renders as a red admonition
+    # rather than as an ordinary blockquote somebody can skim past.
+    assert "> [!WARNING]" in body
+    # And a way out: the stable release the reader almost certainly wants.
+    assert f"{_SERVER_URL}/{_REPOSITORY}/releases/latest" in body
+    # The warning goes FIRST. Below the install instructions it is furniture.
+    assert body.index("[!WARNING]") < body.index("Install by importing")
+    # Still a pre-release, still says which version it is.
+    assert "--prerelease" in " ".join(calls)
+    assert "v0.4.0-beta.8" in body
+
+
+def test_a_stable_release_page_carries_no_warning(tmp_path: Path) -> None:
+    """The other arm, and the one a careless conditional breaks silently: a real
+    release must not tell users not to install it."""
+    result, calls, body = _run_release(tmp_path, tag="v0.4.0", version="0.4.0")
+    assert result.returncode == 0, result.stderr
+    assert any(c.startswith("release create ") for c in calls), calls
+
+    assert "[!WARNING]" not in body
+    assert "unstable" not in body.lower()
+    assert "--prerelease" not in " ".join(calls)
+    assert body.strip() == (
+        "Inbound Liquidity Manager plugin v0.4.0. Install by importing the "
+        "attached zip into Electrum's plugin manager.")
+
+
+def test_generated_notes_are_still_appended(tmp_path: Path) -> None:
+    """--generate-notes is what produces the "What's Changed" list. It is passed
+    alongside --notes-file, not replaced by it."""
+    result, calls, _ = _run_release(tmp_path, tag="v0.4.0", version="0.4.0")
+    assert result.returncode == 0, result.stderr
+    create = next(c for c in calls if c.startswith("release create "))
+    assert "--generate-notes" in create
+    assert "--notes-file" in create
