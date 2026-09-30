@@ -538,15 +538,18 @@ def test_the_cascade_deadline_reaches_every_ranked_provider() -> None:
         SWAP_HTLC_RESOLVE_WAIT_SEC, REVERSE_SWAP_TIMEOUT_SEC,
         swap_cascade_deadline_sec)
     per_rung = REVERSE_SWAP_TIMEOUT_SEC + SWAP_HTLC_RESOLVE_WAIT_SEC
-    for providers in (1, 2, 3, 7, 25):
-        budget = swap_cascade_deadline_sec(providers)
-        # Two rungs per provider: the planned amount and its reduced retry.
-        latest_start = (providers * 2 - 1) * per_rung
+    for rungs in (1, 2, 3, 7, 25, 28):
+        budget = swap_cascade_deadline_sec(rungs)
+        # One cascade entry is now one rung: the engine's ladder already expanded
+        # every provider into its own (provider, size) entries, so nothing
+        # multiplies further here. 28 is a realistic worst case -- 7 providers
+        # across a 4-step ladder.
+        latest_start = (rungs - 1) * per_rung
         assert budget > latest_start, (
-            f"a {providers}-provider cascade budgets {budget}s, which cannot reach "
+            f"a {rungs}-rung cascade budgets {budget}s, which cannot reach "
             f"its last rung at {latest_start}s")
-    # Monotonic in the provider count: adding a provider must never shrink the
-    # budget (which would drop a provider that used to be reachable).
+    # Monotonic in the rung count: adding a rung must never shrink the budget
+    # (which would drop a rung that used to be reachable).
     budgets = [swap_cascade_deadline_sec(n) for n in range(1, 10)]
     assert budgets == sorted(budgets)
     # A degenerate count still yields a usable budget rather than zero.
@@ -948,7 +951,7 @@ def test_cascade_deadline_stops_before_starting_another_attempt() -> None:
                       if d.get("reason") == "swap provider cascade deadline reached"]
     assert len(deadline_diags) == 1
     # It says how much was left undone, so a recurring deadline is diagnosable.
-    assert "2 provider(s) untried" in deadline_diags[0]["detail"]
+    assert "2 rung(s) untried" in deadline_diags[0]["detail"]
 
 
 def test_an_expired_deadline_starts_nothing_at_all() -> None:

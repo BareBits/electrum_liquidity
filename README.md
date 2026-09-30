@@ -64,6 +64,7 @@ ceilings, diagnostics, etc.).
 | `max_swap_fee_pct` | Settings | **Max fee to move LN → on-chain** — don't reverse-swap if the **effective all-in cost %** (percentage fee + provider mining fee + on-chain claim fee, as a share of the amount) exceeds this | `0.9` |
 | `swap_trigger_pct` | Settings | Reverse-swap a channel at/above this % of capacity (local) | `25` |
 | `swap_trigger_sat` | Settings | …or once local balance exceeds this many sats | `25_000` |
+| `min_swap_sat` | Settings | **Minimum swap size** — never make a reverse swap smaller than this, however cheap it prices. Checked *in addition to* `max_swap_fee_pct`, and applied to every rung of the size ladder, so it is also what stops the ladder descending into swaps too small to be worth their on-chain claim. `0` turns the rule off. See [The size ladder](#the-size-ladder) | `25_000` |
 | `dev_fee_pct` | Settings | Optional contribution to plugin development, charged on what the plugin drains from a channel — the on-chain amount received from a reverse swap, or the amount paid to your liquidity sink (0 = off). Paid automatically to a fixed payout address | `0.1` |
 | `sink_address` | Settings | **Liquidity sink** — a Lightning address (`user@domain`), LNURL-pay string or LNURL-pay URL to drain outbound into *instead of* reverse-swapping it on-chain. A payment that fails is retried at half the amount, down to 10 000 sat; if every attempt fails, a reverse swap is used instead. Empty = off (swap only). See [The liquidity sink](#the-liquidity-sink) | `""` (off) |
 | `defer_sink_until_goal` | Settings | **Don't use liquidity sink until inbound liquidity goal is met** — while the wallet is still building its channels, drain by reverse-swapping (the balance comes back as on-chain coins that can fund the next channel) instead of paying it away to the sink. The sink takes over once you hold `max_channels` channels with none of the plugin-opened ones below `liquidity_goal_sat`. On by default. See [Holding the sink back until the goal is met](#holding-the-sink-back-until-the-goal-is-met) | `true` |
@@ -109,16 +110,52 @@ shorter, and every attempt is logged as it happens. Anything the budget does not
 reach is retried next cycle, by which time the failed providers have sunk in the
 ranking.
 
-Each provider also gets **one retry at 90% of the amount** before the cascade moves
-on, and only when its *Lightning payment* is what failed. A payment can fail simply
-because no single route carries the full amount — the size is chosen from what
-Electrum says it can send, which is not the same question as whether the network can
-route it — so a slightly smaller swap is often the thing that works. That retry is
-re-checked against your cost ceiling first, and frequently refused: shrinking a swap
-makes it *dearer* as a percentage, because the provider's mining fee and the on-chain
-claim fee do not shrink with it. Failures of any other kind (a provider that
-declined, rejected, cheated, or never answered) go straight to the next provider —
-they would answer the same way at any size.
+### The size ladder
+
+A swap that fails to route does not usually fail because of *who* you asked — it
+fails because of *how much* you asked for. A large payment must find one contiguous
+path with that much liquidity at every hop, and when the wallet has a single funded
+channel there is nothing to split across, so there is no MPP to fall back on. The
+failure that prompted this was ~90% of a wallet's only channel dying three to four
+hops out against 36 distinct mid-route channels in 15 minutes — none of which had a
+policy limit anywhere near the amount. They were simply dry at that size.
+
+So the plugin does not rank *providers*; it ranks **swaps**. Every eligible provider
+is expanded across a descending size ladder — **100%, 90%, 50% and 30%** of the
+planned amount — every rung is priced on its own, any rung that breaches
+`max_swap_fee_pct`, `min_swap_sat` or that provider's own minimum is dropped, and
+what survives is walked in order of **cost per sat of inbound liquidity** until one
+commits.
+
+Ordering by cost per sat is what makes the two dimensions comparable. A reverse swap
+of *a* sats buys *a* sats of inbound, so the per-sat price is just the all-in cost
+percentage — which means a cheap provider's smaller rung can legitimately outrank an
+expensive provider's full-size swap, and the walk will try it first. Providers and
+sizes are interleaved by price rather than nested one inside the other.
+
+The ceiling and the ladder pull against each other on purpose, and it is worth
+knowing which way. Shrinking a swap makes it **dearer** as a percentage, because the
+provider's mining fee and the on-chain claim fee do not shrink with it. So the lower,
+more routable rungs are the first to breach `max_swap_fee_pct` — your cost ceiling is
+also, in effect, a *routability floor*. The smallest rung that can ever pass is
+`fixed_fees / (ceiling − percentage_fee)`; raising the ceiling is what buys the
+plugin permission to try the sizes that actually route. `min_swap_sat` bounds the
+same ladder from below for a different reason: a small swap still needs a full
+on-chain claim to sweep, so past some size the block space outweighs the liquidity.
+
+The walk stops at the **first** rung that commits funds, even when that rung drained
+less than the plugin planned. There is no "carry on for the remainder" pass — the
+rest is the next evaluation's business, planned from a fresh snapshot of what the
+channel actually holds, rather than from a ladder priced against a balance that has
+since changed.
+
+Only a failed **Lightning payment** earns the descent. Failures of any other kind (a
+provider that declined, rejected, cheated, or never answered) move on to the next
+rung without pretending the size was at fault — they would answer the same way at any
+size. And a provider whose payment fails is faulted **once per cascade**, not once
+per rung: the ladder gives the cheapest providers the most rungs, so charging per
+rung would demote exactly the providers you most want to keep.
+
 
 The swap's **HTLCs** get special handling, because they are what used to make this
 whole cascade unreachable. The cascade must never fail over while any HTLC for the

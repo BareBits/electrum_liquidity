@@ -61,6 +61,7 @@ from .liquidity_manager import (
     CloseChannelAction,
     DAILY_WINDOW_SEC,
     DeclineRecord,
+    DEFAULT_MIN_SWAP_SAT,
     LiquidityConfig,
     LiquiditySinkAction,
     LiquiditySnapshot,
@@ -309,11 +310,13 @@ SWAP_HTLC_RESOLVE_WAIT_SEC = 150.0
 SWAP_HTLC_POLL_INTERVAL_SEC = 0.5
 
 
-# Attempts one provider may consume: the planned amount, then at most one reduced
-# retry (SWAP_REDUCTION_FACTOR). Only used to size the deadline below -- whether a
-# given provider actually gets its reduced rung is decided per attempt, on the
-# engine's cost arithmetic.
-_SWAP_RUNGS_PER_PROVIDER = 2
+# Cascade rungs each planned attempt can consume. One, now: the engine's ladder
+# (``rank_swap_rungs``) already expands every provider into its own separate
+# (provider, size) rungs, so the list handed to the executor IS the rung list and
+# nothing expands further at execution time. Kept as a named constant rather than
+# inlined because it is the single place the deadline's shape would change if a
+# rung ever regained sub-steps.
+_SWAP_RUNGS_PER_PROVIDER = 1
 
 
 def swap_cascade_deadline_sec(attempts: int,
@@ -355,11 +358,13 @@ def swap_cascade_deadline_sec(attempts: int,
     see ``_shutting_down``. The budget is unchanged by that: it still has to
     reach the last rung on a wallet nobody is closing.
 
-    The cost of having no ceiling here is real and accepted knowingly: on a wallet
-    with many discovered providers, a channel where every provider fails can hold
-    the per-wallet evaluation lock for a long time -- 7 providers works out near
-    90 minutes in the pathological case where every rung runs its full backstop --
-    and nothing else for that wallet runs meanwhile. Realistic failing rungs are
+    The cost of having no ceiling here is real and accepted knowingly, and the
+    ladder raised it: ``attempts`` is now (providers x ladder sizes that cleared
+    the cost gate), not providers, so the same 7 providers can present up to ~28
+    rungs and a channel where every one fails can hold the per-wallet evaluation
+    lock for hours in the pathological case where every rung runs its full
+    backstop. That is the deliberate trade -- an uncapped, cost-ordered list is
+    what makes the cheapest viable swap reachable at all. Realistic failing rungs are
     far shorter (PAYMENT_TIMEOUT 120s plus a few seconds of prepayment wait), and
     every rung logs and diag-records as it goes, so a long cascade is visible
     rather than silent.
@@ -1168,6 +1173,18 @@ SimpleConfig.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = ConfigVar(
     'plugins.inbound_liquidity.swap_trigger_sat', default=25_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Swap-out trigger (sat)"),
     long_desc=lambda: _("...or once a channel's local balance exceeds this many sats (whichever comes first)."))
+SimpleConfig.INBOUND_LIQUIDITY_MIN_SWAP_SAT = ConfigVar(
+    'plugins.inbound_liquidity.min_swap_sat', default=DEFAULT_MIN_SWAP_SAT,
+    type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Minimum swap size (sat)"),
+    long_desc=lambda: _("Never make a reverse swap smaller than this, however cheap "
+                        "it looks. A small swap still costs a full on-chain claim to "
+                        "sweep, so below some size the block space outweighs the "
+                        "liquidity it buys. This is checked in addition to the cost "
+                        "ceiling, and applies to the smaller retries too: raising it "
+                        "makes the plugin give up on a channel sooner, lowering it "
+                        "lets it keep trying at sizes that route more easily. "
+                        "Set to 0 to disable."))
 # Outbound-liquidity preservation. By default the plugin drains all outbound to
 # manufacture maximum inbound; these two knobs let a user hold some back.
 SimpleConfig.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = ConfigVar(
@@ -2403,6 +2420,7 @@ class LiquidityPlugin(BasePlugin):
             swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
             min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
+            min_swap_sat=self._min_swap_sat(),
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(),
             liquidity_goal_sat=self._liquidity_goal_sat(),
@@ -2456,6 +2474,24 @@ class LiquidityPlugin(BasePlugin):
                                       DEFAULT_LIQUIDITY_GOAL_SAT)))
         except (TypeError, ValueError):
             return DEFAULT_LIQUIDITY_GOAL_SAT
+
+    def _min_swap_sat(self) -> int:
+        """The configured floor on a single reverse swap, in sat, clamped
+        non-negative.
+
+        Total in exactly the way :meth:`_liquidity_goal_sat` is, and for the same
+        reason: read on every tick, so a hand-edited value -- or a config written
+        before this setting existed -- must answer rather than abort the whole
+        evaluation. Both failure answers are the shipped default, because unlike
+        the older switches here there is no pre-feature behaviour to preserve:
+        the floor is a rule the plugin should apply whether or not the user has
+        ever seen the setting.
+        """
+        try:
+            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_MIN_SWAP_SAT",
+                                      DEFAULT_MIN_SWAP_SAT)))
+        except (TypeError, ValueError):
+            return DEFAULT_MIN_SWAP_SAT
 
     def _max_channel_size_sat(self) -> int:
         """The configured ceiling on a single channel's funding amount, in sat, or
@@ -5748,7 +5784,7 @@ class LiquidityPlugin(BasePlugin):
             htlc_wait_sec=self._htlc_resolve_wait_sec,
             init_timeout_sec=self._swap_init_timeout_sec)
         self.logger.info(
-            f"reverse swap for {action.short_id}: {total} provider(s) to try "
+            f"reverse swap for {action.short_id}: {total} rung(s) to try "
             f"(uncapped, {budget:.0f}s budget): {action.reason}")
 
         # Reuse the evaluation's open session when present; otherwise open a
@@ -5780,21 +5816,36 @@ class LiquidityPlugin(BasePlugin):
         Split out of ``_reverse_swap`` only so the buffered reachability faults can
         be adjudicated in a ``finally`` around the whole walk.
 
-        Each provider gets up to two rungs: its planned amount, then -- only if that
-        rung's LIGHTNING PAYMENT failed, and only if the engine priced a reduced size
-        that still clears the user's cost ceiling -- one retry at that smaller size.
-        The distinction matters: a payment failure is the one outcome a smaller
-        amount plausibly fixes (no single route carried the full size), whereas a
-        provider that declined, rejected, cheated or never answered would fail the
-        same way at any size, and a smaller swap is if anything *less* attractive to
-        it. Those arms go straight to the next provider.
+        ``attempts`` is the engine's flat ladder (``rank_swap_rungs``): every
+        (provider, size) pair that cleared the cost gate, ordered by cost per sat
+        of inbound liquidity. One entry is one complete swap, so this walk is a
+        single loop over concrete alternatives rather than the providers-outer /
+        sizes-inner nesting it replaced. A given provider can therefore appear
+        several times, at different sizes and at different positions -- with a
+        cheaper provider's smaller rung ahead of a dearer provider's full size,
+        which is the whole point of pricing them against each other.
+
+        The inner rung loop survives only for hand-constructed attempts that still
+        carry ``reduced_amount_sat`` (the unit tests, and any caller predating the
+        ladder); the engine no longer populates it, so in production every entry
+        yields exactly one rung.
+
+        The walk stops on the FIRST attempt that commits funds. There is no
+        "continue for the remainder" pass: a partially-drained channel is simply a
+        channel whose next evaluation sees a smaller local balance and plans the
+        rest from a fresh snapshot -- which gets the outbound floor, the provider
+        capacities and the cost gate re-applied against reality, and never has two
+        live swaps on one channel.
 
         A shutdown ends the walk at the next rung boundary -- see
         ``_shutting_down``. Checked in both loops rather than only the outer one,
-        because a reduced retry is every bit as much "starting a new Lightning
-        payment on a wallet that is closing" as the next provider is.
+        because every rung is a new Lightning payment on a wallet that is closing.
         """
         sm = wallet.lnworker.swap_manager
+        # Providers already charged a soft fault for a failed Lightning payment in
+        # THIS cascade. The ladder means one provider can appear at several sizes;
+        # the fault belongs to the provider, so it is charged at most once here.
+        charged_npubs: Set[str] = set()
         async with session as tr:
             for index, (attempt, offer) in enumerate(attempts, start=1):
                 if self._stop_cascade_for_shutdown(wallet, action, total - index + 1):
@@ -5804,18 +5855,19 @@ class LiquidityPlugin(BasePlugin):
                     self.logger.warning(
                         f"swap cascade for {action.short_id} hit its "
                         f"{deadline_sec:.0f}s deadline with {remaining} "
-                        f"provider(s) untried; waiting for the next cycle")
+                        f"rung(s) untried; waiting for the next cycle")
                     self._diag_event(
                         wallet, category="error", kind="swap",
                         reason="swap provider cascade deadline reached",
                         source=attempt.npub,
-                        detail=f"{remaining} provider(s) untried after {index - 1} attempt(s)")
+                        detail=f"{remaining} rung(s) untried after {index - 1} attempt(s)")
                     break
                 rungs = self._attempt_rungs(attempt)
                 stop = False
-                # Whether any rung for THIS provider died with a failed Lightning
-                # payment. The soft fault for that is charged once, below, when the
-                # provider is finished with -- see _charge_payment_failure.
+                # Whether any rung for THIS entry died with a failed Lightning
+                # payment. Charged through ``charged_npubs`` so one provider that
+                # appears at several ladder sizes is still faulted once -- see
+                # below and _charge_payment_failure.
                 payment_failed = False
                 for rung, (rung_amount, rung_cost) in enumerate(rungs, start=1):
                     is_last_rung = rung == len(rungs)
@@ -5852,13 +5904,26 @@ class LiquidityPlugin(BasePlugin):
                         # channel again.
                         stop = True
                     break
-                if payment_failed:
+                if payment_failed and attempt.npub not in charged_npubs:
+                    # Once per PROVIDER per cascade, not once per rung. The ladder
+                    # puts the same provider in this list several times (at 1.0,
+                    # 0.9, 0.5 ...), and its payment failing at three sizes is one
+                    # observation about that provider, not three -- charging each
+                    # would sink it at triple rate for a single event, and would
+                    # do so hardest to the CHEAPEST providers, which are precisely
+                    # the ones the ladder tries most often.
+                    #
+                    # Charged here, at the moment the evidence appears, rather than
+                    # after the walk: the cascade can leave by half a dozen paths
+                    # (commit, abort, shutdown, deadline) and evidence already
+                    # collected should survive all of them.
+                    charged_npubs.add(attempt.npub)
                     self._charge_payment_failure(wallet, action, attempt.npub)
                 if stop:
                     break
                 if index < total:
                     self.logger.info(
-                        f"failing over to the next provider for {action.short_id} "
+                        f"falling back to the next rung for {action.short_id} "
                         f"({index + 1} of {total})")
 
     async def _run_attempt_tracked(self, wallet: 'Abstract_Wallet',
@@ -5929,11 +5994,11 @@ class LiquidityPlugin(BasePlugin):
             return False
         self.logger.info(
             f"wallet is closing; stopping the swap cascade for {action.short_id} "
-            f"with {untried} provider(s) untried")
+            f"with {untried} rung(s) untried")
         self._diag_event(
             wallet, category="lifecycle", kind="swap",
             reason="swap cascade stopped for shutdown",
-            detail=f"{untried} provider(s) untried on {action.short_id}")
+            detail=f"{untried} rung(s) untried on {action.short_id}")
         return True
 
     def _charge_payment_failure(self, wallet: 'Abstract_Wallet',
@@ -6059,12 +6124,16 @@ class LiquidityPlugin(BasePlugin):
         if amount_sat is None:
             amount_sat = attempt.amount_sat
             all_in_cost_pct = attempt.all_in_cost_pct
-        reduced = amount_sat != attempt.amount_sat
+        # "Reduced" now means "below the size the engine planned for this channel",
+        # not "below this attempt's own size" -- under the ladder every entry IS
+        # its own size, so the old comparison could never be true and the label
+        # would have silently disappeared from the logs.
+        reduced = amount_sat < action.lightning_amount_sat
         of_n = f"{index} of {total}" if total > 1 else ""
         # One label for every log line, status update and decision-log detail in
         # this attempt, so "which try was this" reads identically everywhere.
         rung_label = ", ".join(part for part in (
-            f"provider {of_n}" if of_n else "",
+            f"rung {of_n}" if of_n else "",
             "reduced size" if reduced else "") if part)
         cost_note = ("" if all_in_cost_pct is None
                      else f", all-in cost {all_in_cost_pct:.3f}%")
@@ -7518,6 +7587,7 @@ class LiquidityPlugin(BasePlugin):
                 "max_swap_fee_pct": config.max_swap_fee_pct,
                 "swap_trigger_pct": config.swap_trigger_pct,
                 "swap_trigger_sat": config.swap_trigger_sat,
+                "min_swap_sat": config.min_swap_sat,
                 "min_outbound_sat": config.min_outbound_sat,
                 "liquidity_goal_sat": config.liquidity_goal_sat,
                 "liquidity_goal_met": liquidity_goal_met(snapshot, config),

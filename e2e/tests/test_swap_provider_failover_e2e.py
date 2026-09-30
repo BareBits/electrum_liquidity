@@ -455,8 +455,7 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
 
 
 def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
-    """Before failing over, a provider whose Lightning payment failed is tried once
-    more at 90% of the amount.
+    """A provider whose Lightning payment failed is tried again at a smaller size.
 
     This is the other half of why swaps were not completing. Sizing already asks
     Electrum what it can send (``num_sats_can_send`` minus a fee-reserve headroom),
@@ -469,10 +468,18 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
 
     Asserted on the log rather than on an outcome, because whether the smaller rung
     SUCCEEDS depends on the rig's liquidity at that moment -- what must hold is that
-    it is attempted, at the right size, before the cascade moves on. The rig's
-    permissive 10% fee ceiling (see _arm_swap_config) guarantees the reduced amount
-    still clears the cost gate, so a rung is always priced here; the refusal case is
-    unit-tested, where the arithmetic can be pinned exactly.
+    it is attempted, at a ladder size. The rig's permissive 10% fee ceiling (see
+    _arm_swap_config) guarantees the smaller amounts still clear the cost gate, so
+    the rungs are always priced here; the refusal case is unit-tested, where the
+    arithmetic can be pinned exactly.
+
+    NB what this NO LONGER asserts. Under the size ladder the smaller rung is not
+    bolted onto the provider that just failed -- it is an independent entry in one
+    cost-ordered list, so another provider's full-size swap legitimately runs first
+    whenever it is cheaper per sat. "Smaller size before the next provider" was an
+    artefact of the old providers-outer walk and is not a property worth preserving;
+    what IS still true, and is checked here, is that the same provider is retried
+    smaller somewhere in the walk, at a size off the ladder.
     """
     assert rig.partner2_nodeid, "rig did not bring up a second provider"
 
@@ -485,26 +492,36 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
                 in _client_log_text(), rig=rig, timeout=600), \
         "no swap reached the failed-payment arm, so no reduced retry was possible"
 
-    # The retry is announced with both sizes, so a log reader can see the step.
-    assert _wait_until(
-        lambda: "retrying the same provider at" in _client_log_text(),
-        rig=rig, timeout=420), \
-        ("the failed payment went straight to the next provider without trying a "
-         "smaller size first")
-
-    # And the smaller attempt really ran, labelled as such.
+    # A rung below the planned size really ran, labelled as such.
     assert _wait_until(
         lambda: "reduced size" in _client_log_text(), rig=rig, timeout=420), \
-        "the reduced rung was announced but never attempted"
+        "no rung below the planned size was ever attempted"
 
-    # The reduced amount is the engine's 10% step off whatever was planned, never a
-    # number the executor invented. Recover both from the log and check the ratio.
-    m = re.search(r"the Lightning payment for (\d+) sat failed; "
-                  r"retrying the same provider at (\d+) sat", _client_log_text())
-    assert m, "could not read the full and reduced sizes out of the log"
-    full, reduced = int(m.group(1)), int(m.group(2))
-    assert reduced == int(full * 0.9), \
-        f"reduced size {reduced} is not 90% of {full}"
+    # Recover every attempted rung as (provider, amount) and find a provider that
+    # was tried at more than one size.
+    rungs = re.findall(
+        r"reverse swap via (\S+?)…? \(rung \d+ of \d+(?:, reduced size)?\): (\d+) sat",
+        _client_log_text())
+    by_provider = {}
+    for npub, amount in rungs:
+        by_provider.setdefault(npub, []).append(int(amount))
+    retried = {n: a for n, a in by_provider.items() if len(a) > 1}
+    assert retried, (
+        f"no provider was retried at a second size; rungs seen: {by_provider}")
+
+    # The sizes are the engine's ladder steps off the planned amount, never numbers
+    # the executor invented: each is some SWAP_LADDER_FACTORS fraction of the
+    # largest size that provider was tried at, and they descend.
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        SWAP_LADDER_FACTORS)
+    for npub, amounts in retried.items():
+        assert amounts == sorted(amounts, reverse=True), \
+            f"{npub} rungs are not descending: {amounts}"
+        planned = amounts[0]
+        allowed = {int(planned * f) for f in SWAP_LADDER_FACTORS}
+        assert set(amounts) <= allowed, (
+            f"{npub} was tried at {amounts}, which is not a subset of the ladder "
+            f"{sorted(allowed, reverse=True)} off {planned}")
 
     # One observation, one fault: the pair of rungs must not charge the provider
     # twice. (Which provider is faulted depends on ranking, so this checks the

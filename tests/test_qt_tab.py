@@ -76,6 +76,7 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT = 25.0
         self.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT = 25_000
         self.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT = 0
+        self.INBOUND_LIQUIDITY_MIN_SWAP_SAT = 25_000
         self.INBOUND_LIQUIDITY_GOAL_SAT = 100_000
         # Mirrors the shipped ConfigVar default (on: never touch a channel the
         # user opened by hand unless they say so).
@@ -768,6 +769,30 @@ def test_settings_tab_omits_moved_and_removed_fields(qapp):
     assert p.config.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS == "electrum_liqhelper@getbarebits.com"
 
 
+def _edit_for(tab, label_prefix: str):
+    """The QLineEdit sitting beside the label that starts with ``label_prefix``.
+
+    By label rather than by position: these grids are a running list of tuning
+    knobs, and indexing into them positionally means every new setting silently
+    re-points an existing assertion at the wrong field.
+    """
+    from PyQt6.QtWidgets import QGridLayout, QLabel, QLineEdit
+    for grid in tab.findChildren(QGridLayout):
+        for i in range(grid.count()):
+            item = grid.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if not isinstance(widget, QLabel):
+                continue
+            if not widget.text().startswith(label_prefix):
+                continue
+            row, _col, _rs, _cs = grid.getItemPosition(i)
+            beside = grid.itemAtPosition(row, 1)
+            if beside is not None and isinstance(beside.widget(), QLineEdit):
+                return beside.widget()
+    raise AssertionError(f"no line edit found beside a label starting "
+                         f"{label_prefix!r}")
+
+
 def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
     from PyQt6.QtWidgets import QCheckBox, QLineEdit, QPushButton
     from electrum.plugins.inbound_liquidity import MAX_LOG_RETENTION_DAYS
@@ -775,12 +800,10 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
     advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
-    edits = advanced_tab.findChildren(QLineEdit)
-    # Advanced QLineEdit order: 0 opens/day, 1 closes/day, 2 on-chain reserve,
-    # 3 keep-outbound-per-channel, 4 log retention, then the reliability/offline
-    # tuning knobs.
-    edits[2].setText("7500")                 # on-chain reserve (moved from Settings)
-    edits[4].setText("99999")                # log retention -> clamped
+    reserve = _edit_for(advanced_tab, "On-chain reserve")
+    retention = _edit_for(advanced_tab, "Keep decision log")
+    reserve.setText("7500")
+    retention.setText("99999")               # -> clamped
     for cb in advanced_tab.findChildren(QCheckBox):
         cb.setChecked(False)                 # flip every feature toggle off
     apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
@@ -789,7 +812,7 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
 
     assert p.config.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
     assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
-    assert edits[4].text() == str(MAX_LOG_RETENTION_DAYS)
+    assert retention.text() == str(MAX_LOG_RETENTION_DAYS)
     assert p.config.INBOUND_LIQUIDITY_RELIABILITY_ENABLED is False
     assert p.config.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED is False
     assert p.config.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED is False
@@ -1535,3 +1558,28 @@ def test_refresh_resyncs_both_sink_switches(qapp):
     # Re-syncing must not have written anything back through the toggle handlers.
     assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
     assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
+
+
+def test_advanced_tab_exposes_and_persists_the_minimum_swap_size(qapp):
+    """The floor is user-facing, so it needs a field -- and one that round-trips.
+
+    Clamping is asserted too: a negative floor is meaningless and must land as 0
+    (off) rather than as a negative bound nothing can satisfy.
+    """
+    from PyQt6.QtWidgets import QPushButton
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    edit = _edit_for(advanced_tab, "Minimum swap size")
+    assert edit.text() == "25000", "the field does not show the shipped default"
+
+    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
+                     if b.text() == "Apply")
+    edit.setText("60000")
+    apply_btn.click()
+    assert p.config.INBOUND_LIQUIDITY_MIN_SWAP_SAT == 60_000
+
+    edit.setText("-1")
+    apply_btn.click()
+    assert p.config.INBOUND_LIQUIDITY_MIN_SWAP_SAT == 0
