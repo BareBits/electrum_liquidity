@@ -65,10 +65,11 @@ def _plugin(**config_over) -> LiquidityPlugin:
     # Per-provider wait for advertised terms; shrunk so an unreachable
     # provider trips the init timeout instantly instead of in 15s.
     p._swap_init_timeout_sec = 0.01
-    # Bounded wait for a swap's mining-fee prepayment to resolve before the
-    # failover gate decides; shrunk so no test sits through the real 150s.
-    p._prepay_resolve_wait_sec = 0.05
-    p._prepay_poll_interval_sec = 0.01
+    # Bounded wait for a swap's HTLCs (main payment and mining-fee prepayment)
+    # to resolve before the failover gate decides; shrunk so no test sits
+    # through the real 150s.
+    p._htlc_resolve_wait_sec = 0.05
+    p._htlc_poll_interval_sec = 0.01
     cfg = dict(SWAPSERVER_NPUB=None, SWAPSERVER_URL=None)
     cfg.update(config_over)
     p.config = SimpleNamespace(**cfg)
@@ -477,9 +478,10 @@ def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
     """The safety-critical half. An HTLC may still be live, so draining this
     channel again through another provider could pay out twice.
 
-    Note this is the MAIN payment in flight, which is the one that means "possibly
-    committed" and is never waited on -- only a live prepayment gets the bounded
-    wait (see the prepay tests below)."""
+    This is the MAIN payment, in flight and staying that way for the whole
+    bounded wait. It gets the same patience the prepayment does -- see the
+    resolution tests below -- but patience is all it gets: an HTLC that never
+    resolves still stops the cascade."""
     sm = _SM({A: _accept_without_funding})
     p = _plugin()
     _run(p, sm, _action(alternates=(B,)), ln_payment="inflight")
@@ -533,9 +535,9 @@ def test_the_cascade_deadline_reaches_every_ranked_provider() -> None:
     there is no fixed number for a constant to have been sized against.
     """
     from electrum.plugins.inbound_liquidity import (  # type: ignore
-        PREPAY_RESOLVE_WAIT_SEC, REVERSE_SWAP_TIMEOUT_SEC,
+        SWAP_HTLC_RESOLVE_WAIT_SEC, REVERSE_SWAP_TIMEOUT_SEC,
         swap_cascade_deadline_sec)
-    per_rung = REVERSE_SWAP_TIMEOUT_SEC + PREPAY_RESOLVE_WAIT_SEC
+    per_rung = REVERSE_SWAP_TIMEOUT_SEC + SWAP_HTLC_RESOLVE_WAIT_SEC
     for providers in (1, 2, 3, 7, 25):
         budget = swap_cascade_deadline_sec(providers)
         # Two rungs per provider: the planned amount and its reduced retry.
@@ -612,7 +614,7 @@ def test_a_live_prepay_htlc_still_blocks_failover_while_it_stays_live() -> None:
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]        # B never tried
     assert p.successes == []
-    assert any("prepayment did not resolve in time" in (d.get("reason") or "")
+    assert any("did not resolve in time" in (d.get("reason") or "")
                for d in p.diags)
 
 
@@ -621,8 +623,8 @@ def test_the_prepay_wait_is_bounded() -> None:
     that never resolves."""
     sm = _SM({A: _accept_with_prepay})
     p = _plugin()
-    p._prepay_resolve_wait_sec = 0.2
-    p._prepay_poll_interval_sec = 0.01
+    p._htlc_resolve_wait_sec = 0.2
+    p._htlc_poll_interval_sec = 0.01
     wallet, _calls = _prepay_wallet(sm, inflight_calls=10_000)
     started = time.monotonic()
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
@@ -666,6 +668,161 @@ def test_a_settled_prepay_stops_the_cascade() -> None:
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]
     assert p.successes == []
+
+
+# --- the MAIN payment's HTLCs, and the other half of the same bug ---------
+# The prepayment wait above fixed one leg and left the other strict, so the
+# cascade still died whenever the main payment lost the same race -- which it does
+# routinely. LNWallet.pay_to_node raises PaymentFailure the moment it passes
+# PAYMENT_TIMEOUT (120s) or runs out of attempts, while its `finally` deliberately
+# leaves unresolved HTLCs alone ("no one is consuming from sent_htlcs_q anymore").
+# What it already sent therefore sits in the channel until the far end fails it
+# back -- on an MPP_TIMEOUT, up to the receiver's MPP expiry -- and
+# lnworker.get_payments(status='inflight') reads live CHANNEL state, so it keeps
+# naming that payment for the whole of it.
+#
+# Observed on mainnet: two rungs of one provider failed identically ~126s apart.
+# The first was read as "payment failed, nothing committed" and correctly retried
+# smaller; the second, losing the same race by a second or two, was read as "may
+# have committed funds" and ended the cascade with FOUR ranked providers untried.
+def _main_htlc_wallet(sm, inflight_calls: int, *, settles: bool = False):
+    """A wallet whose MAIN payment reads as in flight for the first
+    ``inflight_calls`` polls and resolved afterwards -- as failed, or (with
+    ``settles``) as PR_PAID, which is the one resolution that must still stop the
+    cascade."""
+    wallet = _wallet(sm, "failed")
+    calls = {"n": 0, "settled": False}
+
+    def get_payments(*, status=None):
+        if status != "inflight":
+            return set()
+        calls["n"] += 1
+        if calls["n"] <= inflight_calls:
+            return {bytes.fromhex(k) for k in sm._swaps}
+        if settles:
+            calls["settled"] = True
+        return set()
+
+    def get_payment_status(ph, direction=None):
+        from electrum.invoices import PR_PAID, PR_UNPAID  # type: ignore
+        return PR_PAID if calls["settled"] else PR_UNPAID
+
+    wallet.lnworker.get_payments = get_payments
+    wallet.lnworker.get_payment_status = get_payment_status
+    return wallet, calls
+
+
+def test_a_resolving_main_htlc_no_longer_blocks_failover() -> None:
+    """The fix. The main payment's HTLCs are still live when the gate is first
+    asked and fail back a moment later, so the cascade waits and then does exactly
+    what it exists for -- instead of abandoning every remaining provider."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    wallet, calls = _main_htlc_wallet(sm, inflight_calls=2)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A, B]     # B WAS tried
+    assert p.successes == [B]
+    assert calls["n"] > 2, "the gate never re-asked after the first live reading"
+
+
+def test_a_live_main_htlc_still_blocks_failover_while_it_stays_live() -> None:
+    """The safety property is unchanged. Patience is not permission: a main
+    payment whose HTLCs never resolve within the budget still stops the cascade,
+    because draining this channel again could pay out twice."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=10_000)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]        # B never tried
+    assert p.successes == []
+    assert any("did not resolve in time" in (d.get("reason") or "")
+               for d in p.diags)
+
+
+def test_a_main_payment_that_settles_during_the_wait_stops_the_cascade() -> None:
+    """Waiting must not turn a SETTLED payment into a failover. A main payment
+    that resolves as PR_PAID means the swap is live and only its funding txid is
+    lagging -- the one resolution that is evidence of commitment, not of
+    freedom."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    wallet, calls = _main_htlc_wallet(sm, inflight_calls=2, settles=True)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert calls["settled"], "the test never reached the settled branch"
+    assert [n for n, _amt in sm.attempts] == [A]        # B never tried
+    assert p.successes == []
+
+
+def test_the_main_htlc_wait_is_bounded() -> None:
+    """It must not be able to hold the per-wallet evaluation lock indefinitely on
+    a main payment whose HTLCs never resolve."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    p._htlc_resolve_wait_sec = 0.2
+    p._htlc_poll_interval_sec = 0.01
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=10_000)
+    started = time.monotonic()
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    elapsed = time.monotonic() - started
+    assert 0.2 <= elapsed < 3.0, f"main-HTLC wait took {elapsed:.2f}s"
+
+
+def test_a_swap_that_funds_while_the_main_htlc_is_live_stops_the_cascade() -> None:
+    """The provider funded while we waited. The swap is alive, so the wait exits
+    early rather than sitting out the budget and then failing over into a second
+    drain."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=10_000)
+
+    def _fund_then_report_inflight(*, status=None):
+        if status != "inflight":
+            return set()
+        for swap in sm._swaps.values():
+            swap.funding_txid = "deadbeef"
+        return {bytes.fromhex(k) for k in sm._swaps}
+
+    wallet.lnworker.get_payments = _fund_then_report_inflight
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]
+    assert p.successes == []
+
+
+# --- the gate says WHY ----------------------------------------------------
+# Every COMMITTED verdict is a cascade that ends with providers untried, and
+# before this the gate reached that verdict silently: a live main HTLC, a settled
+# prepayment and a failed lookup were indistinguishable in the log, and telling
+# them apart meant re-reading the source.
+def test_the_failover_verdict_logs_why_it_stopped(caplog) -> None:
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=10_000)
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
+        asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                    transport=_transport([A, B])))
+    text = caplog.text
+    assert "main Lightning payment" in text and "HTLC in flight" in text
+
+
+def test_the_failover_verdict_logs_why_it_cleared(caplog) -> None:
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
+        _run(p, sm, _action(alternates=(B,)), ln_payment="failed")
+    assert "clear to fail over" in caplog.text
+
+
+def test_the_failover_verdict_names_a_settled_payment(caplog) -> None:
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
+        _run(p, sm, _action(alternates=(B,)), ln_payment="paid")
+    assert "has settled" in caplog.text
 
 
 def test_unfunded_swap_with_no_swap_object_stops_the_cascade() -> None:

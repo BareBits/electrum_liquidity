@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
-    LiquidityPlugin, SWAP_FIRST_SEEN_DB_KEY)
+    LiquidityPlugin, SWAP_FIRST_SEEN_DB_KEY, _InflightAttempt)
 
 
 # --- fakes ----------------------------------------------------------------
@@ -148,13 +150,22 @@ def test_start_heartbeat_noop_without_loop() -> None:
 def test_stop_wallet_forgets_all_per_wallet_state() -> None:
     p = _bare_plugin()
     wallet = _FakeWallet()
-    # Populate every per-wallet dict + the managed set. The two task maps get a
-    # cancellable stand-in rather than a marker dict: stop_wallet cancels what it
-    # finds there, which is the behaviour under test for them.
-    task_attrs = ("_heartbeat_tasks", "_trailing_eval_tasks")
+    # Populate every per-wallet dict + the managed set. Most get an inert marker;
+    # the stores stop_wallet actually ACTS on get a usable stand-in instead, since
+    # acting on them is the behaviour under test. The attempt record is stamped
+    # with a deadline already in the past so the shutdown wait has nothing left to
+    # sit through (the waiting itself is covered in test_shutdown_mid_cascade).
+    typed_attrs = {
+        "_heartbeat_tasks": _FakeFuture,
+        "_trailing_eval_tasks": _FakeFuture,
+        "_attempt_done_events": threading.Event,
+        "_inflight_attempt": lambda: _InflightAttempt(
+            short_id="0x0x0", provider_npub="", amount_sat=0,
+            started_at=time.monotonic() - 1.0, deadline=time.monotonic() - 1.0),
+    }
     for attr in LiquidityPlugin._PER_WALLET_STATE_ATTRS:
-        getattr(p, attr)[wallet] = (_FakeFuture() if attr in task_attrs
-                                    else {"marker": True})
+        make = typed_attrs.get(attr)
+        getattr(p, attr)[wallet] = make() if make else {"marker": True}
     p.wallets[wallet] = "lock"
     fut = p._heartbeat_tasks[wallet]
     trailing = p._trailing_eval_tasks[wallet]

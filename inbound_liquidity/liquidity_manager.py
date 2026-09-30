@@ -983,6 +983,32 @@ class ChannelSnapshot:
     # any non-populating caller keep the "manage every channel" behaviour when the
     # scope switch is off (where the flag is irrelevant anyway).
     is_plugin_opened: bool = True
+    # Whether Electrum will refuse to SEND over this channel
+    # (``lnchannel.Channel.is_frozen_for_sending``).
+    #
+    # Draining a channel means sending over it, so this has to be honoured here
+    # rather than left to Electrum -- because Electrum never gets asked. Both drain
+    # paths (a reverse swap's Lightning leg and a liquidity-sink payment) pin the
+    # payment to one channel via ``pay_invoice(channels=[chan])``, and that argument
+    # REPLACES the candidate set inside ``lnworker.create_routes_for_payment`` --
+    # the very list comprehension that applies this filter. Nothing downstream
+    # re-checks (``suggest_payment_splits`` only reads balances and HTLC slots), so
+    # a pinned payment is pushed down a channel unpinned routing would have
+    # excluded, and fails after burning the full payment timeout. Declining is the
+    # only place the refusal still bites.
+    #
+    # Defaults False so the pure tests and any non-populating caller keep prior
+    # behaviour ("nothing is frozen").
+    is_frozen_for_sending: bool = False
+    # WHY Electrum refuses, when it does -- True if the user froze this channel
+    # themselves. Carried separately because ``is_frozen_for_sending`` is not only
+    # about the user's switch: under trampoline routing (no gossip) it is also True
+    # for any channel whose peer does not advertise trampoline forwarding, which
+    # the user did not choose and cannot fix by unfreezing. Telling them "you have
+    # frozen this" when they have not would be a worse failure than saying nothing,
+    # so the two get different decline reasons. Meaningless unless
+    # ``is_frozen_for_sending`` is set.
+    frozen_by_user: bool = False
 
 
 @dataclass(frozen=True)
@@ -2345,6 +2371,32 @@ def _decide_reverse_swaps(
                 kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
                 reason=(f"channel {chan.short_id} over {trigger} trigger but not "
                         f"active (peer offline / not yet OPEN); skipping"),
+            ))
+            continue
+        # Rule: never drain a channel Electrum will not SEND over.
+        #
+        # Draining is sending, so this is a refusal we have to respect -- and one we
+        # have to respect HERE, because Electrum is never asked. Both drain paths
+        # pin the payment with ``pay_invoice(channels=[chan])``, and that argument
+        # REPLACES the candidate set inside ``lnworker.create_routes_for_payment``,
+        # which is exactly where the ``is_frozen_for_sending`` filter sits. A pinned
+        # payment is therefore forced down a channel unpinned routing would have
+        # excluded, where it burns the full payment timeout and fails.
+        #
+        # The two causes get different reasons because only one of them is the
+        # user's doing and only one of them is theirs to undo.
+        if chan.is_frozen_for_sending:
+            reason = (
+                (f"channel {chan.short_id} over {trigger} trigger but you have "
+                 f"frozen it for sending; leaving its outbound untouched")
+                if chan.frozen_by_user else
+                (f"channel {chan.short_id} over {trigger} trigger but Electrum "
+                 f"will not send over it: its peer does not advertise trampoline "
+                 f"routing and channel gossip is off, so no payment can be routed "
+                 f"through this channel at all"))
+            declines.append(DeclineRecord(
+                kind="swap", channel_id=chan.channel_id, short_id=chan.short_id,
+                reason=reason,
             ))
             continue
         # Rule: don't add an HTLC to a channel that still has unsettled HTLCs.

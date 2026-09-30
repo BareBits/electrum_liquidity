@@ -116,12 +116,17 @@ claim fee do not shrink with it. Failures of any other kind (a provider that
 declined, rejected, cheated, or never answered) go straight to the next provider —
 they would answer the same way at any size.
 
-The mining-fee **prepayment** gets special handling, because it is what used to make
-this whole cascade unreachable. Electrum issues it as a separate fire-and-forget
-payment and returns from the swap as soon as the *main* payment finishes, so the
-prepayment's HTLC is usually still live at that moment — and the cascade must never
-fail over while any HTLC for the swap is live. The plugin now *waits* for it
-(bounded), rather than treating "not resolved yet" as "funds may be committed".
+The swap's **HTLCs** get special handling, because they are what used to make this
+whole cascade unreachable. The cascade must never fail over while any HTLC for the
+swap is live — but at the instant Electrum returns from the swap, both of its
+payments usually still have one, for different reasons. The mining-fee
+**prepayment** is issued as a separate fire-and-forget payment that Electrum never
+waits for. The **main payment** gives up on a timeout while the HTLCs it already
+sent are still sitting in the channel, and they stay there until the far end fails
+them back. Reading either as "funds may be committed" ends the cascade on
+essentially every failed swap. The plugin now *waits* for both (bounded), rather
+than treating "not resolved yet" as "committed" — and logs which one it was
+waiting on, and what it decided, so a cascade that stops short says why.
 
 The cascade stops immediately, and never retries, once funds may have moved.
 Electrum's pre-payment checks (cost sanity, the provider's `createswap` reply,
@@ -134,6 +139,49 @@ also ends the cascade rather than burning attempts on a guaranteed repeat.
 Failures are still recorded against the provider's reliability exactly as
 before, so a repeatedly-failing provider sinks in the ranking and stops being
 tried first.
+
+### Quitting while a swap is running
+
+A reverse swap can have a Lightning payment committed for a couple of minutes
+before any on-chain output exists, and quitting in that window used to be silent
+and unmanaged: the evaluation was a background task nobody cancelled or waited
+for, so it carried on starting new providers while Electrum stopped the wallet
+underneath it.
+
+Closing Electrum now goes through a handshake. If an attempt is in flight you get
+a **warning naming the amount, the channel and how long closing will take**, on
+top of Electrum's own swap warning — which cannot see this window, because it only
+covers swaps whose funding transaction already exists. If you go ahead, the plugin
+**stops cascading immediately** (no further provider is tried, and no smaller
+retry is issued), **waits for the one attempt already running** — behind a
+progress window if it takes more than a moment — and then lets Electrum save and
+exit. An attempt already under way is never interrupted: aborting a swap whose
+payment may be in flight is the one thing worth delaying a shutdown for.
+
+Independently of that handshake, a swap is written to the wallet file **the moment
+it is created**, rather than whenever Electrum next happens to save. That matters
+because the record holds the key and preimage needed to ever claim the swap's
+on-chain output, and it is what protects the cases no handshake can reach — a
+crash, a kill, or a headless daemon, none of which give the plugin a chance to
+run.
+
+### Channels Electrum will not send over
+
+Draining a channel means *sending* over it, so the plugin never drains a channel
+you have **frozen for sending** in Electrum's own Channels tab. This has to be
+enforced by the plugin rather than left to Electrum: both drain paths pin the
+payment to the channel being drained (`pay_invoice(channels=[chan])`), and that
+argument *replaces* Electrum's candidate list — the very list its own
+frozen-for-sending filter builds. A pinned payment would therefore be forced down
+a channel Electrum would otherwise have excluded, and would simply burn the 120s
+payment timeout.
+
+The same check catches a case that is not your doing at all. With channel gossip
+off (the default for Electrum-to-Electrum channels), Electrum also refuses to send
+over any channel whose peer does not advertise **trampoline routing** — so such a
+channel can never be drained, however much outbound it holds. The plugin reports
+that as its own distinct reason rather than claiming you froze it, because it is
+not something unfreezing would fix.
 
 By default the plugin manages **only the channels it opened itself**
 (`manage_plugin_opened_only`, on the Settings tab, is on out of the box), so a

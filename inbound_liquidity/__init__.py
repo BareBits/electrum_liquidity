@@ -16,6 +16,7 @@ import math
 import os
 import pkgutil
 import sys
+import threading
 import time
 from concurrent import futures
 from contextlib import asynccontextmanager
@@ -260,37 +261,52 @@ SWAP_UNREACHABLE_REASON = "not reachable (init timeout)"
 # see ``_ln_failure_attribution``.
 PEER_LN_FAILURE_REASON = "reverse-swap Lightning payment failed at this peer (first hop)"
 
-# How long to keep waiting for a reverse swap's mining-fee PREPAYMENT to resolve
-# once its main payment has finished, before giving up on knowing the answer.
+# How long to keep waiting for a reverse swap's HTLCs -- the main payment AND the
+# mining-fee prepayment -- to resolve once ``reverse_swap`` has returned, before
+# giving up on knowing the answer.
 #
-# This bounded wait is what makes the failover cascade work at all. Electrum's
-# reverse_swap fires the prepayment with ``asyncio.ensure_future`` and then races
-# only the MAIN payment against funding detection, so it returns the instant the
-# main payment finishes -- typically a few seconds before the prepayment's own
-# HTLC resolves. The failover gate must not fail over while any HTLC for the swap
-# is live (``_unfunded_swap_outcome``), so asking the question at that exact
-# moment reliably answered "something may be committed" and the cascade stopped
-# every time. Observed live on mainnet: main payment gave up at 16:45:27 after 29
-# route attempts, prepayment MPP_TIMEOUTed at 16:45:30, and two ranked failover
-# providers were never tried.
+# This bounded wait is what makes the failover cascade work at all. The failover
+# gate must not fail over while any HTLC for the swap is live
+# (``_unfunded_swap_outcome``), so asking that question at the exact instant
+# ``reverse_swap`` returns reliably answered "something may be committed" and the
+# cascade stopped every time. Waiting is the fix rather than ignoring the HTLCs,
+# because the safety property is worth keeping exactly as it was: we still never
+# fail over with a live HTLC, we just stop mistaking "not resolved yet" for "may
+# be committed".
 #
-# Waiting is the fix rather than ignoring the prepayment, because the safety
-# property is worth keeping exactly as it was: we still never fail over with a
-# live HTLC, we just stop mistaking "not resolved yet" for "may be committed".
+# It covers BOTH legs because both lose the same race, for different reasons:
 #
-# Sized off the thing we are waiting for. The provider only fulfils the prepayment
-# once the main payment's MPP set also arrives, so a failed main payment dooms the
-# prepayment -- it dies at the provider's MPP expiry (LNWallet.MPP_EXPIRY = 120s
-# from the first HTLC of the set). Both legs start together and both are bounded
-# at ~120s, so in the common case this wait is a few seconds. The case it has to
-# cover is a main payment that fails IMMEDIATELY for want of a route, leaving the
-# prepayment its full expiry to run. Referenced via
-# ``self._prepay_resolve_wait_sec`` so tests can shrink it.
-PREPAY_RESOLVE_WAIT_SEC = 150.0
+# * The PREPAYMENT, because ``reverse_swap`` fires it with
+#   ``asyncio.ensure_future`` and then races only the MAIN payment against funding
+#   detection -- so it returns while the prepayment's HTLC is typically still
+#   live. Observed live on mainnet: main payment gave up at 16:45:27 after 29
+#   route attempts, prepayment MPP_TIMEOUTed at 16:45:30, and two ranked failover
+#   providers were never tried.
+#
+# * The MAIN payment, because ``pay_to_node`` raises PaymentFailure the moment it
+#   passes LNWallet.PAYMENT_TIMEOUT (120s) or runs out of attempts, and its
+#   ``finally`` deliberately leaves the paysession alive while HTLCs are
+#   unresolved -- so the HTLCs it already sent are still in the channel, and
+#   ``get_payments(status='inflight')`` (which reads live channel state) still
+#   names them, for as long as it takes the far end to fail them back. On an
+#   MPP_TIMEOUT that is up to the receiver's MPP expiry. Observed live: two rungs
+#   failed identically ~126s apart, the first was read as "payment failed, nothing
+#   committed" and the second -- losing the same race by a second or two -- as
+#   "may have committed funds", ending the cascade with four ranked providers
+#   untried. Giving the main leg the same patience the prepayment already had is
+#   what closes that gap.
+#
+# Sized off the thing we are waiting for. Both legs die at an MPP expiry
+# (LNWallet.MPP_EXPIRY = 120s from the first HTLC of the set) and both start
+# together, so in the common case this wait is a few seconds. The case it has to
+# cover is one leg failing IMMEDIATELY for want of a route, leaving the other its
+# full expiry to run. Referenced via ``self._htlc_resolve_wait_sec`` so tests can
+# shrink it.
+SWAP_HTLC_RESOLVE_WAIT_SEC = 150.0
 
 # How often to re-ask while waiting above. Cheap (a set membership test against
 # lnworker's in-flight payments), so this is about responsiveness, not load.
-PREPAY_POLL_INTERVAL_SEC = 0.5
+SWAP_HTLC_POLL_INTERVAL_SEC = 0.5
 
 
 # Attempts one provider may consume: the planned amount, then at most one reduced
@@ -302,7 +318,7 @@ _SWAP_RUNGS_PER_PROVIDER = 2
 
 def swap_cascade_deadline_sec(attempts: int,
                               *, reverse_swap_timeout_sec: float = REVERSE_SWAP_TIMEOUT_SEC,
-                              prepay_wait_sec: float = PREPAY_RESOLVE_WAIT_SEC,
+                              htlc_wait_sec: float = SWAP_HTLC_RESOLVE_WAIT_SEC,
                               init_timeout_sec: float = SWAP_INIT_TIMEOUT_SEC) -> float:
     """Wall-clock ceiling on one channel's whole provider cascade, for a cascade
     that plans ``attempts`` providers.
@@ -325,15 +341,19 @@ def swap_cascade_deadline_sec(attempts: int,
     Per-rung cost is everything a rung can spend that is not already inside
     something else's timeout: the wait for the provider's terms
     (``SWAP_INIT_TIMEOUT_SEC``, which precedes the swap call), the swap backstop
-    itself, and the prepayment wait (which happens after ``sm.reverse_swap`` has
-    returned and is therefore outside its timeout). Two rungs per provider: the
-    full-size attempt and its one reduced retry (see SWAP_REDUCTION_FACTOR).
+    itself, and the HTLC-resolution wait (which happens after ``sm.reverse_swap``
+    has returned and is therefore outside its timeout). Two rungs per provider:
+    the full-size attempt and its one reduced retry (see SWAP_REDUCTION_FACTOR).
 
     Because that sum bounds what a rung can actually consume, a cascade whose rungs
     all behave cannot exhaust this budget -- which is the point. The deadline exists
     for the time nobody budgeted for: transport setup, waiter reaping, a coroutine
     that overshoots its own backstop. It is a backstop on a backstop, not the
     ordinary bound.
+
+    A shutdown stops the cascade between rungs rather than waiting this out --
+    see ``_shutting_down``. The budget is unchanged by that: it still has to
+    reach the last rung on a wallet nobody is closing.
 
     The cost of having no ceiling here is real and accepted knowingly: on a wallet
     with many discovered providers, a channel where every provider fails can hold
@@ -345,7 +365,7 @@ def swap_cascade_deadline_sec(attempts: int,
     rather than silent.
     """
     rungs = max(1, int(attempts)) * _SWAP_RUNGS_PER_PROVIDER
-    return rungs * (init_timeout_sec + reverse_swap_timeout_sec + prepay_wait_sec)
+    return rungs * (init_timeout_sec + reverse_swap_timeout_sec + htlc_wait_sec)
 
 # --- liquidity sink timing ------------------------------------------------
 # Coarse backstop on ONE sink payment. Electrum gives up on a payment of its own
@@ -425,11 +445,13 @@ class _SwapAttempt(Enum):
     # retry before we move on. Every other NEXT arm would fail identically at any
     # size, so only this one returns it.
     PAYMENT_FAILED = auto()
-    # Internal to the failover gate, never returned by an attempt: the only HTLC
-    # still live is the mining-fee prepayment, so the answer is not yet knowable.
-    # ``_unfunded_swap_outcome`` resolves it into one of the others by waiting
-    # (see PREPAY_RESOLVE_WAIT_SEC); it must never reach the cascade loop.
-    PREPAY_PENDING = auto()
+    # Internal to the failover gate, never returned by an attempt: an HTLC for
+    # this swap (the main payment, the mining-fee prepayment, or both) is still
+    # live, so the answer is not yet knowable -- UNDECIDED, which is emphatically
+    # not the same as committed. ``_unfunded_swap_outcome`` resolves it into one
+    # of the others by waiting (see SWAP_HTLC_RESOLVE_WAIT_SEC); it must never
+    # reach the cascade loop.
+    HTLC_PENDING = auto()
 
 
 # Who a failed reverse-swap Lightning payment is evidence against, decided from
@@ -508,6 +530,39 @@ class _CascadeFaults:
     def is_common_mode(self) -> bool:
         """Whether the evidence points at our transport rather than at providers."""
         return not self.reached_init and len(self.init_timeouts) >= 2
+
+
+@dataclasses.dataclass(frozen=True)
+class _InflightAttempt:
+    """The one reverse-swap attempt running for a wallet right now.
+
+    Published by the executor purely so that code on OTHER threads can see it:
+    Electrum's closing-warning callback and the shutdown wait both run on the
+    GUI thread while the attempt itself runs on the asyncio loop. Frozen, and
+    only ever swapped in or deleted whole, so a reader can never observe a
+    half-updated record without taking a lock.
+
+    ``deadline`` is monotonic and is the attempt's own worst case (its
+    ``REVERSE_SWAP_TIMEOUT_SEC`` backstop plus the HTLC-resolution wait that
+    follows it). The shutdown wait uses it to show a remaining time and to know
+    when waiting further is pointless.
+    """
+    short_id: str
+    provider_npub: str
+    amount_sat: int
+    started_at: float           # time.monotonic()
+    deadline: float             # time.monotonic()
+
+    def remaining_sec(self, now: Optional[float] = None) -> float:
+        """Seconds left before this attempt's own backstops must have fired.
+        Never negative -- an overshoot reads as "no time left", not as a
+        negative countdown in the GUI."""
+        now = time.monotonic() if now is None else now
+        return max(0.0, self.deadline - now)
+
+    def elapsed_sec(self, now: Optional[float] = None) -> float:
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - self.started_at)
 
 
 # What one liquidity-sink payment attempt concluded, and hence what the ladder
@@ -1465,16 +1520,31 @@ class LiquidityPlugin(BasePlugin):
         # Per-provider wait for advertised terms to arrive, as an instance
         # attribute so tests can shrink it (the module constant is the default).
         self._swap_init_timeout_sec: float = SWAP_INIT_TIMEOUT_SEC
-        # Bounded wait for a swap's mining-fee prepayment to resolve before the
-        # failover gate decides. Instance attribute so tests can shrink it -- the
-        # production default is ~2.5 minutes and no test should sit through it.
-        self._prepay_resolve_wait_sec: float = PREPAY_RESOLVE_WAIT_SEC
-        self._prepay_poll_interval_sec: float = PREPAY_POLL_INTERVAL_SEC
+        # Bounded wait for a swap's HTLCs (main payment and mining-fee
+        # prepayment) to resolve before the failover gate decides. Instance
+        # attribute so tests can shrink it -- the production default is ~2.5
+        # minutes and no test should sit through it.
+        self._htlc_resolve_wait_sec: float = SWAP_HTLC_RESOLVE_WAIT_SEC
+        self._htlc_poll_interval_sec: float = SWAP_HTLC_POLL_INTERVAL_SEC
         self._sink_payment_timeout_sec: float = SINK_PAYMENT_TIMEOUT_SEC
         # wallet -> payment_hash hexes of stuck swaps we have already logged as
         # having aged out of the freeze, so the escape is logged once per swap (not
         # every tick) while it stays pending. Pruned against the live pending set.
         self._swap_freeze_escaped_logged: Dict['Abstract_Wallet', set] = {}
+        # --- shutdown coordination (see stop_wallet / _shutting_down) ---------
+        # Wallets whose teardown has begun. The cascade reads this between rungs
+        # and between providers so a quit never STARTS new work, while an attempt
+        # already under way is never interrupted.
+        self._stopping: Set['Abstract_Wallet'] = set()
+        # wallet -> the reverse-swap attempt running right now, or absent. Read
+        # from the GUI thread by the closing-warning callback and by the
+        # shutdown wait, so it is only ever assigned/deleted whole -- never
+        # mutated in place.
+        self._inflight_attempt: Dict['Abstract_Wallet', '_InflightAttempt'] = {}
+        # Set whenever an attempt finishes, so the shutdown wait -- which runs on
+        # the GUI thread, not the asyncio loop -- can block on something cheap
+        # rather than spin. Recreated per wallet on first use.
+        self._attempt_done_events: Dict['Abstract_Wallet', threading.Event] = {}
         # wallet -> the running heartbeat task (a concurrent.futures.Future from
         # run_coroutine_threadsafe), so we can cancel it in stop_wallet and never
         # leave a periodic loop running for a wallet we no longer manage.
@@ -1536,6 +1606,11 @@ class LiquidityPlugin(BasePlugin):
         # it is smaller, so the plugin can open sub-stock channels from startup.
         self._enforce_min_funding_floor()
         self._install_close_hooks(wallet, wallet.lnworker)
+        # This wallet is live again, so retract any shutdown flag left over from a
+        # previous close (see _forget_wallet, which deliberately leaves it set).
+        stopping = getattr(self, "_stopping", None)
+        if isinstance(stopping, set):
+            stopping.discard(wallet)
         self.wallets.setdefault(wallet, asyncio.Lock())
         self._started_at[wallet] = time.time()
         self._peer_seen_online.setdefault(wallet, set())
@@ -1657,6 +1732,7 @@ class LiquidityPlugin(BasePlugin):
         "_heartbeat_tasks",
         "_last_eval_at", "_auto_eval_interval", "_last_state_sig",
         "_trailing_eval_tasks",
+        "_inflight_attempt", "_attempt_done_events",
     )
 
     def _forget_wallet(self, wallet: 'Abstract_Wallet') -> None:
@@ -1667,9 +1743,175 @@ class LiquidityPlugin(BasePlugin):
             store = getattr(self, attr_name, None)
             if isinstance(store, dict):
                 store.pop(wallet, None)
+        # NB: `_stopping` is deliberately NOT cleared here. An evaluation task can
+        # still be mid-cascade at this point -- teardown only waited out the one
+        # ATTEMPT, not the whole cascade -- and clearing the flag would let its
+        # next between-providers check read "not stopping" and start another
+        # provider on a wallet we have just finished dismantling. It is cleared in
+        # start_wallet instead, i.e. when the wallet is genuinely live again.
+
+    # --- shutdown coordination -------------------------------------------
+    # Electrum tears a wallet down from the GUI thread: closeEvent -> clean_up()
+    # -> run_hook('close_wallet') -> our stop_wallet() -> daemon.stop_wallet() ->
+    # wallet.stop(), which stops lnworker and writes the wallet file. Our
+    # evaluation, meanwhile, is a bare task on the asyncio loop (see
+    # request_evaluation): nothing cancels it and nothing waits for it, so before
+    # this it simply carried on against a wallet being dismantled underneath it.
+    #
+    # The contract now is: stop cascading immediately, let the ONE attempt already
+    # under way finish, then save and exit. Interrupting an attempt whose
+    # Lightning payment may be in flight is the one thing we must never do -- it
+    # is the same rule the failover gate enforces, applied to shutdown.
+    #
+    # LIMIT, stated because it bounds what the rest of this can promise: the only
+    # thing that fires our stop_wallet before Electrum writes the wallet file is
+    # the Qt `close_wallet` hook, which `main_window.clean_up()` runs. A HEADLESS
+    # daemon has no equivalent -- `daemon.stop()` awaits `wallet.stop()` first and
+    # only stops plugins afterwards -- and a crash or SIGKILL has no handshake at
+    # all. Those cases get no handshake, which is exactly why the durability half
+    # does not depend on one: `_flush_new_swaps` writes the wallet file the moment
+    # a swap object exists, so the secrets needed to claim its funding output are
+    # already on disk however the process ends.
+
+    def _shutting_down(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether this wallet's teardown has begun. Read between rungs and
+        between providers, never mid-attempt.
+
+        Tolerant of a partially-built plugin (the glue tests construct one via
+        ``object.__new__``): an absent store answers "not stopping", which is the
+        behaviour every existing test was written against."""
+        stopping = getattr(self, "_stopping", None)
+        return isinstance(stopping, set) and wallet in stopping
+
+    def _note_attempt_started(self, wallet: 'Abstract_Wallet',
+                              attempt: '_InflightAttempt') -> None:
+        """Publish the attempt now running, for the closing-warning callback and
+        the shutdown wait to read from the GUI thread.
+
+        Like ``_set_status``, this only does anything on a fully-constructed
+        plugin: the stores are created in ``__init__``, and the glue harnesses
+        build a plugin via ``object.__new__``. An absent store means nobody is
+        watching for a shutdown, so there is nothing to publish to -- and
+        publishing is bookkeeping that must never be the thing that breaks a
+        swap.
+        """
+        store = getattr(self, "_inflight_attempt", None)
+        if not isinstance(store, dict):
+            return
+        store[wallet] = attempt
+        event = self._attempt_done_event(wallet)
+        if event is not None:
+            event.clear()
+
+    def _note_attempt_finished(self, wallet: 'Abstract_Wallet') -> None:
+        """Retract the published attempt and wake anything waiting on it.
+
+        Always called from a ``finally``: a shutdown that waits on this event
+        must be released by every exit path, including an exception and a
+        cancellation, or the quit would sit out the full budget for nothing."""
+        store = getattr(self, "_inflight_attempt", None)
+        if isinstance(store, dict):
+            store.pop(wallet, None)
+        event = self._attempt_done_event(wallet)
+        if event is not None:
+            event.set()
+
+    def _attempt_done_event(self, wallet: 'Abstract_Wallet') -> Optional[threading.Event]:
+        """The per-wallet "an attempt just finished" event, created on first use.
+        None on a plugin too partially built to have the store at all."""
+        store = getattr(self, "_attempt_done_events", None)
+        if not isinstance(store, dict):
+            return None
+        event = store.get(wallet)
+        if event is None:
+            event = threading.Event()
+            store[wallet] = event
+        return event
+
+    def inflight_swap_attempt(self, wallet: 'Abstract_Wallet') -> Optional['_InflightAttempt']:
+        """The reverse-swap attempt running for ``wallet`` right now, or None.
+
+        Public because the Qt plugin reads it from the GUI thread, both for
+        Electrum's closing warning and for the shutdown wait. A single dict
+        lookup returning a frozen record, so it is safe to call from any thread.
+        """
+        store = getattr(self, "_inflight_attempt", None)
+        if not isinstance(store, dict):
+            return None
+        return store.get(wallet)
+
+    def begin_shutdown(self, wallet: 'Abstract_Wallet') -> Optional['_InflightAttempt']:
+        """Mark ``wallet`` as stopping and report the attempt (if any) that the
+        caller must now wait out.
+
+        Split from the waiting itself so the GUI can decide HOW to wait -- a
+        headless caller blocks, Qt pumps its event loop behind a dialog -- while
+        the "stop cascading now" half is identical everywhere and, crucially,
+        takes effect the instant this returns rather than after the wait.
+        """
+        stopping = getattr(self, "_stopping", None)
+        if not isinstance(stopping, set):
+            stopping = set()
+            self._stopping = stopping
+        stopping.add(wallet)
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is not None:
+            self.logger.info(
+                f"shutdown requested while a reverse swap with "
+                f"{attempt.provider_npub[:12] or 'the configured provider'}… is in "
+                f"flight on {attempt.short_id}; no further providers will be "
+                f"tried, waiting up to {attempt.remaining_sec():.0f}s for this "
+                f"attempt to finish before closing")
+        return attempt
+
+    def wait_for_swap_attempt(self, wallet: 'Abstract_Wallet',
+                              timeout: Optional[float] = None) -> bool:
+        """Block until the in-flight attempt for ``wallet`` finishes, or until
+        ``timeout``. Returns True if it finished.
+
+        Called from the thread that is closing the wallet -- NOT the asyncio loop
+        -- so it blocks on a ``threading.Event`` the executor sets. ``timeout``
+        defaults to whatever the attempt itself has left to run; expiry is not an
+        error, it just means we save and exit anyway (the attempt's own backstops
+        still bound it, and the pending-swap record it will write is reconciled on
+        the next load).
+        """
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is None:
+            return True
+        if timeout is None:
+            timeout = attempt.remaining_sec()
+        event = self._attempt_done_event(wallet)
+        if event is None:
+            return False
+        finished = event.wait(max(0.0, float(timeout)))
+        self.log_shutdown_wait_outcome(attempt, finished, float(timeout))
+        return finished
+
+    def log_shutdown_wait_outcome(self, attempt: '_InflightAttempt',
+                                  finished: bool, budget: float) -> None:
+        """Report how the shutdown wait ended. Shared so the Qt override, which
+        drives its own polling loop to keep the window responsive, says exactly
+        the same things as the headless path."""
+        if finished:
+            self.logger.info(
+                f"the in-flight reverse swap on {attempt.short_id} finished after "
+                f"{attempt.elapsed_sec():.0f}s; closing")
+        else:
+            self.logger.warning(
+                f"the reverse swap on {attempt.short_id} did not finish within "
+                f"{budget:.0f}s; closing anyway (its outcome will be reconciled "
+                f"when this wallet is next opened)")
 
     def stop_wallet(self, wallet: 'Abstract_Wallet') -> None:
-        # Remove from the managed set first so the heartbeat loop sees it gone and
+        # Stop cascading FIRST, before anything else is torn down, so that the
+        # window between "the user confirmed the quit" and "we are gone" cannot
+        # start another provider. Then wait out whatever attempt was already
+        # running: `_await_shutdown` is the hook Qt overrides to keep the window
+        # responsive (the base one simply blocks).
+        self.begin_shutdown(wallet)
+        self._await_shutdown(wallet)
+        # Remove from the managed set so the heartbeat loop sees it gone and
         # exits, then cancel it outright so we don't wait out a whole interval.
         self.wallets.pop(wallet, None)
         hb = self._heartbeat_tasks.get(wallet)
@@ -1681,6 +1923,12 @@ class LiquidityPlugin(BasePlugin):
         # this cancel may have to cross threads. See _cancel_trailing_evaluation.)
         self._cancel_trailing_evaluation(wallet)
         self._forget_wallet(wallet)
+
+    def _await_shutdown(self, wallet: 'Abstract_Wallet') -> None:
+        """Wait out the in-flight attempt during teardown. Overridden in qt.py to
+        show a dialog; here it is a plain bounded block, which is right for
+        headless/cmdline where there is no window to keep responsive."""
+        self.wait_for_swap_attempt(wallet)
 
     def _per_wallet_store(self, name: str) -> dict:
         """The named per-wallet dict, created on first use if it is missing.
@@ -4236,6 +4484,57 @@ class LiquidityPlugin(BasePlugin):
         return count
 
     @staticmethod
+    def _chan_frozen_for_sending(chan) -> bool:
+        """Whether Electrum will refuse to SEND over this channel.
+
+        Read here rather than relied on downstream, because downstream never sees
+        it. Both drain paths pin their payment with
+        ``pay_invoice(channels=[chan])``, and that argument *replaces* the
+        candidate set in ``lnworker.create_routes_for_payment`` -- the very list
+        comprehension that applies this filter. A pinned payment is therefore
+        pushed down a channel unpinned routing would have excluded, and nothing
+        else re-checks (``suggest_payment_splits`` only reads balances and HTLC
+        slots). So the engine has to refuse it, and this is where it finds out.
+
+        Note this is broader than the user's freeze switch. Under trampoline
+        routing, ``Channel.is_frozen_for_sending`` also returns True for any peer
+        that does not advertise trampoline forwarding::
+
+            if self.lnworker.uses_trampoline() and not self.lnworker.is_trampoline_peer(self.node_id):
+                return True
+            return self.storage.get('frozen_for_sending', False)
+
+        That case is not the user's doing, which is why ``_chan_frozen_by_user``
+        exists to tell them apart for the decline message. It is not redundant with
+        the ``is_active`` gate either: ``is_active`` is OPEN + PeerState.GOOD, so a
+        peer that is connected and healthy but simply has no trampoline support
+        passes that gate and fails this one.
+
+        Defensive: a channel object that cannot answer reads as NOT frozen, which
+        keeps behaviour identical to before this flag existed rather than silently
+        refusing every channel on an upstream rename.
+        """
+        try:
+            return bool(chan.is_frozen_for_sending())
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _chan_frozen_by_user(chan) -> bool:
+        """Whether the user set the send-freeze themselves, as opposed to Electrum
+        refusing for its own reasons (see ``_chan_frozen_for_sending``).
+
+        Reads the stored flag directly because that is the only place the
+        distinction survives -- ``is_frozen_for_sending()`` has already folded the
+        two causes into one bool by the time it returns. Purely for wording a
+        decline honestly; nothing gates on it.
+        """
+        try:
+            return bool(chan.storage.get('frozen_for_sending', False))
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
     def _channel_sendable_sat(lnworker, chan) -> int:
         """How much of ``chan``'s local balance Electrum can actually *send*.
 
@@ -4457,6 +4756,8 @@ class LiquidityPlugin(BasePlugin):
                 has_unsettled_htlcs=has_unsettled,
                 unsettled_is_swap=unsettled_is_swap,
                 is_plugin_opened=chan.channel_id.hex() in plugin_opened,
+                is_frozen_for_sending=self._chan_frozen_for_sending(chan),
+                frozen_by_user=self._chan_frozen_by_user(chan),
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
@@ -5332,6 +5633,16 @@ class LiquidityPlugin(BasePlugin):
         """
         from contextlib import nullcontext
         sm = wallet.lnworker.swap_manager
+        # Nothing starts on a wallet that is closing. Checked here, ahead of the
+        # cooldown, precisely so the cooldown is not armed: `_swap_cooldown_until`
+        # is keyed by CHANNEL and survives a wallet reload within the same
+        # process, so arming it for a cascade that then did nothing would make a
+        # reopened wallet skip that channel for no reason.
+        if self._shutting_down(wallet):
+            self.logger.info(
+                f"wallet is closing; not starting a swap cascade for "
+                f"{action.short_id}")
+            return
         # Cooldown: don't re-attempt a channel we just acted on.
         now = time.monotonic()
         until = self._swap_cooldown_until.get(action.channel_id, 0.0)
@@ -5349,7 +5660,7 @@ class LiquidityPlugin(BasePlugin):
         # number is no longer a constant -- see swap_cascade_deadline_sec.
         budget = swap_cascade_deadline_sec(
             total, reverse_swap_timeout_sec=self._reverse_swap_timeout_sec,
-            prepay_wait_sec=self._prepay_resolve_wait_sec,
+            htlc_wait_sec=self._htlc_resolve_wait_sec,
             init_timeout_sec=self._swap_init_timeout_sec)
         self.logger.info(
             f"reverse swap for {action.short_id}: {total} provider(s) to try "
@@ -5392,10 +5703,17 @@ class LiquidityPlugin(BasePlugin):
         provider that declined, rejected, cheated or never answered would fail the
         same way at any size, and a smaller swap is if anything *less* attractive to
         it. Those arms go straight to the next provider.
+
+        A shutdown ends the walk at the next rung boundary -- see
+        ``_shutting_down``. Checked in both loops rather than only the outer one,
+        because a reduced retry is every bit as much "starting a new Lightning
+        payment on a wallet that is closing" as the next provider is.
         """
         sm = wallet.lnworker.swap_manager
         async with session as tr:
             for index, (attempt, offer) in enumerate(attempts, start=1):
+                if self._stop_cascade_for_shutdown(wallet, action, total - index + 1):
+                    break
                 if time.monotonic() >= deadline:
                     remaining = total - index + 1
                     self.logger.warning(
@@ -5416,7 +5734,16 @@ class LiquidityPlugin(BasePlugin):
                 payment_failed = False
                 for rung, (rung_amount, rung_cost) in enumerate(rungs, start=1):
                     is_last_rung = rung == len(rungs)
-                    outcome = await self._attempt_reverse_swap(
+                    if rung > 1 and self._stop_cascade_for_shutdown(
+                            wallet, action, total - index + 1):
+                        # ``stop`` ends the outer loop directly rather than letting
+                        # it re-check, so shutdown is logged exactly once however
+                        # deep in the walk it lands. The provider is still charged
+                        # below for the rung that DID fail -- that evidence is real
+                        # and has nothing to do with us closing.
+                        stop = True
+                        break
+                    outcome = await self._run_attempt_tracked(
                         wallet, action, attempt, offer, sm, tr, state,
                         index=index, total=total, faults=faults,
                         amount_sat=rung_amount, all_in_cost_pct=rung_cost)
@@ -5448,6 +5775,81 @@ class LiquidityPlugin(BasePlugin):
                     self.logger.info(
                         f"failing over to the next provider for {action.short_id} "
                         f"({index + 1} of {total})")
+
+    async def _run_attempt_tracked(self, wallet: 'Abstract_Wallet',
+                                   action: ReverseSwapAction,
+                                   attempt: ProviderAttempt,
+                                   offer: Optional['SwapOffer'],
+                                   sm: Any, tr: Any, state: Optional[Dict],
+                                   *, index: int, total: int,
+                                   faults: Optional['_CascadeFaults'] = None,
+                                   amount_sat: Optional[int] = None,
+                                   all_in_cost_pct: Optional[float] = None,
+                                   ) -> '_SwapAttempt':
+        """Run one rung with its existence published for other threads to see.
+
+        A thin wrapper rather than something inside ``_attempt_reverse_swap``
+        because the publication has to span the WHOLE rung -- including the
+        HTLC-resolution wait that follows ``sm.reverse_swap`` -- and that method
+        returns from a dozen places. Keeping it out here also leaves the attempt
+        itself callable directly, which is how most of the glue tests drive it.
+
+        The deadline published is the rung's own worst case: its
+        ``REVERSE_SWAP_TIMEOUT_SEC`` backstop plus the HTLC wait that can follow
+        it. That is what a shutdown is asked to sit through, so it is what the
+        shutdown wait counts down.
+
+        The ORDERING this creates is the point of the whole handshake, so it is
+        worth naming: everything fund-critical about a rung is persisted *inside*
+        the attempt -- ``_flush_new_swaps`` in ``_call_reverse_swap``'s finally,
+        then ``_track_new_swaps`` -- and only then does the finally below release
+        the shutdown wait. So by the time teardown resumes and Electrum writes the
+        wallet file, the swap's claim secrets and its tracking record are already
+        on disk. What follows the release (a reliability fault, the cascade
+        unwind) is ranking bookkeeping: losing it to a race costs a demotion, not
+        funds.
+        """
+        published = _InflightAttempt(
+            short_id=action.short_id,
+            provider_npub=attempt.npub or "",
+            amount_sat=int(amount_sat if amount_sat is not None else attempt.amount_sat),
+            started_at=time.monotonic(),
+            deadline=(time.monotonic() + float(self._reverse_swap_timeout_sec)
+                      + float(self._htlc_resolve_wait_sec)))
+        self._note_attempt_started(wallet, published)
+        try:
+            return await self._attempt_reverse_swap(
+                wallet, action, attempt, offer, sm, tr, state,
+                index=index, total=total, faults=faults,
+                amount_sat=amount_sat, all_in_cost_pct=all_in_cost_pct)
+        finally:
+            # Every exit path, including a cancellation: a shutdown blocked on this
+            # must be released or the quit would sit out the full budget for
+            # nothing.
+            self._note_attempt_finished(wallet)
+
+    def _stop_cascade_for_shutdown(self, wallet: 'Abstract_Wallet',
+                                   action: ReverseSwapAction,
+                                   untried: int) -> bool:
+        """Whether the cascade must stop here because the wallet is closing, and
+        say so if it must.
+
+        Deliberately a *decline* rather than a silent break: from the user's side
+        this is "I asked it to drain a channel and then quit, and it didn't
+        finish", which is exactly the question the decline log exists to answer.
+        Nobody is faulted -- a provider we never tried has done nothing wrong, and
+        the one we did try is judged on its own outcome.
+        """
+        if not self._shutting_down(wallet):
+            return False
+        self.logger.info(
+            f"wallet is closing; stopping the swap cascade for {action.short_id} "
+            f"with {untried} provider(s) untried")
+        self._diag_event(
+            wallet, category="lifecycle", kind="swap",
+            reason="swap cascade stopped for shutdown",
+            detail=f"{untried} provider(s) untried on {action.short_id}")
+        return True
 
     def _charge_payment_failure(self, wallet: 'Abstract_Wallet',
                                 action: ReverseSwapAction, npub: str) -> None:
@@ -5678,7 +6080,7 @@ class LiquidityPlugin(BasePlugin):
             # path -- see _call_reverse_swap. A timeout surfaces here as
             # asyncio.TimeoutError, handled below like any unresponsive provider.
             funding_txid = await self._call_reverse_swap(
-                sm, reverse_swap_kwargs, swaps_before)
+                sm, reverse_swap_kwargs, swaps_before, wallet)
         except UserFacingException as e:
             # e.g. the provider deems the swap uneconomical for this amount.
             # This is a legitimate response, NOT a reliability fault. It is raised
@@ -5897,9 +6299,11 @@ class LiquidityPlugin(BasePlugin):
         return _SwapAttempt.COMMITTED
 
     async def _call_reverse_swap(self, sm, kwargs: Dict[str, Any],
-                                 swaps_before: Set[str]) -> Optional[str]:
+                                 swaps_before: Set[str],
+                                 wallet: Optional['Abstract_Wallet'] = None,
+                                 ) -> Optional[str]:
         """Run ``sm.reverse_swap`` under the coarse timeout, then clean up the
-        funding waiter Electrum leaves behind.
+        funding waiter Electrum leaves behind and make the new swap durable.
 
         Bounded so no single swap can hold the per-wallet evaluation lock
         indefinitely. The precise hang (a provider that never answers the
@@ -5908,10 +6312,11 @@ class LiquidityPlugin(BasePlugin):
         REVERSE_SWAP_TIMEOUT_SEC). A timeout surfaces as asyncio.TimeoutError,
         handled by the caller like any unresponsive provider.
 
-        The reap runs in a ``finally`` so it covers every exit: a normal return,
-        any of the provider-failure exceptions, and the timeout -- which needs it
-        most, because ``asyncio.wait_for`` cancelling ``reverse_swap`` does NOT
-        cancel the tasks it left running inside its own ``asyncio.wait``.
+        Both the reap and the flush run in a ``finally`` so they cover every exit:
+        a normal return, any of the provider-failure exceptions, and the timeout
+        -- which needs them most, because ``asyncio.wait_for`` cancelling
+        ``reverse_swap`` does NOT cancel the tasks it left running inside its own
+        ``asyncio.wait``.
         """
         try:
             return await asyncio.wait_for(
@@ -5920,6 +6325,44 @@ class LiquidityPlugin(BasePlugin):
             )
         finally:
             self._reap_funding_waiters(sm, swaps_before)
+            if wallet is not None:
+                self._flush_new_swaps(wallet, sm, swaps_before)
+
+    def _flush_new_swaps(self, wallet: 'Abstract_Wallet', sm,
+                         swaps_before: Set[str]) -> bool:
+        """Write the wallet file if this call created a swap. Returns whether it
+        did (for tests).
+
+        ``add_reverse_swap`` stores the swap -- its privkey, preimage and redeem
+        script, i.e. everything needed to ever claim the on-chain output -- into
+        the ``submarine_swaps`` StoredDict. A StoredDict only reaches disk on an
+        explicit ``db.write()``, and the last one Electrum performs is inside
+        ``wallet.stop()``. So a swap created after that point exists only in
+        memory, and a process that ends there loses the ability to claim its
+        funding output for good.
+
+        The shutdown handshake makes that window small (teardown waits out the
+        attempt already running, so in practice the swap is written by the
+        pending-swap tracking that follows it), but "small" is not the same as
+        "closed" -- a crash, an OOM kill or a Ctrl-C has no handshake at all. A
+        db write costs nothing next to a swap, so it is done here, at the earliest
+        moment we can prove a swap object exists.
+
+        Best-effort like every other persistence path in this file: a failure to
+        write must never be able to sink the swap it is trying to protect.
+        """
+        try:
+            if not (set(getattr(sm, "_swaps", {}) or {}) - swaps_before):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            wallet.save_db()
+        except Exception as e:  # noqa: BLE001
+            self.logger.error(
+                f"could not flush the wallet file after creating a swap: {e!r}")
+            return False
+        return True
 
     def _reap_funding_waiters(self, sm, swaps_before: Set[str]) -> int:
         """Cancel the ``wait_for_funding`` task Electrum orphans for each swap we
@@ -6045,17 +6488,27 @@ class LiquidityPlugin(BasePlugin):
         nothing sits in ``inflight_payments`` AND nothing has settled -- see
         :meth:`_unfunded_swap_verdict`, which is that rule with no waiting in it.
 
-        What this coroutine adds is patience. ``reverse_swap`` races ONLY the main
-        payment against funding detection (the prepayment is fired with
-        ``asyncio.ensure_future`` and never awaited), so it returns while the
-        prepayment's HTLC is typically still live -- and the rule above then reads
-        that as "may be committed" and stops the cascade. That is not a rare race:
-        it is what happens on essentially every failed swap, and it made failover
-        unreachable in practice. So when the ONLY thing standing in the way is a
-        live prepayment, wait for it -- bounded by
-        ``self._prepay_resolve_wait_sec`` -- and answer once it has actually
-        resolved. The safety property is unchanged; we merely stop mistaking
-        "undecided" for "committed".
+        What this coroutine adds is patience, and it is why the cascade works at
+        all. Asked at the instant ``reverse_swap`` returns, that rule reliably
+        answers "something may be committed", because BOTH of the swap's HTLCs are
+        typically still unresolved at exactly that moment:
+
+        * the PREPAYMENT, because ``reverse_swap`` fires it with
+          ``asyncio.ensure_future`` and races only the MAIN payment against funding
+          detection, so it returns without ever looking at the prepayment;
+        * the MAIN payment, because ``pay_to_node`` raises PaymentFailure the
+          moment it passes PAYMENT_TIMEOUT or runs out of attempts, while its
+          ``finally`` deliberately leaves unresolved HTLCs alone -- so what it
+          already sent is still sitting in the channel, and stays there until the
+          far end fails it back.
+
+        Neither is a rare race; both are what happens on essentially every failed
+        swap. So when the only thing in the way is a live HTLC, wait for it --
+        bounded by ``self._htlc_resolve_wait_sec`` -- and answer once it has
+        actually resolved. The safety property is untouched: we still never fail
+        over while an HTLC is live, we merely stop mistaking "undecided" for
+        "committed". A payment that settles during the wait reads as PR_PAID and
+        still stops the cascade, and a swap that funds during it exits early.
 
         Note this deliberately does NOT ask ``_ln_payment_failed``, which is the
         stricter question reconciliation asks when it needs to blame somebody.
@@ -6066,57 +6519,72 @@ class LiquidityPlugin(BasePlugin):
         provider is safe to try; demanding proof of failure would strand exactly
         the case failover is most useful for.
         """
-        verdict = self._unfunded_swap_verdict(wallet, sm, tracked)
-        if verdict is not _SwapAttempt.PREPAY_PENDING:
+        verdict, reason = self._unfunded_swap_verdict(wallet, sm, tracked)
+        if verdict is not _SwapAttempt.HTLC_PENDING:
+            self._log_failover_verdict(verdict, reason)
             return verdict
-        return await self._await_prepay_resolution(wallet, sm, tracked)
+        return await self._await_htlc_resolution(wallet, sm, tracked, reason)
 
-    async def _await_prepay_resolution(self, wallet: 'Abstract_Wallet', sm,
-                                       tracked: Set[str]) -> '_SwapAttempt':
-        """Poll until a swap's mining-fee prepayment stops being in flight, then
-        re-ask :meth:`_unfunded_swap_verdict`. Bounded; COMMITTED on expiry.
+    def _log_failover_verdict(self, verdict: '_SwapAttempt', reason: str) -> None:
+        """Say why the failover gate answered as it did.
+
+        Every COMMITTED is a cascade that ends with providers untried, so "why"
+        is the single most useful thing the log can carry when a drain does not
+        happen -- and before this it carried nothing at all: the gate returned
+        COMMITTED silently and the only way to tell a live main HTLC from a
+        settled prepayment from a failed lookup was to re-read the source.
+        """
+        if verdict is _SwapAttempt.COMMITTED:
+            self.logger.info(f"failover gate: not failing over -- {reason}")
+        else:
+            self.logger.info(f"failover gate: clear to fail over -- {reason}")
+
+    async def _await_htlc_resolution(self, wallet: 'Abstract_Wallet', sm,
+                                     tracked: Set[str],
+                                     reason: str) -> '_SwapAttempt':
+        """Poll until this swap's HTLCs stop being in flight, then re-ask
+        :meth:`_unfunded_swap_verdict`. Bounded; COMMITTED on expiry.
 
         Exits early on a funding txid: if the provider funded while we waited, the
         swap is alive and this channel is emphatically not free, so there is no
-        point waiting out the prepayment.
+        point waiting the HTLCs out.
         """
-        budget = max(0.0, float(self._prepay_resolve_wait_sec))
-        interval = max(0.01, float(self._prepay_poll_interval_sec))
+        budget = max(0.0, float(self._htlc_resolve_wait_sec))
+        interval = max(0.01, float(self._htlc_poll_interval_sec))
         deadline = time.monotonic() + budget
         self.logger.info(
-            f"reverse swap returned no funding and its mining-fee prepayment is "
-            f"still in flight; waiting up to {budget:.0f}s for it to resolve "
-            f"before deciding whether to fail over")
+            f"reverse swap returned no funding and {reason}; waiting up to "
+            f"{budget:.0f}s for it to resolve before deciding whether to fail over")
         while time.monotonic() < deadline:
             await asyncio.sleep(interval)
             if self._any_tracked_swap_funded(sm, tracked):
                 self.logger.info(
-                    "the swap funded while we waited for its prepayment; "
+                    "the swap funded while we waited for its HTLCs to resolve; "
                     "not failing over")
                 return _SwapAttempt.COMMITTED
-            verdict = self._unfunded_swap_verdict(wallet, sm, tracked)
-            if verdict is not _SwapAttempt.PREPAY_PENDING:
-                self.logger.info(
-                    f"mining-fee prepayment resolved; failover gate says "
-                    f"{verdict.name}")
+            verdict, reason = self._unfunded_swap_verdict(wallet, sm, tracked)
+            if verdict is not _SwapAttempt.HTLC_PENDING:
+                self.logger.info(f"swap HTLCs resolved; failover gate says "
+                                 f"{verdict.name}")
+                self._log_failover_verdict(verdict, reason)
                 return verdict
         # One last ask. The loop's final check lands somewhere before the deadline,
-        # so without this a prepayment that resolved in the remaining sliver would be
+        # so without this an HTLC that resolved in the remaining sliver would be
         # reported as "never resolved" -- and cost a cascade for nothing.
-        verdict = self._unfunded_swap_verdict(wallet, sm, tracked)
-        if verdict is not _SwapAttempt.PREPAY_PENDING:
-            self.logger.info(
-                f"mining-fee prepayment resolved as the wait expired; failover gate "
-                f"says {verdict.name}")
+        verdict, reason = self._unfunded_swap_verdict(wallet, sm, tracked)
+        if verdict is not _SwapAttempt.HTLC_PENDING:
+            self.logger.info(f"swap HTLCs resolved as the wait expired; failover "
+                             f"gate says {verdict.name}")
+            self._log_failover_verdict(verdict, reason)
             return verdict
         self.logger.warning(
-            f"mining-fee prepayment still in flight after {budget:.0f}s; treating "
-            f"this channel as possibly committed and not failing over")
+            f"{reason} after {budget:.0f}s; treating this channel as possibly "
+            f"committed and not failing over")
         self._diag_event(
             wallet, category="error", kind="swap",
-            reason="prepayment did not resolve in time; failover skipped",
-            detail=(f"waited {budget:.0f}s for the mining-fee prepayment of "
-                    f"{len(tracked)} swap(s) to resolve"))
+            reason="swap HTLCs did not resolve in time; failover skipped",
+            detail=(f"waited {budget:.0f}s for the HTLCs of {len(tracked)} swap(s) "
+                    f"to resolve; {reason}"))
         return _SwapAttempt.COMMITTED
 
     @staticmethod
@@ -6132,37 +6600,53 @@ class LiquidityPlugin(BasePlugin):
             return False
 
     def _unfunded_swap_verdict(self, wallet: 'Abstract_Wallet', sm,
-                               tracked: Set[str]) -> '_SwapAttempt':
+                               tracked: Set[str]) -> Tuple['_SwapAttempt', str]:
         """The failover gate, asked and answered right now with no waiting.
+        Returns the verdict and the human reason for it.
 
-        NEXT             nothing for this swap is in flight or settled: the channel
-                         is free and another provider is safe to try.
-        PREPAY_PENDING   the only thing in flight is the mining-fee prepayment.
-                         Undecided, not committed -- the caller may wait it out.
-        COMMITTED        everything else, including every case we cannot look up
-                         (an unparseable hash, a failed query, no swap object at
-                         all). The cost of a false "all clear" is a double drain;
-                         the cost of a false alarm is one skipped cascade.
+        NEXT           nothing for this swap is in flight or settled: the channel
+                       is free and another provider is safe to try.
+        HTLC_PENDING   an HTLC for this swap is still live -- the main payment,
+                       the prepayment, or both. UNDECIDED, not committed: the
+                       caller may wait it out (see ``_await_htlc_resolution``).
+        COMMITTED      something settled, or we cannot tell (an unparseable hash,
+                       a failed query, no swap object at all). The cost of a false
+                       "all clear" is a double drain; the cost of a false alarm is
+                       one skipped cascade.
 
-        Separating the prepayment from the main invoice is the whole point of the
-        three-way answer. Both are genuinely "an HTLC exists", so neither may
-        return NEXT -- but only the prepayment is one we have a reason to expect
-        will resolve on its own shortly (the provider fulfils it only once the main
-        payment's MPP set arrives too, so a dead main payment dooms it), which is
-        what makes waiting worthwhile rather than a stall.
+        "Still in flight" and "settled" are genuinely different answers, and
+        collapsing them is what used to kill cascades. A SETTLED payment is
+        evidence the swap is live and must stop the cascade for good. A live HTLC
+        is evidence of nothing yet: it is the ordinary state of a payment Electrum
+        has just given up on but whose HTLCs the far end has not failed back, and
+        it resolves on its own within the MPP expiry. Both legs reach that state
+        on essentially every failed swap -- the main one because ``pay_to_node``
+        returns while unresolved HTLCs are still out, the prepayment because
+        ``reverse_swap`` never waits for it -- so answering COMMITTED for either
+        is answering "committed" to the normal case.
+
+        The reason string is returned rather than logged here because this is
+        asked repeatedly while polling; the caller logs the one that decided it.
         """
         from electrum.invoices import PR_PAID
         lnworker = getattr(wallet, "lnworker", None)
-        if lnworker is None or not tracked:
-            # No swap object was created, or no wallet to ask. We cannot show the
-            # channel is clear, so treat it as committed.
-            return _SwapAttempt.COMMITTED
-        prepay_pending = False
+        if lnworker is None:
+            # No wallet to ask (it is being torn down, or a stub). We cannot show
+            # the channel is clear, so treat it as committed.
+            return (_SwapAttempt.COMMITTED,
+                    "the wallet's Lightning worker is gone, so nothing can be checked")
+        if not tracked:
+            # No swap object was created, so there is nothing to inspect -- and a
+            # swap we cannot identify is one we cannot clear.
+            return (_SwapAttempt.COMMITTED,
+                    "no swap object was created, so nothing can be checked")
+        htlc_pending = ""
         for ph_hex in tracked:
             try:
                 main_hash = bytes.fromhex(ph_hex)
             except ValueError:
-                return _SwapAttempt.COMMITTED
+                return (_SwapAttempt.COMMITTED,
+                        f"the payment hash {ph_hex[:10]}… could not be parsed")
             # The prepayment hash, when the swap carries one.
             prepay_hash: Optional[bytes] = None
             try:
@@ -6172,15 +6656,19 @@ class LiquidityPlugin(BasePlugin):
                 self.logger.info(
                     f"could not read the prepay hash for swap {ph_hex[:10]}… "
                     f"({e!r}); not failing over")
-                return _SwapAttempt.COMMITTED
+                return (_SwapAttempt.COMMITTED,
+                        f"the prepay hash for swap {ph_hex[:10]}… could not be read")
             hashes: List[bytes] = [main_hash] + ([prepay_hash] if prepay_hash else [])
-            # The MAIN payment in flight is the one that means "possibly committed":
-            # it is the one that drains this channel, and nothing about it is
-            # expected to resolve promptly.
+            # Both legs are treated alike: a live HTLC is undecided, not committed.
+            # The main payment is named separately in the reason because it is the
+            # one that drains this channel, so it is the one an operator reading
+            # the log cares which of the two it was.
             if self._payment_still_inflight(lnworker, main_hash):
-                return _SwapAttempt.COMMITTED
-            if prepay_hash and self._payment_still_inflight(lnworker, prepay_hash):
-                prepay_pending = True
+                htlc_pending = (f"the main Lightning payment for swap "
+                                f"{ph_hex[:10]}… still has an HTLC in flight")
+            elif prepay_hash and self._payment_still_inflight(lnworker, prepay_hash):
+                htlc_pending = (f"the mining-fee prepayment for swap "
+                                f"{ph_hex[:10]}… still has an HTLC in flight")
             # A reverse swap's main invoice is a HOLD invoice: the provider keeps
             # the HTLC until we claim the on-chain output, so a payment that has
             # reached it reads as in flight above, not as settled. Seeing PR_PAID
@@ -6192,14 +6680,19 @@ class LiquidityPlugin(BasePlugin):
                 from electrum.lnutil import Direction
                 if any(lnworker.get_payment_status(h, direction=Direction.SENT)
                        == PR_PAID for h in hashes):
-                    return _SwapAttempt.COMMITTED
+                    return (_SwapAttempt.COMMITTED,
+                            f"a payment for swap {ph_hex[:10]}… has settled, so the "
+                            f"swap is live")
             except Exception as e:  # noqa: BLE001
                 self.logger.info(
                     f"could not read the payment status for swap {ph_hex[:10]}… "
                     f"({e!r}); not failing over")
-                return _SwapAttempt.COMMITTED
-        return (_SwapAttempt.PREPAY_PENDING if prepay_pending
-                else _SwapAttempt.NEXT)
+                return (_SwapAttempt.COMMITTED,
+                        f"the payment status for swap {ph_hex[:10]}… could not be read")
+        if htlc_pending:
+            return _SwapAttempt.HTLC_PENDING, htlc_pending
+        return (_SwapAttempt.NEXT,
+                "no HTLC is in flight and nothing has settled, so the channel is free")
 
     # --- liquidity sink ---------------------------------------------------
     # Draining a channel by PAYING somebody, instead of reverse-swapping on-chain.
@@ -6389,6 +6882,19 @@ class LiquidityPlugin(BasePlugin):
         deadline = time.monotonic() + SINK_CASCADE_DEADLINE_SEC
         total = len(rungs)
         for index, amount in enumerate(rungs, start=1):
+            if self._shutting_down(wallet):
+                # Same rule as the swap cascade: a closing wallet may finish the
+                # rung it is on, but must not start another Lightning payment.
+                remaining = total - index + 1
+                self.logger.info(
+                    f"wallet is closing; stopping the liquidity-sink ladder for "
+                    f"{action.short_id} with {remaining} amount(s) untried")
+                self._diag_event(
+                    wallet, category="lifecycle", kind="sink",
+                    reason="liquidity sink ladder stopped for shutdown",
+                    dest=action.address,
+                    detail=f"{remaining} amount(s) untried on {action.short_id}")
+                break
             if time.monotonic() >= deadline:
                 remaining = total - index + 1
                 self.logger.warning(

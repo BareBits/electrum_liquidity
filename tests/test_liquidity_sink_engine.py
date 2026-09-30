@@ -228,6 +228,17 @@ def test_sink_skips_inactive_channels() -> None:
     assert "not active" in _reasons(result)
 
 
+def test_sink_skips_channels_electrum_will_not_send_over() -> None:
+    """The sink pins its payment to the channel exactly as the swap path does, so
+    the same refusal applies -- a sink payment forced down a frozen channel fails
+    the same way, and the sink has no provider to blame for it."""
+    chan = make_channel(is_frozen_for_sending=True, frozen_by_user=True)
+    snap = make_snapshot([], channels=(chan,))
+    result = evaluate(snap, make_config(liquidity_sink_address=SINK))
+    assert not result.actions
+    assert "frozen it for sending" in _reasons(result)
+
+
 def test_sink_skips_channels_with_unsettled_htlcs() -> None:
     chan = make_channel(has_unsettled_htlcs=True)
     snap = make_snapshot([], channels=(chan,))

@@ -62,8 +62,8 @@ def _plugin() -> LiquidityPlugin:
     p._swap_init_timeout_sec = 0.01
     # Bounded wait for a swap's mining-fee prepayment to resolve before the
     # failover gate decides; shrunk so no test sits through the real 150s.
-    p._prepay_resolve_wait_sec = 0.05
-    p._prepay_poll_interval_sec = 0.01
+    p._htlc_resolve_wait_sec = 0.05
+    p._htlc_poll_interval_sec = 0.01
     # One-slot per-channel dedupe for declines the executor writes itself.
     p._last_exec_decline_sig = {}
     p.config = SimpleNamespace()  # getattr defaults kick in

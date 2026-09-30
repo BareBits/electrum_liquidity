@@ -166,6 +166,54 @@ def test_inactive_channel_not_swapped() -> None:
     assert not any(isinstance(a, ReverseSwapAction) for a in decide(snap, make_config()))
 
 
+# --- channels Electrum will not send over --------------------------------
+# A drain is a send, and both drain paths pin the payment to one channel with
+# pay_invoice(channels=[chan]). That argument REPLACES the candidate set inside
+# lnworker.create_routes_for_payment -- the very comprehension that applies
+# Electrum's is_frozen_for_sending filter -- and nothing downstream re-checks. So
+# without this gate a pinned payment is forced down a channel Electrum would have
+# excluded, and simply burns the 120s payment timeout.
+def test_a_channel_frozen_for_sending_is_not_swapped() -> None:
+    chan = make_channel(local_sat=1_000_000, spendable_local_sat=900_000,
+                        is_frozen_for_sending=True, frozen_by_user=True)
+    snap = make_snapshot(channels=(chan,))
+    result = evaluate(snap, make_config())
+    assert not any(isinstance(a, ReverseSwapAction) for a in result.actions)
+
+
+def test_a_user_freeze_is_reported_as_the_users_own_doing() -> None:
+    """They can undo this one, so the reason should say it is theirs."""
+    chan = make_channel(local_sat=1_000_000, spendable_local_sat=900_000,
+                        is_frozen_for_sending=True, frozen_by_user=True)
+    result = evaluate(make_snapshot(channels=(chan,)), make_config())
+    reasons = " ".join(d.reason for d in result.declines)
+    assert "you have frozen it for sending" in reasons
+    assert "trampoline" not in reasons
+
+
+def test_an_unroutable_channel_is_not_blamed_on_the_user() -> None:
+    """Under trampoline routing, Channel.is_frozen_for_sending is ALSO True for a
+    peer that does not advertise trampoline forwarding -- nothing the user chose
+    and nothing unfreezing would fix. Telling them "you have frozen this" would be
+    worse than saying nothing, so that case gets its own reason."""
+    chan = make_channel(local_sat=1_000_000, spendable_local_sat=900_000,
+                        is_frozen_for_sending=True, frozen_by_user=False)
+    result = evaluate(make_snapshot(channels=(chan,)), make_config())
+    reasons = " ".join(d.reason for d in result.declines)
+    assert "you have frozen" not in reasons
+    assert "does not advertise trampoline routing" in reasons
+
+
+def test_an_unfrozen_channel_is_swapped_as_before() -> None:
+    """The gate must be inert in the ordinary case: both flags default False, so
+    nothing that worked before this existed can start declining."""
+    chan = make_channel(local_sat=1_000_000, spendable_local_sat=900_000)
+    assert chan.is_frozen_for_sending is False
+    assert chan.frozen_by_user is False
+    snap = make_snapshot(channels=(chan,))
+    assert any(isinstance(a, ReverseSwapAction) for a in decide(snap, make_config()))
+
+
 # --- effective all-in cost gate ------------------------------------------
 def test_effective_cost_matches_electrum_costs_abs() -> None:
     # Mirrors a real SwapManager case: amount 25_650, 0.5% fee, mining 22_500,
