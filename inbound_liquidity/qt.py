@@ -54,6 +54,18 @@ if TYPE_CHECKING:
 UNLOCK_PROMPT_COOLDOWN_SEC = 3600.0
 
 
+# How long teardown may block silently before the "finishing a swap" dialog is
+# put up. The overwhelmingly common close has no attempt in flight at all and
+# returns in microseconds; the next most common has one that is nearly done.
+# Flashing a dialog for either would be worse than showing nothing, so the wait
+# starts silent and only becomes visible once it is clearly going to be a wait.
+SHUTDOWN_DIALOG_DELAY_SEC = 2.0
+
+# How often the shutdown wait re-paints and re-checks. Small enough that the
+# countdown looks live, large enough not to spin the GUI thread.
+SHUTDOWN_POLL_INTERVAL_SEC = 0.1
+
+
 # --- Electrum "Channels" tab: a "Managed by" column ------------------------
 # The plugin drains outbound from channels; a user needs to see, on Electrum's
 # own Channels tab, which channels the plugin opened (and so will manage) versus
@@ -907,7 +919,149 @@ class Plugin(LiquidityPlugin):
             window.update_status()
         except Exception:
             self.logger.debug("could not refresh the balance chart after load")
+        self._register_closing_warning(window, wallet)
         self._maybe_prompt_update_opt_in(window, wallet)
+
+    def _register_closing_warning(self, window: 'ElectrumWindow',
+                                  wallet: 'Abstract_Wallet') -> None:
+        """Ask Electrum to warn before closing while we have a swap attempt live.
+
+        Electrum already warns about swaps whose funding tx is on-chain but
+        unconfirmed (``_check_ongoing_submarine_swaps_callback``, which reads
+        ``get_pending_swaps()``). That check cannot see the window this plugin
+        actually creates: a reverse swap whose Lightning payment is committed but
+        whose funding output does not exist yet. The swap is absent from
+        ``get_pending_swaps()`` for the whole of it, so without this the riskiest
+        moment of the whole operation is the one moment the user is told nothing.
+
+        Registration is best-effort and version-tolerant: the hook is a recent
+        addition to Electrum's main window, and a build without it should cost us
+        a debug line, not a wallet that will not load.
+        """
+        register = getattr(window, "register_closing_warning_callback", None)
+        if register is None:
+            self.logger.debug(
+                "this Electrum build has no closing-warning hook; not registering")
+            return
+        try:
+            register(lambda: self._closing_warning(wallet))
+        except Exception:
+            self.logger.debug("could not register the closing warning")
+
+    def _closing_warning(self, wallet: 'Abstract_Wallet') -> Optional[str]:
+        """The warning text while a reverse-swap attempt is in flight, else None.
+
+        Deliberately says what will happen if they go ahead -- we stop cascading,
+        wait for this one attempt, then close -- because the honest answer to "is
+        it safe to quit now?" is "nearly, and here is the bit you are waiting
+        for". Returning None is the normal case and shows no dialog at all.
+        """
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is None:
+            return None
+        return "\n\n".join((
+            _("Inbound Liquidity: a swap is in progress"),
+            _("A reverse swap of {amount} sat from channel {channel} has a "
+              "Lightning payment in flight. Its funds are not at rest: the "
+              "payment is committed but the on-chain output does not exist "
+              "yet.").format(amount=f"{attempt.amount_sat:,}",
+                             channel=attempt.short_id),
+            _("If you close now, no further swap providers will be tried and "
+              "Electrum will wait for this attempt to finish (up to {seconds} "
+              "more seconds) before shutting down.").format(
+                  seconds=int(attempt.remaining_sec())),
+        ))
+
+    def _await_shutdown(self, wallet: 'Abstract_Wallet') -> None:
+        """Wait out the in-flight attempt without freezing the window.
+
+        ``stop_wallet`` runs on the GUI thread (closeEvent -> clean_up ->
+        run_hook('close_wallet')), while the attempt runs on the asyncio loop, so
+        the base class's plain ``Event.wait`` would block Qt's event loop for up
+        to a couple of minutes. To the user that is indistinguishable from a
+        hang, and the reflex it produces -- force-killing Electrum -- is the exact
+        outcome this whole handshake exists to prevent.
+
+        So the wait is driven from here instead: poll the event in short slices,
+        pumping Qt between them, and put up a modal dialog once it is clear this
+        is going to take a moment (see SHUTDOWN_DIALOG_DELAY_SEC). Closing the
+        dialog is not offered: this is the wait the user already agreed to in the
+        closing warning, and its budget is bounded by the attempt's own backstop.
+        """
+        attempt = self.inflight_swap_attempt(wallet)
+        if attempt is None:
+            return
+        event = self._attempt_done_event(wallet)
+        if event is None:
+            return
+        budget = attempt.remaining_sec()
+        started = time.monotonic()
+        deadline = started + budget
+        dialog: Optional[QWidget] = None
+        label: Optional[QLabel] = None
+        finished = False
+        try:
+            while time.monotonic() < deadline:
+                if event.wait(SHUTDOWN_POLL_INTERVAL_SEC):
+                    finished = True
+                    break
+                waited = time.monotonic() - started
+                if dialog is None and waited >= SHUTDOWN_DIALOG_DELAY_SEC:
+                    dialog, label = self._build_shutdown_dialog(attempt, deadline)
+                if label is not None:
+                    label.setText(self._shutdown_dialog_text(attempt, deadline))
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    # No usable event loop (headless tests, or Qt already torn
+                    # down): keep waiting, just without repainting. The wait is
+                    # what matters; the dialog is a courtesy.
+                    pass
+            else:
+                # The budget ran out. One last non-blocking ask, so an attempt
+                # that finished inside the final slice is not reported as a
+                # timeout it never hit.
+                finished = event.is_set()
+        finally:
+            if dialog is not None:
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+        self.log_shutdown_wait_outcome(attempt, finished, budget)
+
+    @staticmethod
+    def _shutdown_dialog_text(attempt, deadline: float) -> str:
+        remaining = max(0, int(deadline - time.monotonic()))
+        return "\n".join((
+            _("Finishing a swap of {amount} sat from channel {channel}.").format(
+                amount=f"{attempt.amount_sat:,}", channel=attempt.short_id),
+            _("No further providers will be tried."),
+            _("Closing in up to {seconds}s.").format(seconds=remaining),
+        ))
+
+    def _build_shutdown_dialog(self, attempt, deadline: float,
+                               ) -> Tuple[Optional[QWidget], Optional[QLabel]]:
+        """The "please wait" window, or (None, None) if Qt cannot show one.
+
+        Button-less, and with the title-bar close button removed: there is
+        nothing here for the user to decide. It exists to say "still working, not
+        hung", which is the only question they have at this point. Answers
+        (None, None) rather than raising, because failing to show a progress
+        window is a cosmetic loss while aborting the close path is not.
+        """
+        try:
+            from electrum.gui.qt.util import WindowModalDialog
+            dialog = WindowModalDialog(None, _("Closing Electrum"))
+            layout = QVBoxLayout(dialog)
+            label = QLabel(self._shutdown_dialog_text(attempt, deadline))
+            layout.addWidget(label)
+            dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+            dialog.show()
+            return dialog, label
+        except Exception:
+            self.logger.debug("could not show the shutdown-wait dialog")
+            return None, None
 
     def _maybe_prompt_update_opt_in(self, window: 'ElectrumWindow',
                                     wallet: 'Abstract_Wallet') -> None:
