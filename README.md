@@ -14,9 +14,11 @@ An Electrum plugin that automatically manages **inbound Lightning liquidity** by
 opening channels and performing **submarine (reverse) swaps**, on top of
 Electrum's existing Nostr submarine-swap extension.
 
-This plugin works, the main rough edges are around swap payments failing due to Electrum struggling to find routes for larger payments. This doesn't cause funds loss, but means funds may sit in channels instead of being swapped back to on-chain for the purposes of provisioning inbound liquidity. This is an issue with Electrum, not the plugin. The longer the wallet is running, the more it learns about route reliability and the more likely payments are to go through.
+**When you first run this plugin, you may need to run it in automatic mode for 30 or more minutes** before it finds a successful path for a swap. Over time, it learns and gets faster. Since this is all automatic, it's not a big deal, but it shows how painful manually managing your liquidity would be. You can monitor the log in the log tab to see it attempting hundreds of different swap paths (enable debug to see each path individually). 
 
-**If you are having trouble getting swaps to complete reliably** use a liquidity sink instead, any LNURL/Lightning address will work.
+This plugin works, the main rough edges are around swap payments failing due to Electrum struggling to find routes for larger payments. This doesn't cause funds loss, but means funds may sit in channels instead of being swapped back to on-chain for the purposes of provisioning inbound liquidity. This is an issue with Electrum, not the plugin. 
+
+**If you are having trouble getting swaps to complete reliably** you can use a liquidity sink instead, any LNURL/Lightning address will work.
 
 You may wish to combine this plugin with our self-custody, open source e-commerce/point-of-sale software called [BareBits](https://github.com/BareBits/cashupayserver) and our [CLINK Plugin](https://github.com/BareBits/electrum_clink) to accept payments without NAT punching/opening a port.
 
