@@ -434,8 +434,9 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
     forgets itself is worse than no checkbox.
 
     The unit tests drive this against a fake pref object; what is proved here is
-    that the value lands in a real ``SimpleConfig`` under the documented key and
-    reads back out of it.
+    that the value lands in the REAL WALLET under the documented key and reads
+    back out of it -- and, since the setting is per wallet, that it does not land
+    in the installation-wide config instead.
     """
     if _ELECTRUM_IMPORT_ERROR is not None:
         pytest.skip(f"Electrum's Qt GUI is unavailable: {_ELECTRUM_IMPORT_ERROR!r}")
@@ -448,8 +449,10 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
     app = QApplication.instance() or QApplication([])
     assert app is not None
 
+    from electrum.plugins.inbound_liquidity import SETTINGS_DB_KEY  # type: ignore
+
     # The Qt subclass, not LiquidityPlugin: the checkbox's getter/setter are the
-    # GUI half of the plugin. Both only touch ``self.config``.
+    # GUI half of the plugin. Both read and write THIS WALLET's settings.
     p = object.__new__(qt_mod.Plugin)
     p.logger = logging.getLogger("e2e.inbound_liquidity.goal_buffer.checkbox")
     p.config = live_wallet.config
@@ -481,17 +484,21 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
                    for _n, c, _a in piechart._list)
         assert next(a for _n, c, a in piechart._list
                     if c == COLOR_CONFIRMED) == int(bal.confirmed)
-        # ...and the choice is on the real config, under the documented key.
-        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is False
-        assert p.config.get('plugins.inbound_liquidity.show_goal_in_piechart') is False
-        assert p.show_goal_in_piechart() is False
+        # ...and the choice is stored on the REAL wallet, under the documented
+        # key -- the setting is per wallet, so the installation-wide config is
+        # exactly where it must NOT have landed.
+        assert p.show_goal_in_piechart(live_wallet) is False
+        stored = dict(live_wallet.db.get(SETTINGS_DB_KEY))
+        assert stored["SHOW_GOAL_IN_PIECHART"] is False
+        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True, \
+            "the choice leaked into the installation-wide config"
 
         box.setChecked(True)
-        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True
+        assert p.show_goal_in_piechart(live_wallet) is True
         assert next(a for _n, c, a in piechart._list
                     if c == qt_mod.COLOR_GOAL_BUFFER_ONCHAIN) == GOAL_SAT
         dialog.deleteLater()
     finally:
         qt_mod._set_buffer_provider(None)
         qt_mod._set_goal_visibility(None)
-        p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = True
+        p.reset_settings(live_wallet)

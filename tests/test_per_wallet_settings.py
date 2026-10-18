@@ -477,3 +477,63 @@ def test_no_module_reads_a_plugin_setting_off_the_shared_config() -> None:
     assert not offenders, (
         "these read a per-wallet setting off the process-wide config; route "
         "them through self.settings(wallet) instead:\n  " + "\n  ".join(offenders))
+
+
+# --- batching -------------------------------------------------------------
+def test_a_batch_writes_the_wallet_file_once() -> None:
+    """A settings form is two dozen fields; one write per field would be two
+    dozen full wallet-file writes for one click of Apply."""
+    p, w = _plugin(), _FakeWallet()
+    with p.settings_batch(w):
+        p.set_setting(w, "MAX_CHANNELS", 3)
+        p.set_setting(w, "GOAL_SAT", 50_000)
+        p.set_setting(w, "MAX_SWAP_FEE_PCT", 1.25)
+    assert w.saves == 1
+    stored = dict(w.db.get(SETTINGS_DB_KEY))
+    assert (stored["MAX_CHANNELS"], stored["GOAL_SAT"], stored["MAX_SWAP_FEE_PCT"]) \
+        == (3, 50_000, 1.25)
+
+
+def test_values_in_a_batch_are_readable_before_it_closes() -> None:
+    """The validation in the Apply handlers reads back what it has just set."""
+    p, w = _plugin(), _FakeWallet()
+    with p.settings_batch(w):
+        p.set_setting(w, "MAX_CHANNELS", 3)
+        assert p.settings(w).INBOUND_LIQUIDITY_MAX_CHANNELS == 3
+    assert p.settings(w).INBOUND_LIQUIDITY_MAX_CHANNELS == 3
+
+
+def test_a_batch_that_raises_still_persists_what_it_accepted() -> None:
+    """The cache has the values by then, so leaving them unwritten would show
+    the user settings the wallet file does not have."""
+    p, w = _plugin(), _FakeWallet()
+    with pytest.raises(RuntimeError):
+        with p.settings_batch(w):
+            p.set_setting(w, "MAX_CHANNELS", 3)
+            raise RuntimeError("the GUI blew up mid-form")
+    assert w.saves == 1
+    assert dict(w.db.get(SETTINGS_DB_KEY))["MAX_CHANNELS"] == 3
+
+
+def test_batches_nest() -> None:
+    p, w = _plugin(), _FakeWallet()
+    with p.settings_batch(w):
+        p.set_setting(w, "MAX_CHANNELS", 3)
+        with p.settings_batch(w):
+            p.set_setting(w, "GOAL_SAT", 7_000)
+        assert w.saves == 0, "the inner block must not flush"
+    assert w.saves == 1
+
+
+def test_a_batch_re_derives_the_process_wide_settings_once(restore_floor) -> None:
+    p, w = _plugin(), _FakeWallet()
+    calls: List[int] = []
+    original = type(p)._on_setting_changed
+    try:
+        type(p)._on_setting_changed = lambda self, wallet, name: calls.append(1)
+        with p.settings_batch(w):
+            p.set_setting(w, "MAX_CHANNELS", 3)
+            p.set_setting(w, "GOAL_SAT", 50_000)
+    finally:
+        type(p)._on_setting_changed = original
+    assert len(calls) == 1

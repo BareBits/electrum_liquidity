@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from concurrent import futures
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (TYPE_CHECKING, Any, AsyncContextManager, AsyncIterator, Callable,
@@ -2736,8 +2736,38 @@ class LiquidityPlugin(BasePlugin):
         known = {_settings_field(name) for name in _plugin_config_vars()}
         return {k: v for k, v in raw.items() if k in known}
 
+    @contextmanager
+    def settings_batch(self, wallet: 'Abstract_Wallet'):
+        """Apply several settings as one write.
+
+        The settings tabs apply a form at a time -- two dozen fields on
+        Advanced. Written one by one that is two dozen full wallet-file writes
+        for one click of Apply, and a crash halfway through leaves the form
+        half-applied. Inside this block the writes accumulate in the cache and
+        are persisted once, on the way out; the process-wide re-derive is
+        likewise done once rather than per field.
+
+        Re-entrant, and it persists on the way out of an exception too: by then
+        the values have already been accepted into the cache, so leaving them
+        unwritten would mean the GUI showing settings the wallet file does not
+        have.
+        """
+        depth = getattr(self, "_settings_batch_depth", 0)
+        self._settings_batch_depth = depth + 1
+        try:
+            yield
+        finally:
+            self._settings_batch_depth = depth
+            if depth == 0:
+                try:
+                    self._save_settings(wallet, self.settings_store(wallet))
+                finally:
+                    self._on_setting_changed(wallet, None)
+
     def _save_settings(self, wallet: 'Abstract_Wallet',
                        store: Dict[str, Any]) -> None:
+        if getattr(self, "_settings_batch_depth", 0):
+            return  # deferred to the end of the batch (see settings_batch)
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
@@ -2775,7 +2805,8 @@ class LiquidityPlugin(BasePlugin):
         store[_settings_field(name)] = value
         self._save_settings(wallet, store)
         self._settings_cache[wallet] = store
-        self._on_setting_changed(wallet, name)
+        if not getattr(self, "_settings_batch_depth", 0):
+            self._on_setting_changed(wallet, name)
         return value
 
     def reset_settings(self, wallet: 'Abstract_Wallet') -> None:
@@ -8263,13 +8294,11 @@ def _register_commands() -> None:
         """
         Set one inbound-liquidity setting ON THIS WALLET.
 
-        name: the setting, with or without the INBOUND_LIQUIDITY_ prefix
-              (case-insensitive), e.g. MAX_CHANNELS or automation_enabled.
-        value: the new value. Parsed against the setting's declared type;
-               booleans accept true/false/yes/no/on/off/1/0.
-
         Returns the stored value. Unlike `setconfig`, this changes nothing for
         any other wallet.
+
+        arg:str:name:The setting, with or without the INBOUND_LIQUIDITY_ prefix (case-insensitive), e.g. MAX_CHANNELS or automation_enabled
+        arg:str:value:The new value, parsed against the setting's declared type. Booleans accept true/false/yes/no/on/off/1/0
         """
         return plugin.set_setting(wallet, str(name).strip().upper(), value)
 

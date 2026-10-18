@@ -2409,10 +2409,15 @@ class Plugin(LiquidityPlugin):
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
-            for setter, value in parsed:
-                setter(value)
+            #
+            # One batch, so this form is one write to the wallet file rather
+            # than one per field -- and so a crash cannot leave it half applied.
+            with self.settings_batch(wallet):
+                for setter, value in parsed:
+                    setter(value)
             # min_onchain may have changed: re-assert the channel-funding floor so
             # a lowered floor keeps matching the (new) configured value at once.
+            # (The batch already did this; kept for a caller that bypasses it.)
             self._enforce_min_funding_floor()
             self._reload_settings_fields(wallet, edits, _sync_toggle_from_config)
             _reload_goal()
@@ -2733,12 +2738,15 @@ class Plugin(LiquidityPlugin):
                     status.setStyleSheet("color: red;")
                     status.setText(_("Invalid value for: {}").format(label))
                     return
-            for attr, value in parsed_ceilings:
-                setattr(c, attr, value)
-            for cb, attr in checkboxes:
-                setattr(c, attr, cb.isChecked())
-            for setter, value in parsed_fields:
-                setter(value)
+            # One batch for the whole form: see the note on the Settings tab's
+            # Apply. This tab carries two dozen fields, so it matters most here.
+            with self.settings_batch(wallet):
+                for attr, value in parsed_ceilings:
+                    setattr(c, attr, value)
+                for cb, attr in checkboxes:
+                    setattr(c, attr, cb.isChecked())
+                for setter, value in parsed_fields:
+                    setter(value)
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))
@@ -2914,8 +2922,9 @@ class Plugin(LiquidityPlugin):
                     ban.discard(npub)
             pref -= ban  # a banned provider can't also be preferred
             c = self.settings(wallet)
-            c.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
-            c.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
+            with self.settings_batch(wallet):       # one write for both lists
+                c.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
+                c.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Providers saved."))
@@ -3118,10 +3127,11 @@ class Plugin(LiquidityPlugin):
             # A banned partner can't also be preferred.
             preferred = [p for p in preferred if normalize_node_id(p) not in banned]
             c = self.settings(wallet)
-            c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
-            c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
-            c.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
-            c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
+            with self.settings_batch(wallet):       # one write for the form
+                c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
+                c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
+                c.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
+                c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Channel partners saved."))
