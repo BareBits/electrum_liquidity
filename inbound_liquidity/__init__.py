@@ -21,8 +21,9 @@ import time
 from concurrent import futures
 from contextlib import asynccontextmanager
 from enum import Enum, auto
+from types import MappingProxyType
 from typing import (TYPE_CHECKING, Any, AsyncContextManager, AsyncIterator, Callable,
-                    Dict, List, Optional, Sequence, Set, Tuple)
+                    Dict, List, Mapping, Optional, Sequence, Set, Tuple)
 
 from electrum import util
 from electrum.i18n import _
@@ -1513,18 +1514,25 @@ _CONFIG_PREFIX = "INBOUND_LIQUIDITY_"
 _MISSING = object()
 
 
-def _plugin_config_vars() -> Dict[str, ConfigVar]:
+@functools.lru_cache(maxsize=1)
+def _plugin_config_vars() -> Mapping[str, ConfigVar]:
     """``{attribute name: ConfigVar}`` for every setting this module declares.
 
     Read off SimpleConfig rather than kept as a hand-written list: the ConfigVar
     block above is the single place a setting is introduced, and a list here
     would be one more thing to forget to update (and would fail silently -- the
-    setting would simply stop being per-wallet)."""
+    setting would simply stop being per-wallet).
+
+    Cached, and returned read-only, because this is consulted on every settings
+    read -- a dozen per tick, more per repaint -- and SimpleConfig carries
+    several hundred attributes to sift. The ConfigVars are class attributes
+    assigned at import, so the answer cannot change afterwards.
+    """
     out: Dict[str, ConfigVar] = {}
     for name, value in vars(SimpleConfig).items():
         if name.startswith(_CONFIG_PREFIX) and isinstance(value, ConfigVar):
             out[name] = value
-    return out
+    return MappingProxyType(out)
 
 
 def _settings_field(name: str) -> str:

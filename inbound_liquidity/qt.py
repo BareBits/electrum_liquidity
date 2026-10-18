@@ -1178,6 +1178,11 @@ class Plugin(LiquidityPlugin):
         if not self.wallets:
             _set_buffer_provider(None)
             _set_goal_visibility(None)
+        # This wallet is no longer one of the open ones, so the process-wide
+        # answers drawn from all of them have to drop it (see
+        # apply_process_wide_settings): its capture preference should not outlive
+        # it, and the funding floor should rise back if it was the lowest.
+        self.apply_process_wide_settings()
 
     @hook
     def on_close_window(self, window: 'ElectrumWindow') -> None:

@@ -166,3 +166,97 @@ def test_on_close_detaches_the_capture(tree) -> None:
     assert not any(isinstance(h, PluginLogHandler) for h in tree.handlers)
     _child("inbound_liquidity").warning("after unload")
     assert p.get_log_lines() == []               # a disabled plugin stops capturing
+
+
+# --- per-wallet settings, process-wide capture ----------------------------
+class _FakeDB:
+    def __init__(self) -> None:
+        self._d = {}
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+    def put(self, key, value):
+        self._d[key] = value
+
+
+class _FakeWallet:
+    def __init__(self) -> None:
+        self.db = _FakeDB()
+
+    def save_db(self) -> None:
+        pass
+
+
+def test_capture_follows_the_broadest_setting_among_open_wallets(tree) -> None:
+    """The three capture settings are per wallet, but there is one handler set
+    and one ring buffer per process. Taking the last writer's answer would mean
+    opening a second wallet silently switched off a capture the user turned on to
+    diagnose the first, so the broadest answer wins."""
+    p = _plugin(tree)
+    quiet, loud = _FakeWallet(), _FakeWallet()
+    p.settings(quiet), p.settings(loud)
+    p.set_setting(loud, "INBOUND_LIQUIDITY_LOG_CAPTURE_LN", True)
+
+    p.apply_log_capture_settings()
+    _child("lnrater.LNRater").info("no peer to suggest")
+    assert [line.message for line in p.get_log_lines()] == ["no peer to suggest"]
+    # And the wallet that did not ask for it still reads its own answer.
+    assert p.settings(quiet).INBOUND_LIQUIDITY_LOG_CAPTURE_LN is False
+
+
+def test_the_transport_is_told_whether_any_wallet_wants_debug_logs(tree) -> None:
+    """``get_relay_manager`` lifts aionostr's INFO pin, and the switch behind it
+    is per wallet while the logger is not -- so the plugin decides and passes the
+    answer in rather than the transport reading a wallet's setting it has no way
+    to choose."""
+    mod = pytest.importorskip("electrum.plugins.inbound_liquidity.swap_transport")
+    p = _plugin(tree)
+    wallet = _FakeWallet()
+    p.settings(wallet)
+    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG") is False
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", True)
+    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG") is True
+
+
+def _transport(monkeypatch, *, debug_logs: bool):
+    """A TargetedNostrTransport with its base class's get_relay_manager stubbed.
+
+    Built without __init__ and with the stock method replaced, because a real
+    one needs a config, a swap manager and a keypair -- none of which this
+    branch touches. What is under test is what the override does AFTER the
+    stock method has pinned the level."""
+    mod = pytest.importorskip("electrum.plugins.inbound_liquidity.swap_transport")
+    sentinel = object()
+    monkeypatch.setattr(mod.NostrTransport, "get_relay_manager",
+                        lambda self: sentinel, raising=True)
+    t = object.__new__(mod.TargetedNostrTransport)
+    t.logger = logging.getLogger(f"{ROOT}.transport")
+    t.debug_logs = debug_logs
+    return t, sentinel
+
+
+def test_the_transport_lifts_the_aionostr_pin_only_when_told_to(monkeypatch) -> None:
+    aionostr = logging.getLogger(f"{ROOT}.transport.aionostr")
+
+    t, sentinel = _transport(monkeypatch, debug_logs=False)
+    aionostr.setLevel(logging.INFO)             # as the stock method pins it
+    assert t.get_relay_manager() is sentinel, "the stock manager must be returned"
+    assert aionostr.level == logging.INFO
+
+    t, sentinel = _transport(monkeypatch, debug_logs=True)
+    aionostr.setLevel(logging.INFO)
+    assert t.get_relay_manager() is sentinel
+    assert aionostr.level == logging.DEBUG, "the pin was not lifted"
+
+
+def test_a_failure_lifting_the_pin_never_breaks_a_swap(monkeypatch) -> None:
+    """Diagnostics must not be able to abort provider discovery."""
+    t, sentinel = _transport(monkeypatch, debug_logs=True)
+
+    class _Boom:
+        def getChild(self, name):
+            raise RuntimeError("no such logger")
+
+    t.logger = _Boom()
+    assert t.get_relay_manager() is sentinel

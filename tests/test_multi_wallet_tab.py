@@ -375,3 +375,22 @@ def test_a_window_that_cannot_ask_does_not_reset(qapp):
     window.question = _boom
     _reset_button(p, wallet).click()
     assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS == 8
+
+
+def test_closing_a_wallet_stops_it_setting_the_process_wide_answers(qapp):
+    """Log capture is one handler set per process, drawn from the open wallets.
+    A closed wallet must stop contributing -- otherwise a capture it turned on
+    outlives it, for the rest of the session."""
+    p = _make_plugin()
+    window, wallet = _FakeWindow(), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", True)
+    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG") is True
+
+    # Only the part of the teardown this is about: the full `stop_wallet` wants
+    # the heartbeat/evaluation state a plugin built without BasePlugin.__init__
+    # does not have, and none of it bears on which wallets are open.
+    p.stop_wallet = p._forget_wallet
+    p._unlock_declined_at, p._unlock_prompting = {}, set()
+    p.close_wallet(wallet)
+    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG") is False
