@@ -221,7 +221,7 @@ def _wire_tick(p) -> None:
     """Stub the tick's collaborators so only the gate is under test; each
     records whether it ran, which is what "defers before doing any work" means."""
     p._enforce_min_funding_floor = lambda: 0
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p.ran: List[str] = []
     p._reconcile_pending_swaps = lambda wallet: p.ran.append("swaps")
     p._maybe_pay_dev_fee = lambda wallet: p.ran.append("dev_fee")

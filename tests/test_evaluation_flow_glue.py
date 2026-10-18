@@ -38,7 +38,7 @@ def _snapshot() -> SimpleNamespace:
 
 
 def _wire_common_spies(p):
-    p._state_dict = lambda snapshot, config: {}
+    p._state_dict = lambda wallet, snapshot, config: {}
     p._filter_new_declines = lambda wallet, declines: declines   # log them all
     logged_declines = []
     p._log_decline = lambda wallet, decline, state: logged_declines.append(decline)

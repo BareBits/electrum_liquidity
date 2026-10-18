@@ -164,6 +164,20 @@ def _run(p, lnworker, action) -> None:
     asyncio.run(p._liquidity_sink_drain(wallet, action, state={}))
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- the happy path -------------------------------------------------------
 def test_first_rung_settles_and_is_recorded() -> None:
     p = _plugin()
@@ -518,7 +532,7 @@ def test_read_config_carries_the_sink_settings() -> None:
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=f"  {SINK} ",
                             INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS=True)
-    cfg = p.read_config()
+    cfg = p.read_config(wallet)
     assert cfg.liquidity_sink_address == SINK      # trimmed on the way in
     assert cfg.disable_submarine_swaps is True
 
@@ -527,7 +541,7 @@ def test_read_config_defaults_the_sink_off_on_an_older_config() -> None:
     # A config predating these settings must read as "off", not raise on a tick.
     p = _plugin()
     p.config = _full_config()
-    cfg = p.read_config()
+    cfg = p.read_config(wallet)
     assert cfg.liquidity_sink_address == ""
     assert cfg.disable_submarine_swaps is False
 
@@ -536,7 +550,7 @@ def test_read_config_carries_the_defer_until_goal_switch() -> None:
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK,
                             INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL=False)
-    assert p.read_config().defer_sink_until_goal is False
+    assert p.read_config(wallet).defer_sink_until_goal is False
 
 
 def test_defer_until_goal_defaults_ON_on_an_older_config() -> None:
@@ -547,7 +561,7 @@ def test_defer_until_goal_defaults_ON_on_an_older_config() -> None:
     # way, for the pure tests; read_config always passes this explicitly.)
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK)
-    assert p.read_config().defer_sink_until_goal is True
+    assert p.read_config(wallet).defer_sink_until_goal is True
 
 
 # --- the outcome enum -----------------------------------------------------

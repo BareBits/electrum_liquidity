@@ -65,6 +65,11 @@ This table lists the most-used settings and their tab — the tabs also carry mo
 knobs not shown here (reliability tuning, offline auto-close, daily action
 ceilings, diagnostics, etc.).
 
+**Settings are per wallet.** Open two wallets in one Electrum and each gets its
+own **Liquidity** tab with its own settings: how much inbound that wallet wants,
+what it will pay for it, and whether it is armed at all are properties of the
+wallet, not of the installation. See [Per-wallet settings](#per-wallet-settings).
+
 | Setting | Tab | Meaning | Default |
 |---|---|---|---|
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
@@ -751,13 +756,63 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+## Per-wallet settings
+
+Every setting is stored **in the wallet file** (under
+`inbound_liquidity_settings`, alongside the plugin's other per-wallet stores),
+and every open wallet gets its own **Liquidity** tab. Changing a setting on one
+wallet changes nothing for any other — including the **ENABLED/DISABLED** arm
+switch, so one armed wallet cannot arm the rest.
+
+A setting a wallet has never been given a value for reads the
+**installation-wide default**: the `plugins.inbound_liquidity.*` config key, as
+set by `electrum setconfig` (or left at the shipped default). So the two levels
+are:
+
+| Level | Where | Set by | Applies to |
+|---|---|---|---|
+| wallet | the wallet file | the Liquidity tab, `inbound_liquidity_set_setting` | that wallet only |
+| installation | Electrum's config | `electrum setconfig plugins.inbound_liquidity.<key>` | every wallet without a value of its own |
+
+**Resetting.** *Advanced → Reset this wallet to defaults* discards everything
+stored for that wallet, putting it back on the installation defaults. No other
+wallet is touched, and nothing about channels, swaps or funds changes.
+
+**Headless / CLI.** `setconfig` sets the installation default, which a wallet
+with its own value ignores — so there are per-wallet equivalents:
+
+```bash
+electrum inbound_liquidity_get_settings   -w /path/to/wallet
+electrum inbound_liquidity_set_setting    max_channels 3   -w /path/to/wallet
+electrum inbound_liquidity_set_setting    automation_enabled true -w /path/to/wallet
+electrum inbound_liquidity_reset_settings -w /path/to/wallet
+```
+
+The setting name is accepted with or without the `INBOUND_LIQUIDITY_` prefix and
+is case-insensitive; values are checked against the setting's declared type
+(booleans take `true/false/yes/no/on/off/1/0`). Each returns the wallet's
+settings as they read afterwards.
+
+**Three exceptions**, where what the setting controls is one thing per *process*
+rather than one per wallet — Python's logging configuration, and Electrum's
+`MIN_FUNDING_SAT` constant. They are still set per wallet; the effective value
+is just drawn from all the open wallets at once, taking the most permissive
+answer so one wallet cannot override another's:
+
+| Setting | Effective value |
+|---|---|
+| `log_capture_ln`, `log_capture_debug` | on if **any** open wallet asks for it |
+| `log_buffer_lines` | the **largest** any open wallet asks for |
+| `min_onchain_to_open_sat` (as it lowers the channel-funding floor) | the **lowest** across open wallets — the floor is a permission, and each wallet is still held to its own value by the engine |
+
 ## Layout
 
 ```
 inbound_liquidity/
   manifest.json         plugin metadata (available_for: qt, cmdline)
-  __init__.py           ConfigVars + base plugin: event wiring, snapshot, executor, decision-log
-                        store, dev fee, daily ceilings, offline auto-close, MIN_FUNDING_SAT floor override
+  __init__.py           ConfigVars + base plugin: per-wallet settings store, event wiring, snapshot,
+                        executor, decision-log store, dev fee, daily ceilings, offline auto-close,
+                        MIN_FUNDING_SAT floor override, and the inbound_liquidity_* CLI commands
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
                         Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs),
@@ -770,8 +825,9 @@ inbound_liquidity/
   log_buffer.py         bounded in-memory log capture backing the Log sub-tab (no Electrum imports)
   cmdline.py            headless entry point
 tests/                  pure-engine unit tests + Electrum-glue tests covering the rules engine,
-                        decision log, provider/peer reliability, dev fee, daily caps, offline
-                        auto-close, startup readiness, diagnostics, the Qt tab, and the funding floor
+                        per-wallet settings, decision log, provider/peer reliability, dev fee, daily
+                        caps, offline auto-close, startup readiness, diagnostics, the Qt tab (incl.
+                        one tab per open wallet), and the funding floor
 ```
 
 The decision logic lives in `liquidity_manager.py` as a pure function
@@ -812,6 +868,11 @@ installed editable. `e2e/setup.sh` builds one at `e2e/.venv-electrum`.
 ```bash
 # unit (pure rules engine) + Electrum-glue tests — from this plugin directory
 e2e/.venv-electrum/bin/python -m pytest tests/ -q
+
+# multi-wallet GUI test: several wallets in one REAL Electrum Qt process
+# (offline + offscreen, no rig, seconds to run) -- from the e2e directory
+cd e2e && RUN_GUI_E2E=1 .venv-electrum/bin/python -m pytest \
+    tests/test_multi_wallet_gui_e2e.py -q
 
 # end-to-end (heavy; needs bitcoind + Fulcrum + docker):
 cd e2e && ./setup.sh                        # one-time: builds the venv, clones Electrum

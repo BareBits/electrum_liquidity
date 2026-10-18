@@ -71,7 +71,7 @@ def _plugin(**config) -> LiquidityPlugin:
 def _wire_tick(p, *, automation: bool = True) -> None:
     """Stub everything _evaluate calls so only the status plumbing is under test."""
     p._enforce_min_funding_floor = lambda: 0
-    p.read_config = lambda: SimpleNamespace(automation_enabled=automation)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=automation)
     p._reconcile_pending_swaps = lambda wallet: None
     p._maybe_pay_dev_fee = lambda wallet: None
     p._scan_channel_health = lambda wallet: None

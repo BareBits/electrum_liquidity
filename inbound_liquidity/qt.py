@@ -199,23 +199,28 @@ _SEND_WARNING_REFRESH: Optional[Callable[[], None]] = None
 
 class _GoalVisibility:
     """Reader and writer for the "show the liquidity goal on the chart"
-    checkbox, which is persisted in ``INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART``.
+    checkbox, which is persisted per wallet under
+    ``INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART``.
 
     One object rather than two module globals so the getter and the setter can
     never be installed out of step -- a chart that could be read but not written
     would give the user a checkbox that forgets itself.
+
+    Both take the wallet whose chart is being drawn, because the setting is that
+    wallet's: with two wallets open, unticking the box on one must not strip the
+    slices off the other's chart.
     """
 
-    def __init__(self, get: Callable[[], bool],
-                 set_: Callable[[bool], None]) -> None:
+    def __init__(self, get: Callable[['Abstract_Wallet'], bool],
+                 set_: Callable[['Abstract_Wallet', bool], None]) -> None:
         self._get = get
         self._set = set_
 
-    def get(self) -> bool:
-        return bool(self._get())
+    def get(self, wallet: 'Abstract_Wallet') -> bool:
+        return bool(self._get(wallet))
 
-    def set(self, show: bool) -> None:
-        self._set(bool(show))
+    def set(self, wallet: 'Abstract_Wallet', show: bool) -> None:
+        self._set(wallet, bool(show))
 
 
 # Set by Plugin.load_wallet, cleared by close_wallet -- same lifetime, and for
@@ -238,7 +243,7 @@ def _set_goal_visibility(visibility: Optional[_GoalVisibility]) -> None:
     _GOAL_VISIBILITY = visibility
 
 
-def _goal_is_shown() -> bool:
+def _goal_is_shown(wallet: 'Abstract_Wallet') -> bool:
     """Whether the goal slices are wanted on the chart right now.
 
     Defaults to True when nothing is installed or the read fails -- that is the
@@ -250,19 +255,19 @@ def _goal_is_shown() -> bool:
     if visibility is None:
         return True
     try:
-        return visibility.get()
+        return visibility.get(wallet)
     except Exception:
         return True
 
 
-def _set_goal_shown(show: bool) -> None:
+def _set_goal_shown(wallet: 'Abstract_Wallet', show: bool) -> None:
     """Persist the checkbox. A failure here costs the user the *memory* of their
     choice, not the choice itself -- the chart is repainted either way."""
     visibility = _GOAL_VISIBILITY
     if visibility is None:
         return
     try:
-        visibility.set(show)
+        visibility.set(wallet, show)
     except Exception:
         pass
 
@@ -391,7 +396,7 @@ def _rewrite_piechart_entries(entries, wallet: 'Abstract_Wallet'):
     and the switched-off case cost no allocation, and the caller's ``is`` check
     is enough to decide whether anything needs repainting.
     """
-    if not _goal_is_shown():
+    if not _goal_is_shown(wallet):
         return entries
     split = _goal_buffer_split(entries, wallet)
     if split is None:
@@ -581,10 +586,10 @@ def _install_goal_view(dialog, wallet: 'Abstract_Wallet') -> bool:
     # Checked BEFORE the signal is connected: setChecked would otherwise write
     # the stored setting straight back and repaint the status bar just from
     # opening the dialog.
-    checkbox.setChecked(_goal_is_shown())
+    checkbox.setChecked(_goal_is_shown(wallet))
 
     def on_toggled(show: bool) -> None:
-        _set_goal_shown(show)
+        _set_goal_shown(wallet, show)
         render(show)
         # The status-bar pie is a different widget built by a different patch,
         # and the user asked for one consistent view -- so push it through
@@ -823,6 +828,16 @@ def _fmt_sat(amount: Optional[int]) -> str:
 def _fmt_time(ts: float) -> str:
     try:
         return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "?"
+
+
+def _wallet_name(wallet: 'Abstract_Wallet') -> str:
+    """The wallet's file name, for log lines. Falls back to a placeholder rather
+    than raising: every caller is on an error path or a lifecycle log, where
+    failing to name the wallet must not become a second failure."""
+    try:
+        return wallet.basename()
     except Exception:
         return "?"
 
@@ -1078,8 +1093,8 @@ class Plugin(LiquidityPlugin):
         Never blocks or breaks wallet load: a failure to show the dialog leaves
         the flag unset (it will be offered again next time) and nothing else.
         """
-        c = self.config
-        if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED', False)):
+        c = self.settings(wallet)
+        if bool(c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED):
             return
         if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED', False)):
             return          # already switched on from Advanced; nothing to ask
@@ -1164,19 +1179,42 @@ class Plugin(LiquidityPlugin):
             _set_buffer_provider(None)
             _set_goal_visibility(None)
 
-    def show_goal_in_piechart(self) -> bool:
-        """Whether the user wants the liquidity-goal slices on the balance chart.
+    @hook
+    def on_close_window(self, window: 'ElectrumWindow') -> None:
+        """Drop the UI handle for a window Electrum has finished with.
 
-        A display setting, so it is read straight off the config rather than
-        going through ``read_config()`` -- the rules engine has no business
-        knowing about it, and defaulting to True keeps the chart as it was for
-        anyone upgrading.
+        In the ordinary close, ``clean_up`` runs ``close_wallet`` before
+        ``close_window``, so this finds nothing left to do -- which is the point:
+        it is the backstop for the paths that reach window teardown WITHOUT the
+        wallet being closed, where a kept handle would make the next
+        ``_add_liquidity_tab`` for that wallet a no-op (see :meth:`_tab_is_live`).
+
+        Deliberately narrower than ``close_wallet``: the window is going, the
+        wallet may well not be (``should_stop_wallet_on_close`` is False for a
+        reload), so this touches the tab handle only and leaves automation,
+        heartbeat and per-wallet state alone.
         """
-        return bool(getattr(self.config,
-                            'INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART', True))
+        wallet = getattr(window, "wallet", None)
+        if wallet is None:
+            return
+        state = self._tabs.get(wallet)
+        if state is not None and state.window is window:
+            self._remove_liquidity_tab(wallet)
 
-    def set_show_goal_in_piechart(self, show: bool) -> None:
-        self.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = bool(show)
+    def show_goal_in_piechart(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether the user wants the liquidity-goal slices on this wallet's
+        balance chart.
+
+        A display setting, so it is read straight off the wallet's settings
+        rather than going through ``read_config()`` -- the rules engine has no
+        business knowing about it, and defaulting to True keeps the chart as it
+        was for anyone upgrading.
+        """
+        return bool(self.settings(wallet).INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART)
+
+    def set_show_goal_in_piechart(self, wallet: 'Abstract_Wallet',
+                                  show: bool) -> None:
+        self.settings(wallet).INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = bool(show)
 
     def requires_settings(self) -> bool:
         # Settings now live in the Liquidity tab rather than a settings dialog.
@@ -1302,16 +1340,74 @@ class Plugin(LiquidityPlugin):
             pass    # widgets deleted between the emit and its delivery
 
     # --- tab lifecycle ----------------------------------------------------
+    @staticmethod
+    def _tab_is_live(state: _TabState, window: 'ElectrumWindow') -> bool:
+        """Whether ``state`` still describes a tab the user can actually see in
+        ``window``.
+
+        A bookkeeping entry is not proof of a tab on screen. Electrum replaces a
+        window without necessarily firing ``close_wallet`` -- ``reload_window``
+        (used by the Plugins dialog) calls ``window.close()`` and then builds a
+        new window regardless of whether the close was accepted, and
+        ``closeEvent`` is free to ``event.ignore()`` on a closing warning. Either
+        way the plugin can be left holding a :class:`_TabState` for a window that
+        is gone or no longer the one being loaded, and keying the add off mere
+        presence in ``_tabs`` would then skip the rebuild and leave that wallet
+        with no Liquidity tab at all, for the rest of the session.
+
+        So the entry has to answer two questions, not one: is it for THIS window,
+        and is its container still in that window's tab bar.
+        """
+        if state.window is not window:
+            return False
+        try:
+            return window.tabs.indexOf(state.container) != -1
+        except Exception:
+            return False    # the C++ window went away under us
+
     def _add_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet') -> None:
-        if wallet in self._tabs:
+        existing = self._tabs.get(wallet)
+        if existing is not None:
+            if self._tab_is_live(existing, window):
+                return      # already on screen in this window; nothing to do
+            # Stale: the window was replaced, or the tab was taken out from under
+            # us. Drop the dead handle so the rebuild below is not skipped.
+            self.logger.info(
+                f"replacing a stale Liquidity tab handle for {_wallet_name(wallet)}")
+            self._remove_liquidity_tab(wallet)
+        # Every step from here is guarded, because this runs inside the
+        # `load_wallet` hook: an exception would propagate into Electrum's
+        # run_hook, which logs it and moves on -- costing this wallet its tab
+        # silently. One wallet's bad data must never cost another wallet its tab.
+        try:
+            container, handles = self._build_liquidity_tab(window, wallet)
+        except Exception:
+            self.logger.exception(
+                f"could not build the Liquidity tab for {_wallet_name(wallet)}")
             return
-        container, handles = self._build_liquidity_tab(window, wallet)
         state = self._tabs[wallet] = _TabState(window, wallet, container, handles)
-        state.refresh()
+        # Add the tab BEFORE the first refresh. The refresh reads this wallet's
+        # stored history (decision log, providers, partners, uptime), and a single
+        # malformed record in there must cost the user stale contents, not the
+        # whole tab.
         try:
             window.tabs.addTab(container, read_QIcon("lightning.png"), _("Liquidity"))
         except Exception:
-            self.logger.exception("could not add Liquidity tab")
+            self.logger.exception(
+                f"could not add the Liquidity tab for {_wallet_name(wallet)}")
+            self._tabs.pop(wallet, None)
+            return
+        self.logger.info(f"Liquidity tab added for {_wallet_name(wallet)} "
+                         f"({len(self._tabs)} open with a tab)")
+        # This wallet is now one of the open ones, so the settings whose effect
+        # is process-wide (log capture, the funding floor) have to be re-derived
+        # to include it -- even if it is never managed.
+        self.apply_process_wide_settings()
+        try:
+            state.refresh()
+        except Exception:
+            self.logger.exception(
+                f"could not populate the Liquidity tab for {_wallet_name(wallet)}")
 
     def _remove_liquidity_tab(self, wallet: 'Abstract_Wallet') -> None:
         state = self._tabs.pop(wallet, None)
@@ -1536,7 +1632,7 @@ class Plugin(LiquidityPlugin):
         # The first two are separate switches on purpose: WHICH loggers to record,
         # and WHETHER to force debug level, are independent questions -- and only
         # the second has a side effect outside this plugin (see its tooltip).
-        c = self.config
+        c = self.settings(wallet)
         capture_ln_cb = QCheckBox(_("Also capture Electrum Lightning logs"))
         capture_ln_cb.setToolTip(_("Include Electrum's own Lightning and swap logging (peer "
                                    "manager, node rater, channels, routing, submarine swaps) in "
@@ -1784,7 +1880,7 @@ class Plugin(LiquidityPlugin):
         settings_tab = QWidget()
         vbox = QVBoxLayout(settings_tab)
 
-        c = self.config
+        c = self.settings(wallet)
 
         # --- master ENABLED/DISABLED slider -------------------------------
         # The big, obvious arm switch for all automation. It is DISABLED by
@@ -1888,7 +1984,7 @@ class Plugin(LiquidityPlugin):
         update_label.setTextFormat(Qt.TextFormat.RichText)
 
         def _refresh_update_label() -> None:
-            text = self.update_status()
+            text = self.update_status(wallet)
             update_label.setVisible(bool(text))
             if not text:
                 update_label.setText("")
@@ -1898,8 +1994,8 @@ class Plugin(LiquidityPlugin):
             # only https URLs): this label renders rich text, and the strings
             # originate off-machine. Two independent guards, not one.
             safe_text = html.escape(text)
-            if self.update_available():
-                url = html.escape(self.latest_release_url(), quote=True)
+            if self.update_available(wallet):
+                url = html.escape(self.latest_release_url(wallet), quote=True)
                 # The link goes to the release page and nothing is downloaded
                 # here: updating stays something the user does deliberately.
                 update_label.setText(
@@ -2087,7 +2183,7 @@ class Plugin(LiquidityPlugin):
         get_decimal_point = getattr(window, "get_decimal_point", None) or (lambda: 8)
         goal_e = BTCAmountEdit(get_decimal_point)
         goal_e.setToolTip(goal_tooltip)
-        goal_e.setAmount(self._liquidity_goal_sat())
+        goal_e.setAmount(self._liquidity_goal_sat(wallet))
         grid.addWidget(goal_e, goal_row, 1)
         fx = getattr(window, "fx", None)
         goal_fiat_e = None
@@ -2117,7 +2213,7 @@ class Plugin(LiquidityPlugin):
             a wallet and then changing the base unit must not put a traceback in the
             user's log."""
             try:
-                goal_e.setAmount(self._liquidity_goal_sat())
+                goal_e.setAmount(self._liquidity_goal_sat(wallet))
                 if goal_fiat_e is not None:
                     goal_fiat_e.setVisible(bool(fx.is_enabled()))
             except RuntimeError:
@@ -2152,7 +2248,7 @@ class Plugin(LiquidityPlugin):
             "With submarine swaps also disabled, nothing drains a channel until "
             "the goal is met. The plugin says so in its decision log rather than "
             "pay your outbound away against your wishes."))
-        defer_sink_cb.setChecked(self._defer_sink_until_goal())
+        defer_sink_cb.setChecked(self._defer_sink_until_goal(wallet))
 
         sink_only_cb = QCheckBox(_("Disable submarine swaps (use the liquidity sink only)"))
         sink_only_cb.setToolTip(_(
@@ -2172,10 +2268,10 @@ class Plugin(LiquidityPlugin):
             """
             if not bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)):
                 return ""
-            if not self._liquidity_sink_address():
+            if not self._liquidity_sink_address(wallet):
                 return _("Submarine swaps are disabled but no liquidity sink is set: "
                          "nothing can drain a channel until you set one.")
-            if self._defer_sink_until_goal():
+            if self._defer_sink_until_goal(wallet):
                 return _("Submarine swaps are disabled and the liquidity sink is held "
                          "back until the liquidity goal is met: nothing can drain a "
                          "channel until then.")
@@ -2297,7 +2393,7 @@ class Plugin(LiquidityPlugin):
                 # floor tracks min-on-chain-to-open, which is also on this form, so
                 # ask what it will be once this click is applied.
                 floor = self.effective_min_funding_sat(
-                    by_label.get(min_onchain_label_text))
+                    wallet, by_label.get(min_onchain_label_text))
                 if max_size < floor:
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_(
@@ -2313,7 +2409,7 @@ class Plugin(LiquidityPlugin):
             # min_onchain may have changed: re-assert the channel-funding floor so
             # a lowered floor keeps matching the (new) configured value at once.
             self._enforce_min_funding_floor()
-            self._reload_settings_fields(edits, _sync_toggle_from_config)
+            self._reload_settings_fields(wallet, edits, _sync_toggle_from_config)
             _reload_goal()
             _refresh_dev_fee_label()
             # Saving a sink setting that leaves nothing able to drain a channel
@@ -2363,7 +2459,7 @@ class Plugin(LiquidityPlugin):
         tabs.addTab(partners_tab, _("Channel partners"))
 
         # --- Advanced sub-tab (last config tab, before the read-only logs) -
-        advanced_tab, repopulate_advanced = self._build_advanced_tab(wallet)
+        advanced_tab, repopulate_advanced = self._build_advanced_tab(window, wallet)
         tabs.addTab(advanced_tab, _("Advanced"))
 
         # --- Decision-log sub-tabs ----------------------------------------
@@ -2393,7 +2489,7 @@ class Plugin(LiquidityPlugin):
             # stale tick-box next to the sink address would misreport whether the
             # sink is actually in use.
             defer_sink_cb.blockSignals(True)
-            defer_sink_cb.setChecked(self._defer_sink_until_goal())
+            defer_sink_cb.setChecked(self._defer_sink_until_goal(wallet))
             defer_sink_cb.blockSignals(False)
             sink_only_cb.blockSignals(True)
             sink_only_cb.setChecked(
@@ -2425,15 +2521,20 @@ class Plugin(LiquidityPlugin):
         }
 
     # --- advanced sub-tab -------------------------------------------------
-    def _build_advanced_tab(self, wallet: 'Abstract_Wallet'):
+    def _build_advanced_tab(self, window: 'ElectrumWindow',
+                            wallet: 'Abstract_Wallet'):
         """Build the Advanced sub-tab: the feature on/off toggles, the daily
-        (rolling-24h) action ceilings (a runaway guard), and the power-user tuning
+        (rolling-24h) action ceilings (a runaway guard), the power-user tuning
         knobs (on-chain reserve, reliability tuning, offline auto-close, log
-        retention) moved off the main Settings tab. Returns (widget, repopulate).
+        retention) moved off the main Settings tab, and the reset-to-defaults
+        button. Returns (widget, repopulate).
+
+        Takes the window because the reset asks for confirmation first, and the
+        confirmation is a modal on the window that owns this tab.
         """
         from . import DEFAULT_MAX_OPENS_PER_DAY, DEFAULT_MAX_CLOSES_PER_DAY
 
-        c = self.config
+        c = self.settings(wallet)
         tab = QWidget()
         v = QVBoxLayout(tab)
         v.addWidget(_wrapped_label(_(
@@ -2637,9 +2738,53 @@ class Plugin(LiquidityPlugin):
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))
 
+        # --- back to the defaults -----------------------------------------
+        # Settings are this wallet's own, which raises a question the plugin
+        # owes an answer to: how do I undo them? Clearing the wallet's values
+        # is one action (they live in one store), and it is the only way back
+        # for a wallet that inherited a tuned installation default it did not
+        # want -- a newly created wallet on an installation configured before
+        # this version, say.
+        reset_btn = QPushButton(_("Reset this wallet to defaults"))
+        reset_btn.setToolTip(_(
+            "Discard every Inbound Liquidity setting stored for THIS wallet, so "
+            "all of them go back to the defaults. Other wallets are not "
+            "touched, and nothing about your channels, swaps or funds changes."))
+
+        def on_reset() -> None:
+            try:
+                confirmed = bool(window.question(
+                    _("Discard every Inbound Liquidity setting stored for this "
+                      "wallet ({name}) and go back to the defaults?\n\n"
+                      "No other wallet is affected. Your channels, swaps and "
+                      "funds are not touched.").format(name=_wallet_name(wallet)),
+                    title=_("Reset this wallet's settings?")))
+            except Exception:
+                self.logger.exception("could not ask about resetting the settings")
+                return
+            if not confirmed:
+                return
+            self.reset_settings(wallet)
+            # Every field on every sub-tab is now stale, so refresh the whole
+            # tab rather than this one's fields: the Settings tab's slider and
+            # amount box read the same store.
+            state = self._tabs.get(wallet)
+            if state is not None:
+                try:
+                    state.refresh()
+                except Exception:
+                    self.logger.exception("could not refresh the tab after a reset")
+            else:
+                repopulate()
+            status.setStyleSheet("color: green;")
+            status.setText(_("Settings reset to the defaults."))
+
+        reset_btn.clicked.connect(on_reset)
+
         apply_btn = QPushButton(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row = QHBoxLayout()
+        btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
         v.addLayout(btn_row)
@@ -2696,7 +2841,7 @@ class Plugin(LiquidityPlugin):
         v.addWidget(status)
 
         def load_text_from_config() -> None:
-            c = self.config
+            c = self.settings(wallet)
             pref_edit.setPlainText(", ".join(sorted(_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS))))
             ban_edit.setPlainText(", ".join(sorted(_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS))))
 
@@ -2763,8 +2908,9 @@ class Plugin(LiquidityPlugin):
                 else:
                     ban.discard(npub)
             pref -= ban  # a banned provider can't also be preferred
-            self.config.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
-            self.config.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
+            c = self.settings(wallet)
+            c.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
+            c.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Providers saved."))
@@ -2850,12 +2996,14 @@ class Plugin(LiquidityPlugin):
             "“Preferred partners” box.")))
 
         strict_cb = QCheckBox(_("Only open channels to preferred partners (never fall back to suggestions)"))
-        strict_cb.setChecked(bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT))
+        strict_cb.setChecked(bool(
+            self.settings(wallet).INBOUND_LIQUIDITY_PARTNERS_STRICT))
         v.addWidget(strict_cb)
 
         one_per_peer_cb = QCheckBox(_("Only one channel per peer (don't open a second channel to a node "
                                       "you already have one with)"))
-        one_per_peer_cb.setChecked(bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER))
+        one_per_peer_cb.setChecked(bool(
+            self.settings(wallet).INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER))
         v.addWidget(one_per_peer_cb)
 
         v.addWidget(_wrapped_label(_(
@@ -2892,7 +3040,7 @@ class Plugin(LiquidityPlugin):
         v.addWidget(status)
 
         def load_text_from_config() -> None:
-            c = self.config
+            c = self.settings(wallet)
             pref_edit.setPlainText("\n".join(_parse_partner_list(c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)))
             ban_edit.setPlainText("\n".join(sorted(_parse_banned_partners(c.INBOUND_LIQUIDITY_BANNED_PARTNERS))))
             strict_cb.setChecked(bool(c.INBOUND_LIQUIDITY_PARTNERS_STRICT))
@@ -2964,10 +3112,11 @@ class Plugin(LiquidityPlugin):
                     pref_ids.discard(low)
             # A banned partner can't also be preferred.
             preferred = [p for p in preferred if normalize_node_id(p) not in banned]
-            self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
-            self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
-            self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
-            self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
+            c = self.settings(wallet)
+            c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
+            c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
+            c.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
+            c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Channel partners saved."))
@@ -3001,12 +3150,13 @@ class Plugin(LiquidityPlugin):
 
         return tab, repopulate
 
-    def _reload_settings_fields(self, edits,
+    def _reload_settings_fields(self, wallet: 'Abstract_Wallet', edits,
                                 sync_toggle: Optional[Callable[[], None]] = None) -> None:
-        """Re-read persisted config back into the editable Settings-tab fields, so
-        any clamping/normalisation done on save is visible to the user. (The
-        Advanced tab reloads its own fields via its repopulate().)"""
-        c = self.config
+        """Re-read this wallet's persisted settings back into the editable
+        Settings-tab fields, so any clamping/normalisation done on save is
+        visible to the user. (The Advanced tab reloads its own fields via its
+        repopulate().)"""
+        c = self.settings(wallet)
         if sync_toggle is not None:
             sync_toggle()
         # Positional: this list must stay in the same order as the `fields` list

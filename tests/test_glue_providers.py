@@ -77,6 +77,20 @@ def _snapshot(channels, **over) -> LiquiditySnapshot:
     return LiquiditySnapshot(**base)
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- npub parsing ---------------------------------------------------------
 def test_parse_npub_set_variants() -> None:
     assert _parse_npub_set("npub1, npub2") == frozenset({"npub1", "npub2"})
@@ -196,7 +210,7 @@ def test_read_config_parses_provider_lists() -> None:
         INBOUND_LIQUIDITY_PREFERRED_NPUBS="npubA, npubB",
         INBOUND_LIQUIDITY_BANNED_NPUBS="npubC",
     )
-    cfg = p.read_config()
+    cfg = p.read_config(wallet)
     assert cfg.preferred_npubs == frozenset({"npubA", "npubB"})
     assert cfg.banned_npubs == frozenset({"npubC"})
     assert cfg.min_outbound_sat == 0

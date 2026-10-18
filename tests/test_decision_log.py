@@ -90,6 +90,20 @@ def _snapshot() -> LiquiditySnapshot:
         swap_claim_fee_sat=22_500, pending_channel_count=1, inflight_swap_count=0)
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- abbreviation ---------------------------------------------------------
 def test_abbrev_shortens_long_ids() -> None:
     node = "02b2a9bbdd7513a559deb22666afd04a4c80fe400eeda34dd7ba53d3e027a06501"
@@ -105,7 +119,7 @@ def test_abbrev_passes_short_values_through() -> None:
 def test_state_dict_is_json_plain_and_complete() -> None:
     import json
     p = _make_plugin()
-    state = p._state_dict(_snapshot(), _config())
+    state = p._state_dict(wallet, _snapshot(), _config())
     # Must round-trip through JSON (it is persisted in wallet.db).
     json.loads(json.dumps(state))
     assert state["pending_channel_count"] == 1
@@ -120,11 +134,11 @@ def test_state_dict_records_the_max_channel_size_ceiling() -> None:
     capped open's amount is unexplainable from the log alone."""
     from dataclasses import replace
     p = _make_plugin()
-    state = p._state_dict(_snapshot(), replace(_config(), max_channel_size_sat=750_000))
+    state = p._state_dict(wallet, _snapshot(), replace(_config(), max_channel_size_sat=750_000))
     assert state["config"]["max_channel_size_sat"] == 750_000
     # And "off" is recorded as 0 rather than omitted -- an absent key would read as
     # an older build rather than as a deliberately disabled ceiling.
-    off = p._state_dict(_snapshot(), replace(_config(), max_channel_size_sat=0))
+    off = p._state_dict(wallet, _snapshot(), replace(_config(), max_channel_size_sat=0))
     assert off["config"]["max_channel_size_sat"] == 0
 
 
@@ -135,7 +149,7 @@ def test_log_action_persists_and_abbreviates() -> None:
     node = "02b2a9bbdd7513a559deb22666afd04a4c80fe400eeda34dd7ba53d3e027a06501"
     p._log_action(w, kind="open", amount_sat=1_990_000, source="on-chain",
                   dest=node, reason="cold wallet", detail="funding txid abc",
-                  state=p._state_dict(_snapshot(), _config()))
+                  state=p._state_dict(wallet, _snapshot(), _config()))
     assert w.saved == 1
     stored: List[Dict] = w.db.get(LOG_DB_KEY)
     assert len(stored) == 1
@@ -213,9 +227,9 @@ def test_prune_drops_entries_older_than_retention() -> None:
 
 
 def test_retention_days_clamped_to_bounds() -> None:
-    assert _make_plugin(retention_days=0)._retention_days() == 1
-    assert _make_plugin(retention_days=10_000)._retention_days() == MAX_LOG_RETENTION_DAYS
-    assert _make_plugin(retention_days="bad")._retention_days() == DEFAULT_LOG_RETENTION_DAYS
+    assert _make_plugin(retention_days=0)._retention_days(wallet) == 1
+    assert _make_plugin(retention_days=10_000)._retention_days(wallet) == MAX_LOG_RETENTION_DAYS
+    assert _make_plugin(retention_days="bad")._retention_days(wallet) == DEFAULT_LOG_RETENTION_DAYS
 
 
 def test_prune_caps_total_entries() -> None:
@@ -225,7 +239,7 @@ def test_prune_caps_total_entries() -> None:
     many = [{"ts": now, "category": "action", "reason": str(i)}
             for i in range(MAX_LOG_ENTRIES + 50)]
     w.db.put(LOG_DB_KEY, many)
-    kept = p._prune(list(many))
+    kept = p._prune(wallet, list(many))
     assert len(kept) == MAX_LOG_ENTRIES
     # the most recent are kept (tail of the list)
     assert kept[-1]["reason"] == str(MAX_LOG_ENTRIES + 49)

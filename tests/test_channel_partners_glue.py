@@ -61,6 +61,21 @@ def _resolve(p, wallet, **kwargs):
     return asyncio.run(p._resolve_channel_partners(wallet, **kwargs))
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
+
 # --- parsing --------------------------------------------------------------
 def test_parse_partner_list_orders_and_dedupes():
     raw = f"{PUB_A}@h:1\n{PUB_B}@h:2, {PUB_A}@h:3"
@@ -75,23 +90,23 @@ def test_parse_banned_partners_normalizes_to_pubkeys():
 def test_migrate_channel_peer_prepends_and_clears():
     p = _plugin(INBOUND_LIQUIDITY_CHANNEL_PEER=f"{PUB_A}@h:1",
                 INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_B}@h:2")
-    p._migrate_channel_peer()
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
+    p._migrate_channel_peer(wallet)
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
         f"{PUB_A}@h:1", f"{PUB_B}@h:2"]
-    assert p.config.INBOUND_LIQUIDITY_CHANNEL_PEER == ""
+    assert p.settings(wallet).INBOUND_LIQUIDITY_CHANNEL_PEER == ""
     # Idempotent: a second run is a no-op.
-    p._migrate_channel_peer()
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
+    p._migrate_channel_peer(wallet)
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
         f"{PUB_A}@h:1", f"{PUB_B}@h:2"]
 
 
 def test_migrate_channel_peer_skips_duplicate():
     p = _plugin(INBOUND_LIQUIDITY_CHANNEL_PEER=f"{PUB_A}@h:1",
                 INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_A}@h:9")
-    p._migrate_channel_peer()
+    p._migrate_channel_peer(wallet)
     # Already present (by pubkey) -> not duplicated, just cleared.
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [f"{PUB_A}@h:9"]
-    assert p.config.INBOUND_LIQUIDITY_CHANNEL_PEER == ""
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [f"{PUB_A}@h:9"]
+    assert p.settings(wallet).INBOUND_LIQUIDITY_CHANNEL_PEER == ""
 
 
 # --- resolution -----------------------------------------------------------

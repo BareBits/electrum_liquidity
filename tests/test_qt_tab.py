@@ -356,10 +356,10 @@ def test_apply_persists_and_clamps(qapp):
     line_edits[7].setText("  alice@example.com  ")   # sink -> stored trimmed
     apply_btn.click()
 
-    assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 5
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS == 5
     from electrum.plugins.inbound_liquidity import DEV_FEE_MAX_PCT  # noqa
-    assert p.config.INBOUND_LIQUIDITY_DEV_FEE_PCT == DEV_FEE_MAX_PCT
-    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == "alice@example.com"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DEV_FEE_PCT == DEV_FEE_MAX_PCT
+    assert p.settings(wallet).INBOUND_LIQUIDITY_SINK_ADDRESS == "alice@example.com"
     # Fields reloaded to the clamped / normalised values.
     assert line_edits[6].text() == str(DEV_FEE_MAX_PCT)
     assert line_edits[7].text() == "alice@example.com"
@@ -374,13 +374,13 @@ def test_apply_rejects_invalid_without_persisting(qapp):
     settings_tab = sub.widget(0)
     from PyQt6.QtWidgets import QPushButton
     line_edits = _plain_line_edits(settings_tab)
-    before = p.config.INBOUND_LIQUIDITY_MAX_CHANNELS
+    before = p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS
     line_edits[1].setText("not-a-number")   # max-channels is index 1 post-reorg
     apply_btn = next(b for b in settings_tab.findChildren(QPushButton)
                      if b.text() == "Apply")
     apply_btn.click()
     # Nothing persisted.
-    assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == before
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS == before
 
 
 # --- ENABLED/DISABLED slider ---------------------------------------------
@@ -403,7 +403,7 @@ def test_slider_reflects_default_disabled(qapp):
     # slider and its status label must show DISABLED, and no automation runs.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
     p._add_liquidity_tab(window, wallet)
     sw = _slider(p, wallet)
     assert sw is not None
@@ -421,7 +421,7 @@ def test_slider_enables_immediately_and_triggers_eval(qapp):
 
     # Flipping the slider persists at once, without any Apply click.
     sw.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
     # ...and kicks an evaluation so it starts acting right away.
     assert evaluated == [wallet]
     assert _has_label(_settings_tab(p, wallet), "ENABLED")
@@ -438,7 +438,7 @@ def test_slider_disables_immediately_without_eval(qapp):
     assert sw.isChecked() is True  # reflects the enabled config on build
 
     sw.setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
     # Disabling does not schedule new work.
     assert evaluated == []
     assert _has_label(_settings_tab(p, wallet), "DISABLED")
@@ -467,7 +467,7 @@ def test_slider_knob_matches_disabled_config_on_build(qapp):
     # The shipped default: automation off -> knob parked OFF, DISABLED label.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is False
     p._add_liquidity_tab(window, wallet)
     sw = _slider(p, wallet)
     assert sw.isChecked() is False
@@ -484,16 +484,16 @@ def test_apply_does_not_disturb_slider_state(qapp):
     p._add_liquidity_tab(window, wallet)
     sw = _slider(p, wallet)
     sw.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
 
     settings_tab = _settings_tab(p, wallet)
     settings_tab.findChildren(QLineEdit)[1].setText("4")   # max-channels index 1
     next(b for b in settings_tab.findChildren(QPushButton)
          if b.text() == "Apply").click()
 
-    assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == 4
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS == 4
     # Slider (and its config) unchanged by Apply.
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
     assert sw.isChecked() is True
 
 
@@ -517,7 +517,7 @@ def test_manual_run_only_checkbox_present_and_reflects_default(qapp):
     # checkbox and a "Run now" button; the checkbox mirrors the shipped default.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
     p._add_liquidity_tab(window, wallet)
     cb = _manual_only_cb(p, wallet)
     assert cb.isChecked() is False
@@ -532,9 +532,9 @@ def test_manual_run_only_checkbox_persists_immediately(qapp):
     cb = _manual_only_cb(p, wallet)
 
     cb.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is True
     cb.setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MANUAL_RUN_ONLY is False
 
 
 def test_manual_run_only_checkbox_reflects_config_on_build(qapp):
@@ -592,9 +592,9 @@ def test_scope_switch_persists_immediately(qapp):
     cb = _plugin_only_cb(p, wallet)
 
     cb.setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is False
     cb.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY is True
 
 
 def test_scope_switch_reflects_config_on_build(qapp):
@@ -665,8 +665,8 @@ def test_providers_tab_apply_persists_checked_and_manual(qapp):
                      if b.text() == "Apply")
     apply_btn.click()
 
-    assert p.config.INBOUND_LIQUIDITY_BANNED_NPUBS == "npubAAA"
-    assert p.config.INBOUND_LIQUIDITY_PREFERRED_NPUBS == "npubOFFLINE"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_BANNED_NPUBS == "npubAAA"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_NPUBS == "npubOFFLINE"
 
 
 # --- Channel partners sub-tab --------------------------------------------
@@ -699,10 +699,10 @@ def test_channel_partners_apply_persists_text_and_strict(qapp):
                      if b.text() == "Apply")
     apply_btn.click()
 
-    assert p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS == f"{pub_a}@127.0.0.1:9735"
-    assert p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS == pub_b
-    assert p.config.INBOUND_LIQUIDITY_PARTNERS_STRICT is True
-    assert p.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS == f"{pub_a}@127.0.0.1:9735"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_BANNED_PARTNERS == pub_b
+    assert p.settings(wallet).INBOUND_LIQUIDITY_PARTNERS_STRICT is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER is False
 
 
 # --- Advanced sub-tab ----------------------------------------------------
@@ -728,8 +728,8 @@ def test_advanced_tab_persists_daily_ceilings(qapp):
                      if b.text() == "Apply")
     apply_btn.click()
 
-    assert p.config.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 7
-    assert p.config.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 0
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 7
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 0
 
 
 def test_advanced_tab_rejects_invalid_without_persisting(qapp):
@@ -747,8 +747,8 @@ def test_advanced_tab_rejects_invalid_without_persisting(qapp):
     apply_btn.click()
 
     # Neither invalid value is written; defaults are untouched.
-    assert p.config.INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 5
-    assert p.config.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 5
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 5
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 5
 
 
 def test_settings_tab_omits_moved_and_removed_fields(qapp):
@@ -766,7 +766,7 @@ def test_settings_tab_omits_moved_and_removed_fields(qapp):
     assert not any(t.startswith("Keep decision log") for t in labels)
     assert any("Max fee to move LN" in t for t in labels)
     # The removed address field must not have disturbed the persisted default.
-    assert p.config.INBOUND_LIQUIDITY_DEV_FEE_ADDRESS == "electrum_liqhelper@getbarebits.com"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DEV_FEE_ADDRESS == "electrum_liqhelper@getbarebits.com"
 
 
 def _edit_for(tab, label_prefix: str):
@@ -810,12 +810,12 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
                      if b.text() == "Apply")
     apply_btn.click()
 
-    assert p.config.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
-    assert p.config.INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
+    assert p.settings(wallet).INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
     assert retention.text() == str(MAX_LOG_RETENTION_DAYS)
-    assert p.config.INBOUND_LIQUIDITY_RELIABILITY_ENABLED is False
-    assert p.config.INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED is False
-    assert p.config.INBOUND_LIQUIDITY_DIAG_LOG_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_RELIABILITY_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DIAG_LOG_ENABLED is False
 
 
 # --- description text wrapping -------------------------------------------
@@ -1076,7 +1076,11 @@ def test_log_tab_clear_still_shows_what_happens_next(qapp):
 def test_log_tab_summary_reports_the_ring_state(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.log_buffer = LogRingBuffer(100)
+    # Via the setting, not by swapping the object in: building a tab now applies
+    # the wallet's configured buffer size to the (process-wide) ring, so a ring
+    # installed by hand beforehand would be resized straight back out from under
+    # the test. 100 is MIN_MAX_LINES, so it survives the clamp.
+    p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES = 100
     p._add_liquidity_tab(window, wallet)
     state = p._tabs[wallet]
     for i in range(120):
@@ -1322,14 +1326,14 @@ def test_capture_checkboxes_apply_immediately(qapp):
     state = p._tabs[wallet]
 
     _capture_cb(state, "Lightning logs").setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_LN is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_CAPTURE_LN is True
     assert p.log_capture.capture_ln is True          # live handler reconfigured
 
     _capture_cb(state, "debug-level").setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG is True
 
     _capture_cb(state, "Lightning logs").setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_LOG_CAPTURE_LN is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_CAPTURE_LN is False
     assert p.log_capture.capture_ln is False
 
 
@@ -1345,17 +1349,17 @@ def test_buffer_size_applies_and_clamps_on_edit(qapp):
 
     edit.setText("2500")
     edit.editingFinished.emit()
-    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == 2500
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_BUFFER_LINES == 2500
     assert p.log_buffer.max_lines == 2500
 
     edit.setText("1")                                 # below the floor
     edit.editingFinished.emit()
-    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MIN_LOG_BUFFER_LINES
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MIN_LOG_BUFFER_LINES
     assert edit.text() == str(MIN_LOG_BUFFER_LINES)   # box snaps to what is in force
 
     edit.setText("10" + "0" * 9)                      # above the ceiling
     edit.editingFinished.emit()
-    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MAX_LOG_BUFFER_LINES
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_BUFFER_LINES == MAX_LOG_BUFFER_LINES
     assert edit.text() == str(MAX_LOG_BUFFER_LINES)
 
 
@@ -1370,7 +1374,7 @@ def test_buffer_size_rejects_a_non_numeric_entry(qapp):
 
     edit.setText("not a number")
     edit.editingFinished.emit()
-    assert p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES == DEFAULT_LOG_BUFFER_LINES
+    assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_BUFFER_LINES == DEFAULT_LOG_BUFFER_LINES
     assert edit.text() == str(DEFAULT_LOG_BUFFER_LINES)
 
 
@@ -1412,7 +1416,7 @@ def test_sink_address_accepts_a_lightning_address(qapp):
 
     _sink_edit(tab).setText("myname@strike.me")
     _apply_button(tab).click()
-    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == "myname@strike.me"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_SINK_ADDRESS == "myname@strike.me"
 
 
 def test_sink_address_that_cannot_be_resolved_is_refused(qapp):
@@ -1425,7 +1429,7 @@ def test_sink_address_that_cannot_be_resolved_is_refused(qapp):
 
     _sink_edit(tab).setText("definitely not an address")
     _apply_button(tab).click()
-    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == ""
+    assert p.settings(wallet).INBOUND_LIQUIDITY_SINK_ADDRESS == ""
     assert any("Not a Lightning address" in t for t in _status_text(tab))
 
 
@@ -1438,7 +1442,7 @@ def test_a_blank_sink_address_is_accepted_as_off(qapp):
 
     _sink_edit(tab).setText("")
     _apply_button(tab).click()
-    assert p.config.INBOUND_LIQUIDITY_SINK_ADDRESS == ""
+    assert p.settings(wallet).INBOUND_LIQUIDITY_SINK_ADDRESS == ""
     assert any(t == "Settings saved." for t in _status_text(tab))
 
 
@@ -1450,9 +1454,9 @@ def test_sink_only_checkbox_applies_immediately(qapp):
     cb = _sink_only_checkbox(_settings_tab(p, wallet))
 
     cb.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
     cb.setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is False
 
 
 def test_sink_only_without_a_sink_warns_that_nothing_can_drain(qapp):
@@ -1510,9 +1514,9 @@ def test_defer_sink_checkbox_applies_immediately(qapp):
     cb = _defer_sink_checkbox(_settings_tab(p, wallet))
 
     cb.setChecked(False)
-    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
     cb.setChecked(True)
-    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is True
 
 
 def test_defer_sink_reflects_the_persisted_value_on_build(qapp):
@@ -1556,8 +1560,8 @@ def test_refresh_resyncs_both_sink_switches(qapp):
     assert not _defer_sink_checkbox(tab).isChecked()
     assert _sink_only_checkbox(tab).isChecked()
     # Re-syncing must not have written anything back through the toggle handlers.
-    assert p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
-    assert p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL is False
+    assert p.settings(wallet).INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS is True
 
 
 def test_advanced_tab_exposes_and_persists_the_minimum_swap_size(qapp):
@@ -1578,8 +1582,8 @@ def test_advanced_tab_exposes_and_persists_the_minimum_swap_size(qapp):
                      if b.text() == "Apply")
     edit.setText("60000")
     apply_btn.click()
-    assert p.config.INBOUND_LIQUIDITY_MIN_SWAP_SAT == 60_000
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MIN_SWAP_SAT == 60_000
 
     edit.setText("-1")
     apply_btn.click()
-    assert p.config.INBOUND_LIQUIDITY_MIN_SWAP_SAT == 0
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MIN_SWAP_SAT == 0

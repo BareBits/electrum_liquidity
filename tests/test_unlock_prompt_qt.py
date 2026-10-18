@@ -236,7 +236,7 @@ def test_declining_does_not_switch_automation_off(qapp):
     _wire_tab(p, w, window)
 
     p._on_unlock_requested_ui(w)
-    assert p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
+    assert p.settings(w).INBOUND_LIQUIDITY_AUTOMATION_ENABLED is True
 
 
 def test_declining_leaves_the_button_showing(qapp):

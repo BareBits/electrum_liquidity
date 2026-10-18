@@ -647,18 +647,23 @@ def test_balance_dialog_is_untouched_without_a_buffer(qapp) -> None:
 
 # --- the "Show liquidity goal" checkbox ----------------------------------
 class _VisibilityPref:
-    """A stand-in for the stored ConfigVar: what the checkbox reads and writes."""
+    """A stand-in for the stored per-wallet setting: what the checkbox reads and
+    writes. Both sides take the wallet whose chart is being drawn, because the
+    real setting is that wallet's (see qt._GoalVisibility)."""
 
     def __init__(self, show: bool = True) -> None:
         self.show = show
         self.writes: List[bool] = []
+        self.wallets: List[object] = []
 
-    def get(self) -> bool:
+    def get(self, wallet) -> bool:
+        self.wallets.append(wallet)
         return self.show
 
-    def set(self, show: bool) -> None:
+    def set(self, wallet, show: bool) -> None:
         self.show = bool(show)
         self.writes.append(bool(show))
+        self.wallets.append(wallet)
 
     def install(self) -> '_VisibilityPref':
         qt_mod._set_goal_visibility(qt_mod._GoalVisibility(self.get, self.set))
@@ -872,21 +877,23 @@ def test_a_broken_visibility_pref_falls_back_to_showing_the_goal(qapp) -> None:
     """This is read inside a status-bar repaint. A pref that raises must not take
     the window down, and the safe answer is the ConfigVar's own default."""
     class _Boom:
-        def get(self): raise RuntimeError("config is on fire")
-        def set(self, show): raise RuntimeError("config is on fire")
+        def get(self, wallet): raise RuntimeError("settings are on fire")
+        def set(self, wallet, show): raise RuntimeError("settings are on fire")
 
     boom = _Boom()
+    wallet = object()
     qt_mod._set_goal_visibility(qt_mod._GoalVisibility(boom.get, boom.set))
-    assert qt_mod._goal_is_shown() is True
-    qt_mod._set_goal_shown(False)        # must not raise
+    assert qt_mod._goal_is_shown(wallet) is True
+    qt_mod._set_goal_shown(wallet, False)        # must not raise
 
 
 def test_no_visibility_installed_means_the_goal_is_shown(qapp) -> None:
     """The ConfigVar ships on, so an unwired module (or a plugin that has not
     loaded a wallet yet) behaves as a ticked box would."""
+    wallet = object()
     qt_mod._set_goal_visibility(None)
-    assert qt_mod._goal_is_shown() is True
-    qt_mod._set_goal_shown(False)        # nowhere to write it; must not raise
+    assert qt_mod._goal_is_shown(wallet) is True
+    qt_mod._set_goal_shown(wallet, False)   # nowhere to write it; must not raise
 
 
 # --- the Send tab warning -------------------------------------------------

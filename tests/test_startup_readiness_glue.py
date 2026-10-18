@@ -127,6 +127,12 @@ def _plugin(clock: Optional[_Clock] = None, *, grace: float = GRACE,
     # offline-autoclose state
     p._coop_closing = {}
     p._coop_close_cooldown_until = {}
+    # dev-fee payout state. Needed because a setting this stub config does not
+    # carry now reads as the setting's own declared default rather than as a
+    # fallback written at the call site -- and the declared default for the
+    # payout address is a real address, so a tick reaches the payout step.
+    p._dev_fee_paying = {}
+    p._dev_fee_retry_until = {}
     cfg = dict(
         INBOUND_LIQUIDITY_BANNED_PARTNERS="",
         INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED=True,
@@ -222,7 +228,7 @@ def test_evaluate_defers_all_automation_until_ready(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._reconcile_pending_swaps = lambda wal: called.append("reconcile")
     p._scan_channel_health = lambda wal: called.append("health")
     p._scan_offline_autoclose = lambda wal: called.append("autoclose")
@@ -248,7 +254,7 @@ def test_evaluate_manual_run_acts_inside_the_startup_window(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._reconcile_pending_swaps = lambda wal: called.append("reconcile")
     p._scan_channel_health = lambda wal: called.append("health")
     p._scan_offline_autoclose = lambda wal: called.append("autoclose")
@@ -272,7 +278,7 @@ def test_evaluate_manual_run_still_refused_when_disconnected(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln, connected=False)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._scan_channel_health = lambda wal: called.append("health")
     _mark_started(p, w, clock)
     asyncio.run(p._evaluate(w, manual=True))

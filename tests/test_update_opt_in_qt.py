@@ -96,16 +96,16 @@ def test_the_question_states_the_privacy_cost_and_that_nothing_is_installed(qapp
 def test_yes_enables_the_check_and_looks_immediately(qapp):
     p, w, window = _plugin(), _FakeWallet(), _FakeWindow(answer=True)
     p._maybe_prompt_update_opt_in(window, w)
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is True
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is True
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is True
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is True
     assert p.checks == [w], "the user said yes and then had to wait for a heartbeat"
 
 
 def test_no_is_remembered_and_never_checks(qapp):
     p, w, window = _plugin(), _FakeWallet(), _FakeWindow(answer=False)
     p._maybe_prompt_update_opt_in(window, w)
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is True
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is True
     assert p.checks == []
 
 
@@ -120,7 +120,7 @@ def test_a_user_who_declined_is_not_asked_again(qapp):
     second = _FakeWindow(answer=True)
     p._maybe_prompt_update_opt_in(second, w)
     assert second.asked == []
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
 
 
 def test_enabling_it_from_advanced_settings_stops_the_question(qapp):
@@ -147,8 +147,8 @@ def test_a_dialog_that_cannot_be_shown_does_not_break_loading(qapp):
     p, w, window = _plugin(), _FakeWallet(), _FakeWindow(raises=True)
     p._maybe_prompt_update_opt_in(window, w)      # must not raise
     # Nothing was decided on the user's behalf, and the question is still open.
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is False
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
+    assert p.settings(w).INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED is False
     assert p.checks == []
 
     working = _FakeWindow(answer=True)

@@ -51,6 +51,20 @@ def _reset_to_stock(stock: int = 200_000) -> None:
     lnutil.MIN_FUNDING_SAT = stock
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 def test_floor_lowered_when_min_onchain_below_stock(restore_floor):
     import electrum.lnutil as lnutil
     from electrum.plugins.inbound_liquidity import liquidity_manager as engine
@@ -225,13 +239,13 @@ def test_max_channel_size_reader_survives_a_hand_edited_config():
     answer a user who set this setting definitely did not want."""
     from electrum.plugins.inbound_liquidity import DEFAULT_MAX_CHANNEL_SIZE_SAT  # noqa
     assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT="nonsense") \
-        ._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+        ._max_channel_size_sat(wallet) == DEFAULT_MAX_CHANNEL_SIZE_SAT
     assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=None) \
-        ._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+        ._max_channel_size_sat(wallet) == DEFAULT_MAX_CHANNEL_SIZE_SAT
     # Missing entirely (a config predating the setting) reads as the default too.
-    assert _plugin()._max_channel_size_sat() == DEFAULT_MAX_CHANNEL_SIZE_SAT
+    assert _plugin()._max_channel_size_sat(wallet) == DEFAULT_MAX_CHANNEL_SIZE_SAT
     # A negative value is clamped to "off" rather than becoming a negative amount.
-    assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=-1)._max_channel_size_sat() == 0
+    assert _plugin(INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT=-1)._max_channel_size_sat(wallet) == 0
 
 
 def test_read_config_passes_the_ceiling_to_the_engine():
@@ -258,7 +272,7 @@ def test_read_config_passes_the_ceiling_to_the_engine():
         INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS=False,
         INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL=True,
     )
-    assert p.read_config().max_channel_size_sat == 777_000
+    assert p.read_config(wallet).max_channel_size_sat == 777_000
 
 
 # --- effective_min_funding_sat -------------------------------------------
@@ -267,13 +281,13 @@ def test_read_config_passes_the_ceiling_to_the_engine():
 def test_effective_floor_follows_the_configured_min_onchain(restore_floor):
     _reset_to_stock(200_000)
     p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=50_000)
-    assert p.effective_min_funding_sat() == 50_000
+    assert p.effective_min_funding_sat(wallet) == 50_000
 
 
 def test_effective_floor_never_exceeds_the_stock_floor(restore_floor):
     _reset_to_stock(200_000)
     p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=1_000_000)
-    assert p.effective_min_funding_sat() == 200_000
+    assert p.effective_min_funding_sat(wallet) == 200_000
 
 
 def test_effective_floor_accepts_an_unsaved_override(restore_floor):
@@ -282,11 +296,11 @@ def test_effective_floor_accepts_an_unsaved_override(restore_floor):
     min-on-chain."""
     _reset_to_stock(200_000)
     p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT=150_000)
-    assert p.effective_min_funding_sat(30_000) == 30_000
-    assert p.effective_min_funding_sat(500_000) == 200_000
+    assert p.effective_min_funding_sat(wallet, 30_000) == 30_000
+    assert p.effective_min_funding_sat(wallet, 500_000) == 200_000
 
 
 def test_effective_floor_survives_a_hand_edited_min_onchain(restore_floor):
     _reset_to_stock(200_000)
     p = _plugin(INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT="rubbish")
-    assert p.effective_min_funding_sat() == 200_000
+    assert p.effective_min_funding_sat(wallet) == 200_000

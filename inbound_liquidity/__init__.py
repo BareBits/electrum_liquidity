@@ -1473,6 +1473,193 @@ SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
     short_desc=lambda: _("Release page for the latest release seen"))
 
 
+# --- per-wallet settings ---------------------------------------------------
+# Every setting above is declared as a ConfigVar, i.e. in Electrum's
+# process-wide config -- so before this, two wallets open in one Electrum shared
+# a single liquidity policy. They should not: how much inbound one wallet wants,
+# what it will pay for it, and whether it is armed at all are properties of that
+# wallet, not of the installation.
+#
+# So a setting now has two levels, and WalletSettings is the one place that
+# resolves them:
+#
+#   * the WALLET's own value, in its wallet file under SETTINGS_DB_KEY, next to
+#     the other per-wallet stores. Every write goes here -- which is the whole
+#     point: changing a setting on one open wallet can no longer move another.
+#   * the INSTALLATION's value, i.e. the ConfigVar in Electrum's config, used
+#     for any setting this wallet has never been given one of. It is the default
+#     for new and untouched wallets, and remains the lever for configuring the
+#     plugin from outside the GUI -- ``electrum setconfig``, which is how the
+#     headless/regtest paths set the plugin up before any wallet is open.
+#
+# A wallet is therefore self-contained for everything its owner has actually
+# set, and tracks the installation default for the rest. ``reset_settings``
+# clears a wallet's own values and puts it back on the defaults; the per-wallet
+# CLI commands (``inbound_liquidity_set_setting``) write the wallet level.
+SETTINGS_DB_KEY = "inbound_liquidity_settings"
+
+# Bumped only for a change that needs the store rewritten.
+SETTINGS_STORE_VERSION = 1
+
+# The version marker inside the store. Leading underscore so it can never
+# collide with a setting name (those are the ConfigVar attribute names with the
+# INBOUND_LIQUIDITY_ prefix stripped, which are always [A-Z]).
+_SETTINGS_VERSION_FIELD = "_v"
+
+_CONFIG_PREFIX = "INBOUND_LIQUIDITY_"
+
+# Sentinel for "the config has no such attribute at all", which is a different
+# answer from "it has it, and the value is None".
+_MISSING = object()
+
+
+def _plugin_config_vars() -> Dict[str, ConfigVar]:
+    """``{attribute name: ConfigVar}`` for every setting this module declares.
+
+    Read off SimpleConfig rather than kept as a hand-written list: the ConfigVar
+    block above is the single place a setting is introduced, and a list here
+    would be one more thing to forget to update (and would fail silently -- the
+    setting would simply stop being per-wallet)."""
+    out: Dict[str, ConfigVar] = {}
+    for name, value in vars(SimpleConfig).items():
+        if name.startswith(_CONFIG_PREFIX) and isinstance(value, ConfigVar):
+            out[name] = value
+    return out
+
+
+def _settings_field(name: str) -> str:
+    """The store key for a setting, i.e. its ConfigVar attribute name without the
+    INBOUND_LIQUIDITY_ prefix. Stored unprefixed because the wallet file is a
+    place a user may well read by hand, and the prefix is pure noise there."""
+    return name[len(_CONFIG_PREFIX):] if name.startswith(_CONFIG_PREFIX) else name
+
+
+def _wallet_basename(wallet: 'Abstract_Wallet') -> str:
+    """The wallet's file name, for log lines; never raises (see qt._wallet_name)."""
+    try:
+        return wallet.basename()
+    except Exception:
+        return "?"
+
+
+def _coerce_setting(cv: ConfigVar, value: Any) -> Any:
+    """Fit ``value`` to a ConfigVar's declared type, or raise ValueError.
+
+    Mirrors ``ConfigVar._set_config_value``'s type-check, with one addition: a
+    str is converted rather than refused, because the CLI setter (like
+    Electrum's own ``setconfig``) can only hand us text. Booleans are parsed
+    from the words Electrum accepts, not via ``bool("false")`` -- which is True
+    and would arm automation on being asked to disarm it.
+    """
+    type_ = getattr(cv, "_type", None)
+    if type_ is None or value is None:
+        return value
+    # NB: `isinstance(True, int)` is True, so a bool is only "already the right
+    # type" when bool is what was asked for; otherwise it goes through the
+    # conversion below like any other value.
+    if isinstance(value, type_) and (type_ is bool or not isinstance(value, bool)):
+        return value
+    if type_ is bool:
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("1", "true", "yes", "on"):
+                return True
+            if text in ("0", "false", "no", "off"):
+                return False
+            raise ValueError(f"not a boolean: {value!r}")
+        return bool(value)
+    try:
+        return type_(value)
+    except Exception as e:
+        raise ValueError(
+            f"value {value!r} does not fit setting {cv.key()!r} "
+            f"(expected {type_.__name__})") from e
+
+
+def config_var_default(config: 'SimpleConfig', name: str) -> Any:
+    """The shipped default for a setting -- what a wallet that has never been
+    configured reads. The default may be declared as a callable of the config
+    (Electrum allows that), so it is resolved here rather than returned raw."""
+    cv = _plugin_config_vars().get(name)
+    if cv is None:
+        raise AttributeError(name)
+    default = cv.get_default_value()
+    return default(config) if callable(default) else default
+
+
+class WalletSettings:
+    """The plugin's settings as seen by exactly one wallet.
+
+    Reads and writes of ``INBOUND_LIQUIDITY_*`` go to that wallet's own store;
+    a setting the wallet has no value for reads as the shipped default. Any
+    OTHER attribute is delegated straight to the real :class:`SimpleConfig`,
+    which is what makes this a drop-in for ``self.config`` at the call sites --
+    the GUI reads Electrum's own settings (base unit, fees) off the same object.
+
+    Deliberately attribute-shaped rather than a dict: it keeps every existing
+    ``c.INBOUND_LIQUIDITY_X`` read working unchanged, so switching a call site
+    to per-wallet is a change of which object ``c`` is, not a rewrite of the
+    code around it. It also means a typo'd setting name still raises, exactly as
+    it does on SimpleConfig.
+    """
+
+    def __init__(self, plugin: 'LiquidityPlugin', wallet: 'Abstract_Wallet') -> None:
+        # object.__setattr__ because __setattr__ below routes everything else.
+        object.__setattr__(self, "_plugin", plugin)
+        object.__setattr__(self, "_wallet", wallet)
+
+    @property
+    def wallet(self) -> 'Abstract_Wallet':
+        return object.__getattribute__(self, "_wallet")
+
+    def _store(self) -> Dict[str, Any]:
+        return object.__getattribute__(self, "_plugin").settings_store(self.wallet)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails, so the two instance attributes
+        # and the properties/methods on this class resolve before we get here.
+        plugin = object.__getattribute__(self, "_plugin")
+        if name.startswith(_CONFIG_PREFIX):
+            if name not in _plugin_config_vars():
+                raise AttributeError(
+                    f"no such inbound-liquidity setting: {name!r}")
+            store = self._store()
+            field = _settings_field(name)
+            if field in store:
+                return store[field]
+            # Not set for this wallet: fall back to the installation-wide value.
+            # On a real SimpleConfig that is the ConfigVar's own default unless
+            # the config has been given a value, which is exactly the layering
+            # described at the top of this section.
+            #
+            # A config object that does not carry the setting at all answers
+            # with the declared default rather than raising. That keeps this
+            # total for every declared setting -- which the call sites rely on,
+            # since many read settings on paths (a repaint, a tick) that must
+            # not be able to fail -- and it is what the `getattr(config, X,
+            # default)` reads these replaced did.
+            value = getattr(plugin.config, name, _MISSING)
+            if value is _MISSING:
+                return config_var_default(plugin.config, name)
+            return value
+        return getattr(plugin.config, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        plugin = object.__getattribute__(self, "_plugin")
+        if name.startswith(_CONFIG_PREFIX):
+            plugin.set_setting(self.wallet, name, value)
+            return
+        setattr(plugin.config, name, value)
+
+    def __repr__(self) -> str:
+        plugin = object.__getattribute__(self, "_plugin")
+        try:
+            name = self.wallet.basename()
+        except Exception:
+            name = "?"
+        return f"<WalletSettings wallet={name!r} plugin={plugin.name!r}>"
+
+
 class LiquidityPlugin(BasePlugin):
     """Base plugin: snapshots wallet state, runs the rules engine, executes."""
 
@@ -1481,6 +1668,14 @@ class LiquidityPlugin(BasePlugin):
         # Wallets we are managing -> a re-entrancy guard so we never run two
         # evaluation loops (or fire two actions) for the same wallet at once.
         self.wallets: Dict['Abstract_Wallet', asyncio.Lock] = {}
+        # wallet -> its settings view, and wallet -> that wallet's settings store
+        # as last read/written. The cache spares every read a wallet-db lookup
+        # (the engine reads a dozen settings per tick) and, more importantly,
+        # gives one place where a wallet's values live in memory so a write is
+        # visible to the next read even on a db-less test wallet. Both are keyed
+        # by wallet and dropped with it in _forget_wallet.
+        self._settings_views: Dict['Abstract_Wallet', WalletSettings] = {}
+        self._settings_cache: Dict['Abstract_Wallet', Dict[str, Any]] = {}
         # channel_id (hex) -> monotonic time until which we won't re-swap it.
         self._swap_cooldown_until: Dict[str, float] = {}
         # wallet -> whether an evaluation is already queued (event debounce).
@@ -1631,9 +1826,9 @@ class LiquidityPlugin(BasePlugin):
         # Live log capture backing the GUI's Log tab. Created here (not per
         # wallet) because Python logging is process-global: one bounded ring and
         # one handler serve every wallet this plugin instance manages.
-        self.log_buffer = LogRingBuffer(
-            clamp_max_lines(getattr(config, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES",
-                                    DEFAULT_LOG_BUFFER_LINES)))
+        # Sized at the shipped default here and re-sized as wallets open: the
+        # size is a per-wallet setting now, and no wallet exists yet.
+        self.log_buffer = LogRingBuffer(clamp_max_lines(DEFAULT_LOG_BUFFER_LINES))
         self.log_capture = LogCapture(self.log_buffer)
         self.apply_log_capture_settings()
         util.register_callback(self._on_wallet_event, _TRIGGER_EVENTS)
@@ -1646,10 +1841,12 @@ class LiquidityPlugin(BasePlugin):
             return
         if wallet.network is None:
             return  # offline mode
-        self._migrate_channel_peer()
-        # Lower Electrum's channel-funding floor to the configured min_onchain if
-        # it is smaller, so the plugin can open sub-stock channels from startup.
-        self._enforce_min_funding_floor()
+        self._migrate_channel_peer(wallet)
+        # Lower Electrum's channel-funding floor to the lowest configured
+        # min_onchain across the open wallets, so the plugin can open sub-stock
+        # channels from startup; and re-derive log capture, which is likewise
+        # one process-wide answer drawn from every open wallet.
+        self.apply_process_wide_settings()
         self._install_close_hooks(wallet, wallet.lnworker)
         # This wallet is live again, so retract any shutdown flag left over from a
         # previous close (see _forget_wallet, which deliberately leaves it set).
@@ -1722,7 +1919,16 @@ class LiquidityPlugin(BasePlugin):
         so the plugin (and manual opens) can create smaller channels. Only ever
         lowers, never raises above stock. Re-applied at startup and on every tick
         so the user's value always wins even if some code path resets it. Returns
-        the floor now in force (in sat)."""
+        the floor now in force (in sat).
+
+        ``MIN_FUNDING_SAT`` is a module constant in Electrum -- one per process,
+        not one per wallet -- so with per-wallet settings there is no single
+        wallet's value to apply. It takes the LOWEST across the open wallets:
+        the floor is a permission, not a policy (each wallet is still held to
+        its own ``min_onchain_to_open_sat`` by the engine), and taking the
+        lowest is what lets the wallet with the smallest configured value open
+        the channel it was configured for. Taking the highest instead would let
+        one wallet's conservative setting silently block another's opens."""
         global _stock_min_funding_sat
         # Capture the stock floor exactly once, before we ever lower it, so
         # re-assertion is always measured against the real default.
@@ -1731,11 +1937,7 @@ class LiquidityPlugin(BasePlugin):
             stock = getattr(lnutil, 'MIN_FUNDING_SAT', None) if lnutil is not None else None
             _stock_min_funding_sat = int(stock) if stock is not None else int(MIN_FUNDING_SAT)
         stock = _stock_min_funding_sat
-        try:
-            configured = int(getattr(self.config, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', stock))
-        except (TypeError, ValueError):
-            configured = stock
-        desired = max(1, min(stock, configured))
+        desired = max(1, min([stock] + self._configured_min_funding_sats(stock)))
         # Patch every already-imported binding: Electrum's core/GUI modules plus
         # this plugin's own engine mirror and glue import of the constant.
         names = list(_MIN_FUNDING_CORE_MODULES) + [__name__ + '.liquidity_manager', __name__]
@@ -1749,6 +1951,30 @@ class LiquidityPlugin(BasePlugin):
                 except Exception:
                     self.logger.exception(f"could not lower MIN_FUNDING_SAT in {name}")
         return desired
+
+    def _configured_min_funding_sats(self, stock: int) -> List[int]:
+        """Each open wallet's ``min_onchain_to_open_sat``, for the process-wide
+        funding floor. A wallet whose value is unreadable (hand-edited to
+        nonsense) contributes the stock floor rather than aborting the sweep --
+        the alternative is one bad wallet file deciding the floor for every
+        other wallet.
+
+        With no wallet open it is the installation-wide value, which is the only
+        answer available then -- and the right one: that is what the next wallet
+        to open will read for this setting unless it has one of its own."""
+        out: List[int] = []
+        for view in self._open_settings_views():
+            try:
+                out.append(int(view.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT))
+            except (TypeError, ValueError):
+                out.append(stock)
+        if not out:
+            try:
+                out.append(int(self._installation_setting(
+                    "INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT")))
+            except (TypeError, ValueError):
+                out.append(stock)
+        return out
 
     def _schedule_post_grace_evaluation(self, wallet: 'Abstract_Wallet') -> None:
         """Fire one evaluation shortly after the startup grace elapses, so a
@@ -1769,6 +1995,7 @@ class LiquidityPlugin(BasePlugin):
     # (the lock map) is popped first and separately in stop_wallet, because the
     # heartbeat loop watches it to know when to exit.
     _PER_WALLET_STATE_ATTRS = (
+        "_settings_views", "_settings_cache",
         "_eval_pending", "_last_decline_sigs", "_last_offers", "_suggest_errors",
         "_remediating_opens", "_tick_status",
         "_local_closes", "_wedged_faulted", "_close_capped_logged",
@@ -2071,7 +2298,7 @@ class LiquidityPlugin(BasePlugin):
         """
         if config is not None and not config.automation_enabled:
             return STATUS_DISABLED
-        if not manual and self._manual_run_only():
+        if not manual and self._manual_run_only(wallet):
             return STATUS_MANUAL_ONLY
         # `manual` is threaded through so a "Run now" that actually ran does not
         # come to rest on "warming up" -- the state it would have been blocked by
@@ -2117,28 +2344,32 @@ class LiquidityPlugin(BasePlugin):
         self._plugin_version_cache = version
         return version
 
-    def latest_known_version(self) -> str:
+    def latest_known_version(self, wallet: 'Abstract_Wallet') -> str:
         """The newest release seen by the last successful check (cached in the
-        config, so it survives a restart and is available before the first
-        check of a session completes). "" if we have never looked."""
-        return str(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "") or "")
+        wallet's settings, so it survives a restart and is available before the
+        first check of a session completes). "" if we have never looked.
 
-    def latest_release_url(self) -> str:
-        return (str(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", "") or "")
+        Per wallet like every other setting: the update check is opt-in, and a
+        wallet whose owner declined it must not be shown a version banner
+        because a different wallet in the same Electrum opted in."""
+        return str(self.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION or "")
+
+    def latest_release_url(self, wallet: 'Abstract_Wallet') -> str:
+        return (str(self.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LATEST_URL or "")
                 or UPDATE_RELEASES_URL)
 
-    def update_available(self) -> bool:
-        return is_newer_version(self.latest_known_version(), self.plugin_version())
+    def update_available(self, wallet: 'Abstract_Wallet') -> bool:
+        return is_newer_version(self.latest_known_version(wallet), self.plugin_version())
 
-    def update_status(self) -> str:
+    def update_status(self, wallet: 'Abstract_Wallet') -> str:
         """One line for the Status footer / headless caller: what version is
         running, and whether something newer is published. "" when the check is
         switched off, so an opted-out user sees nothing about it anywhere."""
-        if not bool(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", False)):
+        if not bool(self.settings(wallet).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED):
             return ""
         running = self.plugin_version() or "unknown"
-        if self.update_available():
-            return (f"update available: {self.latest_known_version()} "
+        if self.update_available(wallet):
+            return (f"update available: {self.latest_known_version(wallet)} "
                     f"(running {running})")
         return f"version {running} (up to date)"
 
@@ -2162,18 +2393,19 @@ class LiquidityPlugin(BasePlugin):
         The timestamp is stamped BEFORE the request, so an endpoint that is down
         (or rate-limiting us) is retried tomorrow rather than on every heartbeat.
         """
-        if not bool(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", False)):
+        c = self.settings(wallet)
+        if not bool(c.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED):
             return
         now = time.time()
-        last = float(getattr(self.config, "INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS", 0.0) or 0.0)
+        last = float(c.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS or 0.0)
         if 0.0 <= now - last < UPDATE_CHECK_INTERVAL_SEC:
             return
-        self.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = now
+        c.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = now
         release = await self._fetch_latest_release(wallet)
         if release is None:
             return
-        self.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = release.version
-        self.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = release.url or UPDATE_RELEASES_URL
+        c.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = release.version
+        c.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = release.url or UPDATE_RELEASES_URL
         running = self.plugin_version()
         if not is_newer_version(release.version, running):
             self.logger.info(
@@ -2187,7 +2419,7 @@ class LiquidityPlugin(BasePlugin):
             seen = set()
             self._update_logged = seen
         message = (f"a newer version of this plugin is available: {release.version} "
-                   f"(running {running or 'unknown'}) -- {self.latest_release_url()}")
+                   f"(running {running or 'unknown'}) -- {self.latest_release_url(wallet)}")
         if release.version not in seen:
             seen.add(release.version)
             self.logger.warning(message)
@@ -2264,19 +2496,60 @@ class LiquidityPlugin(BasePlugin):
         return release
 
     # --- live log capture -------------------------------------------------
+    #
+    # These three settings are per-wallet like all the others, but what they
+    # configure is not: Python logging has one handler set per process, and this
+    # plugin keeps ONE ring buffer serving every wallet it manages. So the
+    # effective capture is the most inclusive answer among the open wallets --
+    # the widest buffer, and capture on if any wallet asked for it. Taking the
+    # last writer's answer instead would mean opening a second wallet silently
+    # turned off the capture a user had switched on to diagnose the first.
     def log_buffer_lines(self) -> int:
-        """Configured Log-tab buffer size, clamped to the supported range."""
-        return clamp_max_lines(getattr(self.config, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES",
-                                       DEFAULT_LOG_BUFFER_LINES))
+        """Log-tab buffer size now in force: the largest any open wallet asks
+        for, clamped to the supported range. The installation-wide value when no
+        wallet is open (see :meth:`_configured_min_funding_sats`)."""
+        sizes: List[int] = []
+        for view in self._open_settings_views():
+            try:
+                sizes.append(clamp_max_lines(view.INBOUND_LIQUIDITY_LOG_BUFFER_LINES))
+            except Exception:
+                continue    # a wallet with an unreadable value simply abstains
+        if not sizes:
+            return clamp_max_lines(self._installation_setting(
+                "INBOUND_LIQUIDITY_LOG_BUFFER_LINES"))
+        return max(sizes)
+
+    def _installation_setting(self, name: str) -> Any:
+        """A setting's installation-wide value -- the level a wallet without one
+        of its own reads (see WalletSettings). Used by the process-wide
+        settings when there is no wallet to ask."""
+        value = getattr(self.config, name, _MISSING)
+        if value is _MISSING:
+            return config_var_default(self.config, name)
+        return value
+
+    def _any_wallet_wants(self, name: str) -> bool:
+        """Whether any open wallet has the named (boolean) setting switched on.
+        Falls back to the installation-wide value with no wallet open."""
+        views = self._open_settings_views()
+        if not views:
+            return bool(self._installation_setting(name))
+        for view in views:
+            try:
+                if bool(getattr(view, name)):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def apply_log_capture_settings(self) -> None:
-        """(Re)configure log capture from the current config. Idempotent, so the
-        Advanced tab can just call it after any of the three settings change."""
+        """(Re)configure log capture from the open wallets' settings. Idempotent,
+        so the Advanced tab can just call it after any of the three change."""
         try:
             self.log_buffer.resize(self.log_buffer_lines())
             self.log_capture.configure(
-                capture_ln=bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_LN", False)),
-                force_debug=bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", False)),
+                capture_ln=self._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_LN"),
+                force_debug=self._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG"),
             )
         except Exception as e:
             # Capture is a diagnostic convenience; never let it break plugin load.
@@ -2407,107 +2680,256 @@ class LiquidityPlugin(BasePlugin):
         if loop is not None:
             asyncio.run_coroutine_threadsafe(self._evaluate(wallet, manual=manual), loop)
 
+    # --- per-wallet settings ----------------------------------------------
+    def settings(self, wallet: 'Abstract_Wallet') -> WalletSettings:
+        """This wallet's view of the settings. Cheap and cached: call it rather
+        than holding one, so a view is never kept across a wallet reload.
+
+        Settings are read on paths that must not be able to fail -- a status-bar
+        repaint, a keystroke in the Send tab, every tick -- so an object that
+        cannot be used as a cache key gets an uncached view rather than a
+        TypeError out of a dict lookup.
+        """
+        try:
+            views = self._settings_dict("_settings_views")
+            view = views.get(wallet)
+            if view is None:
+                view = views[wallet] = WalletSettings(self, wallet)
+            return view
+        except TypeError:
+            return WalletSettings(self, wallet)
+
+    def settings_store(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
+        """The settings this wallet has values of its own for.
+
+        Only the ones actually set for this wallet are in here; everything else
+        answers from the installation-wide config (see WalletSettings). Returns
+        a dict that is safe to read but must not be mutated by callers -- writes
+        go through :meth:`set_setting`, so they are validated and persisted in
+        one place.
+        """
+        try:
+            cache = self._settings_dict("_settings_cache")
+            store = cache.get(wallet)
+            if store is None:
+                store = cache[wallet] = self._load_settings(wallet)
+            return store
+        except TypeError:
+            return self._load_settings(wallet)   # unhashable wallet; see settings()
+
+    def _load_settings(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
+        db = getattr(wallet, "db", None)
+        raw = db.get(SETTINGS_DB_KEY) if db is not None else None
+        if not isinstance(raw, dict):
+            return {}
+        # Keep only keys that are settings this build knows, so a store written
+        # by a newer version (or hand-edited) cannot smuggle an unknown field
+        # into a read. The version marker is dropped here and re-added on write.
+        known = {_settings_field(name) for name in _plugin_config_vars()}
+        return {k: v for k, v in raw.items() if k in known}
+
+    def _save_settings(self, wallet: 'Abstract_Wallet',
+                       store: Dict[str, Any]) -> None:
+        db = getattr(wallet, "db", None)
+        if db is None:
+            return  # db-less wallet (unit-test mock); nothing to persist
+        try:
+            persisted = dict(store)
+            persisted[_SETTINGS_VERSION_FIELD] = SETTINGS_STORE_VERSION
+            db.put(SETTINGS_DB_KEY, persisted)
+            wallet.save_db()
+        except Exception as e:
+            self.logger.error(f"could not persist settings for "
+                              f"{_wallet_basename(wallet)}: {e!r}", exc_info=True)
+
+    def set_setting(self, wallet: 'Abstract_Wallet', name: str,
+                    value: Any) -> Any:
+        """Set one setting on one wallet, type-checked against its ConfigVar.
+
+        Returns the stored value. Raises AttributeError for an unknown setting
+        and ValueError if the value does not fit the declared type -- the same
+        two failures SimpleConfig gives for the same mistakes, so the GUI, the
+        CLI command and the tests all get one behaviour.
+        """
+        if not name.startswith(_CONFIG_PREFIX):
+            name = _CONFIG_PREFIX + name
+        cvars = _plugin_config_vars()
+        cv = cvars.get(name)
+        if cv is None:
+            raise AttributeError(f"no such inbound-liquidity setting: {name!r}")
+        value = _coerce_setting(cv, value)
+        # Make sure this wallet has a view, so it counts as one of the open
+        # wallets the process-wide settings are derived from (see
+        # _open_settings_views): a wallet the plugin has only ever been asked to
+        # WRITE -- the CLI setter's path -- is as open as any other.
+        self.settings(wallet)
+        store = dict(self.settings_store(wallet))
+        store[_settings_field(name)] = value
+        self._save_settings(wallet, store)
+        self._settings_cache[wallet] = store
+        self._on_setting_changed(wallet, name)
+        return value
+
+    def reset_settings(self, wallet: 'Abstract_Wallet') -> None:
+        """Drop every value this wallet has of its own, so all of its settings
+        go back to answering from the installation-wide defaults."""
+        self._save_settings(wallet, {})
+        self._settings_cache[wallet] = {}
+        self.logger.info(f"settings for {_wallet_basename(wallet)} reset to the "
+                         f"installation defaults")
+        self._on_setting_changed(wallet, None)
+
+    def apply_process_wide_settings(self) -> None:
+        """Re-derive the settings whose effect cannot be per wallet, across the
+        open wallets: Electrum's channel-funding floor and log capture.
+
+        Called when a wallet joins or leaves (``start_wallet``, the Qt
+        ``load_wallet``/``close_wallet``) and after any setting is written. NOT
+        called from :meth:`settings`: merely reading a setting must not reach out
+        and change a process-wide constant.
+        """
+        try:
+            self._enforce_min_funding_floor()
+        except Exception as e:
+            self.logger.info(f"could not re-apply the funding floor: {e!r}")
+        try:
+            self.apply_log_capture_settings()
+        except Exception as e:
+            self.logger.info(f"could not re-apply log capture settings: {e!r}")
+
+    def _on_setting_changed(self, wallet: 'Abstract_Wallet',
+                            name: Optional[str]) -> None:
+        """React to a setting that just changed on ``wallet``.
+
+        Two of the plugin's knobs reach beyond the wallet that owns them --
+        Electrum's channel-funding floor is process-wide, and so is Python
+        logging -- so both are re-derived across all open wallets whenever any
+        wallet's value moves. See :meth:`apply_process_wide_settings`.
+        """
+        self.apply_process_wide_settings()
+
+    def settings_as_dict(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
+        """Every setting's effective value for this wallet -- its own where it
+        has one, the installation default otherwise -- keyed by the unprefixed
+        name. What the CLI's getter returns."""
+        view = self.settings(wallet)
+        return {_settings_field(name): getattr(view, name)
+                for name in sorted(_plugin_config_vars())}
+
+    def _settings_dict(self, attr: str) -> Dict:
+        """One of the two settings dicts, created on demand.
+
+        ``__init__`` sets both, so this only ever has to build one for a Plugin
+        assembled without it -- which the GUI-glue tests do deliberately (no
+        BasePlugin.__init__, hence no network or parent). Same shape as the
+        ``_update_logged`` lazy set elsewhere in this class.
+        """
+        store = getattr(self, attr, None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self, attr, store)
+        return store
+
+    def _open_settings_views(self) -> List[WalletSettings]:
+        """A settings view per wallet this plugin currently knows about.
+
+        Used by the handful of settings whose effect is process-wide and so
+        cannot honour one wallet at a time (see :meth:`_on_setting_changed`).
+        Covers every wallet with a view -- which includes ones that are open but
+        not managed, since their tab can set these just as well.
+        """
+        return list(self._settings_dict("_settings_views").values())
+
     # --- config -> engine -------------------------------------------------
-    def read_config(self) -> LiquidityConfig:
-        c = self.config
+    def read_config(self, wallet: 'Abstract_Wallet') -> LiquidityConfig:
+        c = self.settings(wallet)
         return LiquidityConfig(
             automation_enabled=bool(c.INBOUND_LIQUIDITY_AUTOMATION_ENABLED),
             min_onchain_to_open_sat=int(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
             onchain_reserve_sat=int(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
             max_channels=int(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
-            max_channel_size_sat=self._max_channel_size_sat(),
+            max_channel_size_sat=self._max_channel_size_sat(wallet),
             max_swap_fee_pct=float(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
             swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
             swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
             min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
-            min_swap_sat=self._min_swap_sat(),
+            min_swap_sat=self._min_swap_sat(wallet),
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
-            max_opens_per_day=self._max_opens_per_day(),
-            liquidity_goal_sat=self._liquidity_goal_sat(),
+            max_opens_per_day=self._max_opens_per_day(wallet),
+            liquidity_goal_sat=self._liquidity_goal_sat(wallet),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
-            liquidity_sink_address=self._liquidity_sink_address(),
-            disable_submarine_swaps=self._submarine_swaps_disabled(),
-            defer_sink_until_goal=self._defer_sink_until_goal(),
+            liquidity_sink_address=self._liquidity_sink_address(wallet),
+            disable_submarine_swaps=self._submarine_swaps_disabled(wallet),
+            defer_sink_until_goal=self._defer_sink_until_goal(wallet),
         )
 
-    def _liquidity_sink_address(self) -> str:
-        """The configured liquidity-sink address, trimmed. Empty means the
-        feature is off and the plugin reverse-swaps as it always did. Read via
-        getattr so a config predating this setting (or a stubbed one in tests)
-        reads as "off" rather than raising on every tick."""
-        return (getattr(self.config, "INBOUND_LIQUIDITY_SINK_ADDRESS", "") or "").strip()
+    def _liquidity_sink_address(self, wallet: 'Abstract_Wallet') -> str:
+        """The wallet's liquidity-sink address, trimmed. Empty means the feature
+        is off for this wallet and the plugin reverse-swaps as it always did."""
+        return (self.settings(wallet).INBOUND_LIQUIDITY_SINK_ADDRESS or "").strip()
 
-    def _submarine_swaps_disabled(self) -> bool:
-        """Whether the user has turned reverse swaps off entirely, leaving the
-        liquidity sink as the only way to drain a channel. Honoured even with no
+    def _submarine_swaps_disabled(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether this wallet has reverse swaps turned off entirely, leaving the
+        liquidity sink as its only way to drain a channel. Honoured even with no
         sink configured -- see the note on ``LiquidityConfig.disable_submarine_swaps``."""
-        return bool(getattr(
-            self.config, "INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS", False))
+        return bool(self.settings(wallet).INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS)
 
-    def _defer_sink_until_goal(self) -> bool:
-        """Whether the liquidity sink is held back until the channel build-out
-        reaches the liquidity goal (see ``liquidity_goal_met``). Defaults to True
-        -- the shipped default -- so a config predating this setting reads as ON,
-        which is the funds-preserving answer: the sink keeps sending outbound out
-        of the wallet only once the goal it would otherwise starve has been
-        met."""
-        return bool(getattr(
-            self.config, "INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL", True))
+    def _defer_sink_until_goal(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether this wallet's liquidity sink is held back until its channel
+        build-out reaches the liquidity goal (see ``liquidity_goal_met``).
+        Defaults to True -- the shipped default -- which is the funds-preserving
+        answer: the sink only starts sending outbound out of the wallet once the
+        goal it would otherwise starve has been met."""
+        return bool(self.settings(wallet).INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL)
 
-    def _manual_run_only(self) -> bool:
-        """Whether the user has put the plugin in "manual run only" mode: no
-        automatic evaluation fires (wallet events, the heartbeat, the post-grace
+    def _manual_run_only(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether this wallet is in "manual run only" mode: no automatic
+        evaluation fires for it (wallet events, the heartbeat, the post-grace
         one-shot, and the arm-switch kick are all no-ops); the plugin acts only on
         an explicit "Run now". A pure glue concern -- the rules engine never sees
         this flag, so a manual run still flows through the engine and acts
         normally."""
-        return bool(getattr(self.config, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", False))
+        return bool(self.settings(wallet).INBOUND_LIQUIDITY_MANUAL_RUN_ONLY)
 
-    def _liquidity_goal_sat(self) -> int:
-        """The configured liquidity goal in sat, clamped non-negative. A garbage
-        or missing value reads as the shipped default rather than raising: this
-        is read on every tick, and a hand-edited config must not be able to abort
-        the whole evaluation."""
+    def _liquidity_goal_sat(self, wallet: 'Abstract_Wallet') -> int:
+        """This wallet's liquidity goal in sat, clamped non-negative. A garbage
+        value reads as the shipped default rather than raising: this is read on
+        every tick, and a hand-edited wallet file must not be able to abort the
+        whole evaluation."""
         try:
-            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_GOAL_SAT",
-                                      DEFAULT_LIQUIDITY_GOAL_SAT)))
+            return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT))
         except (TypeError, ValueError):
             return DEFAULT_LIQUIDITY_GOAL_SAT
 
-    def _min_swap_sat(self) -> int:
-        """The configured floor on a single reverse swap, in sat, clamped
+    def _min_swap_sat(self, wallet: 'Abstract_Wallet') -> int:
+        """This wallet's floor on a single reverse swap, in sat, clamped
         non-negative.
 
         Total in exactly the way :meth:`_liquidity_goal_sat` is, and for the same
-        reason: read on every tick, so a hand-edited value -- or a config written
-        before this setting existed -- must answer rather than abort the whole
-        evaluation. Both failure answers are the shipped default, because unlike
-        the older switches here there is no pre-feature behaviour to preserve:
-        the floor is a rule the plugin should apply whether or not the user has
-        ever seen the setting.
+        reason: read on every tick, so a hand-edited value must answer rather
+        than abort the whole evaluation. The failure answer is the shipped
+        default, because the floor is a rule the plugin should apply whether or
+        not the user has ever seen the setting.
         """
         try:
-            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_MIN_SWAP_SAT",
-                                      DEFAULT_MIN_SWAP_SAT)))
+            return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MIN_SWAP_SAT))
         except (TypeError, ValueError):
             return DEFAULT_MIN_SWAP_SAT
 
-    def _max_channel_size_sat(self) -> int:
-        """The configured ceiling on a single channel's funding amount, in sat, or
+    def _max_channel_size_sat(self, wallet: 'Abstract_Wallet') -> int:
+        """This wallet's ceiling on a single channel's funding amount, in sat, or
         0 for "no ceiling".
 
         Clamped non-negative, and total in exactly the way
-        :meth:`_liquidity_goal_sat` is: read on every tick, so a hand-edited or
-        missing value must answer rather than abort the whole evaluation. Note the
-        two failure answers differ on purpose -- a garbage value here falls back to
-        the shipped ceiling rather than to 0, because 0 means "no ceiling" and
-        reverting to unbounded channel sizes is the one answer a user who set this
-        setting definitely did not want.
+        :meth:`_liquidity_goal_sat` is: read on every tick, so a hand-edited
+        value must answer rather than abort the whole evaluation. Note the
+        failure answer is the shipped ceiling rather than 0, because 0 means "no
+        ceiling" and reverting to unbounded channel sizes is the one answer a
+        user who set this setting definitely did not want.
         """
         try:
-            return max(0, int(getattr(self.config, "INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT",
-                                      DEFAULT_MAX_CHANNEL_SIZE_SAT)))
+            return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT))
         except (TypeError, ValueError):
             return DEFAULT_MAX_CHANNEL_SIZE_SAT
 
@@ -2520,7 +2942,8 @@ class LiquidityPlugin(BasePlugin):
             self._enforce_min_funding_floor()
         return int(_stock_min_funding_sat or MIN_FUNDING_SAT)
 
-    def effective_min_funding_sat(self, min_onchain_sat: Optional[int] = None) -> int:
+    def effective_min_funding_sat(self, wallet: 'Abstract_Wallet',
+                                  min_onchain_sat: Optional[int] = None) -> int:
         """The channel-funding floor in force: Electrum's stock floor, or the
         configured ``min_onchain_to_open_sat`` when that is lower (the plugin only
         ever lowers it -- see :meth:`_enforce_min_funding_floor`).
@@ -2532,8 +2955,7 @@ class LiquidityPlugin(BasePlugin):
         """
         stock = self._stock_funding_floor()
         if min_onchain_sat is None:
-            min_onchain_sat = getattr(
-                self.config, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', stock)
+            min_onchain_sat = self.settings(wallet).INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT
         try:
             configured = int(min_onchain_sat)
         except (TypeError, ValueError):
@@ -2558,7 +2980,7 @@ class LiquidityPlugin(BasePlugin):
         try:
             if wallet not in self.wallets:
                 return 0
-            return goal_buffer_sat(self.read_config())
+            return goal_buffer_sat(self.read_config(wallet))
         except Exception:
             # Never let a config or wallet-state problem break a repaint.
             return 0
@@ -2623,13 +3045,11 @@ class LiquidityPlugin(BasePlugin):
     # decision log, so they survive the log's retention/size pruning). The open
     # ceiling is enforced in the pure engine (it fed `opens_last_24h` into the
     # snapshot); the close ceiling is enforced here in the watchdog.
-    def _max_opens_per_day(self) -> int:
-        return max(0, int(getattr(
-            self.config, "INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY", DEFAULT_MAX_OPENS_PER_DAY)))
+    def _max_opens_per_day(self, wallet: 'Abstract_Wallet') -> int:
+        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY))
 
-    def _max_closes_per_day(self) -> int:
-        return max(0, int(getattr(
-            self.config, "INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY", DEFAULT_MAX_CLOSES_PER_DAY)))
+    def _max_closes_per_day(self, wallet: 'Abstract_Wallet') -> int:
+        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY))
 
     def _load_action_timestamps(self, wallet: 'Abstract_Wallet') -> Dict[str, List[float]]:
         db = getattr(wallet, "db", None)
@@ -2679,7 +3099,7 @@ class LiquidityPlugin(BasePlugin):
                           now: Optional[float] = None) -> bool:
         """True if a channel close is still allowed under the rolling-24h close
         ceiling (or the ceiling is disabled)."""
-        cap = self._max_closes_per_day()
+        cap = self._max_closes_per_day(wallet)
         if cap <= 0:
             return True
         return not daily_cap_reached(self._count_actions_last_24h(wallet, "close", now), cap)
@@ -2692,17 +3112,17 @@ class LiquidityPlugin(BasePlugin):
     # charged. Accrual is decoupled from payout: the owed total is drawn down by
     # `_maybe_pay_dev_fee` once it clears the batch threshold. All state lives in
     # `wallet.db` so it survives restarts (fees owed must outlive a restart).
-    def _dev_fee_pct(self) -> float:
-        """The configured dev-fee percentage, clamped into the allowed range so a
-        hand-edited config can't charge an out-of-bounds fee. 0 disables it."""
+    def _dev_fee_pct(self, wallet: 'Abstract_Wallet') -> float:
+        """This wallet's dev-fee percentage, clamped into the allowed range so a
+        hand-edited wallet file can't charge an out-of-bounds fee. 0 disables it."""
         try:
-            raw = float(getattr(self.config, "INBOUND_LIQUIDITY_DEV_FEE_PCT", 0.1))
+            raw = float(self.settings(wallet).INBOUND_LIQUIDITY_DEV_FEE_PCT)
         except (TypeError, ValueError):
             raw = 0.0
         return clamp_dev_fee_pct(raw, max_pct=DEV_FEE_MAX_PCT)
 
-    def _dev_fee_address(self) -> str:
-        return (getattr(self.config, "INBOUND_LIQUIDITY_DEV_FEE_ADDRESS", "") or "").strip()
+    def _dev_fee_address(self, wallet: 'Abstract_Wallet') -> str:
+        return (self.settings(wallet).INBOUND_LIQUIDITY_DEV_FEE_ADDRESS or "").strip()
 
     def _load_dev_fee_owed(self, wallet: 'Abstract_Wallet') -> int:
         db = getattr(wallet, "db", None)
@@ -2729,7 +3149,7 @@ class LiquidityPlugin(BasePlugin):
         amount rounds to nothing). Idempotency is the caller's responsibility --
         this is invoked exactly once per swap, at its single confirmed-completion
         point."""
-        fee = compute_dev_fee(int(basis_sat), self._dev_fee_pct())
+        fee = compute_dev_fee(int(basis_sat), self._dev_fee_pct(wallet))
         if fee <= 0:
             return 0
         owed = self._load_dev_fee_owed(wallet) + fee
@@ -2878,7 +3298,7 @@ class LiquidityPlugin(BasePlugin):
         Payout is intentionally independent of the current fee percentage: fees
         already accrued are paid out even if the operator has since set the fee to
         0 (the money is genuinely owed)."""
-        address = self._dev_fee_address()
+        address = self._dev_fee_address(wallet)
         if not address:
             return  # no payout target configured; keep accruing
         if self._dev_fee_paying.get(wallet):
@@ -2966,11 +3386,11 @@ class LiquidityPlugin(BasePlugin):
                 self._dev_fee_retry_until[wallet] = time.monotonic() + DEV_FEE_RETRY_BACKOFF_SEC
 
     # --- provider reliability --------------------------------------------
-    def _reliability_params(self) -> Dict[str, float]:
-        """The reliability tuning, read fresh so edits take effect immediately.
-        Uses getattr defaults so a partial config (e.g. in unit tests) still
-        yields sane values."""
-        c = self.config
+    def _reliability_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
+        """This wallet's reliability tuning, read fresh so edits take effect
+        immediately. Uses getattr defaults so a partial settings view (e.g. in
+        unit tests) still yields sane values."""
+        c = self.settings(wallet)
         return {
             "enabled": bool(getattr(c, "INBOUND_LIQUIDITY_RELIABILITY_ENABLED", True)),
             "base_pct": float(getattr(c, "INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT", 0.5)),
@@ -3016,7 +3436,7 @@ class LiquidityPlugin(BasePlugin):
                                      offers: List[ProviderOffer]) -> List[ProviderOffer]:
         if not offers:
             return offers
-        params = self._reliability_params()
+        params = self._reliability_params(wallet)
         if not params["enabled"]:
             return offers
         import dataclasses
@@ -3028,7 +3448,8 @@ class LiquidityPlugin(BasePlugin):
             out.append(dataclasses.replace(o, reliability_penalty_pct=penalty))
         return out
 
-    def _aged_consecutive_faults(self, stats: Dict) -> int:
+    def _aged_consecutive_faults(self, wallet: 'Abstract_Wallet',
+                                 stats: Dict) -> int:
         """The stored escalation counter with elapsed quiet time already forgiven:
         one fault level per half-life, floored at 0.
 
@@ -3059,7 +3480,7 @@ class LiquidityPlugin(BasePlugin):
         if prev <= 0:
             return 0
         last = float(stats.get("last_fault_ts", 0.0) or 0.0)
-        halflife = self._reliability_params()["halflife_sec"]
+        halflife = self._reliability_params(wallet)["halflife_sec"]
         if last <= 0.0 or halflife <= 0.0:
             # No timestamp to measure from, or decay switched off: leave the
             # counter alone rather than inventing an age for it.
@@ -3091,7 +3512,7 @@ class LiquidityPlugin(BasePlugin):
             return  # single-provider / URL mode has no per-provider identity
         data = self._load_reliability(wallet)
         s = data.get(npub, {})
-        prev = self._aged_consecutive_faults(s)
+        prev = self._aged_consecutive_faults(wallet, s)
         if soft:
             # Floor at one decaying level; never escalate on repeats.
             s["consecutive_faults"] = max(prev, 1)
@@ -3150,7 +3571,7 @@ class LiquidityPlugin(BasePlugin):
         data = self._load_reliability(wallet)
         if not data:
             return
-        params = dict(self._reliability_params())
+        params = dict(self._reliability_params(wallet))
         params["enabled"] = True
         now = time.time()
         keep: Dict[str, Dict] = {}
@@ -3186,7 +3607,7 @@ class LiquidityPlugin(BasePlugin):
     def provider_reliability_rows(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
         """Per-provider reliability, decorated with the current decayed penalty,
         for the Providers settings tab. Keyed by npub."""
-        params = self._reliability_params()
+        params = self._reliability_params(wallet)
         data = self._load_reliability(wallet)
         now = time.time()
         rows: Dict[str, Dict] = {}
@@ -3207,9 +3628,9 @@ class LiquidityPlugin(BasePlugin):
     # (hex) and applied to the channel-partner try-order. It reuses the provider
     # penalty tuning (base / cap / half-life) and adds an auto-ban threshold on
     # *hard* faults (force-close / repeated open failure).
-    def _peer_reliability_params(self) -> Dict[str, float]:
-        c = self.config
-        base = self._reliability_params()  # reuse base/cap/halflife tuning
+    def _peer_reliability_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
+        c = self.settings(wallet)
+        base = self._reliability_params(wallet)  # reuse base/cap/halflife tuning
         return {
             "enabled": bool(getattr(c, "INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED", True)),
             "base_pct": base["base_pct"],
@@ -3303,7 +3724,7 @@ class LiquidityPlugin(BasePlugin):
         # helper because it shares the tuning: ``_peer_reliability_params`` takes
         # base/cap/half-life straight from ``_reliability_params``, so the rate
         # that helper reads is the rate ``_peer_penalty`` decays at.
-        s["consecutive_faults"] = self._aged_consecutive_faults(s) + 1
+        s["consecutive_faults"] = self._aged_consecutive_faults(wallet, s) + 1
         s["fault_count"] = int(s.get("fault_count", 0)) + 1
         if hard:
             # NOT aged, deliberately. This is the auto-ban tally, not a ranking
@@ -3347,17 +3768,18 @@ class LiquidityPlugin(BasePlugin):
         """Add a peer to the banned-partners list once its hard-fault tally crosses
         the configured threshold. Operator-reversible from the Channel partners
         tab; a no-op if auto-banning is disabled or the peer is already banned."""
-        params = self._peer_reliability_params()
+        params = self._peer_reliability_params(wallet)
         if not params["enabled"]:
             return
         if not should_auto_ban(int(stats.get("hard_fault_count", 0)),
                                params["autoban_faults"]):
             return
-        banned = _parse_banned_partners(self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        c = self.settings(wallet)
+        banned = _parse_banned_partners(c.INBOUND_LIQUIDITY_BANNED_PARTNERS)
         if node_id in banned:
             return
         new_banned = sorted(banned | {node_id})
-        self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(new_banned)
+        c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(new_banned)
         self.logger.warning(
             f"auto-banned channel peer {node_id[:12]}… after "
             f"{int(stats.get('hard_fault_count', 0))} hard fault(s)")
@@ -3386,7 +3808,7 @@ class LiquidityPlugin(BasePlugin):
         data = self._load_peer_reliability(wallet)
         if not data:
             return
-        params = dict(self._peer_reliability_params())
+        params = dict(self._peer_reliability_params(wallet))
         params["enabled"] = True   # never let a disabled feature read as "no penalty"
         now = time.time()
         keep: Dict[str, Dict] = {}
@@ -3422,7 +3844,7 @@ class LiquidityPlugin(BasePlugin):
 
     def _peer_penalties(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
         """node_id(hex) -> current decayed penalty, for the partner ordering."""
-        params = self._peer_reliability_params()
+        params = self._peer_reliability_params(wallet)
         if not params["enabled"]:
             return {}
         data = self._load_peer_reliability(wallet)
@@ -3433,7 +3855,7 @@ class LiquidityPlugin(BasePlugin):
     def peer_reliability_rows(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
         """Per-peer reliability, decorated with the current decayed penalty, for
         the Channel partners settings tab. Keyed by node_id (hex)."""
-        params = self._peer_reliability_params()
+        params = self._peer_reliability_params(wallet)
         data = self._load_peer_reliability(wallet)
         now = time.time()
         rows: Dict[str, Dict] = {}
@@ -3606,7 +4028,7 @@ class LiquidityPlugin(BasePlugin):
         if not data:
             return
         sm = wallet.lnworker.swap_manager
-        params = self._reliability_params()
+        params = self._reliability_params(wallet)
         now = time.time()
         changed = False
         for ph_hex in list(data.keys()):
@@ -3732,7 +4154,7 @@ class LiquidityPlugin(BasePlugin):
             return False
         return (now - init_ts) > timeout_sec
 
-    def _wedge_params(self) -> Dict[str, float]:
+    def _wedge_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
         """Wedged-open gate tuning, read fresh so edits take effect at once. The
         getattr defaults keep partial (unit-test) configs sane."""
         c = self.config
@@ -3833,12 +4255,12 @@ class LiquidityPlugin(BasePlugin):
         lnworker = getattr(wallet, "lnworker", None)
         if lnworker is None:
             return
-        auto_remediate = bool(getattr(
-            self.config, "INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN", True))
+        auto_remediate = bool(
+            self.settings(wallet).INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN)
         # The force-close gates, independent of the freeze-escape timeout: un-
         # freezing is cheap and reversible, force-closing is neither, so they get
         # very different budgets.
-        wedge = self._wedge_params()
+        wedge = self._wedge_params(wallet)
         close_timeout_sec = wedge["close_timeout_sec"]
         closing_states = (
             ChannelState.SHUTDOWN, ChannelState.CLOSING, ChannelState.FORCE_CLOSING,
@@ -3987,7 +4409,7 @@ class LiquidityPlugin(BasePlugin):
         ids.add(channel_id_hex)
         self._save_json(wallet, PLUGIN_OPENED_CHANNELS_DB_KEY, sorted(ids))
 
-    def _offline_autoclose_params(self) -> Dict[str, float]:
+    def _offline_autoclose_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
         """Offline auto-close tuning, read fresh so edits take effect at once.
         Days are converted to seconds; getattr defaults keep partial (unit-test)
         configs sane."""
@@ -4052,7 +4474,7 @@ class LiquidityPlugin(BasePlugin):
         passed) committed channels. All state is persisted so the "trying to close
         since T" clock survives restarts."""
         from electrum.lnchannel import ChannelState
-        params = self._offline_autoclose_params()
+        params = self._offline_autoclose_params(wallet)
         if not params["enabled"]:
             return
         lnworker = getattr(wallet, "lnworker", None)
@@ -4281,7 +4703,7 @@ class LiquidityPlugin(BasePlugin):
             if cid not in self._close_capped_logged.setdefault(wallet, set()):
                 self._close_capped_logged[wallet].add(cid)
                 self.logger.warning(
-                    f"daily close ceiling ({self._max_closes_per_day()}/24h) "
+                    f"daily close ceiling ({self._max_closes_per_day(wallet)}/24h) "
                     f"reached; deferring close of {cid[:12]}… to peer "
                     f"{node_id[:12]}… ({reason})")
             return
@@ -4291,7 +4713,7 @@ class LiquidityPlugin(BasePlugin):
         if cid in self._coop_closing.get(wallet, set()):
             return
         attempts = int(rec.get("coop_attempts", 0) or 0)
-        coop_window_sec = self._wedge_params()["coop_window_sec"]
+        coop_window_sec = self._wedge_params(wallet)["coop_window_sec"]
 
         def _try_coop() -> bool:
             if not self._coop_close_possible(chan):
@@ -4427,7 +4849,7 @@ class LiquidityPlugin(BasePlugin):
                 f"undersized channel {cid[:12]}… is no longer present; skipping close")
             return
         node_id = self._channel_peer_node_id(wallet, cid)
-        goal = self._liquidity_goal_sat()
+        goal = self._liquidity_goal_sat(wallet)
         self.logger.info(
             f"replacing undersized channel {cid[:12]}… ({action.capacity_sat} sat "
             f"capacity, below the {goal} sat liquidity goal)")
@@ -4533,11 +4955,11 @@ class LiquidityPlugin(BasePlugin):
                 continue
         return False
 
-    def _stuck_swap_timeout_sec(self) -> float:
-        """The stuck-reverse-swap freeze-escape timeout (seconds). A pending swap
-        older than this stops counting toward the in-flight freeze."""
-        return max(1, int(getattr(
-            self.config, "INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN", 180))) * 60.0
+    def _stuck_swap_timeout_sec(self, wallet: 'Abstract_Wallet') -> float:
+        """The stuck-reverse-swap freeze-escape timeout (seconds) for this wallet.
+        A pending swap older than this stops counting toward the in-flight freeze."""
+        return max(1, int(
+            self.settings(wallet).INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN)) * 60.0
 
     def _count_freezing_swaps(self, wallet: 'Abstract_Wallet', sm, now: float) -> int:
         """How many in-flight reverse swaps should still FREEZE automation.
@@ -4582,7 +5004,7 @@ class LiquidityPlugin(BasePlugin):
         logged_map = getattr(self, "_swap_freeze_escaped_logged", None)
         escaped_logged = logged_map.setdefault(wallet, set()) if logged_map is not None else set()
         escaped_logged &= pending_set
-        timeout = self._stuck_swap_timeout_sec()
+        timeout = self._stuck_swap_timeout_sec(wallet)
         count = 0
         for ph_hex in pending_set:
             ts = float(first_seen.get(ph_hex, now) or now)
@@ -4785,14 +5207,13 @@ class LiquidityPlugin(BasePlugin):
         # as abandoned by an unresponsive peer and NO LONGER freezes automation
         # (the watchdog records the fault / force-closes it separately). This is
         # what stops one flaky peer from wedging the plugin forever.
-        stuck_open_sec = max(1, int(getattr(
-            self.config, "INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN", 60))) * 60.0
+        stuck_open_sec = max(1, int(
+            self.settings(wallet).INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN)) * 60.0
         # A channel that is merely CONFIRMING is not wedged at all, and gets a
         # far longer -- but opens-only -- freeze: it must not stall reverse swaps
         # on unrelated channels while the fee market does its thing.
-        confirming_freeze_sec = max(0.0, float(getattr(
-            self.config, "INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS",
-            DEFAULT_CONFIRMING_FREEZE_DAYS))) * 86400.0
+        confirming_freeze_sec = max(0.0, float(
+            self.settings(wallet).INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS)) * 86400.0
         now = time.time()
         pending_channel_count = 0
         pending_open_freeze_count = 0
@@ -5054,7 +5475,7 @@ class LiquidityPlugin(BasePlugin):
         """
         try:
             return self._safe_material_state_sig(self.build_snapshot(wallet, None),
-                                                 self.read_config())
+                                                 self.read_config(wallet))
         except Exception as e:
             self.logger.debug(f"could not read state for the signature: {e!r}")
             return None
@@ -5266,7 +5687,7 @@ class LiquidityPlugin(BasePlugin):
                 # constant. Done before the automation gate so a lowered floor also
                 # applies to manual opens while automation is paused.
                 self._enforce_min_funding_floor()
-                config = self.read_config()
+                config = self.read_config(wallet)
                 if not config.automation_enabled:
                     return
                 # "Manual run only": the user keeps the plugin armed but wants no
@@ -5274,7 +5695,7 @@ class LiquidityPlugin(BasePlugin):
                 # explicit "Run now" (manual=True) gets past here. Placed after the
                 # master-switch gate so a manual run still needs automation enabled
                 # to move funds (the rules engine also gates on that).
-                if not manual and self._manual_run_only():
+                if not manual and self._manual_run_only(wallet):
                     self.logger.debug(
                         f"{wallet.basename()} manual-run-only: skipping automatic evaluation")
                     return
@@ -5379,7 +5800,7 @@ class LiquidityPlugin(BasePlugin):
             f"providers={len(snapshot.provider_offers)} "
             f"-> {len(result.actions)} action(s), {len(result.declines)} decline(s)"
             + (" [FROZEN]" if result.frozen else ""))
-        state = self._state_dict(snapshot, config)
+        state = self._state_dict(wallet, snapshot, config)
         declines = list(result.declines)
         # Pre-resolve channel-open candidates: an open the engine approved can
         # still be blocked here if no eligible partner remains -- all banned,
@@ -5489,7 +5910,9 @@ class LiquidityPlugin(BasePlugin):
                         self.logger.info("swap provider (URL) not reachable yet")
                     yield transport
                 return
-            transport = TargetedNostrTransport(self.config, sm, generate_random_keypair())
+            transport = TargetedNostrTransport(
+                self.config, sm, generate_random_keypair(),
+                debug_logs=self._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG"))
             async with transport:
                 try:
                     await asyncio.wait_for(transport.is_connected.wait(),
@@ -5673,7 +6096,7 @@ class LiquidityPlugin(BasePlugin):
         from electrum.fee_policy import FeePolicy
         from electrum.util import NotEnoughFunds
         lnworker = wallet.lnworker
-        reserve = int(self.config.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT)
+        reserve = int(self.settings(wallet).INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT)
         coins = wallet.get_spendable_coins(None)
         try:
             trial = lnworker.mktx_for_open_channel(
@@ -5688,7 +6111,7 @@ class LiquidityPlugin(BasePlugin):
         funding_sat = min(funding_sat, int(self.config.LIGHTNING_MAX_FUNDING_SAT))
         # 0 means "no ceiling", so it must not be allowed to min() the amount to
         # nothing -- hence the explicit test rather than a three-way min().
-        own_cap = self._max_channel_size_sat()
+        own_cap = self._max_channel_size_sat(wallet)
         if own_cap > 0:
             funding_sat = min(funding_sat, own_cap)
         return funding_sat
@@ -7180,19 +7603,20 @@ class LiquidityPlugin(BasePlugin):
         return _SinkAttempt.NEXT
 
     # --- helpers ----------------------------------------------------------
-    def _migrate_channel_peer(self) -> None:
+    def _migrate_channel_peer(self, wallet: 'Abstract_Wallet') -> None:
         """Fold the deprecated single ``channel_peer`` setting into the front of
         the preferred-partners list (one-time), so an existing config keeps its
         target after that field was removed from the UI. Idempotent: it clears
         ``channel_peer`` once migrated."""
-        old = (self.config.INBOUND_LIQUIDITY_CHANNEL_PEER or '').strip()
+        c = self.settings(wallet)
+        old = (c.INBOUND_LIQUIDITY_CHANNEL_PEER or '').strip()
         if not old:
             return
-        preferred = _parse_partner_list(self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
+        preferred = _parse_partner_list(c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
         if normalize_node_id(old) not in {normalize_node_id(p) for p in preferred}:
             preferred.insert(0, old)
-        self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
-        self.config.INBOUND_LIQUIDITY_CHANNEL_PEER = ''
+        c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
+        c.INBOUND_LIQUIDITY_CHANNEL_PEER = ''
         self.logger.info(f"migrated channel_peer {old[:24]}… into preferred partners")
 
     async def _suggest_peers(self, wallet: 'Abstract_Wallet',
@@ -7283,11 +7707,12 @@ class LiquidityPlugin(BasePlugin):
         about to free it. Only that peer is exempted; every other held peer stays
         excluded, so the guard is relaxed exactly as far as the close justifies.
         """
-        preferred = _parse_partner_list(self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
-        banned = _parse_banned_partners(self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
-        strict = bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT)
+        c = self.settings(wallet)
+        preferred = _parse_partner_list(c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
+        banned = _parse_banned_partners(c.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        strict = bool(c.INBOUND_LIQUIDITY_PARTNERS_STRICT)
         exclude: frozenset = frozenset()
-        if apply_peer_guard and bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
+        if apply_peer_guard and bool(c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
             exclude = self._current_peer_node_ids(wallet) - frozenset(ignore_peers)
         suggested: List[str] = []
         if not strict:
@@ -7356,7 +7781,7 @@ class LiquidityPlugin(BasePlugin):
         so the per-stage counts can be appended to the reason without resolving a
         third time. It is optional only for direct/test callers.
         """
-        guard_on = bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER)
+        guard_on = bool(self.settings(wallet).INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER)
         if guard_on and await self._resolve_channel_partners(wallet, apply_peer_guard=False):
             reason = ("have funds and room to open, but already hold a channel with "
                       "every available peer (one-channel-per-peer guard); not opening")
@@ -7525,10 +7950,9 @@ class LiquidityPlugin(BasePlugin):
             return value
         return f"{value[:head]}…{value[-tail:]}"
 
-    def _retention_days(self) -> int:
+    def _retention_days(self, wallet: 'Abstract_Wallet') -> int:
         try:
-            days = int(getattr(self.config, "INBOUND_LIQUIDITY_LOG_RETENTION_DAYS",
-                               DEFAULT_LOG_RETENTION_DAYS))
+            days = int(self.settings(wallet).INBOUND_LIQUIDITY_LOG_RETENTION_DAYS)
         except (TypeError, ValueError):
             days = DEFAULT_LOG_RETENTION_DAYS
         return max(1, min(days, MAX_LOG_RETENTION_DAYS))
@@ -7557,7 +7981,8 @@ class LiquidityPlugin(BasePlugin):
         }
         self._append_log(wallet, entry)
 
-    def _state_dict(self, snapshot: LiquiditySnapshot, config: LiquidityConfig) -> Dict:
+    def _state_dict(self, wallet: 'Abstract_Wallet', snapshot: LiquiditySnapshot,
+                    config: LiquidityConfig) -> Dict:
         """The state variables behind a decision, for the log's expand view.
         Plain JSON-serialisable types only (persisted in wallet.db)."""
         return {
@@ -7599,8 +8024,8 @@ class LiquidityPlugin(BasePlugin):
                 "disable_submarine_swaps": config.disable_submarine_swaps,
                 "manage_plugin_opened_only": config.manage_plugin_opened_only,
                 "max_opens_per_day": config.max_opens_per_day,
-                "max_closes_per_day": self._max_closes_per_day(),
-                "stuck_swap_timeout_min": int(self._stuck_swap_timeout_sec() // 60),
+                "max_closes_per_day": self._max_closes_per_day(wallet),
+                "stuck_swap_timeout_min": int(self._stuck_swap_timeout_sec(wallet) // 60),
                 "preferred_npubs": sorted(config.preferred_npubs),
                 "banned_npubs": sorted(config.banned_npubs),
             },
@@ -7703,8 +8128,9 @@ class LiquidityPlugin(BasePlugin):
         # does -- and that is not a property worth depending on.
         return _plain_json_copy(raw) if isinstance(raw, list) else []
 
-    def _prune(self, entries: List[Dict]) -> List[Dict]:
-        cutoff = time.time() - self._retention_days() * 86400
+    def _prune(self, wallet: 'Abstract_Wallet',
+               entries: List[Dict]) -> List[Dict]:
+        cutoff = time.time() - self._retention_days(wallet) * 86400
         kept = [e for e in entries if float(e.get("ts", 0)) >= cutoff]
         if len(kept) > MAX_LOG_ENTRIES:
             kept = kept[-MAX_LOG_ENTRIES:]
@@ -7720,7 +8146,7 @@ class LiquidityPlugin(BasePlugin):
             return
         entries = self._load_log(wallet)
         entries.append(entry)
-        entries = self._prune(entries)
+        entries = self._prune(wallet, entries)
         try:
             wallet.db.put(LOG_DB_KEY, entries)
             wallet.save_db()
@@ -7732,10 +8158,11 @@ class LiquidityPlugin(BasePlugin):
         self.on_log_changed(wallet)
 
     # --- diagnostic log file (opt-in) -------------------------------------
-    def _diag_logger(self) -> Optional[DiagLog]:
+    def _diag_logger(self, wallet: 'Abstract_Wallet') -> Optional[DiagLog]:
         """A DiagLog rooted under the Electrum data dir, or None when the
-        feature is disabled (or no data dir is available, e.g. test mocks)."""
-        if not bool(getattr(self.config, "INBOUND_LIQUIDITY_DIAG_LOG_ENABLED", False)):
+        feature is disabled for this wallet (or no data dir is available, e.g.
+        test mocks)."""
+        if not bool(self.settings(wallet).INBOUND_LIQUIDITY_DIAG_LOG_ENABLED):
             return None
         base = getattr(self.config, "path", None)
         if not base:
@@ -7745,7 +8172,7 @@ class LiquidityPlugin(BasePlugin):
 
     def _diag_write(self, wallet: 'Abstract_Wallet', entry: Dict) -> None:
         """Append one already-built decision-log entry to the diagnostic file."""
-        logger = self._diag_logger()
+        logger = self._diag_logger(wallet)
         if logger is None:
             return
         name = None
@@ -7761,7 +8188,7 @@ class LiquidityPlugin(BasePlugin):
         """Record a file-only operational event (errors, lifecycle) in the same
         entry shape as a decision. Not added to the in-wallet decision log, so
         the GUI tabs are unchanged; visible only in the diagnostic files."""
-        if self._diag_logger() is None:
+        if self._diag_logger(wallet) is None:
             return
         entry = {
             "ts": time.time(),
@@ -7780,7 +8207,73 @@ class LiquidityPlugin(BasePlugin):
                          category: Optional[str] = None) -> List[Dict]:
         """Most-recent-first log entries, optionally filtered by category
         ("action" / "decline"). Pruned to the retention window on read."""
-        entries = self._prune(self._load_log(wallet))
+        entries = self._prune(wallet, self._load_log(wallet))
         if category is not None:
             entries = [e for e in entries if e.get("category") == category]
         return list(reversed(entries))
+
+
+# --- CLI commands ----------------------------------------------------------
+# Settings are per wallet, so "configure the plugin" is no longer something
+# `electrum setconfig` can finish on its own: that sets the installation-wide
+# default, which a wallet with a value of its own ignores. These two commands
+# are the per-wallet equivalent, and the only way to set a wallet's settings
+# without the Qt tab -- which matters for the headless daemon (this plugin is
+# `available_for: [qt, cmdline]`) and for the regtest rig.
+#
+# Registered via Electrum's own plugin_command decorator, so they appear as
+# `electrum inbound_liquidity_get_settings -w <wallet>` and
+# `electrum inbound_liquidity_set_setting <name> <value> -w <wallet>`.
+def _register_commands() -> None:
+    """Register the plugin's CLI commands, once per process.
+
+    Guarded because ``plugin_command`` raises on a duplicate name, and this
+    module can legitimately be imported twice under different names (the tests
+    reach it as both ``inbound_liquidity`` and
+    ``electrum.plugins.inbound_liquidity``). A second registration is a no-op
+    rather than an import error that would take the plugin down.
+    """
+    try:
+        from electrum.commands import plugin_command, Commands
+    except Exception:
+        return      # an Electrum without plugin commands; the GUI still works
+    if hasattr(Commands, f"{_PLUGIN_NAME}_get_settings"):
+        return
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def get_settings(self, plugin=None, wallet=None) -> Dict[str, Any]:
+        """
+        Show this wallet's inbound-liquidity settings.
+
+        Every setting's effective value for the wallet: its own where it has
+        one, the installation-wide default otherwise.
+        """
+        return plugin.settings_as_dict(wallet)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def set_setting(self, name, value, plugin=None, wallet=None) -> Any:
+        """
+        Set one inbound-liquidity setting ON THIS WALLET.
+
+        name: the setting, with or without the INBOUND_LIQUIDITY_ prefix
+              (case-insensitive), e.g. MAX_CHANNELS or automation_enabled.
+        value: the new value. Parsed against the setting's declared type;
+               booleans accept true/false/yes/no/on/off/1/0.
+
+        Returns the stored value. Unlike `setconfig`, this changes nothing for
+        any other wallet.
+        """
+        return plugin.set_setting(wallet, str(name).strip().upper(), value)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def reset_settings(self, plugin=None, wallet=None) -> Dict[str, Any]:
+        """
+        Drop every inbound-liquidity setting this wallet has of its own, so all
+        of them go back to the installation-wide defaults. Returns the settings
+        as they read afterwards.
+        """
+        plugin.reset_settings(wallet)
+        return plugin.settings_as_dict(wallet)
+
+
+_register_commands()

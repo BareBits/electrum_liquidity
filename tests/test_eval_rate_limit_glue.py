@@ -123,7 +123,7 @@ def _wire_tick(p, *, snapshot: LiquiditySnapshot, config: Optional[LiquidityConf
     runs: List[str] = []
     cfg = config if config is not None else _config()
     p._enforce_min_funding_floor = lambda: 0
-    p.read_config = lambda: cfg
+    p.read_config = lambda wallet=None: cfg
     p._reconcile_pending_swaps = lambda wallet: None
     p._maybe_pay_dev_fee = lambda wallet: None
     p._scan_channel_health = lambda wallet: None
@@ -471,7 +471,7 @@ def test_editing_a_config_threshold_bypasses_the_window() -> None:
         await p._evaluate_rate_limited(wallet)
         await p._evaluate_rate_limited(wallet)
         assert runs == ["ran"]
-        p.read_config = lambda: _config(max_swap_fee_pct=5.0)
+        p.read_config = lambda wallet=None: _config(max_swap_fee_pct=5.0)
         await p._evaluate_rate_limited(wallet)
         assert runs == ["ran", "ran"]
     _run(main())

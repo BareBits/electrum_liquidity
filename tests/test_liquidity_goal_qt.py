@@ -159,49 +159,49 @@ def test_base_unit_name_is_shown_on_the_field(qapp) -> None:
 ])
 def test_apply_stores_sats_from_any_unit(qapp, decimal_point, typed,
                                          expected_sat) -> None:
-    p, _, _, tab = _build(decimal_point=decimal_point)
+    p, _, wallet, tab = _build(decimal_point=decimal_point)
     _goal_edit(tab).setText(typed)
     _apply(tab)
-    assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == expected_sat
+    assert p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT == expected_sat
 
 
 def test_applied_value_is_reloaded_into_the_field(qapp) -> None:
-    p, _, _, tab = _build(decimal_point=SAT)
+    p, _, wallet, tab = _build(decimal_point=SAT)
     _goal_edit(tab).setText("250000")
     _apply(tab)
-    assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == 250_000
+    assert p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT == 250_000
     assert _goal_edit(tab).text() == "250000"
 
 
 def test_zero_is_accepted_and_disables_the_feature(qapp) -> None:
-    p, _, _, tab = _build(decimal_point=SAT)
+    p, _, wallet, tab = _build(decimal_point=SAT)
     _goal_edit(tab).setText("0")
     _apply(tab)
-    assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == 0
+    assert p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT == 0
 
 
 def test_empty_field_is_rejected_rather_than_read_as_zero(qapp) -> None:
     """A cleared box must not silently switch the feature off -- that is a
     destructive change to make by accident. Turning it off takes an explicit 0."""
-    p, _, _, tab = _build(decimal_point=SAT)
-    before = p.config.INBOUND_LIQUIDITY_GOAL_SAT
+    p, _, wallet, tab = _build(decimal_point=SAT)
+    before = p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT
     _goal_edit(tab).setText("")
     _apply(tab)
-    assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == before
+    assert p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT == before
     assert "Invalid value for" in _status_text(tab)
 
 
 def test_invalid_goal_blocks_the_whole_apply(qapp) -> None:
     # Everything is parsed before anything is persisted, so a bad goal must not
     # leave the other fields half-saved.
-    p, _, _, tab = _build(decimal_point=SAT)
-    before_channels = p.config.INBOUND_LIQUIDITY_MAX_CHANNELS
+    p, _, wallet, tab = _build(decimal_point=SAT)
+    before_channels = p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS
     from PyQt6.QtWidgets import QLineEdit
     plain = [e for e in tab.findChildren(QLineEdit) if type(e) is QLineEdit]
     plain[1].setText("7")           # max-channels
     _goal_edit(tab).setText("")
     _apply(tab)
-    assert p.config.INBOUND_LIQUIDITY_MAX_CHANNELS == before_channels
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CHANNELS == before_channels
 
 
 # --- the fiat companion ---------------------------------------------------
@@ -288,7 +288,7 @@ def test_base_unit_change_re_renders_from_the_stored_value(qapp) -> None:
     window.app.refresh_amount_edits_signal.emit()
     assert _goal_edit(tab).text() == "0.001"
     # ...and the stored value never moved.
-    assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == 100_000
+    assert p.settings(wallet).INBOUND_LIQUIDITY_GOAL_SAT == 100_000
 
 
 def test_fiat_visibility_follows_the_update_fiat_signal(qapp) -> None:
