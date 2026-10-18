@@ -89,6 +89,19 @@ def _getcfg(key: str) -> str:
     return electrum_cli("getconfig", key, inst=CLIENT).strip()
 
 
+def _get_setting(name: str) -> object:
+    """One of the CLIENT WALLET's plugin settings, over RPC.
+
+    The update check's cached answer and its timestamp are settings, and
+    settings are per wallet now -- so `getconfig` is the wrong question: it
+    reads the installation-wide default, which is exactly where the plugin must
+    NOT be writing. This also exercises the per-wallet getter command, which is
+    the only way a headless caller can read these at all.
+    """
+    out = electrum_cli("inbound_liquidity_get_settings", inst=CLIENT)
+    return json.loads(out)[name]
+
+
 def _client_log_text() -> str:
     logs = sorted(glob.glob(str(
         paths.CLIENT_DATADIR / "regtest" / "logs" / "electrum_log_*.log")))
@@ -152,7 +165,7 @@ def test_update_check_is_silent_until_enabled_then_reports(rig):
     assert _update_lines() == [], (
         "an install that was never opted in must not contact github.com: "
         f"{_update_lines()!r}")
-    assert _getcfg("plugins.inbound_liquidity.update_latest_version") in ("", "None"), \
+    assert _get_setting("UPDATE_LATEST_VERSION") in ("", None), \
         "a version was cached without the check ever being enabled"
 
     # --- switched on ------------------------------------------------------
@@ -173,10 +186,14 @@ def test_update_check_is_silent_until_enabled_then_reports(rig):
 
     # The answer was parsed and cached (the number itself moves with each
     # release, so what is pinned is that it is a usable version).
-    cached = _getcfg("plugins.inbound_liquidity.update_latest_version")
+    cached = str(_get_setting("UPDATE_LATEST_VERSION"))
     assert cached and cached[0].isdigit(), f"no usable version cached: {cached!r}"
-    stamped = _getcfg("plugins.inbound_liquidity.update_last_check_ts")
+    stamped = _get_setting("UPDATE_LAST_CHECK_TS")
     assert float(stamped) > 0, f"the check was never stamped: {stamped!r}"
+    # On the wallet, not the installation-wide config: these are per-wallet
+    # settings, so a second wallet must not inherit this one's answer.
+    assert _getcfg("plugins.inbound_liquidity.update_latest_version") in ("", "None"), \
+        "the cached version leaked into the installation-wide config"
 
     # Nothing was downloaded or installed: the plugin on disk is untouched, and
     # its own version is still the one that was running.
