@@ -70,7 +70,7 @@ import json
 import os
 import sys
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -142,6 +142,79 @@ _ATTEMPT_RE = re.compile(r"reverse swap via (\S+?)…? \(rung \d+ of \d+")
 
 # The provider recorded on a completed swap's decision-log entry.
 _ACTION_NPUB_RE = re.compile(r"provider (npub1[0-9a-z]+)")
+
+
+# --- reading cascades out of the client log -------------------------------
+#
+# A cascade is ONE channel's drain inside ONE evaluation, and the log marks both
+# boundaries:
+#
+#   * every evaluation opens with "<wallet>: onchain=... channels=...";
+#   * every attempt announces itself with "attempting swap with <provider>
+#     (rung N of M) (<amount> sat from channel <short_id>)".
+#
+# The failed-rung and fault lines name the provider but not the channel, so they
+# are attributed to the most recent attempt -- which is the cascade they belong
+# to by construction, since a cascade runs its rungs in sequence.
+#
+# NB the rung index is NOT a cascade boundary: it is the position of the
+# (provider, size) ENTRY in the ranked list, and every ladder rung of one entry
+# reuses it, so "rung 1 of N" recurs within a single cascade.
+_NPUB_KEY_LEN = 12
+_TICK_RE = re.compile(r": onchain=\d+ channels=\d+")
+_ATTEMPT_CHANNEL_RE = re.compile(
+    r"attempting swap with .*? sat from channel (\S+?)\)")
+_RUNG_FAILED_RE = re.compile(
+    r"reverse swap via (\S+?)…? produced no funding: "
+    r"the Lightning payment failed")
+# `provider <npub>… [soft ]fault #N (total M): <reason>` -- anchored on
+# "provider" so the identically-shaped channel-PEER fault line cannot be counted
+# as a provider's, and carrying the reason because only ONE kind of fault is
+# charged once per cascade. A provider can legitimately collect two faults in
+# one cascade for two different observations (unreachable, then a failed
+# payment); what `charged_npubs` guarantees is that the PAYMENT failure is
+# charged once however many of that provider's rungs it kills.
+_PROVIDER_FAULT_RE = re.compile(
+    r"provider (\S+?)…? (?:soft )?fault #\d+ \(total \d+\): (.+)$")
+# `_charge_payment_failure`'s reason, verbatim.
+_PAYMENT_FAULT_REASON = "reverse-swap Lightning payment failed"
+
+
+def _cascades() -> Dict[Tuple[int, str], Dict[str, Dict[str, int]]]:
+    """Per-cascade, per-provider tallies of failed rungs and faults charged.
+
+    Keyed by ``(evaluation number, channel)`` -- see the note above. Each value
+    maps a provider key (the npub truncated to the shortest width the plugin
+    logs) to ``{"failures": n, "faults": n, "payment_faults": n}``.
+    """
+    cascades: Dict[Tuple[int, str], Dict[str, Dict[str, int]]] = {}
+    tick = 0
+    current: Optional[Tuple[int, str]] = None
+    for line in _client_log_text().splitlines():
+        if _TICK_RE.search(line):
+            tick += 1
+            current = None
+        channel = _ATTEMPT_CHANNEL_RE.search(line)
+        if channel:
+            current = (tick, channel.group(1))
+            cascades.setdefault(current, {})
+        if current is None:
+            continue
+        failed = _RUNG_FAILED_RE.search(line)
+        if failed:
+            _tally(cascades[current], failed.group(1))["failures"] += 1
+        fault = _PROVIDER_FAULT_RE.search(line)
+        if fault:
+            tally = _tally(cascades[current], fault.group(1))
+            tally["faults"] += 1
+            if fault.group(2).strip() == _PAYMENT_FAULT_REASON:
+                tally["payment_faults"] += 1
+    return cascades
+
+
+def _tally(cascade: Dict[str, Dict[str, int]], provider: str) -> Dict[str, int]:
+    return cascade.setdefault(provider[:_NPUB_KEY_LEN],
+                              {"failures": 0, "faults": 0, "payment_faults": 0})
 
 
 def _attempted_providers() -> List[str]:
@@ -576,19 +649,51 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
             f"{npub} was tried at {amounts}, which is not a subset of the ladder "
             f"{sorted(allowed, reverse=True)} off {planned}")
 
-    # One observation, one fault: the pair of rungs must not charge the provider
-    # twice. (Which provider is faulted depends on ranking, so this checks the
-    # count per provider rather than naming one.)
+    # One observation, one fault: a provider whose payment failed on two rungs of
+    # the SAME cascade must be charged ONE payment-failure fault, not one per rung.
+    #
+    # Only the payment-failure reason is counted. A provider can legitimately
+    # collect more than one fault in a cascade when the observations differ --
+    # unreachable on one rung, a failed payment on another -- and an earlier
+    # version of this check, which counted faults of every kind, failed on
+    # exactly that (1 failed rung, 2 faults, the other one a timeout).
+    #
+    # Scoped to a cascade deliberately. This used to compare the reliability
+    # store's cumulative ``fault_count`` against the log's cumulative count of
+    # failed rungs -- and both accumulate over every evaluation cycle the test
+    # happens to witness. Two cycles that each fail one rung and correctly charge
+    # one fault give "2 faults against 2 failures", which it read as a violation.
+    # So it was measuring how many cycles had elapsed before the waits above
+    # returned, not how faults are charged: it failed on main and passed on other
+    # branches for no better reason than timing. Per cascade, the invariant holds
+    # however many cycles run.
     assert _wait_until(
         lambda: any(int(s.get("fault_count", 0)) > 0
                     for s in _reliability().values()),
         rig=rig, timeout=240), f"no provider fault recorded: {_reliability()}"
-    per_provider = [int(s.get("fault_count", 0)) for s in _reliability().values()]
-    failures = _client_log_text().count(
-        "produced no funding: the Lightning payment failed")
-    assert max(per_provider) < failures or failures <= 1, (
-        f"a provider was faulted once per rung rather than once per provider: "
-        f"fault counts {per_provider} against {failures} rung failures")
+    cascades = _cascades()
+    assert cascades, "no swap cascade was found in the log"
+    offenders = [
+        (where, provider, tally)
+        for where, cascade in cascades.items()
+        for provider, tally in cascade.items()
+        if tally["payment_faults"] > 1
+    ]
+    assert not offenders, (
+        f"a provider was charged more than one payment-failure fault in a "
+        f"single cascade: {offenders}")
+
+    # Whether the two-failures-in-one-cascade case actually AROSE is the rig's
+    # timing to decide (the second rung often succeeds), so it is reported rather
+    # than demanded -- the same treatment the HTLC gate gets above. The charging
+    # arithmetic itself is pinned in tests/test_swap_provider_failover_glue.py.
+    doubled = [(where, p, t) for where, c in _cascades().items()
+               for p, t in c.items() if t["failures"] > 1]
+    if doubled:
+        print(f"once-per-provider charging exercised: {doubled}")
+    else:
+        print("no cascade failed the same provider twice this run; the "
+              "once-per-cascade rule was not exercised (see the glue tests)")
 
 
 def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):
