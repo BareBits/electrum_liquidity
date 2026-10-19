@@ -17,7 +17,7 @@ complete a REAL reverse swap, without waiting out the cooldown.
 What is asserted:
   * the dead provider is tried first and collects a reliability fault,
   * the swap nevertheless completes, via the OTHER provider, in the same cycle
-    (the action's detail records it as attempt 2),
+    (the action's detail records which provider served it),
   * inbound liquidity actually increased -- a real swap, not just a log line.
 
 A second test covers the failure on the OTHER side of that RPC: a provider that
@@ -70,7 +70,7 @@ import json
 import os
 import sys
 import time
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 import pytest
 
@@ -133,6 +133,33 @@ def _client_log_text() -> str:
         return ""
     with open(logs[-1], errors="replace") as fh:
         return fh.read()
+
+
+# One "reverse swap via <provider>… (rung N of M…): <amount> sat" line per
+# attempt the cascade makes. The provider label is the npub truncated to 20
+# chars by the executor, which is still unique between two providers.
+_ATTEMPT_RE = re.compile(r"reverse swap via (\S+?)…? \(rung \d+ of \d+")
+
+# The provider recorded on a completed swap's decision-log entry.
+_ACTION_NPUB_RE = re.compile(r"provider (npub1[0-9a-z]+)")
+
+
+def _attempted_providers() -> List[str]:
+    """The provider labels the cascade actually tried, in order, with repeats.
+
+    This is how "the cascade advanced past the first provider" is read now.
+    There is no longer a log line that says so: since c926c05 ("rank swaps, not
+    providers -- price every (provider, size) pair") the cascade walks one
+    cost-ordered list of (provider, size) rungs and simply logs the next
+    attempt. The old ``"failing over to the next provider"`` line went with it.
+    """
+    return _ATTEMPT_RE.findall(_client_log_text())
+
+
+def _swap_action_npub(action: Dict) -> Optional[str]:
+    """The provider npub on a completed swap action, or None if absent."""
+    match = _ACTION_NPUB_RE.search(action.get("detail", "") or "")
+    return match.group(1) if match else None
 
 
 def _mine(rig, n: int = 1) -> None:
@@ -213,17 +240,35 @@ def test_dead_provider_is_skipped_and_the_swap_completes_via_the_next_one(rig):
         ("plugin never completed a reverse swap -- the cascade did not fall back "
          "to the surviving provider")
 
-    # 2) It was a FAILOVER, not a first-attempt success: the executor records the
-    #    attempt index on any swap that was not the first one tried.
+    # 2) It was a FAILOVER, not a first-attempt success: the swap was served by a
+    #    provider OTHER than the one we killed.
+    #
+    #    Asserted on the provider, not on an attempt index. Under the size ladder
+    #    the index in the detail is the rung's position in one cost-ordered list
+    #    of (provider, size) pairs, so "rung 2" can perfectly well be the SAME
+    #    provider at a smaller size, and the second provider's only rung can be
+    #    "rung 1 of 1". The index cannot answer "did we fail over"; the identity
+    #    can. (The old assertion looked for "provider 2 of", which c926c05
+    #    renamed -- it had been failing ever since.)
     action = _swap_actions()[0]
     detail = action.get("detail", "")
-    assert "provider 2 of" in detail, \
-        f"swap did not come from a failover attempt; detail was: {detail!r}"
+    served_by = _swap_action_npub(action)
+    assert served_by, f"the swap action does not record its provider: {detail!r}"
+    assert served_by != rig.swap_npub, \
+        ("the swap was served by the provider we killed, so no failover "
+         f"happened; detail was: {detail!r}")
 
-    # 3) The dead provider was tried and faulted; the swap went to the other one.
+    # 3) The dead provider was tried FIRST, and the cascade then moved to another
+    #    one. Both read off the attempts themselves (see _attempted_providers).
     log_text = _client_log_text()
-    assert "failing over to the next provider" in log_text, \
-        "no failover was logged -- the cascade did not advance past provider 1"
+    attempts = _attempted_providers()
+    assert attempts, "the cascade logged no swap attempt at all"
+    assert attempts[0] == rig.swap_npub[:20], \
+        (f"the dead provider was not tried first; attempts began with "
+         f"{attempts[0]!r} and the rig pinned {rig.swap_npub[:20]!r}")
+    assert len(set(attempts)) >= 2, \
+        (f"the cascade never tried a second provider; it only attempted "
+         f"{set(attempts)}")
     faults = _reliability()
     assert faults, "the dead provider collected no reliability fault"
     assert any(int(s.get("fault_count", 0)) > 0 for s in faults.values()), \
@@ -312,10 +357,14 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
     #    so it essentially never advanced. The gate now waits for both (bounded),
     #    which is why this is a plain wait for the failover rather than "give the
     #    wallet a few cycles and hope".
+    #    Read off the attempts rather than a log line that says "failing over":
+    #    c926c05 removed that line when it made the cascade a walk over ranked
+    #    rungs (see _attempted_providers).
     assert _wait_until(
-        lambda: "failing over to the next provider" in _client_log_text(),
+        lambda: len(set(_attempted_providers())) >= 2,
         rig=rig, timeout=600), \
-        "the failed payment never advanced the cascade to the next provider"
+        ("the failed payment never advanced the cascade to another provider; "
+         f"attempts were: {_attempted_providers()}")
 
     # 2b) The HTLC-resolution gate must never be the reason a cascade stopped.
     #
@@ -366,12 +415,16 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         print("HTLC gate not exercised this run (the HTLCs resolved before the "
               "gate asked); see the glue tests for its outcomes")
 
-    # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
+    # 3) A swap then completed, via a provider other than the first one tried --
+    #    so the failover delivered. On the provider, not the rung index, for the
+    #    reason given in the first test.
+    first_tried = _attempted_providers()[0]
     assert _wait_until(
-        lambda: any("provider 2 of" in a.get("detail", "") for a in _swap_actions()),
+        lambda: any((_swap_action_npub(a) or "")[:20] not in ("", first_tried)
+                    for a in _swap_actions()),
         rig=rig, timeout=480), \
-        (f"no swap completed via a failover attempt; swap actions were: "
-         f"{[a.get('detail') for a in _swap_actions()]}")
+        (f"no swap completed via a provider other than {first_tried!r}; swap "
+         f"actions were: {[a.get('detail') for a in _swap_actions()]}")
 
     # 3b) The funding waiter Electrum orphans for the dead attempt was cancelled
     #     rather than left polling at 10Hz for the life of the daemon. Asserted
