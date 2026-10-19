@@ -23,6 +23,7 @@ Run:  RUN_GUI_E2E=1 .venv-electrum/bin/python -m pytest \\
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -132,10 +133,43 @@ def gui():
     yield _Harness(gui_object=gui_object, plugin=plugin, paths=paths,
                    config=config, plugins=plugins)
 
-    # Deliberately no teardown of the loop/daemon: this module owns the process
-    # (it is gated behind its own env flag and run on its own), and unwinding a
-    # real daemon plus a Qt app from a fixture is a reliable way to turn a green
-    # run into a segfault at exit.
+    # Teardown, in the reverse order of the bring-up. This has to happen: the
+    # asyncio loop runs on a NON-daemon thread (see
+    # electrum/util.py:create_and_start_event_loop), so leaving it running keeps
+    # the pytest process alive long after the tests have passed -- which is
+    # exactly what happened before this, the module reporting "10 passed in 4s"
+    # and then sitting there until its runner's timeout killed it.
+    #
+    # Each step is guarded: a failure to unwind must be reported as what it is,
+    # not turned into a failure of the tests that already passed.
+    for window in list(gui_object.windows):
+        try:
+            window.should_stop_wallet_on_close = False   # the daemon stops them
+            window.close()
+        except Exception as e:
+            print(f"teardown: could not close a window: {e!r}")
+    try:
+        gui_object._cleanup_before_exit()
+    except Exception as e:
+        print(f"teardown: could not clean up the Qt app: {e!r}")
+    try:
+        asyncio.run_coroutine_threadsafe(daemon.stop(), loop).result(timeout=30)
+    except Exception as e:
+        print(f"teardown: could not stop the daemon: {e!r}")
+    try:
+        # Before the loop, not after: the plugin registry is a DaemonThread
+        # whose on_stop needs a live loop (util.py:DaemonThread.on_stop), so
+        # letting it exit at interpreter shutdown instead prints an
+        # "event loop not created yet" traceback over an otherwise clean run.
+        plugins.stop()
+        plugins.stopped_event.wait(10)
+    except Exception as e:
+        print(f"teardown: could not stop the plugin registry: {e!r}")
+    try:
+        loop.call_soon_threadsafe(stopping_fut.set_result, 1)
+        loop_thread.join(timeout=10)
+    except Exception as e:
+        print(f"teardown: could not stop the asyncio loop: {e!r}")
 
 
 class _Harness:
