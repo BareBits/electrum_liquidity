@@ -399,6 +399,12 @@ def test_the_configured_goal_reaches_the_buffer_through_the_real_settings(rig, l
     p.config = live_wallet.config          # a real SimpleConfig
     p.wallets = {live_wallet: object()}
 
+    # ``live_wallet`` is module-scoped and every test before this one has
+    # configured it, so "a wallet that was never given a value" has to be made
+    # true rather than assumed. Safe to do here: the tests after this one build
+    # their own plugin, which re-seeds the wallet.
+    p.reset_settings(live_wallet)
+
     # A value on the installation-wide config reaches no wallet.
     p.config.INBOUND_LIQUIDITY_GOAL_SAT = GOAL_SAT
     assert p.goal_buffer_sat(live_wallet) == DEFAULT_LIQUIDITY_GOAL_SAT, \
