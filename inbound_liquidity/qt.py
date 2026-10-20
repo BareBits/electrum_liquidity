@@ -37,7 +37,10 @@ from . import (
 )
 from .liquidity_manager import BufferSplit, normalize_node_id, split_goal_buffer
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
-from .qt_widgets import ToggleSwitch
+from .qt_widgets import (
+    SortableHeader, SortableTreeItem, ToggleSwitch, add_sortable_row,
+    primary_button, rows_in_insertion_order,
+)
 
 if TYPE_CHECKING:
     from electrum.gui.qt.main_window import ElectrumWindow
@@ -199,23 +202,28 @@ _SEND_WARNING_REFRESH: Optional[Callable[[], None]] = None
 
 class _GoalVisibility:
     """Reader and writer for the "show the liquidity goal on the chart"
-    checkbox, which is persisted in ``INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART``.
+    checkbox, which is persisted per wallet under
+    ``INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART``.
 
     One object rather than two module globals so the getter and the setter can
     never be installed out of step -- a chart that could be read but not written
     would give the user a checkbox that forgets itself.
+
+    Both take the wallet whose chart is being drawn, because the setting is that
+    wallet's: with two wallets open, unticking the box on one must not strip the
+    slices off the other's chart.
     """
 
-    def __init__(self, get: Callable[[], bool],
-                 set_: Callable[[bool], None]) -> None:
+    def __init__(self, get: Callable[['Abstract_Wallet'], bool],
+                 set_: Callable[['Abstract_Wallet', bool], None]) -> None:
         self._get = get
         self._set = set_
 
-    def get(self) -> bool:
-        return bool(self._get())
+    def get(self, wallet: 'Abstract_Wallet') -> bool:
+        return bool(self._get(wallet))
 
-    def set(self, show: bool) -> None:
-        self._set(bool(show))
+    def set(self, wallet: 'Abstract_Wallet', show: bool) -> None:
+        self._set(wallet, bool(show))
 
 
 # Set by Plugin.load_wallet, cleared by close_wallet -- same lifetime, and for
@@ -238,7 +246,7 @@ def _set_goal_visibility(visibility: Optional[_GoalVisibility]) -> None:
     _GOAL_VISIBILITY = visibility
 
 
-def _goal_is_shown() -> bool:
+def _goal_is_shown(wallet: 'Abstract_Wallet') -> bool:
     """Whether the goal slices are wanted on the chart right now.
 
     Defaults to True when nothing is installed or the read fails -- that is the
@@ -250,19 +258,19 @@ def _goal_is_shown() -> bool:
     if visibility is None:
         return True
     try:
-        return visibility.get()
+        return visibility.get(wallet)
     except Exception:
         return True
 
 
-def _set_goal_shown(show: bool) -> None:
+def _set_goal_shown(wallet: 'Abstract_Wallet', show: bool) -> None:
     """Persist the checkbox. A failure here costs the user the *memory* of their
     choice, not the choice itself -- the chart is repainted either way."""
     visibility = _GOAL_VISIBILITY
     if visibility is None:
         return
     try:
-        visibility.set(show)
+        visibility.set(wallet, show)
     except Exception:
         pass
 
@@ -391,7 +399,7 @@ def _rewrite_piechart_entries(entries, wallet: 'Abstract_Wallet'):
     and the switched-off case cost no allocation, and the caller's ``is`` check
     is enough to decide whether anything needs repainting.
     """
-    if not _goal_is_shown():
+    if not _goal_is_shown(wallet):
         return entries
     split = _goal_buffer_split(entries, wallet)
     if split is None:
@@ -581,10 +589,10 @@ def _install_goal_view(dialog, wallet: 'Abstract_Wallet') -> bool:
     # Checked BEFORE the signal is connected: setChecked would otherwise write
     # the stored setting straight back and repaint the status bar just from
     # opening the dialog.
-    checkbox.setChecked(_goal_is_shown())
+    checkbox.setChecked(_goal_is_shown(wallet))
 
     def on_toggled(show: bool) -> None:
-        _set_goal_shown(show)
+        _set_goal_shown(wallet, show)
         render(show)
         # The status-bar pie is a different widget built by a different patch,
         # and the user asked for one consistent view -- so push it through
@@ -823,6 +831,16 @@ def _fmt_sat(amount: Optional[int]) -> str:
 def _fmt_time(ts: float) -> str:
     try:
         return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "?"
+
+
+def _wallet_name(wallet: 'Abstract_Wallet') -> str:
+    """The wallet's file name, for log lines. Falls back to a placeholder rather
+    than raising: every caller is on an error path or a lifecycle log, where
+    failing to name the wallet must not become a second failure."""
+    try:
+        return wallet.basename()
     except Exception:
         return "?"
 
@@ -1078,8 +1096,8 @@ class Plugin(LiquidityPlugin):
         Never blocks or breaks wallet load: a failure to show the dialog leaves
         the flag unset (it will be offered again next time) and nothing else.
         """
-        c = self.config
-        if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED', False)):
+        c = self.settings(wallet)
+        if bool(c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED):
             return
         if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED', False)):
             return          # already switched on from Advanced; nothing to ask
@@ -1163,20 +1181,48 @@ class Plugin(LiquidityPlugin):
         if not self.wallets:
             _set_buffer_provider(None)
             _set_goal_visibility(None)
+        # This wallet is no longer one of the open ones, so the process-wide
+        # answers drawn from all of them have to drop it (see
+        # apply_process_wide_settings): its capture preference should not outlive
+        # it, and the funding floor should rise back if it was the lowest.
+        self.apply_process_wide_settings()
 
-    def show_goal_in_piechart(self) -> bool:
-        """Whether the user wants the liquidity-goal slices on the balance chart.
+    @hook
+    def on_close_window(self, window: 'ElectrumWindow') -> None:
+        """Drop the UI handle for a window Electrum has finished with.
 
-        A display setting, so it is read straight off the config rather than
-        going through ``read_config()`` -- the rules engine has no business
-        knowing about it, and defaulting to True keeps the chart as it was for
-        anyone upgrading.
+        In the ordinary close, ``clean_up`` runs ``close_wallet`` before
+        ``close_window``, so this finds nothing left to do -- which is the point:
+        it is the backstop for the paths that reach window teardown WITHOUT the
+        wallet being closed, where a kept handle would make the next
+        ``_add_liquidity_tab`` for that wallet a no-op (see :meth:`_tab_is_live`).
+
+        Deliberately narrower than ``close_wallet``: the window is going, the
+        wallet may well not be (``should_stop_wallet_on_close`` is False for a
+        reload), so this touches the tab handle only and leaves automation,
+        heartbeat and per-wallet state alone.
         """
-        return bool(getattr(self.config,
-                            'INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART', True))
+        wallet = getattr(window, "wallet", None)
+        if wallet is None:
+            return
+        state = self._tabs.get(wallet)
+        if state is not None and state.window is window:
+            self._remove_liquidity_tab(wallet)
 
-    def set_show_goal_in_piechart(self, show: bool) -> None:
-        self.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = bool(show)
+    def show_goal_in_piechart(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether the user wants the liquidity-goal slices on this wallet's
+        balance chart.
+
+        A display setting, so it is read straight off the wallet's settings
+        rather than going through ``read_config()`` -- the rules engine has no
+        business knowing about it, and defaulting to True keeps the chart as it
+        was for anyone upgrading.
+        """
+        return bool(self.settings(wallet).INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART)
+
+    def set_show_goal_in_piechart(self, wallet: 'Abstract_Wallet',
+                                  show: bool) -> None:
+        self.settings(wallet).INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = bool(show)
 
     def requires_settings(self) -> bool:
         # Settings now live in the Liquidity tab rather than a settings dialog.
@@ -1302,16 +1348,74 @@ class Plugin(LiquidityPlugin):
             pass    # widgets deleted between the emit and its delivery
 
     # --- tab lifecycle ----------------------------------------------------
+    @staticmethod
+    def _tab_is_live(state: _TabState, window: 'ElectrumWindow') -> bool:
+        """Whether ``state`` still describes a tab the user can actually see in
+        ``window``.
+
+        A bookkeeping entry is not proof of a tab on screen. Electrum replaces a
+        window without necessarily firing ``close_wallet`` -- ``reload_window``
+        (used by the Plugins dialog) calls ``window.close()`` and then builds a
+        new window regardless of whether the close was accepted, and
+        ``closeEvent`` is free to ``event.ignore()`` on a closing warning. Either
+        way the plugin can be left holding a :class:`_TabState` for a window that
+        is gone or no longer the one being loaded, and keying the add off mere
+        presence in ``_tabs`` would then skip the rebuild and leave that wallet
+        with no Liquidity tab at all, for the rest of the session.
+
+        So the entry has to answer two questions, not one: is it for THIS window,
+        and is its container still in that window's tab bar.
+        """
+        if state.window is not window:
+            return False
+        try:
+            return window.tabs.indexOf(state.container) != -1
+        except Exception:
+            return False    # the C++ window went away under us
+
     def _add_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet') -> None:
-        if wallet in self._tabs:
+        existing = self._tabs.get(wallet)
+        if existing is not None:
+            if self._tab_is_live(existing, window):
+                return      # already on screen in this window; nothing to do
+            # Stale: the window was replaced, or the tab was taken out from under
+            # us. Drop the dead handle so the rebuild below is not skipped.
+            self.logger.info(
+                f"replacing a stale Liquidity tab handle for {_wallet_name(wallet)}")
+            self._remove_liquidity_tab(wallet)
+        # Every step from here is guarded, because this runs inside the
+        # `load_wallet` hook: an exception would propagate into Electrum's
+        # run_hook, which logs it and moves on -- costing this wallet its tab
+        # silently. One wallet's bad data must never cost another wallet its tab.
+        try:
+            container, handles = self._build_liquidity_tab(window, wallet)
+        except Exception:
+            self.logger.exception(
+                f"could not build the Liquidity tab for {_wallet_name(wallet)}")
             return
-        container, handles = self._build_liquidity_tab(window, wallet)
         state = self._tabs[wallet] = _TabState(window, wallet, container, handles)
-        state.refresh()
+        # Add the tab BEFORE the first refresh. The refresh reads this wallet's
+        # stored history (decision log, providers, partners, uptime), and a single
+        # malformed record in there must cost the user stale contents, not the
+        # whole tab.
         try:
             window.tabs.addTab(container, read_QIcon("lightning.png"), _("Liquidity"))
         except Exception:
-            self.logger.exception("could not add Liquidity tab")
+            self.logger.exception(
+                f"could not add the Liquidity tab for {_wallet_name(wallet)}")
+            self._tabs.pop(wallet, None)
+            return
+        self.logger.info(f"Liquidity tab added for {_wallet_name(wallet)} "
+                         f"({len(self._tabs)} open with a tab)")
+        # This wallet is now one of the open ones, so the settings whose effect
+        # is process-wide (log capture, the funding floor) have to be re-derived
+        # to include it -- even if it is never managed.
+        self.apply_process_wide_settings()
+        try:
+            state.refresh()
+        except Exception:
+            self.logger.exception(
+                f"could not populate the Liquidity tab for {_wallet_name(wallet)}")
 
     def _remove_liquidity_tab(self, wallet: 'Abstract_Wallet') -> None:
         state = self._tabs.pop(wallet, None)
@@ -1536,7 +1640,7 @@ class Plugin(LiquidityPlugin):
         # The first two are separate switches on purpose: WHICH loggers to record,
         # and WHETHER to force debug level, are independent questions -- and only
         # the second has a side effect outside this plugin (see its tooltip).
-        c = self.config
+        c = self.settings(wallet)
         capture_ln_cb = QCheckBox(_("Also capture Electrum Lightning logs"))
         capture_ln_cb.setToolTip(_("Include Electrum's own Lightning and swap logging (peer "
                                    "manager, node rater, channels, routing, submarine swaps) in "
@@ -1784,7 +1888,7 @@ class Plugin(LiquidityPlugin):
         settings_tab = QWidget()
         vbox = QVBoxLayout(settings_tab)
 
-        c = self.config
+        c = self.settings(wallet)
 
         # --- master ENABLED/DISABLED slider -------------------------------
         # The big, obvious arm switch for all automation. It is DISABLED by
@@ -1888,7 +1992,7 @@ class Plugin(LiquidityPlugin):
         update_label.setTextFormat(Qt.TextFormat.RichText)
 
         def _refresh_update_label() -> None:
-            text = self.update_status()
+            text = self.update_status(wallet)
             update_label.setVisible(bool(text))
             if not text:
                 update_label.setText("")
@@ -1898,8 +2002,8 @@ class Plugin(LiquidityPlugin):
             # only https URLs): this label renders rich text, and the strings
             # originate off-machine. Two independent guards, not one.
             safe_text = html.escape(text)
-            if self.update_available():
-                url = html.escape(self.latest_release_url(), quote=True)
+            if self.update_available(wallet):
+                url = html.escape(self.latest_release_url(wallet), quote=True)
                 # The link goes to the release page and nothing is downloaded
                 # here: updating stays something the user does deliberately.
                 update_label.setText(
@@ -2087,7 +2191,7 @@ class Plugin(LiquidityPlugin):
         get_decimal_point = getattr(window, "get_decimal_point", None) or (lambda: 8)
         goal_e = BTCAmountEdit(get_decimal_point)
         goal_e.setToolTip(goal_tooltip)
-        goal_e.setAmount(self._liquidity_goal_sat())
+        goal_e.setAmount(self._liquidity_goal_sat(wallet))
         grid.addWidget(goal_e, goal_row, 1)
         fx = getattr(window, "fx", None)
         goal_fiat_e = None
@@ -2117,7 +2221,7 @@ class Plugin(LiquidityPlugin):
             a wallet and then changing the base unit must not put a traceback in the
             user's log."""
             try:
-                goal_e.setAmount(self._liquidity_goal_sat())
+                goal_e.setAmount(self._liquidity_goal_sat(wallet))
                 if goal_fiat_e is not None:
                     goal_fiat_e.setVisible(bool(fx.is_enabled()))
             except RuntimeError:
@@ -2152,7 +2256,7 @@ class Plugin(LiquidityPlugin):
             "With submarine swaps also disabled, nothing drains a channel until "
             "the goal is met. The plugin says so in its decision log rather than "
             "pay your outbound away against your wishes."))
-        defer_sink_cb.setChecked(self._defer_sink_until_goal())
+        defer_sink_cb.setChecked(self._defer_sink_until_goal(wallet))
 
         sink_only_cb = QCheckBox(_("Disable submarine swaps (use the liquidity sink only)"))
         sink_only_cb.setToolTip(_(
@@ -2172,10 +2276,10 @@ class Plugin(LiquidityPlugin):
             """
             if not bool(getattr(c, 'INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS', False)):
                 return ""
-            if not self._liquidity_sink_address():
+            if not self._liquidity_sink_address(wallet):
                 return _("Submarine swaps are disabled but no liquidity sink is set: "
                          "nothing can drain a channel until you set one.")
-            if self._defer_sink_until_goal():
+            if self._defer_sink_until_goal(wallet):
                 return _("Submarine swaps are disabled and the liquidity sink is held "
                          "back until the liquidity goal is met: nothing can drain a "
                          "channel until then.")
@@ -2228,7 +2332,7 @@ class Plugin(LiquidityPlugin):
         status_label = QLabel("")
         vbox.addWidget(status_label)
 
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
 
         def on_apply() -> None:
             # Parse and validate everything before persisting anything.
@@ -2297,7 +2401,7 @@ class Plugin(LiquidityPlugin):
                 # floor tracks min-on-chain-to-open, which is also on this form, so
                 # ask what it will be once this click is applied.
                 floor = self.effective_min_funding_sat(
-                    by_label.get(min_onchain_label_text))
+                    wallet, by_label.get(min_onchain_label_text))
                 if max_size < floor:
                     status_label.setStyleSheet("color: red;")
                     status_label.setText(_(
@@ -2308,12 +2412,17 @@ class Plugin(LiquidityPlugin):
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
-            for setter, value in parsed:
-                setter(value)
+            #
+            # One batch, so this form is one write to the wallet file rather
+            # than one per field -- and so a crash cannot leave it half applied.
+            with self.settings_batch(wallet):
+                for setter, value in parsed:
+                    setter(value)
             # min_onchain may have changed: re-assert the channel-funding floor so
             # a lowered floor keeps matching the (new) configured value at once.
+            # (The batch already did this; kept for a caller that bypasses it.)
             self._enforce_min_funding_floor()
-            self._reload_settings_fields(edits, _sync_toggle_from_config)
+            self._reload_settings_fields(wallet, edits, _sync_toggle_from_config)
             _reload_goal()
             _refresh_dev_fee_label()
             # Saving a sink setting that leaves nothing able to drain a channel
@@ -2363,7 +2472,7 @@ class Plugin(LiquidityPlugin):
         tabs.addTab(partners_tab, _("Channel partners"))
 
         # --- Advanced sub-tab (last config tab, before the read-only logs) -
-        advanced_tab, repopulate_advanced = self._build_advanced_tab(wallet)
+        advanced_tab, repopulate_advanced = self._build_advanced_tab(window, wallet)
         tabs.addTab(advanced_tab, _("Advanced"))
 
         # --- Decision-log sub-tabs ----------------------------------------
@@ -2393,7 +2502,7 @@ class Plugin(LiquidityPlugin):
             # stale tick-box next to the sink address would misreport whether the
             # sink is actually in use.
             defer_sink_cb.blockSignals(True)
-            defer_sink_cb.setChecked(self._defer_sink_until_goal())
+            defer_sink_cb.setChecked(self._defer_sink_until_goal(wallet))
             defer_sink_cb.blockSignals(False)
             sink_only_cb.blockSignals(True)
             sink_only_cb.setChecked(
@@ -2425,15 +2534,20 @@ class Plugin(LiquidityPlugin):
         }
 
     # --- advanced sub-tab -------------------------------------------------
-    def _build_advanced_tab(self, wallet: 'Abstract_Wallet'):
+    def _build_advanced_tab(self, window: 'ElectrumWindow',
+                            wallet: 'Abstract_Wallet'):
         """Build the Advanced sub-tab: the feature on/off toggles, the daily
-        (rolling-24h) action ceilings (a runaway guard), and the power-user tuning
+        (rolling-24h) action ceilings (a runaway guard), the power-user tuning
         knobs (on-chain reserve, reliability tuning, offline auto-close, log
-        retention) moved off the main Settings tab. Returns (widget, repopulate).
+        retention) moved off the main Settings tab, and the reset-to-defaults
+        button. Returns (widget, repopulate).
+
+        Takes the window because the reset asks for confirmation first, and the
+        confirmation is a modal on the window that owns this tab.
         """
         from . import DEFAULT_MAX_OPENS_PER_DAY, DEFAULT_MAX_CLOSES_PER_DAY
 
-        c = self.config
+        c = self.settings(wallet)
         tab = QWidget()
         v = QVBoxLayout(tab)
         v.addWidget(_wrapped_label(_(
@@ -2627,19 +2741,66 @@ class Plugin(LiquidityPlugin):
                     status.setStyleSheet("color: red;")
                     status.setText(_("Invalid value for: {}").format(label))
                     return
-            for attr, value in parsed_ceilings:
-                setattr(c, attr, value)
-            for cb, attr in checkboxes:
-                setattr(c, attr, cb.isChecked())
-            for setter, value in parsed_fields:
-                setter(value)
+            # One batch for the whole form: see the note on the Settings tab's
+            # Apply. This tab carries two dozen fields, so it matters most here.
+            with self.settings_batch(wallet):
+                for attr, value in parsed_ceilings:
+                    setattr(c, attr, value)
+                for cb, attr in checkboxes:
+                    setattr(c, attr, cb.isChecked())
+                for setter, value in parsed_fields:
+                    setter(value)
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Advanced settings saved."))
 
-        apply_btn = QPushButton(_("Apply"))
+        # --- back to the defaults -----------------------------------------
+        # Settings are this wallet's own, which raises a question the plugin
+        # owes an answer to: how do I undo them? Clearing the wallet's values
+        # is one action (they live in one store), and it is the only way back
+        # for a wallet that inherited a tuned installation default it did not
+        # want -- a newly created wallet on an installation configured before
+        # this version, say.
+        reset_btn = QPushButton(_("Reset this wallet to defaults"))
+        reset_btn.setToolTip(_(
+            "Discard every Inbound Liquidity setting stored for THIS wallet, so "
+            "all of them go back to the defaults. Other wallets are not "
+            "touched, and nothing about your channels, swaps or funds changes."))
+
+        def on_reset() -> None:
+            try:
+                confirmed = bool(window.question(
+                    _("Discard every Inbound Liquidity setting stored for this "
+                      "wallet ({name}) and go back to the defaults?\n\n"
+                      "No other wallet is affected. Your channels, swaps and "
+                      "funds are not touched.").format(name=_wallet_name(wallet)),
+                    title=_("Reset this wallet's settings?")))
+            except Exception:
+                self.logger.exception("could not ask about resetting the settings")
+                return
+            if not confirmed:
+                return
+            self.reset_settings(wallet)
+            # Every field on every sub-tab is now stale, so refresh the whole
+            # tab rather than this one's fields: the Settings tab's slider and
+            # amount box read the same store.
+            state = self._tabs.get(wallet)
+            if state is not None:
+                try:
+                    state.refresh()
+                except Exception:
+                    self.logger.exception("could not refresh the tab after a reset")
+            else:
+                repopulate()
+            status.setStyleSheet("color: green;")
+            status.setText(_("Settings reset to the defaults."))
+
+        reset_btn.clicked.connect(on_reset)
+
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row = QHBoxLayout()
+        btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
         v.addLayout(btn_row)
@@ -2677,6 +2838,9 @@ class Plugin(LiquidityPlugin):
             _("OK"), _("Faults"), _("Penalty %"), _("Last fault")])
         tree.setRootIsDecorated(False)
         tree.setColumnWidth(0, 180)
+        tree.setToolTip(_("Click a column header to sort by it; click the same "
+                          "header again to reverse the order."))
+        sorter = SortableHeader(tree)
         v.addWidget(tree)
 
         grid = QGridLayout()
@@ -2696,7 +2860,7 @@ class Plugin(LiquidityPlugin):
         v.addWidget(status)
 
         def load_text_from_config() -> None:
-            c = self.config
+            c = self.settings(wallet)
             pref_edit.setPlainText(", ".join(sorted(_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS))))
             ban_edit.setPlainText(", ".join(sorted(_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS))))
 
@@ -2709,12 +2873,38 @@ class Plugin(LiquidityPlugin):
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
 
-            def add_row(npub, cells, *, checkable, r):
+            def add_row(npub, cells, *, checkable, r, offer=None):
                 pen = r.get("penalty_pct", 0.0)
-                item = QTreeWidgetItem(cells + [
+                item = SortableTreeItem(cells + [
                     str(r.get("success_count", 0)), str(r.get("fault_count", 0)),
-                    f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))])
+                    f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))],
+                    # Declared even for the offline rows, which carry no box:
+                    # they then sort as "not ticked" rather than as text.
+                    checkbox_cols=(self._PREF_COL, self._BAN_COL))
                 item.setData(0, Qt.ItemDataRole.UserRole, npub)
+                # Sort on the values, not on their formatted text: "1,900,000"
+                # compares as a string between "12" and "2".
+                item.set_sort_key(0, npub)
+                if offer is not None:
+                    item.set_sort_key(1, float(offer.percentage_fee))
+                    item.set_sort_key(2, int(offer.mining_fee_sat))
+                    item.set_sort_key(3, int(offer.min_amount_sat))
+                    item.set_sort_key(4, int(offer.max_reverse_sat))
+                    item.set_sort_key(5, int(offer.pow_bits))
+                else:
+                    # An offline provider advertises no terms. Sort it to the
+                    # WORST end of each of them, so ordering by any term keeps
+                    # the usable providers together at the top: worst is the
+                    # largest fee/mining/min/PoW, and the smallest max.
+                    for col in (1, 2, 3, 5):
+                        item.set_sort_key(col, float("inf"))
+                    item.set_sort_key(4, float("-inf"))
+                item.set_sort_key(8, int(r.get("success_count", 0) or 0))
+                item.set_sort_key(9, int(r.get("fault_count", 0) or 0))
+                item.set_sort_key(10, float(pen or 0.0))
+                # The age column reads "3h ago"/"—"; sort it by the timestamp
+                # it was rendered from, with "never faulted" (0) sorting first.
+                item.set_sort_key(11, float(r.get("last_fault_ts", 0.0) or 0.0))
                 if checkable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(self._PREF_COL, checked if npub in pref else unchecked)
@@ -2722,7 +2912,7 @@ class Plugin(LiquidityPlugin):
                 reason = r.get("last_reason")
                 if reason:
                     item.setToolTip(self._FAULTS_COL, str(reason))
-                tree.addTopLevelItem(item)
+                add_sortable_row(tree, item)
 
             discovered = set()
             for o in self.discovered_providers(wallet):
@@ -2732,7 +2922,7 @@ class Plugin(LiquidityPlugin):
                     f"{o.percentage_fee:g}", f"{o.mining_fee_sat:,}",
                     f"{o.min_amount_sat:,}", f"{o.max_reverse_sat:,}",
                     str(o.pow_bits), "", ""],
-                    checkable=True, r=rel.get(o.npub, {}))
+                    checkable=True, r=rel.get(o.npub, {}), offer=o)
             # Also surface providers that have a reliability history but are not
             # currently advertising, so a penalised/offline provider is still
             # visible (and its stats clearable).
@@ -2743,6 +2933,9 @@ class Plugin(LiquidityPlugin):
                     self._abbrev(npub, 12, 6) or npub,
                     _("(offline)"), "", "", "", "", "", ""],
                     checkable=False, r=r)
+            # The rows were just rebuilt from scratch; put them back in whatever
+            # order the user last clicked a header for.
+            sorter.reapply()
 
         def on_apply() -> None:
             # Seed from the text fields (so offline npubs survive), then fold in
@@ -2763,8 +2956,10 @@ class Plugin(LiquidityPlugin):
                 else:
                     ban.discard(npub)
             pref -= ban  # a banned provider can't also be preferred
-            self.config.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
-            self.config.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
+            c = self.settings(wallet)
+            with self.settings_batch(wallet):       # one write for both lists
+                c.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
+                c.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Providers saved."))
@@ -2810,7 +3005,7 @@ class Plugin(LiquidityPlugin):
         reset_btn.setToolTip(_("Clear the selected provider's reliability history "
                                "(or all providers' if none is selected)."))
         reset_btn.clicked.connect(on_reset_stats)
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row.addWidget(refresh_btn)
         btn_row.addWidget(reset_btn)
@@ -2821,9 +3016,15 @@ class Plugin(LiquidityPlugin):
         return tab, repopulate
 
     # --- channel partners sub-tab -----------------------------------------
-    _PARTNER_PREF_COL = 1
-    _PARTNER_BAN_COL = 2
-    _PARTNER_FAULTS_COL = 4
+    # Column 0 is the human-readable node name; the node id follows it. The
+    # row's identity still rides on column 0's UserRole, so every
+    # `data(0, UserRole)` reader below is unaffected by that ordering.
+    _PARTNER_NAME_COL = 0
+    _PARTNER_NODE_ID_COL = 1
+    _PARTNER_PREF_COL = 2
+    _PARTNER_BAN_COL = 3
+    _PARTNER_FAULTS_COL = 5
+    _PARTNER_REASON_COL = 9
 
     def _build_channel_partners_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Channel partners sub-tab: a strict-mode toggle, a list of the
@@ -2848,14 +3049,22 @@ class Plugin(LiquidityPlugin):
             "with a fault history) — they are not a list of candidates. Tick a row to "
             "prefer/ban that node; a node you are not connected to yet goes in the "
             "“Preferred partners” box.")))
+        v.addWidget(_wrapped_label(_(
+            "“Node name” is the alias the peer announces over Lightning gossip, the "
+            "same name Electrum's own Channels tab shows. It reads “—” when this "
+            "wallet has not been told one — which is the case for most peers while "
+            "gossip is off (the default), since trampoline routing downloads no "
+            "node announcements.")))
 
         strict_cb = QCheckBox(_("Only open channels to preferred partners (never fall back to suggestions)"))
-        strict_cb.setChecked(bool(self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT))
+        strict_cb.setChecked(bool(
+            self.settings(wallet).INBOUND_LIQUIDITY_PARTNERS_STRICT))
         v.addWidget(strict_cb)
 
         one_per_peer_cb = QCheckBox(_("Only one channel per peer (don't open a second channel to a node "
                                       "you already have one with)"))
-        one_per_peer_cb.setChecked(bool(self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER))
+        one_per_peer_cb.setChecked(bool(
+            self.settings(wallet).INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER))
         v.addWidget(one_per_peer_cb)
 
         v.addWidget(_wrapped_label(_(
@@ -2867,12 +3076,18 @@ class Plugin(LiquidityPlugin):
 
         tree = QTreeWidget()
         tree.setHeaderLabels([
-            _("Channel peer (node id)"), _("Preferred"), _("Banned"),
+            _("Node name"), _("Channel peer (node id)"), _("Preferred"), _("Banned"),
             _("OK"), _("Faults"), _("Hard"), _("Penalty %"), _("Last fault"),
             _("Last fault reason")])
         tree.setRootIsDecorated(False)
-        tree.setColumnWidth(0, 300)
-        tree.setColumnWidth(8, 240)
+        tree.setColumnWidth(self._PARTNER_NAME_COL, 160)
+        tree.setColumnWidth(self._PARTNER_NODE_ID_COL, 300)
+        tree.setColumnWidth(self._PARTNER_REASON_COL, 240)
+        tree.setToolTip(_("Click a column header to sort by it; click the same "
+                          "header again to reverse the order. Sorting changes "
+                          "only the view — the order preferred partners are "
+                          "tried in is unaffected."))
+        sorter = SortableHeader(tree)
         v.addWidget(tree)
 
         grid = QGridLayout()
@@ -2892,7 +3107,7 @@ class Plugin(LiquidityPlugin):
         v.addWidget(status)
 
         def load_text_from_config() -> None:
-            c = self.config
+            c = self.settings(wallet)
             pref_edit.setPlainText("\n".join(_parse_partner_list(c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)))
             ban_edit.setPlainText("\n".join(sorted(_parse_banned_partners(c.INBOUND_LIQUIDITY_BANNED_PARTNERS))))
             strict_cb.setChecked(bool(c.INBOUND_LIQUIDITY_PARTNERS_STRICT))
@@ -2907,37 +3122,63 @@ class Plugin(LiquidityPlugin):
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
 
-            def add_row(nid, *, checkable):
+            def add_row(nid, *, checkable, alias=None):
                 low = nid.lower()
                 r = rel.get(low, {})
                 pen = r.get("penalty_pct", 0.0)
                 reason = r.get("last_reason") or ""
-                item = QTreeWidgetItem([
-                    self._abbrev(nid, 12, 6) or nid, "", "",
+                # The name is only as good as what gossip has told this wallet
+                # (see Plugin.node_alias): in trampoline mode -- Electrum's
+                # default -- an ordinary peer has none, and the column reads "—".
+                if alias is None:
+                    alias = self.node_alias(wallet, nid)
+                item = SortableTreeItem([
+                    alias or "—", self._abbrev(nid, 12, 6) or nid, "", "",
                     str(r.get("success_count", 0)), str(r.get("fault_count", 0)),
                     str(r.get("hard_fault_count", 0)), f"{pen:.2f}",
-                    _fmt_age(r.get("last_fault_ts", 0.0)), str(reason)])
+                    _fmt_age(r.get("last_fault_ts", 0.0)), str(reason)],
+                    checkbox_cols=(self._PARTNER_PREF_COL, self._PARTNER_BAN_COL))
                 item.setData(0, Qt.ItemDataRole.UserRole, nid)
+                if alias:
+                    # The cell is elided at the column width, and the full node
+                    # id is abbreviated in the next one; show both in full here.
+                    item.setToolTip(self._PARTNER_NAME_COL, f"{alias}\n{nid}")
+                # Sort on the values, not on their formatted text. An unnamed
+                # peer sorts after every named one either way round: "—" would
+                # otherwise interleave with the names by codepoint.
+                item.set_sort_key(self._PARTNER_NAME_COL,
+                                  alias.casefold() if alias else "￿")
+                item.set_sort_key(self._PARTNER_NODE_ID_COL, low)
+                item.set_sort_key(4, int(r.get("success_count", 0) or 0))
+                item.set_sort_key(self._PARTNER_FAULTS_COL, int(r.get("fault_count", 0) or 0))
+                item.set_sort_key(6, int(r.get("hard_fault_count", 0) or 0))
+                item.set_sort_key(7, float(pen or 0.0))
+                # "3h ago"/"—" sorts by the timestamp behind it; never-faulted
+                # (0) sorts first.
+                item.set_sort_key(8, float(r.get("last_fault_ts", 0.0) or 0.0))
+                item.set_sort_key(self._PARTNER_REASON_COL, str(reason))
                 if checkable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(self._PARTNER_PREF_COL, checked if low in pref_ids else unchecked)
                     item.setCheckState(self._PARTNER_BAN_COL, checked if low in ban_ids else unchecked)
-                reason = r.get("last_reason")
                 if reason:
                     item.setToolTip(self._PARTNER_FAULTS_COL, str(reason))
-                tree.addTopLevelItem(item)
+                add_sortable_row(tree, item)
 
             current = set()
             for partner in self.current_channel_partners(wallet):
                 nid = partner["node_id"]
                 current.add(nid.lower())
-                add_row(nid, checkable=True)
+                add_row(nid, checkable=True, alias=partner.get("alias", ""))
             # Also surface peers we have a reliability history for but no current
             # channel with (e.g. an auto-banned or force-closed peer), so their
             # stats stay visible and clearable.
             for low in rel:
                 if low not in current:
                     add_row(low, checkable=True)
+            # The rows were just rebuilt from scratch; put them back in whatever
+            # order the user last clicked a header for.
+            sorter.reapply()
 
         def on_apply() -> None:
             # Seed from the text fields (so not-yet-connected partners survive),
@@ -2945,8 +3186,11 @@ class Plugin(LiquidityPlugin):
             preferred = _parse_partner_list(pref_edit.toPlainText())
             pref_ids = {normalize_node_id(p) for p in preferred}
             banned = set(_parse_banned_partners(ban_edit.toPlainText()))
-            for i in range(tree.topLevelItemCount()):
-                it = tree.topLevelItem(i)
+            # Insertion order, NOT the order on screen. `preferred` is a
+            # try-order -- the plugin opens to the first partner in it that
+            # accepts -- so re-sorting the table to read a penalty column must
+            # not re-prioritise which peer gets the next channel.
+            for it in rows_in_insertion_order(tree):
                 nid = it.data(0, Qt.ItemDataRole.UserRole)
                 if not nid:
                     continue
@@ -2964,10 +3208,12 @@ class Plugin(LiquidityPlugin):
                     pref_ids.discard(low)
             # A banned partner can't also be preferred.
             preferred = [p for p in preferred if normalize_node_id(p) not in banned]
-            self.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
-            self.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
-            self.config.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
-            self.config.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
+            c = self.settings(wallet)
+            with self.settings_batch(wallet):       # one write for the form
+                c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = ", ".join(preferred)
+                c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
+                c.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
+                c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
             repopulate()
             status.setStyleSheet("color: green;")
             status.setText(_("Channel partners saved."))
@@ -2992,7 +3238,7 @@ class Plugin(LiquidityPlugin):
         reset_btn.setToolTip(_("Clear the selected peer's reliability history "
                                "(or all peers' if none is selected)."))
         reset_btn.clicked.connect(on_reset_stats)
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
@@ -3001,12 +3247,13 @@ class Plugin(LiquidityPlugin):
 
         return tab, repopulate
 
-    def _reload_settings_fields(self, edits,
+    def _reload_settings_fields(self, wallet: 'Abstract_Wallet', edits,
                                 sync_toggle: Optional[Callable[[], None]] = None) -> None:
-        """Re-read persisted config back into the editable Settings-tab fields, so
-        any clamping/normalisation done on save is visible to the user. (The
-        Advanced tab reloads its own fields via its repopulate().)"""
-        c = self.config
+        """Re-read this wallet's persisted settings back into the editable
+        Settings-tab fields, so any clamping/normalisation done on save is
+        visible to the user. (The Advanced tab reloads its own fields via its
+        repopulate().)"""
+        c = self.settings(wallet)
         if sync_toggle is not None:
             sync_toggle()
         # Positional: this list must stay in the same order as the `fields` list

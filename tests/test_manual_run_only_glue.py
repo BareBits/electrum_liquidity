@@ -20,6 +20,8 @@ from typing import List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -44,7 +46,8 @@ def _plugin(*, manual_run_only: bool = False,
     p.logger = logging.getLogger("test.inbound_liquidity.manual_run_only")
     p.config = SimpleNamespace(
         INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=manual_run_only)
-    p.read_config = lambda: SimpleNamespace(automation_enabled=automation_enabled)
+    seed_settings(p)   # the swapped-in config is what its wallets read
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=automation_enabled)
     # Connected, synced, peers dialed: isolate the guard from the readiness gate.
     # ``_evaluate`` consults ``_readiness_block`` (None == ready); the terminal
     # status then re-checks via ``_wallet_ready``, so stub both.
@@ -65,6 +68,9 @@ def _plugin(*, manual_run_only: bool = False,
 
     p._run_decision = _run_decision
     p._called = called  # type: ignore[attr-defined]
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -74,14 +80,28 @@ def _run(p: LiquidityPlugin, w: _FakeWallet, *, manual: bool) -> List[str]:
     return p._called  # type: ignore[attr-defined]
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- the guard helper -----------------------------------------------------
 def test_manual_run_only_helper_reads_config() -> None:
-    assert _plugin(manual_run_only=True)._manual_run_only() is True
-    assert _plugin(manual_run_only=False)._manual_run_only() is False
+    assert _plugin(manual_run_only=True)._manual_run_only(wallet) is True
+    assert _plugin(manual_run_only=False)._manual_run_only(wallet) is False
     # Absent key -> defaults False (a wallet configured before the feature shipped).
     p = object.__new__(LiquidityPlugin)
     p.config = SimpleNamespace()
-    assert p._manual_run_only() is False
+    assert p._manual_run_only(wallet) is False
 
 
 # --- the guard in _evaluate -----------------------------------------------

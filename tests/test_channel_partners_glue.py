@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -52,6 +54,9 @@ def _plugin(**config) -> LiquidityPlugin:
     # Per-wallet state the suggestion lookup writes to (object.__new__ skips
     # __init__, so it is wired explicitly here).
     p._suggest_errors = {}
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config)
     return p
 
 
@@ -59,6 +64,21 @@ def _resolve(p, wallet, **kwargs):
     """_resolve_channel_partners is a coroutine (the suggestion lookup has to be
     awaited so it can run OFF the asyncio loop); drive it from these sync tests."""
     return asyncio.run(p._resolve_channel_partners(wallet, **kwargs))
+
+
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
 
 
 # --- parsing --------------------------------------------------------------
@@ -75,23 +95,23 @@ def test_parse_banned_partners_normalizes_to_pubkeys():
 def test_migrate_channel_peer_prepends_and_clears():
     p = _plugin(INBOUND_LIQUIDITY_CHANNEL_PEER=f"{PUB_A}@h:1",
                 INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_B}@h:2")
-    p._migrate_channel_peer()
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
+    p._migrate_channel_peer(wallet)
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
         f"{PUB_A}@h:1", f"{PUB_B}@h:2"]
-    assert p.config.INBOUND_LIQUIDITY_CHANNEL_PEER == ""
+    assert p.settings(wallet).INBOUND_LIQUIDITY_CHANNEL_PEER == ""
     # Idempotent: a second run is a no-op.
-    p._migrate_channel_peer()
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
+    p._migrate_channel_peer(wallet)
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [
         f"{PUB_A}@h:1", f"{PUB_B}@h:2"]
 
 
 def test_migrate_channel_peer_skips_duplicate():
     p = _plugin(INBOUND_LIQUIDITY_CHANNEL_PEER=f"{PUB_A}@h:1",
                 INBOUND_LIQUIDITY_PREFERRED_PARTNERS=f"{PUB_A}@h:9")
-    p._migrate_channel_peer()
+    p._migrate_channel_peer(wallet)
     # Already present (by pubkey) -> not duplicated, just cleared.
-    assert _parse_partner_list(p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [f"{PUB_A}@h:9"]
-    assert p.config.INBOUND_LIQUIDITY_CHANNEL_PEER == ""
+    assert _parse_partner_list(p.settings(wallet).INBOUND_LIQUIDITY_PREFERRED_PARTNERS) == [f"{PUB_A}@h:9"]
+    assert p.settings(wallet).INBOUND_LIQUIDITY_CHANNEL_PEER == ""
 
 
 # --- resolution -----------------------------------------------------------
@@ -668,8 +688,8 @@ def test_decline_reason_is_unchanged_by_the_breakdown():
     wallet = _wallet()
     action = OpenChannelAction(funding_sat=1, reason="x")
     first = asyncio.run(p._no_partner_decline(wallet, action))
-    p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = f"{PUB_A}@h:1"
-    p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = PUB_A
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_PREFERRED_PARTNERS", f"{PUB_A}@h:1")
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_BANNED_PARTNERS", PUB_A)
     second = asyncio.run(p._no_partner_decline(wallet, action))
     assert first.reason == second.reason        # same signature...
     assert first.detail != second.detail        # ...different explanation

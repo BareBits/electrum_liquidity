@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import run as run_mod  # noqa: E402
 from rig.services import (  # noqa: E402
+    set_client_plugin_setting,
     CLIENT,
     electrum_cli,
     wallet_path,
@@ -111,6 +112,18 @@ GOAL_SAT = 1_500_000
 
 
 def _setcfg(key: str, value: str) -> None:
+    """Set a config key -- or, for one of the plugin's settings, the CLIENT
+    WALLET's value of it.
+
+    The plugin's settings live in the wallet now, so `setconfig
+    plugins.inbound_liquidity.<key>` configures nothing. Routed here rather than
+    at the ~300 call sites, which all read the same either way: "configure the
+    plugin thus". Non-plugin keys (lightning_max_funding_sat, use_gossip, ...)
+    are Electrum's own and still go to the config."""
+    prefix = "plugins.inbound_liquidity."
+    if key.startswith(prefix):
+        set_client_plugin_setting(key[len(prefix):], value)
+        return
     electrum_cli("setconfig", key, value, inst=CLIENT)
 
 
@@ -212,7 +225,34 @@ def _plugin(wallet, *, goal_sat: int = GOAL_SAT):
     p.logger = logging.getLogger("e2e.inbound_liquidity.goal_buffer")
     p.config = _config(goal_sat)
     p.wallets = {wallet: object()}
+    _configure_wallet_from(p, wallet, p.config)
     return p
+
+
+def _configure_wallet_from(plugin, wallet, cfg) -> None:
+    """Give ``wallet`` the plugin settings ``cfg`` declares.
+
+    Settings are per wallet: a wallet reads its own stored value or the
+    setting's shipped default, and NOTHING arrives from the installation-wide
+    config -- which is the whole point of that isolation, since a value a
+    wallet was never given must not turn up from elsewhere and start moving its
+    funds.
+
+    This module expressed "the plugin is configured thus" the old way, by
+    handing the plugin a config object carrying INBOUND_LIQUIDITY_* attributes.
+    That now configures nothing, so every test here was measuring the shipped
+    100k default against its 1.5M goal. The unit suite got
+    ``conftest.seed_settings`` for the same reason; this is the e2e equivalent,
+    and it goes through ``set_setting`` -- the same per-wallet write the
+    Settings tab and the CLI command use -- so what these tests run against is
+    what production actually stores.
+
+    Called per ``_plugin()``, so a test that asks for a different goal gets it
+    rather than inheriting the previous test's (the wallet is module-scoped).
+    """
+    for name in dir(cfg):
+        if name.startswith("INBOUND_LIQUIDITY_"):
+            plugin.set_setting(wallet, name, getattr(cfg, name))
 
 
 def _config(goal_sat: int):
@@ -341,17 +381,37 @@ def test_send_warning_is_off_for_an_unmanaged_wallet(rig, live_wallet):
     assert p.send_warning_text(live_wallet, p.wallet_total_balance_sat(live_wallet)) == ""
 
 
-def test_the_configured_goal_reaches_the_buffer_through_the_real_config(rig, live_wallet):
-    """Not the hand-built config the other tests use: a real SimpleConfig with
-    the ConfigVar set the way the Settings tab sets it."""
-    from electrum.plugins.inbound_liquidity import LiquidityPlugin  # type: ignore
+def test_the_configured_goal_reaches_the_buffer_through_the_real_settings(rig, live_wallet):
+    """Not the hand-built config the other tests use: the REAL wallet, a real
+    SimpleConfig, and the goal written the way the Settings tab writes it.
 
-    _setcfg("plugins.inbound_liquidity.liquidity_goal_sat", str(GOAL_SAT))
+    Renamed from "...through the real config": that route was removed on
+    purpose. A wallet now reads its own stored value or the shipped default,
+    so the config is no longer a way in -- and this test asserts both halves of
+    that, since the inverse is the part that protects a user's funds.
+    """
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        DEFAULT_LIQUIDITY_GOAL_SAT, LiquidityPlugin,
+    )
+
     p = object.__new__(LiquidityPlugin)
     p.logger = logging.getLogger("e2e.inbound_liquidity.goal_buffer.realcfg")
-    p.config = live_wallet.config
-    p.config.INBOUND_LIQUIDITY_GOAL_SAT = GOAL_SAT
+    p.config = live_wallet.config          # a real SimpleConfig
     p.wallets = {live_wallet: object()}
+
+    # ``live_wallet`` is module-scoped and every test before this one has
+    # configured it, so "a wallet that was never given a value" has to be made
+    # true rather than assumed. Safe to do here: the tests after this one build
+    # their own plugin, which re-seeds the wallet.
+    p.reset_settings(live_wallet)
+
+    # A value on the installation-wide config reaches no wallet.
+    p.config.INBOUND_LIQUIDITY_GOAL_SAT = GOAL_SAT
+    assert p.goal_buffer_sat(live_wallet) == DEFAULT_LIQUIDITY_GOAL_SAT, \
+        "a config value reached a wallet that was never given one"
+
+    # The wallet's own value does.
+    p.set_setting(live_wallet, "liquidity_goal_sat", GOAL_SAT)
     assert p.goal_buffer_sat(live_wallet) == GOAL_SAT
 
 
@@ -434,8 +494,9 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
     forgets itself is worse than no checkbox.
 
     The unit tests drive this against a fake pref object; what is proved here is
-    that the value lands in a real ``SimpleConfig`` under the documented key and
-    reads back out of it.
+    that the value lands in the REAL WALLET under the documented key and reads
+    back out of it -- and, since the setting is per wallet, that it does not land
+    in the installation-wide config instead.
     """
     if _ELECTRUM_IMPORT_ERROR is not None:
         pytest.skip(f"Electrum's Qt GUI is unavailable: {_ELECTRUM_IMPORT_ERROR!r}")
@@ -448,15 +509,19 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
     app = QApplication.instance() or QApplication([])
     assert app is not None
 
+    from electrum.plugins.inbound_liquidity import SETTINGS_DB_KEY  # type: ignore
+
     # The Qt subclass, not LiquidityPlugin: the checkbox's getter/setter are the
-    # GUI half of the plugin. Both only touch ``self.config``.
+    # GUI half of the plugin. Both read and write THIS WALLET's settings.
     p = object.__new__(qt_mod.Plugin)
     p.logger = logging.getLogger("e2e.inbound_liquidity.goal_buffer.checkbox")
     p.config = live_wallet.config
     p.wallets = {live_wallet: object()}
-    p.config.INBOUND_LIQUIDITY_GOAL_SAT = GOAL_SAT
+    # On the WALLET: the config is not a way in any more (see
+    # test_the_configured_goal_reaches_the_buffer_through_the_real_settings).
+    p.set_setting(live_wallet, "liquidity_goal_sat", GOAL_SAT)
     # Ships on, so an untouched install shows the goal.
-    assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True
+    assert p.show_goal_in_piechart(live_wallet) is True
     assert qt_mod._patch_balance_dialog() is True
     qt_mod._set_buffer_provider(p.goal_buffer_sat)
     qt_mod._set_goal_visibility(qt_mod._GoalVisibility(
@@ -481,17 +546,21 @@ def test_real_balance_dialog_checkbox_round_trips_through_the_config(rig, live_w
                    for _n, c, _a in piechart._list)
         assert next(a for _n, c, a in piechart._list
                     if c == COLOR_CONFIRMED) == int(bal.confirmed)
-        # ...and the choice is on the real config, under the documented key.
-        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is False
-        assert p.config.get('plugins.inbound_liquidity.show_goal_in_piechart') is False
-        assert p.show_goal_in_piechart() is False
+        # ...and the choice is stored on the REAL wallet, under the documented
+        # key -- the setting is per wallet, so the installation-wide config is
+        # exactly where it must NOT have landed.
+        assert p.show_goal_in_piechart(live_wallet) is False
+        stored = dict(live_wallet.db.get(SETTINGS_DB_KEY))
+        assert stored["SHOW_GOAL_IN_PIECHART"] is False
+        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True, \
+            "the choice leaked into the installation-wide config"
 
         box.setChecked(True)
-        assert p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART is True
+        assert p.show_goal_in_piechart(live_wallet) is True
         assert next(a for _n, c, a in piechart._list
                     if c == qt_mod.COLOR_GOAL_BUFFER_ONCHAIN) == GOAL_SAT
         dialog.deleteLater()
     finally:
         qt_mod._set_buffer_provider(None)
         qt_mod._set_goal_visibility(None)
-        p.config.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = True
+        p.reset_settings(live_wallet)

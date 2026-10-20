@@ -24,6 +24,8 @@ from typing import Dict, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -99,6 +101,9 @@ def _plugin(*, managed: Optional[_FakeWallet] = None, **cfg) -> LiquidityPlugin:
     p.wallets: Dict[object, object] = {}
     if managed is not None:
         p.wallets[managed] = object()
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **cfg)
     return p
 
 

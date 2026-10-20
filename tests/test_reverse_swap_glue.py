@@ -26,6 +26,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.submarine_swaps import SwapServerError  # type: ignore  # noqa: E402
@@ -80,6 +82,9 @@ def _plugin(**config_over) -> LiquidityPlugin:
     # re-evaluated every cooldown, and one row per cycle would flood the log.
     p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_over)
     return p
 
 

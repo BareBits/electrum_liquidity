@@ -22,6 +22,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -145,6 +147,9 @@ def _plugin(**overrides) -> LiquidityPlugin:
     )
     cfg.update(overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **overrides)
     return p
 
 
@@ -154,27 +159,45 @@ def _action(cid=CID, short_id="100x1x0", capacity=200_000) -> CloseChannelAction
                               reason="below the liquidity goal")
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- config -> engine -----------------------------------------------------
 def test_read_config_passes_the_goal_through() -> None:
     p = _plugin(INBOUND_LIQUIDITY_GOAL_SAT=750_000)
-    assert p.read_config().liquidity_goal_sat == 750_000
+    assert p.read_config(wallet).liquidity_goal_sat == 750_000
 
 
 def test_goal_is_clamped_non_negative() -> None:
-    assert _plugin(INBOUND_LIQUIDITY_GOAL_SAT=-5).read_config().liquidity_goal_sat == 0
+    assert _plugin(INBOUND_LIQUIDITY_GOAL_SAT=-5).read_config(wallet).liquidity_goal_sat == 0
 
 
 def test_garbage_goal_falls_back_to_the_shipped_default() -> None:
     # Read on every tick: a hand-edited config must not be able to raise and take
     # down the whole evaluation.
     p = _plugin(INBOUND_LIQUIDITY_GOAL_SAT="not-a-number")
-    assert p.read_config().liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
+    assert p.read_config(wallet).liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
-def test_missing_config_var_falls_back_to_the_shipped_default() -> None:
+def test_a_wallet_that_was_never_given_a_goal_reads_the_shipped_default() -> None:
+    """Deleting the ConfigVar used to be how "a config predating this setting"
+    was expressed. A wallet does not read the config at all now, so the case it
+    stood for -- nothing stored for this wallet -- is simply a wallet with an
+    empty store."""
     p = _plugin()
-    del p.config.INBOUND_LIQUIDITY_GOAL_SAT
-    assert p.read_config().liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
+    p._settings_cache = {}          # no seed: this wallet has nothing stored
+    assert p.read_config(wallet).liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
 def test_shipped_default_is_active_not_off() -> None:
@@ -187,7 +210,7 @@ def test_state_dict_records_the_goal() -> None:
                              swap_percentage_fee=None,
                              provider_max_reverse_sat=None,
                              provider_min_amount_sat=None)
-    state = p._state_dict(snap, p.read_config())
+    state = p._state_dict(wallet, snap, p.read_config(wallet))
     assert state["config"]["liquidity_goal_sat"] == 500_000
 
 
@@ -295,7 +318,7 @@ def _run_decision(p, w, action, *, suggested):
                              swap_percentage_fee=None,
                              provider_max_reverse_sat=None,
                              provider_min_amount_sat=None)
-    cfg = p.read_config()
+    cfg = p.read_config(wallet)
     p._evaluate_result = SimpleNamespace(actions=(action,), declines=(), frozen=None)
     import electrum.plugins.inbound_liquidity as mod
     orig = mod.evaluate
@@ -428,6 +451,6 @@ def _run_decision_open(p, w, *, suggested):
     mod.evaluate = lambda s, c: SimpleNamespace(
         actions=(action,), declines=(), frozen=None)
     try:
-        asyncio.run(p._run_decision(w, snap, p.read_config(), None))
+        asyncio.run(p._run_decision(w, snap, p.read_config(wallet), None))
     finally:
         mod.evaluate = orig

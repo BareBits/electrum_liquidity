@@ -14,6 +14,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 inbound_liquidity = pytest.importorskip("electrum.plugins.inbound_liquidity")
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     LiquidityPlugin,
@@ -57,6 +59,9 @@ def _make_plugin(path: str, enabled: bool) -> LiquidityPlugin:
     p.config = _FakeConfig(path, enabled)
     p.logger = logging.getLogger("test.inbound_liquidity.diag")
     p._last_decline_sigs = {}
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

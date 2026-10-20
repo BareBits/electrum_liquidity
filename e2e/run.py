@@ -58,6 +58,7 @@ from rig.services import (
     fund_address,
     partner_lightning_invoice,
     partner2_lightning_invoice,
+    apply_client_plugin_settings,
     set_client_channel_peer,
     set_client_dev_fee_address,
     set_gossip_seed_peers,
@@ -417,6 +418,10 @@ class Rig:
             log("starting headless client Electrum daemon ...")
             start_electrum_daemon_ready(self.pm, CLIENT, log=log)
         wait_electrum_ready(CLIENT)
+        # The plugin's settings live in the wallet, so they can only be written
+        # now that a daemon has it open -- including the two the earlier
+        # bring-up steps decided (the preferred partner, the dev-fee payout).
+        apply_client_plugin_settings()
         self.client_nodeid = wait_lightning_ready(CLIENT)
         bal = wallet_balance(CLIENT)
         log(f"client online (nodeid {self.client_nodeid[:16]}..., "

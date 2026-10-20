@@ -65,6 +65,13 @@ This table lists the most-used settings and their tab — the tabs also carry mo
 knobs not shown here (reliability tuning, offline auto-close, daily action
 ceilings, diagnostics, etc.).
 
+**Settings are per wallet.** Open two wallets in one Electrum and each gets its
+own **Liquidity** tab with its own settings: how much inbound that wallet wants,
+what it will pay for it, and whether it is armed at all are properties of the
+wallet, not of the installation. A wallet reads only what has been set *on it*,
+and the shipped default for everything else. See
+[Per-wallet settings](#per-wallet-settings).
+
 | Setting | Tab | Meaning | Default |
 |---|---|---|---|
 | `automation_enabled` | Settings | Master on/off switch — the large **ENABLED/DISABLED** slider at the top of the Settings tab (applied immediately). Off by default so you can review every setting before the plugin moves any funds | `false` |
@@ -751,13 +758,111 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+### Reading the provider and partner tables
+
+Both list tabs — **Swap providers** and **Channel partners** — sort on any
+column. Click a header to sort by it, click the same header again to reverse.
+The tables are sorted on the **values**, not the text in the cells, so
+`1,900,000` does not land between `12` and `2`, `2d ago` sorts older than
+`3h ago`, and ticking **Preferred** on a row moves it where you can see it. A
+provider that is offline (advertising no terms) sorts to the bottom on whichever
+term you ordered by, rather than to the top of half of them.
+
+Sorting is a way to **read** the table and nothing more. In particular, the
+preferred channel partners are a *try-order* — the plugin opens to the first one
+that accepts — and re-sorting the table to inspect a penalty column does not
+re-prioritise them. Until you click a header, both tables keep their natural
+order: discovered providers before history-only ones, and peers you have a live
+channel with before peers you only have a fault record for.
+
+The **Channel partners** tab leads with a **Node name** column: the alias the
+peer announces over Lightning gossip, which is the same name Electrum's own
+**Channels** tab shows — the plugin asks Electrum the same question
+(`lnworker.lnpeermgr.get_node_alias`). It reads `—` whenever this wallet has not
+been told a name, and with gossip off — Electrum's default — that is most peers,
+because trampoline routing downloads no node announcements. Turn gossip on and
+the names fill in. The node id is still there in the next column, and hovering
+the name shows both in full.
+
+An alias is chosen by the remote node, so it is treated as untrusted text:
+control characters and line breaks (which would spill a row over its neighbours)
+are collapsed to spaces, the invisible padding and bidi overrides that let one
+alias render as a copy of another node's are dropped, and the result is bounded
+at 32 characters.
+
+## Per-wallet settings
+
+Every setting is stored **in the wallet file** (under
+`inbound_liquidity_settings`, alongside the plugin's other per-wallet stores),
+and every open wallet gets its own **Liquidity** tab. Changing a setting on one
+wallet changes nothing for any other — including the **ENABLED/DISABLED** arm
+switch, so one armed wallet cannot arm the rest.
+
+A wallet reads exactly two things:
+
+| | |
+|---|---|
+| its **own** stored value | set from the Liquidity tab, or `inbound_liquidity_set_setting` |
+| failing that, the setting's **shipped default** | the value in the table above |
+
+Nothing else — in particular **`electrum setconfig
+plugins.inbound_liquidity.<key>` does not reach any wallet.** That is
+deliberate: a value a wallet was never given must not arrive from the
+installation and start moving its funds. (`plugins.inbound_liquidity.enabled`
+is still a config key; that is Electrum's own "is this plugin loaded", not a
+setting of the plugin.)
+
+**Resetting.** *Advanced → Reset this wallet to defaults* discards everything
+stored for that wallet, putting it back on the shipped defaults. No other wallet
+is touched, and nothing about channels, swaps or funds changes.
+
+**Headless / CLI.** `setconfig` cannot set these, so there are per-wallet
+commands:
+
+```bash
+electrum inbound_liquidity_get_settings   -w /path/to/wallet
+electrum inbound_liquidity_set_setting    max_channels 3   -w /path/to/wallet
+electrum inbound_liquidity_set_setting    automation_enabled true -w /path/to/wallet
+electrum inbound_liquidity_reset_settings -w /path/to/wallet
+```
+
+The setting name is accepted with or without the `INBOUND_LIQUIDITY_` prefix,
+by the name in the table above (the tail of its config key), and
+case-insensitively — so the liquidity goal answers to `liquidity_goal_sat`,
+`goal_sat` and `INBOUND_LIQUIDITY_GOAL_SAT` alike. Values are checked against
+the setting's declared type (booleans take `true/false/yes/no/on/off/1/0`).
+Each returns the wallet's settings as they read afterwards. The commands need
+the wallet open (they go through the running daemon), which is also how a
+change takes effect at once.
+
+**Three exceptions**, where what the setting controls is one thing per *process*
+rather than one per wallet — Python's logging configuration, and Electrum's
+`MIN_FUNDING_SAT` constant. They are still set per wallet; the effective value
+is just drawn from all the open wallets at once, taking the most permissive
+answer so one wallet cannot override another's:
+
+| Setting | Effective value |
+|---|---|
+| `log_capture_ln`, `log_capture_debug` | on if **any** open wallet asks for it |
+| `log_buffer_lines` | the **largest** any open wallet asks for |
+| `min_onchain_to_open_sat` (as it lowers the channel-funding floor) | the **lowest** across open wallets — the floor is a permission, and each wallet is still held to its own value by the engine |
+
+Note what that last row does and does not mean. A wallet with a *higher*
+`min_onchain_to_open_sat` is unaffected by another wallet's lower one: the engine
+gates each wallet's opens on that wallet's own value. What the lowered floor
+changes is what Electrum *permits* — so while a wallet configured below
+Electrum's stock `MIN_FUNDING_SAT` is open, a channel you open **by hand** in
+another wallet's window can also go below it. That constant is one per process,
+with no per-wallet form.
+
 ## Layout
 
 ```
 inbound_liquidity/
   manifest.json         plugin metadata (available_for: qt, cmdline)
-  __init__.py           ConfigVars + base plugin: event wiring, snapshot, executor, decision-log
-                        store, dev fee, daily ceilings, offline auto-close, MIN_FUNDING_SAT floor override
+  __init__.py           ConfigVars + base plugin: per-wallet settings store, event wiring, snapshot,
+                        executor, decision-log store, dev fee, daily ceilings, offline auto-close,
+                        MIN_FUNDING_SAT floor override, and the inbound_liquidity_* CLI commands
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
                         Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs),
@@ -770,8 +875,9 @@ inbound_liquidity/
   log_buffer.py         bounded in-memory log capture backing the Log sub-tab (no Electrum imports)
   cmdline.py            headless entry point
 tests/                  pure-engine unit tests + Electrum-glue tests covering the rules engine,
-                        decision log, provider/peer reliability, dev fee, daily caps, offline
-                        auto-close, startup readiness, diagnostics, the Qt tab, and the funding floor
+                        per-wallet settings, decision log, provider/peer reliability, dev fee, daily
+                        caps, offline auto-close, startup readiness, diagnostics, the Qt tab (incl.
+                        one tab per open wallet), and the funding floor
 ```
 
 The decision logic lives in `liquidity_manager.py` as a pure function
@@ -793,6 +899,11 @@ the shipped default) so it doesn't race the rig's own channel setup — flip the
 large **ENABLED/DISABLED** slider at the top of the **Liquidity** tab's Settings
 sub-tab to arm it (it applies immediately, no **Apply** needed).
 
+That `enabled` key is a *config* key (Electrum's own "is this plugin loaded").
+The plugin's own settings are per wallet, so the rig applies them through
+`inbound_liquidity_set_setting` once the client daemon has its wallet open —
+see `services.apply_client_plugin_settings`.
+
 Note: on the rig's small (0.02 BTC) channels a reverse swap's **effective all-in
 cost** (provider percentage + provider mining fee + on-chain claim fee, as a
 share of the amount) is several percent, because the fixed provider/mining fees
@@ -812,6 +923,11 @@ installed editable. `e2e/setup.sh` builds one at `e2e/.venv-electrum`.
 ```bash
 # unit (pure rules engine) + Electrum-glue tests — from this plugin directory
 e2e/.venv-electrum/bin/python -m pytest tests/ -q
+
+# multi-wallet GUI test: several wallets in one REAL Electrum Qt process
+# (offline + offscreen, no rig, seconds to run) -- from the e2e directory
+cd e2e && RUN_GUI_E2E=1 .venv-electrum/bin/python -m pytest \
+    tests/test_multi_wallet_gui_e2e.py -q
 
 # end-to-end (heavy; needs bitcoind + Fulcrum + docker):
 cd e2e && ./setup.sh                        # one-time: builds the venv, clones Electrum

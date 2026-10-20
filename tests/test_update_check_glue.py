@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins import inbound_liquidity as pkg  # type: ignore  # noqa: E402
@@ -56,6 +58,9 @@ def _plugin(*, version: str = "0.1.14", **config_overrides: Any) -> LiquidityPlu
     p._plugin_version_cache = version      # pin the "running" version
     p.statuses: List[str] = []
     p.on_status_changed = lambda wallet, status: p.statuses.append(status)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_overrides)
     return p
 
 
@@ -73,6 +78,12 @@ class _Wallet:
 def _wallet(*, proxy: Any = None) -> _Wallet:
     return _Wallet(proxy=proxy)
 
+
+# The wallet these tests check through. One object, not a fresh ``_wallet()``
+# per call: the update check's throttle and its cached answer are per-wallet
+# settings now, so passing a different wallet each time would be asking a
+# different wallet each time -- and every call would be the first.
+wallet = _wallet()
 
 # --- the running version --------------------------------------------------
 def test_plugin_version_comes_from_the_manifest() -> None:
@@ -97,31 +108,31 @@ def test_update_status_is_silent_when_the_check_is_disabled() -> None:
     # telling them they are up to date.
     p = _plugin(INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED=False,
                 INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION="0.9.9")
-    assert p.update_status() == ""
-    assert p.update_available() is True       # the fact is still knowable
+    assert p.update_status(wallet) == ""
+    assert p.update_available(wallet) is True       # the fact is still knowable
 
 
 def test_update_status_reports_up_to_date_and_behind() -> None:
     p = _plugin(version="0.1.14", INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION="0.1.14")
-    assert p.update_status() == "version 0.1.14 (up to date)"
-    assert p.update_available() is False
+    assert p.update_status(wallet) == "version 0.1.14 (up to date)"
+    assert p.update_available(wallet) is False
 
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.15"
-    assert p.update_available() is True
-    assert p.update_status() == "update available: 0.1.15 (running 0.1.14)"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "0.1.15")
+    assert p.update_available(wallet) is True
+    assert p.update_status(wallet) == "update available: 0.1.15 (running 0.1.14)"
 
 
 def test_release_url_falls_back_to_the_releases_page() -> None:
     p = _plugin()
-    assert p.latest_release_url() == UPDATE_RELEASES_URL
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = "https://example.invalid/r/1"
-    assert p.latest_release_url() == "https://example.invalid/r/1"
+    assert p.latest_release_url(wallet) == UPDATE_RELEASES_URL
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", "https://example.invalid/r/1")
+    assert p.latest_release_url(wallet) == "https://example.invalid/r/1"
 
 
 def test_an_unreadable_running_version_never_claims_an_update() -> None:
     p = _plugin(version="", INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION="0.1.15")
-    assert p.update_available() is False
-    assert p.update_status() == "version unknown (up to date)"
+    assert p.update_available(wallet) is False
+    assert p.update_status(wallet) == "version unknown (up to date)"
 
 
 # --- the throttle ---------------------------------------------------------
@@ -138,24 +149,24 @@ def _stub_fetch(p: LiquidityPlugin, release: Optional[ReleaseInfo]) -> List[int]
 def test_no_request_at_all_when_the_check_is_disabled() -> None:
     p = _plugin(INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED=False)
     calls = _stub_fetch(p, ReleaseInfo(version="0.1.15", url="https://x/1"))
-    asyncio.run(p._maybe_check_for_update(_wallet()))
+    asyncio.run(p._maybe_check_for_update(wallet))
     assert calls == []
     # And nothing is stamped, so enabling it later checks immediately.
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS == 0.0
+    assert p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS == 0.0
 
 
 def test_the_check_runs_at_most_once_per_interval() -> None:
     p = _plugin()
     calls = _stub_fetch(p, ReleaseInfo(version="0.1.15", url="https://x/1"))
 
-    asyncio.run(p._maybe_check_for_update(_wallet()))
-    asyncio.run(p._maybe_check_for_update(_wallet()))
-    asyncio.run(p._maybe_check_for_update(_wallet()))
+    asyncio.run(p._maybe_check_for_update(wallet))
+    asyncio.run(p._maybe_check_for_update(wallet))
+    asyncio.run(p._maybe_check_for_update(wallet))
     assert len(calls) == 1
 
     # A day later it is due again.
-    p.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS -= UPDATE_CHECK_INTERVAL_SEC + 1
-    asyncio.run(p._maybe_check_for_update(_wallet()))
+    p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS -= UPDATE_CHECK_INTERVAL_SEC + 1
+    asyncio.run(p._maybe_check_for_update(wallet))
     assert len(calls) == 2
 
 
@@ -164,22 +175,22 @@ def test_a_failed_lookup_still_costs_a_day() -> None:
     # is down (or rate-limiting us) is not retried on every heartbeat.
     p = _plugin()
     calls = _stub_fetch(p, None)
-    asyncio.run(p._maybe_check_for_update(_wallet()))
-    asyncio.run(p._maybe_check_for_update(_wallet()))
+    asyncio.run(p._maybe_check_for_update(wallet))
+    asyncio.run(p._maybe_check_for_update(wallet))
     assert len(calls) == 1
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS > 0.0
+    assert p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS > 0.0
     # Nothing was cached from a failure, so no stale claim is made.
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION == ""
+    assert p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION == ""
 
 
 def test_a_successful_check_caches_the_answer_and_notifies_the_gui() -> None:
     p = _plugin(version="0.1.14")
     _stub_fetch(p, ReleaseInfo(version="0.1.15", url="https://x/rel"))
-    asyncio.run(p._maybe_check_for_update(_wallet()))
+    asyncio.run(p._maybe_check_for_update(wallet))
 
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION == "0.1.15"
-    assert p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL == "https://x/rel"
-    assert p.update_available() is True
+    assert p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION == "0.1.15"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_UPDATE_LATEST_URL == "https://x/rel"
+    assert p.update_available(wallet) is True
     assert p.statuses, "the tab was never told to re-read the status"
 
 
@@ -187,7 +198,7 @@ def test_being_up_to_date_is_recorded_without_a_warning(caplog) -> None:
     p = _plugin(version="0.1.14")
     _stub_fetch(p, ReleaseInfo(version="0.1.14", url="https://x/rel"))
     with caplog.at_level(logging.INFO):
-        asyncio.run(p._maybe_check_for_update(_wallet()))
+        asyncio.run(p._maybe_check_for_update(wallet))
     assert any("up to date" in r.message for r in caplog.records)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -197,8 +208,8 @@ def test_an_available_update_is_logged_once_per_version(caplog) -> None:
     _stub_fetch(p, ReleaseInfo(version="0.1.15", url="https://x/rel"))
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
-            p.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0   # force it due
-            asyncio.run(p._maybe_check_for_update(_wallet()))
+            p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS", 0.0)   # force it due
+            asyncio.run(p._maybe_check_for_update(wallet))
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1
     assert "0.1.15" in warnings[0].message and "https://x/rel" in warnings[0].message
@@ -411,7 +422,7 @@ def test_a_check_failure_never_escapes_into_the_caller(monkeypatch) -> None:
         raise RuntimeError("boom")
     p._fetch_latest_release = _boom
     with pytest.raises(RuntimeError):
-        asyncio.run(p._maybe_check_for_update(_wallet()))   # the raw coroutine propagates
+        asyncio.run(p._maybe_check_for_update(wallet))   # the raw coroutine propagates
     # ...but the scheduling wrapper (no loop available here) never raises.
     p._request_update_check(_wallet())
 

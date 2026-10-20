@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -127,6 +129,12 @@ def _plugin(clock: Optional[_Clock] = None, *, grace: float = GRACE,
     # offline-autoclose state
     p._coop_closing = {}
     p._coop_close_cooldown_until = {}
+    # dev-fee payout state. Needed because a setting this stub config does not
+    # carry now reads as the setting's own declared default rather than as a
+    # fallback written at the call site -- and the declared default for the
+    # payout address is a real address, so a tick reaches the payout step.
+    p._dev_fee_paying = {}
+    p._dev_fee_retry_until = {}
     cfg = dict(
         INBOUND_LIQUIDITY_BANNED_PARTNERS="",
         INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED=True,
@@ -142,6 +150,9 @@ def _plugin(clock: Optional[_Clock] = None, *, grace: float = GRACE,
     )
     cfg.update(overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **overrides)
     return p
 
 
@@ -222,7 +233,7 @@ def test_evaluate_defers_all_automation_until_ready(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._reconcile_pending_swaps = lambda wal: called.append("reconcile")
     p._scan_channel_health = lambda wal: called.append("health")
     p._scan_offline_autoclose = lambda wal: called.append("autoclose")
@@ -248,14 +259,14 @@ def test_evaluate_manual_run_acts_inside_the_startup_window(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._reconcile_pending_swaps = lambda wal: called.append("reconcile")
     p._scan_channel_health = lambda wal: called.append("health")
     p._scan_offline_autoclose = lambda wal: called.append("autoclose")
     p.build_snapshot = lambda wal, t=None: SimpleNamespace()
     p._swap_may_be_needed = lambda base, config: False
     # Manual-run-only mode on, to prove both gates are bypassed together.
-    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    p.set_setting(w, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", True)
     async def _run_decision(wal, snap, config, transport):
         called.append("decision")
     p._run_decision = _run_decision
@@ -272,7 +283,7 @@ def test_evaluate_manual_run_still_refused_when_disconnected(clock) -> None:
     p, w = _plugin(clock), _FakeWallet(ln, connected=False)
     p.wallets = {w: asyncio.Lock()}
     called: List[str] = []
-    p.read_config = lambda: SimpleNamespace(automation_enabled=True)
+    p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=True)
     p._scan_channel_health = lambda wal: called.append("health")
     _mark_started(p, w, clock)
     asyncio.run(p._evaluate(w, manual=True))

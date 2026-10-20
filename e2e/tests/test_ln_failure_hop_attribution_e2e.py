@@ -66,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import run as run_mod  # noqa: E402
 from rig import paths  # noqa: E402
 from rig.services import (  # noqa: E402
+    set_client_plugin_setting,
     CLIENT,
     PARTNER,
     electrum_cli,
@@ -88,6 +89,20 @@ SUPPRESSED_LOG = "Lightning payment failed beyond our channel peer"
 
 
 def _setcfg(key: str, value: str, *, inst=CLIENT) -> None:
+    """Set a config key -- or, for one of the plugin's settings on the CLIENT
+    wallet, that wallet's value of it. See the note on the helper of this name
+    in the other e2e modules: the plugin's settings live in the wallet, so
+    `setconfig plugins.inbound_liquidity.<key>` configures nothing.
+
+    This module can also target the PARTNER instances, which do not run the
+    plugin, so a plugin setting there would be meaningless -- it is refused
+    rather than silently sent to the config."""
+    prefix = "plugins.inbound_liquidity."
+    if key.startswith(prefix):
+        assert inst is CLIENT, \
+            f"{key} is a per-wallet plugin setting; {inst.name} has no plugin"
+        set_client_plugin_setting(key[len(prefix):], value)
+        return
     electrum_cli("setconfig", key, value, inst=inst)
 
 

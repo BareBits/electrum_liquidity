@@ -251,19 +251,30 @@ def test_the_dialog_text_counts_down_and_says_what_it_is_waiting_for() -> None:
     assert "No further providers" in text
 
 
-def test_the_wait_survives_a_qt_without_an_event_loop(monkeypatch) -> None:
+def test_the_wait_survives_a_qt_without_an_event_loop() -> None:
     """processEvents can fail if Qt is already torn down. The wait is what
-    matters; the repaint is a courtesy, so a failure there must not skip it."""
+    matters; the repaint is a courtesy, so a failure there must not skip it.
+
+    The patch is restored by hand, around the call under test, rather than left
+    to fixture teardown: a raising ``processEvents`` is hostile to anything else
+    that wants to drain the Qt event queue, and leaving it installed for the
+    rest of the test's lifetime made whichever queued event arrived during
+    teardown fail -- blaming this test, or the next one to run.
+    """
     p = _plugin()
     wallet = _Wallet()
 
     def _boom():
         raise RuntimeError("no event loop")
 
-    monkeypatch.setattr(qt_mod.QApplication, "processEvents", staticmethod(_boom))
-    p._note_attempt_started(wallet, _attempt(remaining=0.3))
-    started = time.monotonic()
-    p._await_shutdown(wallet)
+    original = qt_mod.QApplication.processEvents
+    qt_mod.QApplication.processEvents = staticmethod(_boom)
+    try:
+        p._note_attempt_started(wallet, _attempt(remaining=0.3))
+        started = time.monotonic()
+        p._await_shutdown(wallet)
+    finally:
+        qt_mod.QApplication.processEvents = original
     assert 0.3 <= time.monotonic() - started < 3.0
 
 
