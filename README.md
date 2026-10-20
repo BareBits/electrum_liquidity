@@ -6,8 +6,8 @@ An Electrum plugin for merchants that helps you make sure you ALWAYS have enough
 >
 > Once configured and set to automatic mode,
 > money **automatically and without confirmation**: it opens Lightning channels
-> and broadcasts on-chain / submarine-swap transactions on your behalf. While we are using this plugin in production, **Bugs, edge cases, or provider failures can cause LOSS OF
-> FUNDS.** There are some guardrails built in to limit the number of channels created per day etc. Use it **only** with amounts you are fully prepared to lose. There is NO WARRANTY of any kind. You alone are responsible for any funds you place under its control.
+> and broadcasts on-chain / submarine-swap transactions on your behalf. While we are using this plugin in production, bugs, edge cases, or provider failures can theoretically cause LOSS OF
+> FUNDS. There are a number of guardrails built in to limit the number of channels created per day etc. Use this plugin only with amounts you are fully prepared to lose. There is NO WARRANTY of any kind. You alone are responsible for any funds you place under its control.
 > For this reason, we suggest using this pattern: use this plugin on a wallet that has a dedicated purpose of receiving payments. Forward those funds to a cold wallet when they reach any significant amount. 
 
 An Electrum plugin that automatically manages **inbound Lightning liquidity** by
