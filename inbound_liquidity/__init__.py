@@ -183,6 +183,44 @@ def _parse_banned_partners(raw: Optional[str]) -> frozenset:
         nid for nid in (normalize_node_id(e) for e in _parse_partner_list(raw)) if nid)
 
 
+# A node alias is chosen by the remote node and arrives over the wire in its
+# gossip ``node_announcement``, so it is untrusted display input. BOLT 7 caps the
+# field at 32 bytes, but nothing stops a peer filling those bytes with control
+# characters, line breaks or zero-width padding -- which in a table cell means a
+# row that spills over its neighbours, or an alias that renders as a convincing
+# copy of another node's. Keep it to printable, single-line, bounded text.
+MAX_NODE_ALIAS_CHARS = 32
+
+
+def _clean_node_alias(alias: Optional[str]) -> str:
+    """Make an untrusted node alias safe to put in a widget: drop control and
+    zero-width characters, collapse all whitespace to single spaces, and bound
+    the length. Returns '' for anything that cleans down to nothing."""
+    if not alias:
+        return ""
+    try:
+        text = str(alias)
+    except Exception:
+        return ""
+    # `isprintable` is False for every control character (newline, tab, NUL)
+    # AND for the invisible formatting ones an alias has no legitimate use for
+    # -- zero-width space, soft hyphen, and the bidi overrides that let an
+    # alias render as a reversed copy of another node's name. The ASCII space
+    # is printable, so ordinary multi-word names survive.
+    #
+    # Whitespace-like characters become a space rather than vanishing, so a
+    # line break between two words does not weld them together; the zero-width
+    # ones are deleted, since they sit INSIDE a word to disguise it. Then all
+    # runs of whitespace collapse to one.
+    text = "".join(
+        ch if ch.isprintable() else (" " if ch.isspace() else "")
+        for ch in text)
+    text = " ".join(text.split())
+    if len(text) > MAX_NODE_ALIAS_CHARS:
+        text = text[:MAX_NODE_ALIAS_CHARS - 1] + "…"
+    return text
+
+
 _logger = get_logger(__name__)
 
 # The bare plugin name ("inbound_liquidity"), independent of how this package was
@@ -1543,6 +1581,56 @@ def _settings_field(name: str) -> str:
     return name[len(_CONFIG_PREFIX):] if name.startswith(_CONFIG_PREFIX) else name
 
 
+@functools.lru_cache(maxsize=None)
+def _settings_by_config_key() -> Mapping[str, str]:
+    """``{config-key tail: attribute name}`` for every setting declared here.
+
+    A setting has TWO names: the SimpleConfig attribute the code reads
+    (``INBOUND_LIQUIDITY_GOAL_SAT``) and the last segment of its config key,
+    which is what a user types (``plugins.inbound_liquidity.liquidity_goal_sat``
+    -> ``liquidity_goal_sat``). For 56 of the 57 settings those agree once the
+    prefix is added, so :meth:`Plugin.set_setting` resolved a name by simply
+    building ``INBOUND_LIQUIDITY_`` + it.
+
+    The liquidity goal is the one that does not, and building the name there
+    produced ``INBOUND_LIQUIDITY_LIQUIDITY_GOAL_SAT``, which does not exist --
+    so setting the goal by its config name raised AttributeError and took out
+    nine rig e2e modules. This index is the second lookup: the declared key,
+    asked of the ConfigVars themselves rather than reconstructed from a string.
+    """
+    out: Dict[str, str] = {}
+    for attr, var in _plugin_config_vars().items():
+        try:
+            tail = str(var.key()).rsplit(".", 1)[-1]
+        except Exception:
+            continue
+        if tail:
+            # First declaration wins; two settings cannot share a config key
+            # anyway (SimpleConfig would not allow it).
+            out.setdefault(tail.upper(), attr)
+    return MappingProxyType(out)
+
+
+def _resolve_setting_name(name: str) -> Optional[str]:
+    """The ConfigVar attribute name for a setting named any of the ways a caller
+    may reasonably name it, or None if there is no such setting.
+
+    Accepts the attribute name itself (``INBOUND_LIQUIDITY_GOAL_SAT``), the
+    attribute name without the prefix (``goal_sat``), or the tail of the config
+    key (``liquidity_goal_sat``) -- case-insensitively, since the CLI command
+    upper-cases what it is given.
+    """
+    if not name:
+        return None
+    upper = str(name).strip().upper()
+    attr = upper if upper.startswith(_CONFIG_PREFIX) else _CONFIG_PREFIX + upper
+    cvars = _plugin_config_vars()
+    if attr in cvars:
+        return attr
+    # Not an attribute name: try it as the config key's own last segment.
+    return _settings_by_config_key().get(_settings_field(upper))
+
+
 def _wallet_basename(wallet: 'Abstract_Wallet') -> str:
     """The wallet's file name, for log lines; never raises (see qt._wallet_name)."""
     try:
@@ -2780,17 +2868,21 @@ class LiquidityPlugin(BasePlugin):
                     value: Any) -> Any:
         """Set one setting on one wallet, type-checked against its ConfigVar.
 
+        The setting may be named by its attribute (``INBOUND_LIQUIDITY_GOAL_SAT``
+        or just ``goal_sat``) or by the tail of its config key
+        (``liquidity_goal_sat``) -- see :func:`_resolve_setting_name`, which is
+        where that is decided rather than by building a name from a string here.
+
         Returns the stored value. Raises AttributeError for an unknown setting
         and ValueError if the value does not fit the declared type -- the same
         two failures SimpleConfig gives for the same mistakes, so the GUI, the
         CLI command and the tests all get one behaviour.
         """
-        if not name.startswith(_CONFIG_PREFIX):
-            name = _CONFIG_PREFIX + name
-        cvars = _plugin_config_vars()
-        cv = cvars.get(name)
-        if cv is None:
+        resolved = _resolve_setting_name(name)
+        if resolved is None:
             raise AttributeError(f"no such inbound-liquidity setting: {name!r}")
+        name = resolved
+        cv = _plugin_config_vars()[name]
         value = _coerce_setting(cv, value)
         # Make sure this wallet has a view, so it counts as one of the open
         # wallets the process-wide settings are derived from (see
@@ -7870,10 +7962,48 @@ class LiquidityPlugin(BasePlugin):
                 out.add(nid)
         return frozenset(out)
 
-    def current_channel_partners(self, wallet: 'Abstract_Wallet') -> List[Dict]:
+    def node_alias(self, wallet: 'Abstract_Wallet', node_id_hex: str) -> str:
+        """The peer's human-readable node name, or '' if it is not known.
+
+        Asks Electrum exactly what Electrum's own Channels tab asks
+        (``gui/qt/channels_list.py``): ``lnworker.lnpeermgr.get_node_alias``,
+        which reads the alias out of the peer's gossip ``node_announcement``.
+
+        Two consequences worth knowing, both inherited from that call:
+
+        * with gossip OFF -- Electrum's default, and the regtest rig's setting --
+          ``uses_trampoline()`` is true and only the hardcoded trampoline nodes
+          resolve, so an ordinary peer has no name here. A name the host wallet
+          cannot show, this plugin cannot show either;
+        * the alias is chosen by the remote node, so it is untrusted input. It
+          is sanitised (see ``_clean_node_alias``) before it reaches a widget.
+
+        Every hop is guarded: a wallet with no Lightning, an Electrum whose
+        LNWallet exposes no ``lnpeermgr``, a malformed node id, or a lookup that
+        raises all yield '' rather than costing the caller its row.
+        """
+        if not node_id_hex:
+            return ""
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return ""
+        peermgr = getattr(lnworker, "lnpeermgr", None)
+        get_alias = getattr(peermgr, "get_node_alias", None)
+        if get_alias is None:
+            return ""
+        try:
+            alias = get_alias(bytes.fromhex(node_id_hex))
+        except Exception:
+            return ""
+        return _clean_node_alias(alias)
+
+    def current_channel_partners(self, wallet: 'Abstract_Wallet') -> List[Dict[str, str]]:
         """Nodes we already have channels with (deduplicated by node id), for the
-        Channel partners settings tab's quick prefer/ban toggles."""
-        out: List[Dict] = []
+        Channel partners settings tab's quick prefer/ban toggles.
+
+        Each entry carries the peer's ``node_id`` (hex) and its ``alias`` -- the
+        human-readable node name, '' when unknown (see :meth:`node_alias`)."""
+        out: List[Dict[str, str]] = []
         lnworker = getattr(wallet, "lnworker", None)
         if lnworker is None:
             return out
@@ -7890,7 +8020,7 @@ class LiquidityPlugin(BasePlugin):
             if node_id in seen:
                 continue
             seen.add(node_id)
-            out.append({"node_id": node_id})
+            out.append({"node_id": node_id, "alias": self.node_alias(wallet, node_id)})
         return out
 
     def _channel_peer_node_id(self, wallet: 'Abstract_Wallet', channel_id_hex: str) -> str:

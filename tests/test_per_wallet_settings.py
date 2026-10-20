@@ -230,6 +230,77 @@ def test_the_prefix_is_optional_when_writing() -> None:
     assert p.settings(w).INBOUND_LIQUIDITY_MAX_CHANNELS == 3
 
 
+# --- naming a setting -----------------------------------------------------
+# A setting has two names: the SimpleConfig attribute the code reads, and the
+# last segment of its config key, which is what a user (and the rig) types.
+# `set_setting` used to resolve a name by BUILDING the attribute from it, which
+# silently assumed those two always agree. For one setting they do not.
+def test_a_setting_is_reachable_by_the_tail_of_its_config_key() -> None:
+    # `plugins.inbound_liquidity.liquidity_goal_sat` is declared as the
+    # attribute INBOUND_LIQUIDITY_GOAL_SAT -- not ..._LIQUIDITY_GOAL_SAT. The
+    # built name therefore did not exist, and setting the liquidity goal by the
+    # name it is configured under raised AttributeError.
+    p, w = _plugin(), _FakeWallet()
+    assert p.set_setting(w, "liquidity_goal_sat", 1_500_000) == 1_500_000
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == 1_500_000
+
+
+def test_both_names_of_a_setting_write_the_same_place() -> None:
+    # Not two settings that happen to agree: one setting, one store key.
+    p, w = _plugin(), _FakeWallet()
+    p.set_setting(w, "liquidity_goal_sat", 1_500_000)
+    p.set_setting(w, "goal_sat", 250_000)
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == 250_000
+    assert [k for k in p.settings_store(w) if "GOAL_SAT" in k] == ["GOAL_SAT"]
+
+
+@pytest.mark.parametrize("name", [
+    "liquidity_goal_sat", "LIQUIDITY_GOAL_SAT",
+    "INBOUND_LIQUIDITY_GOAL_SAT", "goal_sat", "  Goal_Sat  ",
+])
+def test_every_way_of_naming_the_goal_resolves(name) -> None:
+    p, w = _plugin(), _FakeWallet()
+    assert p.set_setting(w, name, 400_000) == 400_000
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == 400_000
+
+
+def test_every_setting_is_reachable_by_both_of_its_names() -> None:
+    """The guard. Walks all 57 settings and writes each one under BOTH names.
+
+    This is the test that would have caught the goal, and that a future rename
+    cannot slip past: a setting whose attribute stops matching its config key
+    fails here rather than in the e2e suite nine modules later.
+    """
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        _plugin_config_vars, _settings_field,
+    )
+    cvars = _plugin_config_vars()
+    assert len(cvars) > 50, f"only {len(cvars)} settings found -- wrong registry?"
+    p = _plugin()
+    unreachable: List[str] = []
+    for attr, var in sorted(cvars.items()):
+        tail = str(var.key()).rsplit(".", 1)[-1]
+        default = config_var_default(p.config, attr)
+        for name in (_settings_field(attr), tail, attr):
+            w = _FakeWallet()
+            try:
+                p.set_setting(w, name, default)
+            except AttributeError:
+                unreachable.append(f"{attr} not reachable as {name!r}")
+                continue
+            if _settings_field(attr) not in p.settings_store(w):
+                unreachable.append(f"{name!r} wrote something other than {attr}")
+    assert unreachable == [], "\n".join(unreachable)
+
+
+def test_an_unknown_name_is_still_refused_by_either_route() -> None:
+    # The second lookup must not turn a typo into a silent write.
+    p, w = _plugin(), _FakeWallet()
+    for name in ("liquidity_goal", "goal", "liquidity_goal_sats", "no_such_thing"):
+        with pytest.raises(AttributeError):
+            p.set_setting(w, name, 1)
+
+
 def test_a_value_is_fitted_to_the_declared_type() -> None:
     p, w = _plugin(), _FakeWallet()
     assert p.set_setting(w, "MAX_CHANNELS", "3") == 3

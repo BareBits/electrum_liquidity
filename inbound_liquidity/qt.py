@@ -37,7 +37,10 @@ from . import (
 )
 from .liquidity_manager import BufferSplit, normalize_node_id, split_goal_buffer
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
-from .qt_widgets import ToggleSwitch
+from .qt_widgets import (
+    SortableHeader, SortableTreeItem, ToggleSwitch, add_sortable_row,
+    primary_button, rows_in_insertion_order,
+)
 
 if TYPE_CHECKING:
     from electrum.gui.qt.main_window import ElectrumWindow
@@ -2329,7 +2332,7 @@ class Plugin(LiquidityPlugin):
         status_label = QLabel("")
         vbox.addWidget(status_label)
 
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
 
         def on_apply() -> None:
             # Parse and validate everything before persisting anything.
@@ -2794,7 +2797,7 @@ class Plugin(LiquidityPlugin):
 
         reset_btn.clicked.connect(on_reset)
 
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row = QHBoxLayout()
         btn_row.addWidget(reset_btn)
@@ -2835,6 +2838,9 @@ class Plugin(LiquidityPlugin):
             _("OK"), _("Faults"), _("Penalty %"), _("Last fault")])
         tree.setRootIsDecorated(False)
         tree.setColumnWidth(0, 180)
+        tree.setToolTip(_("Click a column header to sort by it; click the same "
+                          "header again to reverse the order."))
+        sorter = SortableHeader(tree)
         v.addWidget(tree)
 
         grid = QGridLayout()
@@ -2867,12 +2873,38 @@ class Plugin(LiquidityPlugin):
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
 
-            def add_row(npub, cells, *, checkable, r):
+            def add_row(npub, cells, *, checkable, r, offer=None):
                 pen = r.get("penalty_pct", 0.0)
-                item = QTreeWidgetItem(cells + [
+                item = SortableTreeItem(cells + [
                     str(r.get("success_count", 0)), str(r.get("fault_count", 0)),
-                    f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))])
+                    f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))],
+                    # Declared even for the offline rows, which carry no box:
+                    # they then sort as "not ticked" rather than as text.
+                    checkbox_cols=(self._PREF_COL, self._BAN_COL))
                 item.setData(0, Qt.ItemDataRole.UserRole, npub)
+                # Sort on the values, not on their formatted text: "1,900,000"
+                # compares as a string between "12" and "2".
+                item.set_sort_key(0, npub)
+                if offer is not None:
+                    item.set_sort_key(1, float(offer.percentage_fee))
+                    item.set_sort_key(2, int(offer.mining_fee_sat))
+                    item.set_sort_key(3, int(offer.min_amount_sat))
+                    item.set_sort_key(4, int(offer.max_reverse_sat))
+                    item.set_sort_key(5, int(offer.pow_bits))
+                else:
+                    # An offline provider advertises no terms. Sort it to the
+                    # WORST end of each of them, so ordering by any term keeps
+                    # the usable providers together at the top: worst is the
+                    # largest fee/mining/min/PoW, and the smallest max.
+                    for col in (1, 2, 3, 5):
+                        item.set_sort_key(col, float("inf"))
+                    item.set_sort_key(4, float("-inf"))
+                item.set_sort_key(8, int(r.get("success_count", 0) or 0))
+                item.set_sort_key(9, int(r.get("fault_count", 0) or 0))
+                item.set_sort_key(10, float(pen or 0.0))
+                # The age column reads "3h ago"/"—"; sort it by the timestamp
+                # it was rendered from, with "never faulted" (0) sorting first.
+                item.set_sort_key(11, float(r.get("last_fault_ts", 0.0) or 0.0))
                 if checkable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(self._PREF_COL, checked if npub in pref else unchecked)
@@ -2880,7 +2912,7 @@ class Plugin(LiquidityPlugin):
                 reason = r.get("last_reason")
                 if reason:
                     item.setToolTip(self._FAULTS_COL, str(reason))
-                tree.addTopLevelItem(item)
+                add_sortable_row(tree, item)
 
             discovered = set()
             for o in self.discovered_providers(wallet):
@@ -2890,7 +2922,7 @@ class Plugin(LiquidityPlugin):
                     f"{o.percentage_fee:g}", f"{o.mining_fee_sat:,}",
                     f"{o.min_amount_sat:,}", f"{o.max_reverse_sat:,}",
                     str(o.pow_bits), "", ""],
-                    checkable=True, r=rel.get(o.npub, {}))
+                    checkable=True, r=rel.get(o.npub, {}), offer=o)
             # Also surface providers that have a reliability history but are not
             # currently advertising, so a penalised/offline provider is still
             # visible (and its stats clearable).
@@ -2901,6 +2933,9 @@ class Plugin(LiquidityPlugin):
                     self._abbrev(npub, 12, 6) or npub,
                     _("(offline)"), "", "", "", "", "", ""],
                     checkable=False, r=r)
+            # The rows were just rebuilt from scratch; put them back in whatever
+            # order the user last clicked a header for.
+            sorter.reapply()
 
         def on_apply() -> None:
             # Seed from the text fields (so offline npubs survive), then fold in
@@ -2970,7 +3005,7 @@ class Plugin(LiquidityPlugin):
         reset_btn.setToolTip(_("Clear the selected provider's reliability history "
                                "(or all providers' if none is selected)."))
         reset_btn.clicked.connect(on_reset_stats)
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row.addWidget(refresh_btn)
         btn_row.addWidget(reset_btn)
@@ -2981,9 +3016,15 @@ class Plugin(LiquidityPlugin):
         return tab, repopulate
 
     # --- channel partners sub-tab -----------------------------------------
-    _PARTNER_PREF_COL = 1
-    _PARTNER_BAN_COL = 2
-    _PARTNER_FAULTS_COL = 4
+    # Column 0 is the human-readable node name; the node id follows it. The
+    # row's identity still rides on column 0's UserRole, so every
+    # `data(0, UserRole)` reader below is unaffected by that ordering.
+    _PARTNER_NAME_COL = 0
+    _PARTNER_NODE_ID_COL = 1
+    _PARTNER_PREF_COL = 2
+    _PARTNER_BAN_COL = 3
+    _PARTNER_FAULTS_COL = 5
+    _PARTNER_REASON_COL = 9
 
     def _build_channel_partners_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Channel partners sub-tab: a strict-mode toggle, a list of the
@@ -3008,6 +3049,12 @@ class Plugin(LiquidityPlugin):
             "with a fault history) — they are not a list of candidates. Tick a row to "
             "prefer/ban that node; a node you are not connected to yet goes in the "
             "“Preferred partners” box.")))
+        v.addWidget(_wrapped_label(_(
+            "“Node name” is the alias the peer announces over Lightning gossip, the "
+            "same name Electrum's own Channels tab shows. It reads “—” when this "
+            "wallet has not been told one — which is the case for most peers while "
+            "gossip is off (the default), since trampoline routing downloads no "
+            "node announcements.")))
 
         strict_cb = QCheckBox(_("Only open channels to preferred partners (never fall back to suggestions)"))
         strict_cb.setChecked(bool(
@@ -3029,12 +3076,18 @@ class Plugin(LiquidityPlugin):
 
         tree = QTreeWidget()
         tree.setHeaderLabels([
-            _("Channel peer (node id)"), _("Preferred"), _("Banned"),
+            _("Node name"), _("Channel peer (node id)"), _("Preferred"), _("Banned"),
             _("OK"), _("Faults"), _("Hard"), _("Penalty %"), _("Last fault"),
             _("Last fault reason")])
         tree.setRootIsDecorated(False)
-        tree.setColumnWidth(0, 300)
-        tree.setColumnWidth(8, 240)
+        tree.setColumnWidth(self._PARTNER_NAME_COL, 160)
+        tree.setColumnWidth(self._PARTNER_NODE_ID_COL, 300)
+        tree.setColumnWidth(self._PARTNER_REASON_COL, 240)
+        tree.setToolTip(_("Click a column header to sort by it; click the same "
+                          "header again to reverse the order. Sorting changes "
+                          "only the view — the order preferred partners are "
+                          "tried in is unaffected."))
+        sorter = SortableHeader(tree)
         v.addWidget(tree)
 
         grid = QGridLayout()
@@ -3069,37 +3122,63 @@ class Plugin(LiquidityPlugin):
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
 
-            def add_row(nid, *, checkable):
+            def add_row(nid, *, checkable, alias=None):
                 low = nid.lower()
                 r = rel.get(low, {})
                 pen = r.get("penalty_pct", 0.0)
                 reason = r.get("last_reason") or ""
-                item = QTreeWidgetItem([
-                    self._abbrev(nid, 12, 6) or nid, "", "",
+                # The name is only as good as what gossip has told this wallet
+                # (see Plugin.node_alias): in trampoline mode -- Electrum's
+                # default -- an ordinary peer has none, and the column reads "—".
+                if alias is None:
+                    alias = self.node_alias(wallet, nid)
+                item = SortableTreeItem([
+                    alias or "—", self._abbrev(nid, 12, 6) or nid, "", "",
                     str(r.get("success_count", 0)), str(r.get("fault_count", 0)),
                     str(r.get("hard_fault_count", 0)), f"{pen:.2f}",
-                    _fmt_age(r.get("last_fault_ts", 0.0)), str(reason)])
+                    _fmt_age(r.get("last_fault_ts", 0.0)), str(reason)],
+                    checkbox_cols=(self._PARTNER_PREF_COL, self._PARTNER_BAN_COL))
                 item.setData(0, Qt.ItemDataRole.UserRole, nid)
+                if alias:
+                    # The cell is elided at the column width, and the full node
+                    # id is abbreviated in the next one; show both in full here.
+                    item.setToolTip(self._PARTNER_NAME_COL, f"{alias}\n{nid}")
+                # Sort on the values, not on their formatted text. An unnamed
+                # peer sorts after every named one either way round: "—" would
+                # otherwise interleave with the names by codepoint.
+                item.set_sort_key(self._PARTNER_NAME_COL,
+                                  alias.casefold() if alias else "￿")
+                item.set_sort_key(self._PARTNER_NODE_ID_COL, low)
+                item.set_sort_key(4, int(r.get("success_count", 0) or 0))
+                item.set_sort_key(self._PARTNER_FAULTS_COL, int(r.get("fault_count", 0) or 0))
+                item.set_sort_key(6, int(r.get("hard_fault_count", 0) or 0))
+                item.set_sort_key(7, float(pen or 0.0))
+                # "3h ago"/"—" sorts by the timestamp behind it; never-faulted
+                # (0) sorts first.
+                item.set_sort_key(8, float(r.get("last_fault_ts", 0.0) or 0.0))
+                item.set_sort_key(self._PARTNER_REASON_COL, str(reason))
                 if checkable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(self._PARTNER_PREF_COL, checked if low in pref_ids else unchecked)
                     item.setCheckState(self._PARTNER_BAN_COL, checked if low in ban_ids else unchecked)
-                reason = r.get("last_reason")
                 if reason:
                     item.setToolTip(self._PARTNER_FAULTS_COL, str(reason))
-                tree.addTopLevelItem(item)
+                add_sortable_row(tree, item)
 
             current = set()
             for partner in self.current_channel_partners(wallet):
                 nid = partner["node_id"]
                 current.add(nid.lower())
-                add_row(nid, checkable=True)
+                add_row(nid, checkable=True, alias=partner.get("alias", ""))
             # Also surface peers we have a reliability history for but no current
             # channel with (e.g. an auto-banned or force-closed peer), so their
             # stats stay visible and clearable.
             for low in rel:
                 if low not in current:
                     add_row(low, checkable=True)
+            # The rows were just rebuilt from scratch; put them back in whatever
+            # order the user last clicked a header for.
+            sorter.reapply()
 
         def on_apply() -> None:
             # Seed from the text fields (so not-yet-connected partners survive),
@@ -3107,8 +3186,11 @@ class Plugin(LiquidityPlugin):
             preferred = _parse_partner_list(pref_edit.toPlainText())
             pref_ids = {normalize_node_id(p) for p in preferred}
             banned = set(_parse_banned_partners(ban_edit.toPlainText()))
-            for i in range(tree.topLevelItemCount()):
-                it = tree.topLevelItem(i)
+            # Insertion order, NOT the order on screen. `preferred` is a
+            # try-order -- the plugin opens to the first partner in it that
+            # accepts -- so re-sorting the table to read a penalty column must
+            # not re-prioritise which peer gets the next channel.
+            for it in rows_in_insertion_order(tree):
                 nid = it.data(0, Qt.ItemDataRole.UserRole)
                 if not nid:
                     continue
@@ -3156,7 +3238,7 @@ class Plugin(LiquidityPlugin):
         reset_btn.setToolTip(_("Clear the selected peer's reliability history "
                                "(or all peers' if none is selected)."))
         reset_btn.clicked.connect(on_reset_stats)
-        apply_btn = QPushButton(_("Apply"))
+        apply_btn = primary_button(_("Apply"))
         apply_btn.clicked.connect(on_apply)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)

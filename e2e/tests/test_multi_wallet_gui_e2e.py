@@ -14,6 +14,12 @@ Plugins dialog's ``reload_windows()``, which closes and rebuilds every open
 window -- and the one that produced it in a unit test: a window replaced without
 ``close_wallet`` firing.
 
+The last section covers the settings tabs' own surface in the same real
+windows: the Channel partners tab's node-name column (resolved through
+Electrum's REAL ``LNPeerManager.get_node_alias``, against a real ``LNWallet``),
+the click-to-sort column headers, and the big green Apply actually writing to a
+real wallet file.
+
 No rig needed: offline and offscreen, with freshly created regtest wallets, so
 there is no bitcoind, no server and no network -- seconds to run, and most of
 that is importing Electrum and building three real windows.
@@ -341,3 +347,127 @@ def test_a_window_replaced_without_a_close_hook_still_gets_a_tab(gui) -> None:
         assert plugin._tabs[wallet].window is replacement
     finally:
         replacement.close()
+
+
+# --- the settings tabs' own surface, in a real window ----------------------
+# These use the LAST wallet, so the per-wallet settings the tests above pinned
+# on wallets 0 and 1 are left alone.
+LAST = len(WALLET_NAMES) - 1
+
+PARTNER_A = "02" + "aa" * 32     # given a trampoline name below
+PARTNER_B = "03" + "bb" * 32     # no name: the ordinary case
+
+
+def _sub_tabs(plugin, wallet):
+    from PyQt6.QtWidgets import QTabWidget
+    return plugin._tabs[wallet].container.findChild(QTabWidget)
+
+
+def _tree_of(plugin, wallet, index):
+    from PyQt6.QtWidgets import QTreeWidget
+    return _sub_tabs(plugin, wallet).widget(index).findChild(QTreeWidget)
+
+
+def _apply_of(plugin, wallet, index):
+    from PyQt6.QtWidgets import QPushButton
+    return next(b for b in _sub_tabs(plugin, wallet).widget(index).findChildren(QPushButton)
+                if b.text() == "Apply")
+
+
+@pytest.fixture
+def partners(gui):
+    """The last wallet's Channel partners tab, holding two peers.
+
+    The peers are given a fault history rather than a channel: that is enough
+    to list them, and it needs no funded regtest wallet. One of them is also
+    registered as a hardcoded trampoline node, which is how a name resolves at
+    all while gossip is off -- so the alias below comes back through Electrum's
+    own ``LNPeerManager.get_node_alias``, not a stand-in for it.
+    """
+    from electrum import trampoline
+    from electrum.lntransport import LNPeerAddr
+
+    window = gui.window_for(LAST) or gui.open(LAST)
+    wallet, plugin = window.wallet, gui.plugin
+    assert wallet.lnworker is not None, "this wallet has no Lightning"
+    assert wallet.lnworker.lnpeermgr is not None, "this LNWallet has no peer manager"
+
+    saved = dict(trampoline._TRAMPOLINE_NODES_UNITTESTS)
+    trampoline._TRAMPOLINE_NODES_UNITTESTS.update(
+        {"Rig Trampoline": LNPeerAddr("127.0.0.1", 9735, bytes.fromhex(PARTNER_A))})
+    plugin._record_peer_fault(wallet, PARTNER_A, "could not connect", hard=False)
+    plugin._record_peer_fault(wallet, PARTNER_B, "force-closed on us", hard=False)
+    plugin._tabs[wallet].refresh()
+    try:
+        yield plugin, wallet, _tree_of(plugin, wallet, 2)
+    finally:
+        trampoline._TRAMPOLINE_NODES_UNITTESTS.clear()
+        trampoline._TRAMPOLINE_NODES_UNITTESTS.update(saved)
+        plugin.clear_peer_reliability(wallet)
+
+
+def _rows(tree, col):
+    return [tree.topLevelItem(i).text(col) for i in range(tree.topLevelItemCount())]
+
+
+def test_the_partners_tab_names_a_peer_electrum_can_name(partners) -> None:
+    plugin, _wallet, tree = partners
+    names = _rows(tree, plugin._PARTNER_NAME_COL)
+    assert sorted(names) == ["Rig Trampoline", "—"], names
+
+
+def test_the_partners_tab_headers_are_clickable_in_a_real_window(partners) -> None:
+    _plugin, _wallet, tree = partners
+    assert tree.header().sectionsClickable()
+    assert tree.header().isSortIndicatorShown()
+
+
+def test_clicking_a_real_header_reorders_the_rows(partners) -> None:
+    plugin, _wallet, tree = partners
+    col = plugin._PARTNER_NAME_COL
+    tree.header().sectionClicked.emit(col)
+    assert _rows(tree, col) == ["Rig Trampoline", "—"]
+    tree.header().sectionClicked.emit(col)
+    assert _rows(tree, col) == ["—", "Rig Trampoline"]
+
+
+def test_the_providers_tab_headers_are_clickable_in_a_real_window(gui) -> None:
+    window = gui.window_for(LAST) or gui.open(LAST)
+    tree = _tree_of(gui.plugin, window.wallet, 1)
+    assert tree.header().sectionsClickable()
+
+
+def test_every_apply_in_a_real_window_is_big_and_green(gui) -> None:
+    from electrum.plugins.inbound_liquidity.qt_widgets import (  # type: ignore
+        ACCENT_GREEN, PRIMARY_BUTTON_MIN_HEIGHT, PRIMARY_BUTTON_MIN_WIDTH,
+    )
+    window = gui.window_for(LAST) or gui.open(LAST)
+    wallet = window.wallet
+    for index in range(4):          # Settings, Swap providers, Channel partners, Advanced
+        btn = _apply_of(gui.plugin, wallet, index)
+        title = _sub_tabs(gui.plugin, wallet).tabText(index)
+        assert btn.minimumWidth() >= PRIMARY_BUTTON_MIN_WIDTH, title
+        assert btn.minimumHeight() >= PRIMARY_BUTTON_MIN_HEIGHT, title
+        assert ACCENT_GREEN in btn.styleSheet(), title
+
+
+def test_the_green_apply_writes_to_the_real_wallet_file(gui) -> None:
+    """End to end for the restyled button: click it in a real window, then read
+    the value back off the wallet's own DB rather than the plugin's cache."""
+    from PyQt6.QtWidgets import QCheckBox
+    from electrum.plugins.inbound_liquidity import SETTINGS_DB_KEY  # type: ignore
+    window = gui.window_for(LAST) or gui.open(LAST)
+    wallet, plugin = window.wallet, gui.plugin
+    partners_tab = _sub_tabs(plugin, wallet).widget(2)
+    strict_cb = partners_tab.findChildren(QCheckBox)[0]
+    assert strict_cb.text().startswith("Only open channels to preferred")
+    assert not strict_cb.isChecked()            # premise
+
+    strict_cb.setChecked(True)
+    _apply_of(plugin, wallet, 2).click()
+    try:
+        assert plugin.settings(wallet).INBOUND_LIQUIDITY_PARTNERS_STRICT is True
+        assert wallet.db.get(SETTINGS_DB_KEY, {}).get("PARTNERS_STRICT") is True
+    finally:
+        strict_cb.setChecked(False)
+        _apply_of(plugin, wallet, 2).click()
