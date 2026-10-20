@@ -18,6 +18,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.lnutil import HtlcLog  # type: ignore  # noqa: E402
@@ -93,8 +95,25 @@ def _plugin(**config_overrides) -> LiquidityPlugin:
     )
     cfg.update(config_overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_overrides)
     return p
 
+
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
 
 # --- store: soft vs hard, success, decay, clear ---------------------------
 def test_soft_fault_does_not_count_toward_autoban() -> None:
@@ -140,7 +159,7 @@ def test_peer_penalties_mapping_and_disabled() -> None:
     p, w = _plugin(), _FakeWallet()
     p._record_peer_fault(w, NODE_A, "x", hard=False)
     assert p._peer_penalties(w)[NODE_A.lower()] == pytest.approx(0.5, abs=1e-3)
-    p.config.INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED = False
+    p.set_setting(w, "INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED", False)
     assert p._peer_penalties(w) == {}
 
 
@@ -159,23 +178,23 @@ def test_autoban_after_threshold_hard_faults() -> None:
     p, w = _plugin(INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS=3), _FakeWallet()
     for _ in range(2):
         p._record_peer_fault(w, NODE_A, "open failed", hard=True)
-    assert NODE_A.lower() not in _parse_banned_partners(p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+    assert NODE_A.lower() not in _parse_banned_partners(p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
     p._record_peer_fault(w, NODE_A, "open failed", hard=True)   # crosses threshold
-    assert NODE_A.lower() in _parse_banned_partners(p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+    assert NODE_A.lower() in _parse_banned_partners(p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
 
 
 def test_soft_faults_never_autoban() -> None:
     p, w = _plugin(INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS=2), _FakeWallet()
     for _ in range(5):
         p._record_peer_fault(w, NODE_A, "offline", hard=False)
-    assert NODE_A.lower() not in _parse_banned_partners(p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+    assert NODE_A.lower() not in _parse_banned_partners(p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
 
 
 def test_autoban_disabled_with_zero_threshold() -> None:
     p, w = _plugin(INBOUND_LIQUIDITY_PEER_AUTOBAN_FAULTS=0), _FakeWallet()
     for _ in range(5):
         p._record_peer_fault(w, NODE_A, "open failed", hard=True)
-    assert p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS == ""
+    assert p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS == ""
 
 
 # --- escalation ages out; the auto-ban tally does not ----------------------
@@ -236,11 +255,11 @@ def test_aging_does_not_forgive_the_autoban_tally() -> None:
     assert s["hard_fault_count"] == 2                   # tally does NOT age
     assert s["consecutive_faults"] == 1                 # ranking counter does
     assert NODE_A.lower() not in _parse_banned_partners(
-        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
     p._record_peer_fault(w, NODE_A, "force-closed", hard=True)   # third, crosses
     assert p._load_peer_reliability(w)[NODE_A.lower()]["hard_fault_count"] == 3
     assert NODE_A.lower() in _parse_banned_partners(
-        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
 
 
 def test_peer_aging_is_skipped_when_decay_is_disabled() -> None:
@@ -291,7 +310,7 @@ def test_prune_never_drops_a_row_carrying_an_autoban_tally() -> None:
     # And the tally it preserved still bans on the next force-close.
     p._record_peer_fault(w, NODE_A, "force-closed", hard=True)
     assert NODE_A.lower() in _parse_banned_partners(
-        p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS)
+        p.settings(w).INBOUND_LIQUIDITY_BANNED_PARTNERS)
 
 
 def test_prune_keeps_an_idle_peer_row_that_still_carries_a_penalty() -> None:

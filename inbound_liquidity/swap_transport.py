@@ -45,8 +45,14 @@ class TargetedNostrTransport(NostrTransport):
     # the comment there. A class attribute so tests can shrink it.
     NO_PROVIDER_BACKOFF_SEC: float = 0.05
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, debug_logs: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # Whether to lift aionostr's INFO pin (see get_relay_manager). Passed in
+        # rather than read off the config, because the switch behind it is a
+        # per-wallet setting now while this logger -- like every logger -- is
+        # process-wide: only the plugin can say whether ANY open wallet wants
+        # debug capture, so it decides and tells us.
+        self.debug_logs = bool(debug_logs)
         self.target_pubkey: Optional[str] = None
         # npub form of the same provider, used to follow its announced relays.
         self.target_npub: Optional[str] = None
@@ -62,7 +68,7 @@ class TargetedNostrTransport(NostrTransport):
         re-lift it here, after super() has pinned it.
         """
         manager = super().get_relay_manager()
-        if bool(getattr(self.config, "INBOUND_LIQUIDITY_LOG_CAPTURE_DEBUG", False)):
+        if self.debug_logs:
             try:
                 self.logger.getChild("aionostr").setLevel(logging.DEBUG)
             except Exception:  # noqa: BLE001  (diagnostics must never break swaps)

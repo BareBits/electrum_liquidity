@@ -13,6 +13,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -168,6 +170,9 @@ def _plugin(**overrides) -> LiquidityPlugin:
     )
     cfg.update(overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **overrides)
     return p
 
 
@@ -302,7 +307,7 @@ def test_force_close_deferred_when_ceiling_reached(clock) -> None:
     p._scan_offline_autoclose(w)
     assert forced == []                                  # deferred by the cap
     # Raising the ceiling releases it.
-    p.config.INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY = 5
+    p.set_setting(w, "INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY", 5)
     p._scan_offline_autoclose(w)
     assert forced == [bytes.fromhex(CID)]
 

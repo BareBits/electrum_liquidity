@@ -100,6 +100,20 @@ def _payment_faults(p) -> List[str]:
     return [n for n, reason, _kw in p.faults if reason == PAYMENT_FAILED]
 
 
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
+
 # --- walking the flat list ------------------------------------------------
 def test_cascade_walks_the_flat_ladder_in_the_order_given() -> None:
     """The executor imposes no ordering of its own: the engine already sorted by
@@ -309,18 +323,18 @@ def _cfg_plugin(**overrides):
 
 def test_read_config_passes_the_minimum_swap_size_through() -> None:
     p = _cfg_plugin(INBOUND_LIQUIDITY_MIN_SWAP_SAT=60_000)
-    assert p.read_config().min_swap_sat == 60_000
+    assert p.read_config(wallet).min_swap_sat == 60_000
 
 
 def test_minimum_swap_size_is_clamped_non_negative() -> None:
     p = _cfg_plugin(INBOUND_LIQUIDITY_MIN_SWAP_SAT=-5)
-    assert p.read_config().min_swap_sat == 0
+    assert p.read_config(wallet).min_swap_sat == 0
 
 
 def test_garbage_minimum_swap_size_falls_back_to_the_shipped_default() -> None:
     from electrum.plugins.inbound_liquidity import DEFAULT_MIN_SWAP_SAT  # type: ignore
     p = _cfg_plugin(INBOUND_LIQUIDITY_MIN_SWAP_SAT="not-a-number")
-    assert p.read_config().min_swap_sat == DEFAULT_MIN_SWAP_SAT
+    assert p.read_config(wallet).min_swap_sat == DEFAULT_MIN_SWAP_SAT
 
 
 def test_a_config_predating_the_setting_still_gets_the_floor() -> None:
@@ -331,7 +345,7 @@ def test_a_config_predating_the_setting_still_gets_the_floor() -> None:
     p = _cfg_plugin()
     if hasattr(p.config, "INBOUND_LIQUIDITY_MIN_SWAP_SAT"):
         del p.config.INBOUND_LIQUIDITY_MIN_SWAP_SAT
-    assert p.read_config().min_swap_sat == DEFAULT_MIN_SWAP_SAT
+    assert p.read_config(wallet).min_swap_sat == DEFAULT_MIN_SWAP_SAT
 
 
 def test_the_shipped_configvar_default_is_25000() -> None:

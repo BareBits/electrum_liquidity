@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     LiquidityPlugin, SWAP_FIRST_SEEN_DB_KEY, _InflightAttempt)
@@ -225,6 +227,7 @@ def test_on_close_cancels_heartbeats_and_unregisters(monkeypatch) -> None:
 def _plugin_with_timeout(minutes: int) -> LiquidityPlugin:
     p = _bare_plugin()
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_STUCK_SWAP_TIMEOUT_MIN=minutes)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     return p
 
 

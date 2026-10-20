@@ -17,7 +17,7 @@ complete a REAL reverse swap, without waiting out the cooldown.
 What is asserted:
   * the dead provider is tried first and collects a reliability fault,
   * the swap nevertheless completes, via the OTHER provider, in the same cycle
-    (the action's detail records it as attempt 2),
+    (the action's detail records which provider served it),
   * inbound liquidity actually increased -- a real swap, not just a log line.
 
 A second test covers the failure on the OTHER side of that RPC: a provider that
@@ -70,7 +70,7 @@ import json
 import os
 import sys
 import time
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -83,6 +83,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import run as run_mod  # noqa: E402
 from rig import paths  # noqa: E402
 from rig.services import (  # noqa: E402
+    set_client_plugin_setting,
     CLIENT,
     PARTNER2,
     electrum_cli,
@@ -95,6 +96,18 @@ from rig.services import (  # noqa: E402
 
 
 def _setcfg(key: str, value: str) -> None:
+    """Set a config key -- or, for one of the plugin's settings, the CLIENT
+    WALLET's value of it.
+
+    The plugin's settings live in the wallet now, so `setconfig
+    plugins.inbound_liquidity.<key>` configures nothing. Routed here rather than
+    at the ~300 call sites, which all read the same either way: "configure the
+    plugin thus". Non-plugin keys (lightning_max_funding_sat, use_gossip, ...)
+    are Electrum's own and still go to the config."""
+    prefix = "plugins.inbound_liquidity."
+    if key.startswith(prefix):
+        set_client_plugin_setting(key[len(prefix):], value)
+        return
     electrum_cli("setconfig", key, value, inst=CLIENT)
 
 
@@ -133,6 +146,106 @@ def _client_log_text() -> str:
         return ""
     with open(logs[-1], errors="replace") as fh:
         return fh.read()
+
+
+# One "reverse swap via <provider>… (rung N of M…): <amount> sat" line per
+# attempt the cascade makes. The provider label is the npub truncated to 20
+# chars by the executor, which is still unique between two providers.
+_ATTEMPT_RE = re.compile(r"reverse swap via (\S+?)…? \(rung \d+ of \d+")
+
+# The provider recorded on a completed swap's decision-log entry.
+_ACTION_NPUB_RE = re.compile(r"provider (npub1[0-9a-z]+)")
+
+
+# --- reading cascades out of the client log -------------------------------
+#
+# A cascade is ONE channel's drain inside ONE evaluation, and the log marks both
+# boundaries:
+#
+#   * every evaluation opens with "<wallet>: onchain=... channels=...";
+#   * every attempt announces itself with "attempting swap with <provider>
+#     (rung N of M) (<amount> sat from channel <short_id>)".
+#
+# The failed-rung and fault lines name the provider but not the channel, so they
+# are attributed to the most recent attempt -- which is the cascade they belong
+# to by construction, since a cascade runs its rungs in sequence.
+#
+# NB the rung index is NOT a cascade boundary: it is the position of the
+# (provider, size) ENTRY in the ranked list, and every ladder rung of one entry
+# reuses it, so "rung 1 of N" recurs within a single cascade.
+_NPUB_KEY_LEN = 12
+_TICK_RE = re.compile(r": onchain=\d+ channels=\d+")
+_ATTEMPT_CHANNEL_RE = re.compile(
+    r"attempting swap with .*? sat from channel (\S+?)\)")
+_RUNG_FAILED_RE = re.compile(
+    r"reverse swap via (\S+?)…? produced no funding: "
+    r"the Lightning payment failed")
+# `provider <npub>… [soft ]fault #N (total M): <reason>` -- anchored on
+# "provider" so the identically-shaped channel-PEER fault line cannot be counted
+# as a provider's, and carrying the reason because only ONE kind of fault is
+# charged once per cascade. A provider can legitimately collect two faults in
+# one cascade for two different observations (unreachable, then a failed
+# payment); what `charged_npubs` guarantees is that the PAYMENT failure is
+# charged once however many of that provider's rungs it kills.
+_PROVIDER_FAULT_RE = re.compile(
+    r"provider (\S+?)…? (?:soft )?fault #\d+ \(total \d+\): (.+)$")
+# `_charge_payment_failure`'s reason, verbatim.
+_PAYMENT_FAULT_REASON = "reverse-swap Lightning payment failed"
+
+
+def _cascades() -> Dict[Tuple[int, str], Dict[str, Dict[str, int]]]:
+    """Per-cascade, per-provider tallies of failed rungs and faults charged.
+
+    Keyed by ``(evaluation number, channel)`` -- see the note above. Each value
+    maps a provider key (the npub truncated to the shortest width the plugin
+    logs) to ``{"failures": n, "faults": n, "payment_faults": n}``.
+    """
+    cascades: Dict[Tuple[int, str], Dict[str, Dict[str, int]]] = {}
+    tick = 0
+    current: Optional[Tuple[int, str]] = None
+    for line in _client_log_text().splitlines():
+        if _TICK_RE.search(line):
+            tick += 1
+            current = None
+        channel = _ATTEMPT_CHANNEL_RE.search(line)
+        if channel:
+            current = (tick, channel.group(1))
+            cascades.setdefault(current, {})
+        if current is None:
+            continue
+        failed = _RUNG_FAILED_RE.search(line)
+        if failed:
+            _tally(cascades[current], failed.group(1))["failures"] += 1
+        fault = _PROVIDER_FAULT_RE.search(line)
+        if fault:
+            tally = _tally(cascades[current], fault.group(1))
+            tally["faults"] += 1
+            if fault.group(2).strip() == _PAYMENT_FAULT_REASON:
+                tally["payment_faults"] += 1
+    return cascades
+
+
+def _tally(cascade: Dict[str, Dict[str, int]], provider: str) -> Dict[str, int]:
+    return cascade.setdefault(provider[:_NPUB_KEY_LEN],
+                              {"failures": 0, "faults": 0, "payment_faults": 0})
+
+
+def _attempted_providers() -> List[str]:
+    """The provider labels the cascade actually tried, in order, with repeats.
+
+    This is how "the cascade advanced past the first provider" is read now.
+    There is no longer a log line that says so: since c926c05 ("rank swaps, not
+    providers -- price every (provider, size) pair") the cascade walks one
+    cost-ordered list of (provider, size) rungs and simply logs the next
+    attempt. The old ``"failing over to the next provider"`` line went with it.
+    """
+    return _ATTEMPT_RE.findall(_client_log_text())
+
+
+def _swap_action_npub(action: Dict) -> Optional[str]:
+    """The provider npub on a completed swap action, or None if absent."""
+    match = _ACTION_NPUB_RE.search(action.get("detail", "") or "")
+    return match.group(1) if match else None
 
 
 def _mine(rig, n: int = 1) -> None:
@@ -213,17 +326,35 @@ def test_dead_provider_is_skipped_and_the_swap_completes_via_the_next_one(rig):
         ("plugin never completed a reverse swap -- the cascade did not fall back "
          "to the surviving provider")
 
-    # 2) It was a FAILOVER, not a first-attempt success: the executor records the
-    #    attempt index on any swap that was not the first one tried.
+    # 2) It was a FAILOVER, not a first-attempt success: the swap was served by a
+    #    provider OTHER than the one we killed.
+    #
+    #    Asserted on the provider, not on an attempt index. Under the size ladder
+    #    the index in the detail is the rung's position in one cost-ordered list
+    #    of (provider, size) pairs, so "rung 2" can perfectly well be the SAME
+    #    provider at a smaller size, and the second provider's only rung can be
+    #    "rung 1 of 1". The index cannot answer "did we fail over"; the identity
+    #    can. (The old assertion looked for "provider 2 of", which c926c05
+    #    renamed -- it had been failing ever since.)
     action = _swap_actions()[0]
     detail = action.get("detail", "")
-    assert "provider 2 of" in detail, \
-        f"swap did not come from a failover attempt; detail was: {detail!r}"
+    served_by = _swap_action_npub(action)
+    assert served_by, f"the swap action does not record its provider: {detail!r}"
+    assert served_by != rig.swap_npub, \
+        ("the swap was served by the provider we killed, so no failover "
+         f"happened; detail was: {detail!r}")
 
-    # 3) The dead provider was tried and faulted; the swap went to the other one.
+    # 3) The dead provider was tried FIRST, and the cascade then moved to another
+    #    one. Both read off the attempts themselves (see _attempted_providers).
     log_text = _client_log_text()
-    assert "failing over to the next provider" in log_text, \
-        "no failover was logged -- the cascade did not advance past provider 1"
+    attempts = _attempted_providers()
+    assert attempts, "the cascade logged no swap attempt at all"
+    assert attempts[0] == rig.swap_npub[:20], \
+        (f"the dead provider was not tried first; attempts began with "
+         f"{attempts[0]!r} and the rig pinned {rig.swap_npub[:20]!r}")
+    assert len(set(attempts)) >= 2, \
+        (f"the cascade never tried a second provider; it only attempted "
+         f"{set(attempts)}")
     faults = _reliability()
     assert faults, "the dead provider collected no reliability fault"
     assert any(int(s.get("fault_count", 0)) > 0 for s in faults.values()), \
@@ -312,10 +443,14 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
     #    so it essentially never advanced. The gate now waits for both (bounded),
     #    which is why this is a plain wait for the failover rather than "give the
     #    wallet a few cycles and hope".
+    #    Read off the attempts rather than a log line that says "failing over":
+    #    c926c05 removed that line when it made the cascade a walk over ranked
+    #    rungs (see _attempted_providers).
     assert _wait_until(
-        lambda: "failing over to the next provider" in _client_log_text(),
+        lambda: len(set(_attempted_providers())) >= 2,
         rig=rig, timeout=600), \
-        "the failed payment never advanced the cascade to the next provider"
+        ("the failed payment never advanced the cascade to another provider; "
+         f"attempts were: {_attempted_providers()}")
 
     # 2b) The HTLC-resolution gate must never be the reason a cascade stopped.
     #
@@ -366,12 +501,16 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         print("HTLC gate not exercised this run (the HTLCs resolved before the "
               "gate asked); see the glue tests for its outcomes")
 
-    # 3) A swap then completed, on a LATER attempt -- so the failover delivered.
+    # 3) A swap then completed, via a provider other than the first one tried --
+    #    so the failover delivered. On the provider, not the rung index, for the
+    #    reason given in the first test.
+    first_tried = _attempted_providers()[0]
     assert _wait_until(
-        lambda: any("provider 2 of" in a.get("detail", "") for a in _swap_actions()),
+        lambda: any((_swap_action_npub(a) or "")[:20] not in ("", first_tried)
+                    for a in _swap_actions()),
         rig=rig, timeout=480), \
-        (f"no swap completed via a failover attempt; swap actions were: "
-         f"{[a.get('detail') for a in _swap_actions()]}")
+        (f"no swap completed via a provider other than {first_tried!r}; swap "
+         f"actions were: {[a.get('detail') for a in _swap_actions()]}")
 
     # 3b) The funding waiter Electrum orphans for the dead attempt was cancelled
     #     rather than left polling at 10Hz for the life of the daemon. Asserted
@@ -523,19 +662,51 @@ def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
             f"{npub} was tried at {amounts}, which is not a subset of the ladder "
             f"{sorted(allowed, reverse=True)} off {planned}")
 
-    # One observation, one fault: the pair of rungs must not charge the provider
-    # twice. (Which provider is faulted depends on ranking, so this checks the
-    # count per provider rather than naming one.)
+    # One observation, one fault: a provider whose payment failed on two rungs of
+    # the SAME cascade must be charged ONE payment-failure fault, not one per rung.
+    #
+    # Only the payment-failure reason is counted. A provider can legitimately
+    # collect more than one fault in a cascade when the observations differ --
+    # unreachable on one rung, a failed payment on another -- and an earlier
+    # version of this check, which counted faults of every kind, failed on
+    # exactly that (1 failed rung, 2 faults, the other one a timeout).
+    #
+    # Scoped to a cascade deliberately. This used to compare the reliability
+    # store's cumulative ``fault_count`` against the log's cumulative count of
+    # failed rungs -- and both accumulate over every evaluation cycle the test
+    # happens to witness. Two cycles that each fail one rung and correctly charge
+    # one fault give "2 faults against 2 failures", which it read as a violation.
+    # So it was measuring how many cycles had elapsed before the waits above
+    # returned, not how faults are charged: it failed on main and passed on other
+    # branches for no better reason than timing. Per cascade, the invariant holds
+    # however many cycles run.
     assert _wait_until(
         lambda: any(int(s.get("fault_count", 0)) > 0
                     for s in _reliability().values()),
         rig=rig, timeout=240), f"no provider fault recorded: {_reliability()}"
-    per_provider = [int(s.get("fault_count", 0)) for s in _reliability().values()]
-    failures = _client_log_text().count(
-        "produced no funding: the Lightning payment failed")
-    assert max(per_provider) < failures or failures <= 1, (
-        f"a provider was faulted once per rung rather than once per provider: "
-        f"fault counts {per_provider} against {failures} rung failures")
+    cascades = _cascades()
+    assert cascades, "no swap cascade was found in the log"
+    offenders = [
+        (where, provider, tally)
+        for where, cascade in cascades.items()
+        for provider, tally in cascade.items()
+        if tally["payment_faults"] > 1
+    ]
+    assert not offenders, (
+        f"a provider was charged more than one payment-failure fault in a "
+        f"single cascade: {offenders}")
+
+    # Whether the two-failures-in-one-cascade case actually AROSE is the rig's
+    # timing to decide (the second rung often succeeds), so it is reported rather
+    # than demanded -- the same treatment the HTLC gate gets above. The charging
+    # arithmetic itself is pinned in tests/test_swap_provider_failover_glue.py.
+    doubled = [(where, p, t) for where, c in _cascades().items()
+               for p, t in c.items() if t["failures"] > 1]
+    if doubled:
+        print(f"once-per-provider charging exercised: {doubled}")
+    else:
+        print("no cascade failed the same provider twice this run; the "
+              "once-per-cascade rule was not exercised (see the glue tests)")
 
 
 def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):

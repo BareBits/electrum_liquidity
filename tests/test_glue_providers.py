@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 swap_transport = pytest.importorskip("electrum.plugins.inbound_liquidity.swap_transport")
 
@@ -48,6 +50,9 @@ def _plugin() -> LiquidityPlugin:
     p._htlc_poll_interval_sec = 0.01
     # One-slot per-channel dedupe for declines the executor writes itself.
     p._last_exec_decline_sig = {}
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -76,6 +81,20 @@ def _snapshot(channels, **over) -> LiquiditySnapshot:
     base.update(over)
     return LiquiditySnapshot(**base)
 
+
+class _SettingsWallet:
+    """Hashable stand-in for the wallet whose settings are being read.
+
+    The plugin's settings are per wallet, so reading one takes a wallet and
+    keys per-wallet state by it (hence hashable; ``db = None`` is a wallet with
+    nothing stored, i.e. one that answers from the installation defaults).
+    These tests exercise the settings -> engine mapping, where any one wallet
+    will do.
+    """
+    db = None
+
+
+wallet = _SettingsWallet()
 
 # --- npub parsing ---------------------------------------------------------
 def test_parse_npub_set_variants() -> None:
@@ -196,7 +215,8 @@ def test_read_config_parses_provider_lists() -> None:
         INBOUND_LIQUIDITY_PREFERRED_NPUBS="npubA, npubB",
         INBOUND_LIQUIDITY_BANNED_NPUBS="npubC",
     )
-    cfg = p.read_config()
+    seed_settings(p)   # the swapped-in config is what its wallets read
+    cfg = p.read_config(wallet)
     assert cfg.preferred_npubs == frozenset({"npubA", "npubB"})
     assert cfg.banned_npubs == frozenset({"npubC"})
     assert cfg.min_outbound_sat == 0

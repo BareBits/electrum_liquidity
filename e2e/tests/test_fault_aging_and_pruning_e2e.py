@@ -85,6 +85,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import run as run_mod  # noqa: E402
 from rig import paths  # noqa: E402
 from rig.services import (  # noqa: E402
+    set_client_plugin_setting,
     CLIENT,
     PARTNER2,
     electrum_cli,
@@ -128,6 +129,18 @@ GHOST_PENDING_HASH = "ab" * 32
 
 
 def _setcfg(key: str, value: str) -> None:
+    """Set a config key -- or, for one of the plugin's settings, the CLIENT
+    WALLET's value of it.
+
+    The plugin's settings live in the wallet now, so `setconfig
+    plugins.inbound_liquidity.<key>` configures nothing. Routed here rather than
+    at the ~300 call sites, which all read the same either way: "configure the
+    plugin thus". Non-plugin keys (lightning_max_funding_sat, use_gossip, ...)
+    are Electrum's own and still go to the config."""
+    prefix = "plugins.inbound_liquidity."
+    if key.startswith(prefix):
+        set_client_plugin_setting(key[len(prefix):], value)
+        return
     electrum_cli("setconfig", key, value, inst=CLIENT)
 
 

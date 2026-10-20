@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -113,7 +115,11 @@ def _plugin() -> LiquidityPlugin:
     p._last_state_sig = {}
     p._trailing_eval_tasks = {}
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=False)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p.on_status_changed = lambda wallet, status: None
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -123,7 +129,7 @@ def _wire_tick(p, *, snapshot: LiquiditySnapshot, config: Optional[LiquidityConf
     runs: List[str] = []
     cfg = config if config is not None else _config()
     p._enforce_min_funding_floor = lambda: 0
-    p.read_config = lambda: cfg
+    p.read_config = lambda wallet=None: cfg
     p._reconcile_pending_swaps = lambda wallet: None
     p._maybe_pay_dev_fee = lambda wallet: None
     p._scan_channel_health = lambda wallet: None
@@ -471,7 +477,7 @@ def test_editing_a_config_threshold_bypasses_the_window() -> None:
         await p._evaluate_rate_limited(wallet)
         await p._evaluate_rate_limited(wallet)
         assert runs == ["ran"]
-        p.read_config = lambda: _config(max_swap_fee_pct=5.0)
+        p.read_config = lambda wallet=None: _config(max_swap_fee_pct=5.0)
         await p._evaluate_rate_limited(wallet)
         assert runs == ["ran", "ran"]
     _run(main())

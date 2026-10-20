@@ -15,6 +15,13 @@ Python package and would otherwise be tested by nothing at all.
 Drop the flag in (1) and the next beta tag notifies every user who opted into
 update checks -- with a green test suite, because nothing else looks at the
 workflow. Hence these.
+
+The channel's other half is how a beta gets cut at all. Stable is tagged by
+hand; beta is published by PUSHING CODE to the `beta` branch, which arrives with
+no tag, so the workflow derives one (``v0.5.0-beta.4``) from the manifest version
+and the tags that already exist. That derivation, the warning the resulting page
+carries, and the pruning of the betas it replaces are each exercised below by
+running the workflow's own shell against stub ``gh`` and ``git`` commands.
 """
 from __future__ import annotations
 
@@ -204,7 +211,7 @@ def _run_prune(tmp_path: Path, *, tag: str,
     env = dict(os.environ)
     env.update(
         PATH=f"{bindir}{os.pathsep}{env['PATH']}",
-        GITHUB_REF_NAME=tag,
+        TAG=tag,
         GH_STUB_LOG=str(log),
         GH_STUB_PRERELEASES=str(listing),
         GH_STUB_NOTES=str(tmp_path / "notes-unused.md"),
@@ -223,13 +230,22 @@ def _deleted(calls: Sequence[str]) -> List[str]:
     return [c.split()[2] for c in calls if c.startswith("release delete ")]
 
 
-def test_prune_step_is_gated_on_a_beta_tag() -> None:
-    """Two conditions, both load-bearing: a tag push (not a branch build), and a
-    -beta.* tag specifically. Without the second, cutting a real v0.4.0 would
-    delete the release list's pre-releases as a side effect."""
+def test_prune_step_is_gated_on_a_beta_release() -> None:
+    """The gate is the RESOLVED tag's own classification, not the ref: a beta
+    cut from a push to the branch has no tag in its ref, and gating on
+    refs/tags/ would silently stop pruning for the automatic channel -- the one
+    that generates the betas in the first place.
+
+    Still load-bearing in the other direction: without the -beta test, cutting a
+    real v0.5.0 would delete the release list's pre-releases as a side effect.
+    `is_beta` is computed by the resolve step from the tag, and is false for a
+    stable one."""
     cond = _step(PRUNE_STEP)["if"]
-    assert "refs/tags/v" in cond
-    assert "-beta." in cond and "github.ref_name" in cond
+    assert "steps.tag.outputs.is_beta" in cond
+    assert "true" in cond
+    assert "refs/tags" not in cond, (
+        "the prune step is gated on a tag ref again; a beta cut by pushing to "
+        "the beta branch would never retire its predecessor")
 
 
 def test_prune_runs_after_the_release_it_replaces_the_betas_with() -> None:
@@ -310,6 +326,8 @@ RELEASE_STEP = "Create GitHub Release"
 
 _SERVER_URL = "https://github.example"
 _REPOSITORY = "BareBits/electrum_liquidity"
+# Stands in for github.sha: the commit a derived tag must be created on.
+_TARGET_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _run_release(tmp_path: Path, *, tag: str,
@@ -338,7 +356,8 @@ def _run_release(tmp_path: Path, *, tag: str,
     env = dict(os.environ)
     env.update(
         PATH=f"{bindir}{os.pathsep}{env['PATH']}",
-        GITHUB_REF_NAME=tag,
+        TAG=tag,
+        TARGET=_TARGET_SHA,
         GH_STUB_LOG=str(log),
         GH_STUB_NOTES=str(notes),
         GH_STUB_PRERELEASES=str(tmp_path / "unused.txt"),
@@ -366,7 +385,8 @@ def test_publish_step_body_needs_no_workflow_interpolation() -> None:
     assert "${{" not in step["run"], (
         "the publish step interpolates a workflow expression into its script; "
         "bind it in the step's env: instead")
-    for name in ("VERSION", "ZIP", "SERVER_URL", "REPOSITORY", "GH_TOKEN"):
+    for name in ("TAG", "TARGET", "VERSION", "ZIP", "SERVER_URL", "REPOSITORY",
+                 "GH_TOKEN"):
         assert name in step["env"], f"{name} is no longer bound in the step's env"
 
 
@@ -379,13 +399,19 @@ def test_a_beta_page_warns_that_the_build_is_unstable(tmp_path: Path) -> None:
     assert any(c.startswith("release create ") for c in calls), calls
 
     lowered = body.lower()
+    # The operator's own sentence, asserted close to verbatim. Pinned as one
+    # string rather than as keywords so a well-meaning rewrite that drops
+    # "funds loss" or the pointer to stable has to come through this test.
+    assert ("warning: this is a beta release and should not be installed as it "
+            "is unstable and may result in funds loss, use the "
+            "[latest stable release]") in lowered
     assert "unstable" in lowered
-    assert "do not use" in lowered
     # GitHub's own callout syntax, so the warning renders as a red admonition
     # rather than as an ordinary blockquote somebody can skim past.
     assert "> [!WARNING]" in body
-    # And a way out: the stable release the reader almost certainly wants.
-    assert f"{_SERVER_URL}/{_REPOSITORY}/releases/latest" in body
+    # And a way out: the stable release the reader almost certainly wants,
+    # linked from that sentence rather than left as a bare URL below it.
+    assert f"]({_SERVER_URL}/{_REPOSITORY}/releases/latest)" in body
     # The warning goes FIRST. Below the install instructions it is furniture.
     assert body.index("[!WARNING]") < body.index("Install by importing")
     # Still a pre-release, still says which version it is.
@@ -416,3 +442,213 @@ def test_generated_notes_are_still_appended(tmp_path: Path) -> None:
     create = next(c for c in calls if c.startswith("release create "))
     assert "--generate-notes" in create
     assert "--notes-file" in create
+
+
+def test_release_step_pins_the_tag_to_the_pushed_commit(tmp_path: Path) -> None:
+    """A derived tag does not exist yet, and `gh release create` puts a missing
+    tag on the repository's DEFAULT branch unless told otherwise. Without
+    --target, a beta cut from the beta branch would be a zip of beta's code
+    published against a tag pointing at main."""
+    result, calls, _ = _run_release(tmp_path, tag="v0.5.0-beta.1",
+                                    version="0.5.0")
+    assert result.returncode == 0, result.stderr
+    create = next(c for c in calls if c.startswith("release create "))
+    assert f"--target {_TARGET_SHA}" in create
+
+
+def test_release_is_skipped_when_no_tag_was_resolved() -> None:
+    """The publish step keys off the resolved tag, so the ref test lives in one
+    place (the resolve step) instead of being restated here and drifting."""
+    cond = _step(RELEASE_STEP)["if"]
+    assert "steps.tag.outputs.tag" in cond
+
+
+# ---------------------------------------------------------------------------
+# Where a beta's tag comes from.
+#
+# The stable channel is cut by pushing a tag. The beta channel is cut by pushing
+# CODE: a push to `beta` carries no tag, so the workflow derives one -- the
+# manifest version plus the next free -beta.N. That derivation IS the automatic
+# channel; if it misfires the channel either publishes nothing or republishes a
+# number it already used, so the shell is executed for real here against a stub
+# `git` that serves a fixed tag list.
+# ---------------------------------------------------------------------------
+
+RESOLVE_STEP = "Resolve the release tag"
+
+_GIT_STUB = r"""#!/usr/bin/env bash
+# Stands in for git. Serves `tag --list <pattern>` out of GIT_STUB_TAGS, doing
+# the glob match git would do, so a test controls exactly which tags exist.
+set -eu
+printf '%s\n' "$*" >> "$GIT_STUB_LOG"
+if [ "${1:-}" = "tag" ] && [ "${2:-}" = "--list" ]; then
+  pattern="${3:-*}"
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    # Unquoted on purpose: this is the glob match.
+    case "$candidate" in
+      $pattern) printf '%s\n' "$candidate" ;;
+    esac
+  done < "$GIT_STUB_TAGS"
+  exit 0
+fi
+echo "stub git: unexpected invocation: $*" >&2
+exit 65
+"""
+
+
+def _run_resolve(tmp_path: Path, *, version: str,
+                 tags: Sequence[str],
+                 ref_type: str = "branch",
+                 ref_name: str = "beta") -> "tuple[subprocess.CompletedProcess[str], Dict[str, str], List[str]]":
+    """Run the resolve step's shell body with `git` stubbed out.
+
+    Returns the completed process, the step outputs it wrote to $GITHUB_OUTPUT,
+    and the stub's call log.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "git"
+    stub.write_text(_GIT_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+
+    tagfile = tmp_path / "tags.txt"
+    tagfile.write_text("".join(f"{t}\n" for t in tags), encoding="utf-8")
+    log = tmp_path / "git-calls.log"
+    log.write_text("", encoding="utf-8")
+    outputs = tmp_path / "github-output.txt"
+    outputs.write_text("", encoding="utf-8")
+
+    script = tmp_path / "resolve.sh"
+    script.write_text(_step(RESOLVE_STEP)["run"], encoding="utf-8")
+
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{bindir}{os.pathsep}{env['PATH']}",
+        VERSION=version,
+        REF_TYPE=ref_type,
+        REF_NAME=ref_name,
+        GIT_STUB_TAGS=str(tagfile),
+        GIT_STUB_LOG=str(log),
+        GITHUB_OUTPUT=str(outputs),
+    )
+    result = subprocess.run(
+        ["bash", "-e", str(script)], env=env, cwd=str(tmp_path),
+        capture_output=True, text=True, timeout=60,
+        preexec_fn=_limit_address_space,
+    )
+    parsed: Dict[str, str] = {}
+    for line in outputs.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            parsed[key] = value
+    return result, parsed, log.read_text(encoding="utf-8").splitlines()
+
+
+def _resolved(tmp_path: Path, **kwargs: Any) -> Dict[str, str]:
+    result, outputs, _ = _run_resolve(tmp_path, **kwargs)
+    assert result.returncode == 0, result.stderr
+    return outputs
+
+
+def test_resolve_step_needs_no_workflow_interpolation() -> None:
+    """Same contract as the publish step: the tests below run this shell
+    verbatim, which is only sound while nothing is substituted into it."""
+    step = _step(RESOLVE_STEP)
+    assert "${{" not in step["run"]
+    for name in ("VERSION", "REF_TYPE", "REF_NAME"):
+        assert name in step["env"], f"{name} is no longer bound in the step's env"
+
+
+def test_resolve_runs_for_a_pushed_tag_or_the_beta_branch() -> None:
+    """The gate on the whole release path. `beta` is named explicitly, so a
+    push to main (or any other branch) builds the zip and publishes nothing."""
+    cond = _step(RESOLVE_STEP)["if"]
+    assert "refs/heads/beta" in cond
+    assert "tag" in cond
+    assert "refs/heads/main" not in cond
+
+
+def test_a_push_to_beta_with_no_existing_beta_starts_at_one(tmp_path: Path) -> None:
+    outputs = _resolved(tmp_path, version="0.5.0", tags=["v0.4.0", "v0.3.0"])
+    assert outputs["tag"] == "v0.5.0-beta.1"
+    assert outputs["is_beta"] == "true"
+
+
+def test_a_push_to_beta_takes_the_next_number(tmp_path: Path) -> None:
+    """The actual ask: pushing code to beta cuts the next beta."""
+    outputs = _resolved(
+        tmp_path, version="0.5.0",
+        tags=["v0.5.0-beta.1", "v0.5.0-beta.2", "v0.5.0-beta.3"])
+    assert outputs["tag"] == "v0.5.0-beta.4"
+
+
+def test_the_number_is_compared_as_an_integer_not_a_string(tmp_path: Path) -> None:
+    """beta.10 sorts BEFORE beta.9 as text. A lexical maximum would hand out
+    beta.10 a second time and the publish would collide with the live tag."""
+    outputs = _resolved(
+        tmp_path, version="0.5.0",
+        tags=["v0.5.0-beta.9", "v0.5.0-beta.10"])
+    assert outputs["tag"] == "v0.5.0-beta.11"
+
+
+def test_derivation_only_counts_this_version_and_this_channel(tmp_path: Path) -> None:
+    """A previous version's betas and a different pre-release channel are not
+    this counter's business. Asserted through the stub's glob, so the narrowing
+    is git's own pattern rather than a filter applied afterwards."""
+    result, outputs, calls = _run_resolve(
+        tmp_path, version="0.5.0",
+        tags=["v0.4.0-beta.7", "v0.5.0-rc.3", "v0.5.0-beta.2", "v0.6.0-beta.9"])
+    assert result.returncode == 0, result.stderr
+    assert outputs["tag"] == "v0.5.0-beta.3"
+    assert any("tag --list v0.5.0-beta.*" in c for c in calls), calls
+
+
+def test_derivation_ignores_a_tag_whose_suffix_is_not_a_number(tmp_path: Path) -> None:
+    """`v0.5.0-beta.4-fix` must not read as 4 -- that would make the next tag
+    beta.5 while beta.4 is the newest real build, skipping a number, or worse
+    read as garbage and fail the arithmetic under `set -u`."""
+    outputs = _resolved(
+        tmp_path, version="0.5.0",
+        tags=["v0.5.0-beta.2", "v0.5.0-beta.4-fix", "v0.5.0-beta.x"])
+    assert outputs["tag"] == "v0.5.0-beta.3"
+
+
+def test_a_pushed_tag_is_released_verbatim(tmp_path: Path) -> None:
+    """The stable path, untouched: a tag push releases exactly that tag, with no
+    derivation and no git lookup at all."""
+    result, outputs, calls = _run_resolve(
+        tmp_path, version="0.5.0", tags=["v0.5.0-beta.1"],
+        ref_type="tag", ref_name="v0.5.0")
+    assert result.returncode == 0, result.stderr
+    assert outputs["tag"] == "v0.5.0"
+    assert outputs["is_beta"] == "false"
+    assert calls == [], f"the stable path consulted git: {calls}"
+
+
+def test_a_hand_pushed_beta_tag_is_still_a_beta(tmp_path: Path) -> None:
+    """is_beta is computed from the resolved tag, so the prune step covers a
+    beta cut by hand as well as a derived one."""
+    outputs = _resolved(tmp_path, version="0.5.0", tags=[],
+                        ref_type="tag", ref_name="v0.5.0-beta.6")
+    assert outputs["tag"] == "v0.5.0-beta.6"
+    assert outputs["is_beta"] == "true"
+
+
+def test_an_rc_tag_is_a_prerelease_but_not_a_beta(tmp_path: Path) -> None:
+    """The two classifications are deliberately different: the publish step
+    treats any hyphen as a pre-release, while is_beta -- which authorises
+    DELETIONS -- is narrower."""
+    outputs = _resolved(tmp_path, version="0.5.0", tags=[],
+                        ref_type="tag", ref_name="v0.5.0-rc.1")
+    assert outputs["is_beta"] == "false"
+
+
+def test_the_build_checkout_fetches_tags() -> None:
+    """The counter is read off the tags in the checkout. actions/checkout is
+    shallow by default and fetches none, which would make every push to beta
+    derive beta.1 and collide with the live release."""
+    with_ = _step("Checkout").get("with") or {}
+    assert with_.get("fetch-depth") == 0, (
+        "the build checkout is shallow again; the -beta.N counter would reset "
+        "to 1 on every run")
