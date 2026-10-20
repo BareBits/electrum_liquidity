@@ -937,17 +937,23 @@ RUN_RIG_E2E=1 e2e/.venv-electrum/bin/python -m pytest e2e/tests -q -s   # full e
 
 ## Releases
 
-Tagging `v*` builds the plugin zip and publishes a GitHub Release
-(`.github/workflows/release.yml`). The version in the release comes from
-`inbound_liquidity/manifest.json`, which is bumped in its own `chore: release
-vX.Y.Z` commit immediately before the tag.
+`.github/workflows/release.yml` builds the plugin zip and publishes GitHub
+Releases. The version comes from `inbound_liquidity/manifest.json`.
 
-**Two channels, decided by the tag itself:**
+**Two channels, cut two different ways:**
 
-| Tag | Published as | Offered by the update check |
-|---|---|---|
-| `v0.4.0` | release | yes |
-| `v0.4.0-beta.1` | **pre-release** | **no** |
+| Channel | How a build is cut | Published as | Offered by the update check |
+|---|---|---|---|
+| **stable** (`main`) | push a tag — `v0.5.0` | release | yes |
+| **beta** (`beta`) | **push code to `beta`** — the tag is derived | **pre-release** | **no** |
+
+Stable is deliberate: bump `manifest.json` in its own `chore: release vX.Y.Z`
+commit, then tag. Beta is automatic — **every push to `beta` that passes the
+tests publishes the next beta.** The branch push carries no tag, so the workflow
+derives one from the manifest version plus the next free `-beta.N`
+(`v0.5.0-beta.1`, `v0.5.0-beta.2`, …), counting off the tags that already exist
+rather than off a stored number. Nothing else releases: a push to `main` builds
+and uploads the artifact and stops.
 
 A tag whose version carries a suffix — semver's rule: a hyphen after the version
 core — is published with `--prerelease`. That flag is what keeps a beta build to
@@ -958,20 +964,24 @@ so a change at the endpoint cannot re-expose one. Install a beta by hand:
 download its zip from the Releases page and import it in Electrum's plugin
 manager.
 
-Betas are cut on the **`beta`** branch — the same commits as `main` plus its
-version-bump commit, so a build can go out ahead of a final release without
-moving `main`'s version. CI runs on both branches.
+**A beta's release page warns what it is.** The `--prerelease` flag keeps the
+build out of the update check and does nothing for somebody already standing on
+the Releases page, where the only marking is a grey "Pre-release" chip beside the
+title. So the body leads with a `[!WARNING]` callout saying the build is unstable,
+may result in funds loss, and should not be installed — linked to
+`releases/latest`, the stable build the reader almost certainly wants. A stable
+release page carries no such warning.
 
-**The beta channel keeps only the newest build.** Once a `-beta.*` tag is
+**The beta channel keeps only the newest build.** Once a `-beta.*` release is
 published, the workflow deletes every older `-beta.*` release and its tag, so the
 Releases page never offers a stale beta zip to hand-install. The prune is scoped
 to that channel: real releases are untouched (they are not pre-releases), and a
-pre-release from any other channel — `v0.4.0-rc.1` — neither triggers it nor gets
+pre-release from any other channel — `v0.5.0-rc.1` — neither triggers it nor gets
 swept up. Pruning runs after the new release is published, so a failed publish
 leaves the existing betas in place. The retired tags' commits stay reachable from
 the `beta` branch.
 
-> A user who installs `v0.4.0-beta.1` is **not** notified when the final
-> `v0.4.0` ships: `parse_version` reads a numeric prefix, so the two compare
+> A user who installs `v0.5.0-beta.1` is **not** notified when the final
+> `v0.5.0` ships: `parse_version` reads a numeric prefix, so the two compare
 > equal. That is the accepted cost of the prefix scheme — a beta is installed by
 > hand, so whoever opted in is the person who can opt back out.

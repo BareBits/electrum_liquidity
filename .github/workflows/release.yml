@@ -1,9 +1,17 @@
 name: CI
 
-# `beta` is the pre-release channel: it carries the same commits as main but is
-# tagged ahead of it (v0.4.0-beta.1), so a build can be published and installed
-# by hand without being offered to everyone. See the pre-release note on the
-# release step below for what actually keeps those builds out of users' way.
+# `beta` is the pre-release channel: code lands there ahead of main and is
+# published as a suffixed, pre-release tag (v0.5.0-beta.1), so a build can be
+# installed by hand without being offered to everyone. See the pre-release note
+# on the release step below for what actually keeps those builds out of users'
+# way.
+#
+# The two channels are cut differently, on purpose:
+#   * stable is cut by pushing a tag -- a deliberate, manual act;
+#   * beta is cut by pushing CODE. Every push to `beta` that passes the tests
+#     publishes the next -beta.N automatically and retires the previous one, so
+#     the channel always offers exactly one build: the tip of the branch.
+# "Resolve the release tag" below is where that difference lives.
 on:
   push:
     branches: [main, beta]
@@ -89,6 +97,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history, which is what brings the tags with it. "Resolve the
+          # release tag" counts existing -beta.N tags to pick the next one; on a
+          # shallow clone it would see none and keep republishing beta.1.
+          fetch-depth: 0
 
       - name: Read plugin version
         id: meta
@@ -112,17 +125,71 @@ jobs:
           path: ${{ steps.meta.outputs.zip }}
           if-no-files-found: error
 
+      - name: Resolve the release tag
+        id: tag
+        # Two ways in, one tag out:
+        #   * a pushed tag releases exactly itself -- how stable is cut;
+        #   * a push to `beta` arrives with no tag, so one is DERIVED here: the
+        #     manifest version plus the next free -beta.N. That derivation is
+        #     the whole of "a beta release is cut whenever code is pushed to
+        #     beta"; without it a branch push builds a zip and publishes nothing.
+        #
+        # Anything else releases nothing: this step does not run, `tag` is
+        # empty, and the two steps below are skipped. A push to main therefore
+        # still only builds and uploads the artifact -- main is cut by tagging.
+        if: github.ref_type == 'tag' || github.ref == 'refs/heads/beta'
+        # Pure shell against `env:`, like the steps below, so the derivation can
+        # be executed verbatim by test_release_channel.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "${REF_TYPE}" = "tag" ]; then
+            tag="${REF_NAME}"
+          else
+            # The counter is read off the tags that exist rather than stored
+            # anywhere, so it cannot drift from the repository. Retiring a beta
+            # deletes its tag too (--cleanup-tag, below), but the newest beta is
+            # always kept, so the maximum never goes backwards and an N is never
+            # handed out twice.
+            highest=0
+            for existing in $(git tag --list "v${VERSION}-beta.*"); do
+              n="${existing##*-beta.}"
+              # Only a plain integer counts. A hand-made `v0.5.0-beta.4-fix`
+              # must not read as 4 and collide with the real beta.4.
+              case "${n}" in ''|*[!0-9]*) continue ;; esac
+              if [ "${n}" -gt "${highest}" ]; then highest="${n}"; fi
+            done
+            tag="v${VERSION}-beta.$((highest + 1))"
+          fi
+          # Recomputed from the resolved tag, not from the ref, so a derived tag
+          # and a hand-pushed one are classified by the same rule.
+          case "${tag}" in
+            *-beta.*) is_beta=true ;;
+            *)        is_beta=false ;;
+          esac
+          echo "releasing ${tag} (beta channel: ${is_beta})"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "is_beta=${is_beta}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.tag.outputs.tag != ''
         # Every `${{ }}` this step needs is bound here rather than interpolated
         # into the script below, so the body is pure shell and can be executed
         # verbatim by test_release_channel against a stub `gh`.
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
           VERSION: ${{ steps.meta.outputs.version }}
           ZIP: ${{ steps.meta.outputs.zip }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
+          # The commit to hang a DERIVED tag on. Without it `gh release create`
+          # creates a missing tag on the default branch, which would publish
+          # main's code under a beta tag cut from the beta branch.
+          TARGET: ${{ github.sha }}
         run: |
           set -eu
           # A tag whose version carries a suffix (v0.4.0-beta.1) is published as
@@ -135,12 +202,14 @@ jobs:
           # into update checks.
           #
           # The test is semver's own: a hyphen after the version core marks a
-          # pre-release, so v0.4.0 ships normally and v0.4.0-beta.1 does not.
-          case "${GITHUB_REF_NAME}" in
+          # pre-release, so v0.5.0 ships normally and v0.5.0-beta.1 does not.
+          # Applied to the RESOLVED tag, so a tag derived from a push to `beta`
+          # is judged by exactly the same rule as a hand-pushed one.
+          case "${TAG}" in
             *-*) prerelease="--prerelease"; kind="pre-release" ;;
             *)   prerelease="";            kind="release" ;;
           esac
-          echo "publishing ${GITHUB_REF_NAME} as a ${kind}"
+          echo "publishing ${TAG} as a ${kind}"
 
           # The notes are assembled in a file rather than passed as one --notes
           # string so the pre-release warning can be real multi-line markdown.
@@ -158,16 +227,12 @@ jobs:
             # Outdenting them any further would close the block scalar.
             cat >> "${notes}" <<WARNING
           > [!WARNING]
-          > ## Unstable build -- do not use this on a wallet holding funds you care about
+          > ## Warning: This is a BETA release and should not be installed as it is unstable and may result in funds loss, use the [latest stable release](${SERVER_URL}/${REPOSITORY}/releases/latest) instead
           >
-          > This is a **beta**, published so it can be exercised on throwaway or
+          > This build is published so it can be exercised on throwaway or
           > small-balance wallets. It has not had the testing a numbered release gets.
           > It moves real money -- it opens channels and pays funds out over Lightning
           > and on-chain -- and it may be withdrawn or replaced without notice.
-          >
-          > Unless you are deliberately testing this build, install the latest stable
-          > release instead:
-          > ${SERVER_URL}/${REPOSITORY}/releases/latest
 
           WARNING
           fi
@@ -175,9 +240,14 @@ jobs:
           Inbound Liquidity Manager plugin v${VERSION}. Install by importing the attached zip into Electrum's plugin manager.
           NOTES
 
-          gh release create "${GITHUB_REF_NAME}" \
+          # --target is what makes a DERIVED tag land on the commit that was
+          # pushed. For an existing (hand-pushed) tag gh leaves it where it is,
+          # and GITHUB_SHA is that same commit anyway, so passing it always is
+          # correct for both channels.
+          gh release create "${TAG}" \
             "${ZIP}" \
-            --title "${GITHUB_REF_NAME}" \
+            --title "${TAG}" \
+            --target "${TARGET}" \
             --generate-notes \
             ${prerelease} \
             --notes-file "${notes}"
@@ -189,19 +259,24 @@ jobs:
         # the wrong thing.
         #
         # Narrow on both axes, deliberately:
-        #   * only a -beta.* tag prunes, and only -beta.* releases are pruned, so
-        #     a future channel (v0.4.0-rc.1) is neither a trigger nor a victim;
+        #   * only a -beta.* release prunes, and only -beta.* releases are
+        #     pruned, so a future channel (v0.5.0-rc.1) is neither a trigger nor
+        #     a victim;
         #   * the `isPrerelease` filter is a second, independent guard -- a real
-        #     v0.4.0 is not a pre-release and so cannot be reached here even if
+        #     v0.5.0 is not a pre-release and so cannot be reached here even if
         #     the name test were ever loosened.
         # The tag goes with the release (--cleanup-tag); the commits it pointed
         # at stay reachable from the beta branch.
         #
         # Ordered after the publish above on purpose: if creating the new release
         # fails, the job stops here and the old betas are still installable.
-        if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-beta.')
+        #
+        # Gated on the resolved tag rather than on the ref, so it covers both
+        # ways a beta can be cut: pushed code and a hand-pushed tag.
+        if: steps.tag.outputs.is_beta == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -eu
           # gh applies --jq itself, so this is the tag names of pre-releases
@@ -216,15 +291,17 @@ jobs:
             echo "no pre-releases found; nothing to prune"
             exit 0
           fi
-          for tag in ${prereleases}; do
-            if [ "${tag}" = "${GITHUB_REF_NAME}" ]; then
-              echo "keeping ${tag} (just published)"
+          # `existing`, not `tag`: ${TAG} is the one being published and the two
+          # would be a single typo apart.
+          for existing in ${prereleases}; do
+            if [ "${existing}" = "${TAG}" ]; then
+              echo "keeping ${existing} (just published)"
               continue
             fi
-            case "${tag}" in
+            case "${existing}" in
               *-beta.*) ;;
-              *) echo "keeping ${tag} (not a -beta.* build)"; continue ;;
+              *) echo "keeping ${existing} (not a -beta.* build)"; continue ;;
             esac
-            echo "deleting previous beta ${tag}"
-            gh release delete "${tag}" --yes --cleanup-tag
+            echo "deleting previous beta ${existing}"
+            gh release delete "${existing}" --yes --cleanup-tag
           done
