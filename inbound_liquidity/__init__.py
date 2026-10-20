@@ -2899,9 +2899,16 @@ class LiquidityPlugin(BasePlugin):
 
     def reset_settings(self, wallet: 'Abstract_Wallet') -> None:
         """Drop every value this wallet has of its own, so all of its settings
-        go back to answering from the shipped defaults."""
+        go back to answering from the shipped defaults.
+
+        The cache is reached through ``_settings_dict`` rather than the
+        attribute, because this is the one settings entry point that can be the
+        FIRST call made on a plugin: ``settings`` and ``set_setting`` both build
+        the cache on their way in, so they left it existing by the time they
+        touched it, and this one assumed they always had.
+        """
         self._save_settings(wallet, {})
-        self._settings_cache[wallet] = {}
+        self._settings_dict("_settings_cache")[wallet] = {}
         self.logger.info(f"settings for {_wallet_basename(wallet)} reset to the "
                          f"shipped defaults")
         self._on_setting_changed(wallet, None)

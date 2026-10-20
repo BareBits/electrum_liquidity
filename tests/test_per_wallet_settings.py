@@ -792,3 +792,25 @@ def test_a_wallet_that_set_none_of_them_gets_the_shipped_defaults() -> None:
     w = _FakeWallet()
     assert p._wedge_params(w)["close_timeout_sec"] == \
         DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN * 60.0
+
+
+def test_reset_works_as_the_first_call_on_a_plugin() -> None:
+    """``reset_settings`` must not need another settings call to have run first.
+
+    ``settings`` and ``set_setting`` both build the cache on their way in, so
+    they always found it there; ``reset_settings`` reached for the attribute
+    directly and raised AttributeError when it happened to be the first thing
+    called -- which the CLI's reset command, and any caller clearing a wallet
+    before touching it, can be.
+    """
+    p, w = _plugin(), _FakeWallet()
+    p.reset_settings(w)                     # must not raise
+    assert p.settings_store(w) == {}
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == DEFAULT_LIQUIDITY_GOAL_SAT
+
+
+def test_reset_after_a_write_still_clears_the_wallet() -> None:
+    p, w = _plugin(), _FakeWallet()
+    p.set_setting(w, "INBOUND_LIQUIDITY_GOAL_SAT", 777_000)
+    p.reset_settings(w)
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == DEFAULT_LIQUIDITY_GOAL_SAT
