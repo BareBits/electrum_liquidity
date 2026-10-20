@@ -549,8 +549,22 @@ def test_no_module_reads_a_plugin_setting_off_the_shared_config() -> None:
 
     The settings layer itself is exempt: it is what reads the installation-wide
     level, by design.
+
+    Parsed rather than grepped. This was a line-level regex for
+    ``self.config.INBOUND_LIQUIDITY_``, and it could not see the form all three
+    of its escapees actually used:
+
+        c = self.config                          # one line
+        ...
+        getattr(c, "INBOUND_LIQUIDITY_X", ...)   # another
+
+    Three functions read nine settings that way -- including the four deciding
+    when the watchdog force-closes a wedged or offline channel, and the sink's
+    fee ceiling -- so those nine were pinned to their shipped defaults however
+    the user set them, and the guard said nothing. Following the alias needs
+    the syntax tree, so that is what it reads now.
     """
-    import re
+    import ast
     import electrum.plugins.inbound_liquidity as pkg  # type: ignore
 
     root = pathlib.Path(pkg.__file__).parent
@@ -558,19 +572,84 @@ def test_no_module_reads_a_plugin_setting_off_the_shared_config() -> None:
     # the process-wide settings that have no single wallet to ask.
     allowed = {"config_var_default", "__getattr__", "__setattr__"}
     offenders: List[str] = []
+
     for path in sorted(root.glob("*.py")):
-        current = ""
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            match = re.match(r"\s*(?:async )?def (\w+)\(", line)
-            if match:
-                current = match.group(1)
-            if current in allowed:
+        tree = ast.parse(path.read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if re.search(r"self\.config[.,]\s*[\"']?INBOUND_LIQUIDITY_", line):
-                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+            if fn.name in allowed:
+                continue
+            # Locals bound to self.config anywhere in this function.
+            aliases = {
+                target.id
+                for node in ast.walk(fn) if isinstance(node, ast.Assign)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "config"
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+            }
+
+            def _is_shared_config(node) -> bool:
+                if isinstance(node, ast.Name) and node.id in aliases:
+                    return True
+                return (isinstance(node, ast.Attribute) and node.attr == "config"
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self")
+
+            for node in ast.walk(fn):
+                # getattr(<shared config>, "INBOUND_LIQUIDITY_X", default)
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+                        and len(node.args) >= 2
+                        and _is_shared_config(node.args[0])
+                        and isinstance(node.args[1], ast.Constant)
+                        and str(node.args[1].value).startswith("INBOUND_LIQUIDITY_")):
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: {fn.name}() reads "
+                        f"{node.args[1].value} off the shared config")
+                # <shared config>.INBOUND_LIQUIDITY_X
+                if (isinstance(node, ast.Attribute)
+                        and str(node.attr).startswith("INBOUND_LIQUIDITY_")
+                        and _is_shared_config(node.value)):
+                    offenders.append(
+                        f"{path.name}:{node.lineno}: {fn.name}() reads "
+                        f"{node.attr} off the shared config")
+
     assert not offenders, (
         "these read a per-wallet setting off the process-wide config; route "
-        "them through self.settings(wallet) instead:\n  " + "\n  ".join(offenders))
+        "them through self.settings(wallet) instead:\n  "
+        + "\n  ".join(sorted(set(offenders))))
+
+
+def test_the_layering_guard_catches_the_alias_it_used_to_miss(tmp_path) -> None:
+    """The guard's own regression test.
+
+    The previous guard passed while three functions were doing exactly this,
+    so the guard needs one of its own: give it a module that launders the
+    shared config through a local and check it is not fooled.
+    """
+    import ast
+
+    source = (
+        "class P:\n"
+        "    def _params(self, wallet):\n"
+        "        c = self.config\n"
+        "        return getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', 2)\n"
+    )
+    tree = ast.parse(source)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    aliases = {
+        t.id for node in ast.walk(fn) if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name) and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "config"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self"
+    }
+    assert aliases == {"c"}, "the alias of self.config was not followed"
 
 
 # --- batching -------------------------------------------------------------
@@ -631,3 +710,85 @@ def test_a_batch_re_derives_the_process_wide_settings_once(restore_floor) -> Non
     finally:
         type(p)._on_setting_changed = original
     assert len(calls) == 1
+
+
+# --- the settings a watchdog reads ---------------------------------------
+# A source guard says no module READS a setting off the shared config. These
+# say the right value ARRIVES -- which is the part a user notices. Both are
+# needed: the three functions that had this wrong passed every behavioural
+# test in the suite, because the test factories seed the wallet store AND set
+# the same values on the fake config, so either route answered the same. Here
+# the two deliberately disagree, so only the wallet can be the source.
+def _plugin_disagreeing(**wallet_values):
+    """A plugin whose config says one thing and whose wallet says another."""
+    p = _plugin(**{k: v for k, v in _CONFIG_SAYS.items()})
+    w = _FakeWallet()
+    for name, value in wallet_values.items():
+        p.set_setting(w, name, value)
+    return p, w
+
+
+# Values put on the installation-wide config, which must reach nothing.
+_CONFIG_SAYS = {
+    "INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN": 999,
+    "INBOUND_LIQUIDITY_WEDGE_REQUIRED_CHECKS": 99,
+    "INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN": 999,
+    "INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN": 999,
+    "INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS": 99.0,
+    "INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS": 99.0,
+    "INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED": False,
+    "INBOUND_LIQUIDITY_OFFLINE_MIN_UPTIME_PCT": 99.0,
+    "INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT": 99.0,
+}
+
+
+def test_the_wedge_watchdogs_timers_come_from_the_wallet() -> None:
+    # These four decide when a wedged open is force-closed. Read off the
+    # shared config -- which nothing writes any more -- they were pinned to
+    # their shipped defaults however the user set them.
+    p, w = _plugin_disagreeing(
+        STUCK_OPEN_CLOSE_TIMEOUT_MIN=2,
+        WEDGE_REQUIRED_CHECKS=3,
+        WEDGE_CHECK_SPREAD_MIN=1,
+        COOP_BEFORE_FORCE_MIN=4,
+    )
+    params = p._wedge_params(w)
+    assert params["close_timeout_sec"] == 2 * 60.0
+    assert params["required_strikes"] == 3
+    assert params["min_spread_sec"] == 1 * 60.0
+    assert params["coop_window_sec"] == 4 * 60.0
+
+
+def test_the_offline_autoclose_timers_come_from_the_wallet() -> None:
+    p, w = _plugin_disagreeing(
+        OFFLINE_UPTIME_WINDOW_DAYS=0.5,
+        OFFLINE_FORCE_CLOSE_DAYS=0.25,
+        OFFLINE_AUTOCLOSE_ENABLED=True,
+        OFFLINE_MIN_UPTIME_PCT=10.0,
+    )
+    params = p._offline_autoclose_params(w)
+    assert params["enabled"] is True, \
+        "the wallet switched auto-close ON; the config's OFF reached it"
+    assert params["window_sec"] == 0.5 * 86400.0
+    assert params["force_close_sec"] == 0.25 * 86400.0
+    assert params["min_uptime_pct"] == 10.0
+
+
+def test_the_sink_fee_ceiling_comes_from_the_wallet() -> None:
+    # A wallet that lowered its fee ceiling was still paying sink routes up to
+    # whatever the shared config said.
+    p, w = _plugin_disagreeing(MAX_SWAP_FEE_PCT=0.5)
+    budget = p._sink_fee_budget(w, 1_000_000)
+    assert budget.fee_msat == int(1_000_000 * 1000 * 0.5 / 100.0)
+
+
+def test_a_wallet_that_set_none_of_them_gets_the_shipped_defaults() -> None:
+    # The other half: with nothing of its own, a wallet reads the SHIPPED
+    # default -- still not the config's value.
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN,
+    )
+    p = _plugin(**_CONFIG_SAYS)
+    w = _FakeWallet()
+    assert p._wedge_params(w)["close_timeout_sec"] == \
+        DEFAULT_STUCK_OPEN_CLOSE_TIMEOUT_MIN * 60.0

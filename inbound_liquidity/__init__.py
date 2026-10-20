@@ -4283,8 +4283,14 @@ class LiquidityPlugin(BasePlugin):
 
     def _wedge_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
         """Wedged-open gate tuning, read fresh so edits take effect at once. The
-        getattr defaults keep partial (unit-test) configs sane."""
-        c = self.config
+        getattr defaults keep partial (unit-test) configs sane.
+
+        Read off THIS WALLET. These four decide when the watchdog gives up on a
+        wedged open and force-closes it, and they were being read off the
+        installation-wide config -- which nothing writes any more, so every one
+        of them was pinned to its shipped default however the user set it.
+        """
+        c = self.settings(wallet)
         return {
             "close_timeout_sec": max(1, int(getattr(
                 c, "INBOUND_LIQUIDITY_STUCK_OPEN_CLOSE_TIMEOUT_MIN",
@@ -4539,8 +4545,13 @@ class LiquidityPlugin(BasePlugin):
     def _offline_autoclose_params(self, wallet: 'Abstract_Wallet') -> Dict[str, float]:
         """Offline auto-close tuning, read fresh so edits take effect at once.
         Days are converted to seconds; getattr defaults keep partial (unit-test)
-        configs sane."""
-        c = self.config
+        configs sane.
+
+        Read off THIS WALLET -- see :meth:`_wedge_params` for the same bug these
+        four shared: including the switch that decides whether the plugin may
+        force-close an offline channel at all.
+        """
+        c = self.settings(wallet)
         window_days = max(0.0, float(getattr(
             c, "INBOUND_LIQUIDITY_OFFLINE_UPTIME_WINDOW_DAYS",
             DEFAULT_OFFLINE_UPTIME_WINDOW_DAYS)))
@@ -7482,7 +7493,7 @@ class LiquidityPlugin(BasePlugin):
             out.append(capped)
         return out
 
-    def _sink_fee_budget(self, amount_sat: int):
+    def _sink_fee_budget(self, wallet: 'Abstract_Wallet', amount_sat: int):
         """The routing-fee budget for a sink payment: the user's existing
         ``max_swap_fee_pct`` ceiling, applied to the amount being sent.
 
@@ -7492,9 +7503,13 @@ class LiquidityPlugin(BasePlugin):
         is strict: a route costing more is not taken, which surfaces as a payment
         failure and drops the ladder to its next rung. A ceiling of 0 therefore
         permits only zero-fee routes (a direct channel to the sink's node).
+
+        Takes the wallet because the ceiling is ITS ceiling: this read was left
+        on the installation-wide config, so a wallet that lowered its fee
+        ceiling still paid sink routes up to the shipped 0.9%.
         """
         from electrum.lnutil import PaymentFeeBudget
-        pct = max(0.0, float(getattr(self.config,
+        pct = max(0.0, float(getattr(self.settings(wallet),
                                      "INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT", 0.9)))
         cap_msat = int(amount_sat * 1000 * pct / 100.0)
         return PaymentFeeBudget.from_invoice_amount(
@@ -7659,7 +7674,7 @@ class LiquidityPlugin(BasePlugin):
             payment_hash = bytes.fromhex(invoice.rhash)
         except Exception:  # noqa: BLE001
             payment_hash = b""
-        kwargs: Dict[str, Any] = {"budget": self._sink_fee_budget(amount_sat)}
+        kwargs: Dict[str, Any] = {"budget": self._sink_fee_budget(wallet, amount_sat)}
         if chan is not None:
             kwargs["channels"] = [chan]
         try:
