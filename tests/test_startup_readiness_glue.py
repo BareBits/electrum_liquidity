@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -148,6 +150,9 @@ def _plugin(clock: Optional[_Clock] = None, *, grace: float = GRACE,
     )
     cfg.update(overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **overrides)
     return p
 
 
@@ -261,7 +266,7 @@ def test_evaluate_manual_run_acts_inside_the_startup_window(clock) -> None:
     p.build_snapshot = lambda wal, t=None: SimpleNamespace()
     p._swap_may_be_needed = lambda base, config: False
     # Manual-run-only mode on, to prove both gates are bypassed together.
-    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    p.set_setting(w, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", True)
     async def _run_decision(wal, snap, config, transport):
         called.append("decision")
     p._run_decision = _run_decision

@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -113,7 +115,11 @@ def _plugin() -> LiquidityPlugin:
     p._last_state_sig = {}
     p._trailing_eval_tasks = {}
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=False)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p.on_status_changed = lambda wallet, status: None
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

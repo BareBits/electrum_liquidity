@@ -28,6 +28,8 @@ from typing import List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PyQt6.QtWidgets")
@@ -109,6 +111,9 @@ def _plugin() -> qt_mod.Plugin:
     p.log_capture = LogCapture(p.log_buffer,
                                root_logger_name="test.inbound_liquidity.unlock_qt")
     p._last_offers = {}
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -230,8 +235,8 @@ def test_the_prompt_returns_after_the_cooldown(qapp):
 def test_declining_does_not_switch_automation_off(qapp):
     # "Not now" is about the dialog, not about the feature.
     p = _plugin()
-    p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = True
     w = _FakeWallet()
+    p.set_setting(w, "INBOUND_LIQUIDITY_AUTOMATION_ENABLED", True)
     window = _FakeWindow(w, user_unlocks=False)
     _wire_tab(p, w, window)
 

@@ -15,6 +15,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Both must import or these tests cannot run.
@@ -234,6 +236,9 @@ def _make_plugin() -> qt_mod.Plugin:
     # isolated, and the capture is left detached (no global handler installed).
     p.log_buffer = LogRingBuffer()
     p.log_capture = LogCapture(p.log_buffer, root_logger_name="test.inbound_liquidity.qt")
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -430,7 +435,7 @@ def test_slider_enables_immediately_and_triggers_eval(qapp):
 def test_slider_disables_immediately_without_eval(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = True
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_AUTOMATION_ENABLED", True)
     evaluated: List = []
     p.request_evaluation = lambda w: evaluated.append(w)  # type: ignore[assignment]
     p._add_liquidity_tab(window, wallet)
@@ -454,7 +459,7 @@ def test_slider_knob_matches_enabled_config_on_build(qapp):
     # isChecked(), is what catches the desync.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_AUTOMATION_ENABLED = True
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_AUTOMATION_ENABLED", True)
     p.request_evaluation = lambda w: None  # type: ignore[assignment]
     p._add_liquidity_tab(window, wallet)  # refresh() -> _sync_toggle_from_config
     sw = _slider(p, wallet)
@@ -541,7 +546,7 @@ def test_manual_run_only_checkbox_reflects_config_on_build(qapp):
     # Built against an already-on config, the checkbox shows checked.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", True)
     p._add_liquidity_tab(window, wallet)
     assert _manual_only_cb(p, wallet).isChecked() is True
 
@@ -600,7 +605,7 @@ def test_scope_switch_persists_immediately(qapp):
 def test_scope_switch_reflects_config_on_build(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY = False
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY", False)
     p._add_liquidity_tab(window, wallet)
     assert _plugin_only_cb(p, wallet).isChecked() is False
 
@@ -610,7 +615,7 @@ def test_run_now_button_triggers_manual_evaluation(qapp):
     # even while manual-run-only is on.
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_MANUAL_RUN_ONLY = True
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_MANUAL_RUN_ONLY", True)
     seen: List = []
     p.request_evaluation = lambda w, *, manual=False: seen.append((w, manual))  # type: ignore[assignment]
     p._add_liquidity_tab(window, wallet)
@@ -1080,7 +1085,7 @@ def test_log_tab_summary_reports_the_ring_state(qapp):
     # the wallet's configured buffer size to the (process-wide) ring, so a ring
     # installed by hand beforehand would be resized straight back out from under
     # the test. 100 is MIN_MAX_LINES, so it survives the clamp.
-    p.config.INBOUND_LIQUIDITY_LOG_BUFFER_LINES = 100
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES", 100)
     p._add_liquidity_tab(window, wallet)
     state = p._tabs[wallet]
     for i in range(120):
@@ -1183,10 +1188,10 @@ def test_the_update_line_is_absent_until_the_check_is_switched_on(qapp):
 
 def test_the_update_line_reports_up_to_date(qapp):
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
-    p._plugin_version_cache = "0.1.14"
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.14"
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", True)
+    p._plugin_version_cache = "0.1.14"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "0.1.14")
     p._add_liquidity_tab(window, wallet)
     assert any("0.1.14 (up to date)" in t for t in _status_labels(p._tabs[wallet]))
 
@@ -1195,11 +1200,11 @@ def test_the_update_line_links_to_the_release_when_behind(qapp):
     # The link is the whole remedy: nothing is downloaded or installed here, so
     # a user who is behind needs somewhere to go.
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
-    p._plugin_version_cache = "0.1.14"
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.15"
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = "https://example.invalid/releases/tag/v0.1.15"
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", True)
+    p._plugin_version_cache = "0.1.14"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "0.1.15")
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", "https://example.invalid/releases/tag/v0.1.15")
     p._add_liquidity_tab(window, wallet)
 
     line = next(t for t in _status_labels(p._tabs[wallet]) if "update available" in t)
@@ -1213,11 +1218,11 @@ def test_the_update_line_escapes_what_it_renders(qapp):
     # this pins the second guard, so markup can never reach a QLabel that would
     # render it -- an <img> here would fetch a remote URL from inside the wallet.
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = True
-    p._plugin_version_cache = "0.1.14"
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = '0.1.15'
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = 'https://x/"><img src="http://tracker.invalid/p">'
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED", True)
+    p._plugin_version_cache = "0.1.14"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", '0.1.15')
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", 'https://x/"><img src="http://tracker.invalid/p">')
     p._add_liquidity_tab(window, wallet)
 
     line = next(t for t in _status_labels(p._tabs[wallet]) if "update available" in t)
@@ -1436,7 +1441,7 @@ def test_sink_address_that_cannot_be_resolved_is_refused(qapp):
 def test_a_blank_sink_address_is_accepted_as_off(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_SINK_ADDRESS", "myname@strike.me")
     p._add_liquidity_tab(window, wallet)
     tab = _settings_tab(p, wallet)
 
@@ -1449,7 +1454,7 @@ def test_a_blank_sink_address_is_accepted_as_off(qapp):
 def test_sink_only_checkbox_applies_immediately(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_SINK_ADDRESS", "myname@strike.me")
     p._add_liquidity_tab(window, wallet)
     cb = _sink_only_checkbox(_settings_tab(p, wallet))
 
@@ -1490,8 +1495,8 @@ def test_the_warning_clears_once_a_sink_is_saved(qapp):
 
 def test_the_checkbox_reflects_the_persisted_value_on_build(qapp):
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = True
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS", True)
     p._add_liquidity_tab(window, wallet)
     assert _sink_only_checkbox(_settings_tab(p, wallet)).isChecked()
 
@@ -1509,7 +1514,7 @@ def test_defer_sink_checkbox_is_checked_by_default(qapp):
 def test_defer_sink_checkbox_applies_immediately(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
-    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_SINK_ADDRESS", "myname@strike.me")
     p._add_liquidity_tab(window, wallet)
     cb = _defer_sink_checkbox(_settings_tab(p, wallet))
 
@@ -1521,8 +1526,8 @@ def test_defer_sink_checkbox_applies_immediately(qapp):
 
 def test_defer_sink_reflects_the_persisted_value_on_build(qapp):
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = False
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL", False)
     p._add_liquidity_tab(window, wallet)
     assert not _defer_sink_checkbox(_settings_tab(p, wallet)).isChecked()
 
@@ -1532,8 +1537,8 @@ def test_deferred_sink_with_swaps_disabled_warns_that_nothing_can_drain(qapp):
     # plugin with no way to drain a channel until the goal is met. Say so at the
     # moment the user creates the combination, not only in the decision log.
     p = _make_plugin()
-    p.config.INBOUND_LIQUIDITY_SINK_ADDRESS = "myname@strike.me"
     window, wallet = _FakeWindow(), _FakeWallet()
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_SINK_ADDRESS", "myname@strike.me")
     p._add_liquidity_tab(window, wallet)
     tab = _settings_tab(p, wallet)
 
@@ -1554,8 +1559,8 @@ def test_refresh_resyncs_both_sink_switches(qapp):
     p._add_liquidity_tab(window, wallet)
     tab = _settings_tab(p, wallet)
 
-    p.config.INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL = False
-    p.config.INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS = True
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL", False)
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS", True)
     p._tabs[wallet].refresh()
     assert not _defer_sink_checkbox(tab).isChecked()
     assert _sink_only_checkbox(tab).isChecked()

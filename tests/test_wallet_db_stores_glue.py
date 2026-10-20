@@ -46,6 +46,8 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.json_db import JsonDB, StoredDict  # type: ignore  # noqa: E402
@@ -104,6 +106,9 @@ def _plugin(**config_overrides: Any) -> LiquidityPlugin:
     )
     cfg.update(config_overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_overrides)
     return p
 
 

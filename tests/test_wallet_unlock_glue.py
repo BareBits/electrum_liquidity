@@ -21,6 +21,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -95,6 +97,9 @@ def _plugin(**config) -> LiquidityPlugin:
     cfg = dict(INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=False)
     cfg.update(config)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config)
     return p
 
 

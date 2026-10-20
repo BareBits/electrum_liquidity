@@ -401,20 +401,11 @@ def _client_config_pairs(ep: Endpoints, *, gossip: bool = False) -> list[tuple[s
     # node id is known -- see run.py).
     return _common_config_pairs(ep, gossip=gossip) + [
         ("lightning_listen", f"127.0.0.1:{ep.ln_listen_client}"),
+        # Whether the plugin is LOADED is a config key (Electrum's own), so it
+        # stays here. Its SETTINGS are not: they live in the wallet, and
+        # `setconfig` does not reach them -- see apply_client_plugin_settings,
+        # which runs once the client daemon has the wallet open.
         ("plugins.inbound_liquidity.enabled", "true"),
-        # Start paused so the rig can open its own baseline channels before the
-        # plugin acts (otherwise it races the rig's setup for the same coins).
-        # Flip the ENABLED/DISABLED slider on (Liquidity tab -> Settings) to
-        # exercise it. Disabled is also the shipped default now.
-        ("plugins.inbound_liquidity.automation_enabled", "false"),
-        # The rig's baseline channels are opened by the rig over the CLI, so the
-        # plugin does not consider them its own. The shipped default of the scope
-        # switch is ON (only manage plugin-opened channels), which would make
-        # every rig channel off-limits to a reverse swap. Pin it OFF here so a
-        # test that wants to drive a swap against the baseline channels can, and
-        # let the tests that care about the switch itself
-        # (test_outbound_preservation_e2e) set it explicitly either way.
-        ("plugins.inbound_liquidity.manage_plugin_opened_only", "false"),
     ]
 
 
@@ -444,13 +435,65 @@ def ensure_plugin_installed() -> None:
     PLUGIN_LINK.symlink_to(PLUGIN_SRC.resolve())
 
 
+# The client wallet's plugin settings, applied once its daemon is up.
+#
+# These live in the WALLET, not in the config, so -- unlike the config pairs --
+# they cannot be written before the wallet is open: the per-wallet setter goes
+# through the running daemon. But the rig decides two of them (the preferred
+# partner, the dev-fee payout address) during bring-up, before the client is
+# started, so those are queued here and flushed by
+# ``apply_client_plugin_settings`` from the client bring-up. Anything that wants
+# to change a setting AFTER that should call ``set_client_plugin_setting``.
+_PENDING_CLIENT_PLUGIN_SETTINGS: dict[str, str] = {}
+
+CLIENT_PLUGIN_SETTINGS: list[tuple[str, str]] = [
+    # Start paused so the rig can open its own baseline channels before the
+    # plugin acts (otherwise it races the rig's setup for the same coins). Flip
+    # the ENABLED/DISABLED slider on (Liquidity tab -> Settings) to exercise it.
+    # Disabled is also the shipped default.
+    ("automation_enabled", "false"),
+    # The rig's baseline channels are opened by the rig over the CLI, so the
+    # plugin does not consider them its own. The shipped default of the scope
+    # switch is ON (only manage plugin-opened channels), which would make every
+    # rig channel off-limits to a reverse swap. Pin it OFF here so a test that
+    # wants to drive a swap against the baseline channels can, and let the tests
+    # that care about the switch itself (test_outbound_preservation_e2e) set it
+    # explicitly either way.
+    ("manage_plugin_opened_only", "false"),
+]
+
+
+def set_client_plugin_setting(name: str, value: str) -> str:
+    """Set one of the CLIENT WALLET's inbound-liquidity settings.
+
+    The per-wallet equivalent of ``setconfig`` for this plugin: settings live in
+    the wallet, so the config key of the same name configures nothing. Goes
+    through the running daemon, so the change is live immediately -- no restart,
+    and no second writer on the wallet file.
+    """
+    return electrum_cli("inbound_liquidity_set_setting", name, value, inst=CLIENT)
+
+
+def apply_client_plugin_settings() -> None:
+    """Apply the rig's plugin settings to the client wallet: the baseline, then
+    whatever bring-up queued. Called once the client daemon has the wallet
+    open."""
+    for name, value in CLIENT_PLUGIN_SETTINGS:
+        set_client_plugin_setting(name, value)
+    while _PENDING_CLIENT_PLUGIN_SETTINGS:
+        name, value = _PENDING_CLIENT_PLUGIN_SETTINGS.popitem()
+        set_client_plugin_setting(name, value)
+
+
 def set_client_channel_peer(connect_str: str) -> None:
     """Point the plugin's channel opens at a preferred partner (the swap provider,
-    in the rig). Written offline before the client comes up so it's read at load.
-    Uses the preferred-partners list (the old single channel_peer field was folded
-    into it)."""
-    electrum_cli("setconfig", "plugins.inbound_liquidity.preferred_partners", connect_str,
-                 inst=CLIENT, offline=True)
+    in the rig). Uses the preferred-partners list (the old single channel_peer
+    field was folded into it).
+
+    Queued rather than written: this is decided before the client daemon exists,
+    and it is a per-wallet setting now, so there is nothing to write it to yet
+    (see _PENDING_CLIENT_PLUGIN_SETTINGS)."""
+    _PENDING_CLIENT_PLUGIN_SETTINGS["preferred_partners"] = connect_str
 
 
 def disable_forwarding(inst: ElectrumInstance) -> None:
@@ -516,9 +559,8 @@ def set_gossip_seed_peers(inst: ElectrumInstance,
 
 def set_client_dev_fee_address(address: str) -> None:
     """Point the plugin's dev-fee payout at the local LNURL stub (rig only).
-    Written offline before the client comes up so it's read at load."""
-    electrum_cli("setconfig", "plugins.inbound_liquidity.dev_fee_address", address,
-                 inst=CLIENT, offline=True)
+    Queued for the same reason as ``set_client_channel_peer``."""
+    _PENDING_CLIENT_PLUGIN_SETTINGS["dev_fee_address"] = address
 
 
 def lightning_invoice(sat: int, *, inst: ElectrumInstance = PARTNER,

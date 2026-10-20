@@ -17,6 +17,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 # Import the package (Electrum core must be importable via the venv). If it is
 # not (e.g. running these without the electrum venv), skip rather than error.
 inbound_liquidity = pytest.importorskip("electrum.plugins.inbound_liquidity")
@@ -68,6 +70,9 @@ def _make_plugin(retention_days=DEFAULT_LOG_RETENTION_DAYS) -> LiquidityPlugin:
     p.config = _FakeConfig(retention_days)
     p.logger = logging.getLogger("test.inbound_liquidity")
     p._last_decline_sigs = {}
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

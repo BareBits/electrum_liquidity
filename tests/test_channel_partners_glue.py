@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -52,6 +54,9 @@ def _plugin(**config) -> LiquidityPlugin:
     # Per-wallet state the suggestion lookup writes to (object.__new__ skips
     # __init__, so it is wired explicitly here).
     p._suggest_errors = {}
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config)
     return p
 
 
@@ -683,8 +688,8 @@ def test_decline_reason_is_unchanged_by_the_breakdown():
     wallet = _wallet()
     action = OpenChannelAction(funding_sat=1, reason="x")
     first = asyncio.run(p._no_partner_decline(wallet, action))
-    p.config.INBOUND_LIQUIDITY_PREFERRED_PARTNERS = f"{PUB_A}@h:1"
-    p.config.INBOUND_LIQUIDITY_BANNED_PARTNERS = PUB_A
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_PREFERRED_PARTNERS", f"{PUB_A}@h:1")
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_BANNED_PARTNERS", PUB_A)
     second = asyncio.run(p._no_partner_decline(wallet, action))
     assert first.reason == second.reason        # same signature...
     assert first.detail != second.detail        # ...different explanation

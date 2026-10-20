@@ -15,6 +15,8 @@ from typing import Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PyQt6.QtWidgets")
@@ -88,6 +90,9 @@ def _make_plugin() -> qt_mod.Plugin:
     p = _make_base_plugin()
     # The shipped default, so the unit-rendering cases have a known amount.
     p.config.INBOUND_LIQUIDITY_GOAL_SAT = DEFAULT_LIQUIDITY_GOAL_SAT
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

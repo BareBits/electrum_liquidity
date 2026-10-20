@@ -99,6 +99,9 @@ def gui():
     loop, stopping_fut, loop_thread = create_and_start_event_loop()
 
     from electrum.wallet import create_new_wallet
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        SETTINGS_DB_KEY, SETTINGS_STORE_VERSION,
+    )
     paths: List[str] = []
     for name in WALLET_NAMES:
         path = os.path.join(datadir, "regtest", "wallets", name)
@@ -107,6 +110,12 @@ def gui():
                                    encrypt_file=False)["wallet"]
         if not wallet.has_lightning():
             wallet.init_lightning(password=None)
+        # Pre-answer the plugin's update-check opt-in, ON THE WALLET. It is a
+        # per-wallet setting, so setting it on the config would not reach any of
+        # these wallets and each window would come up behind a modal with nobody
+        # to click it -- which hung this module for its whole timeout.
+        wallet.db.put(SETTINGS_DB_KEY, {"_v": SETTINGS_STORE_VERSION,
+                                        "UPDATE_CHECK_PROMPTED": True})
         wallet.save_db()
         paths.append(path)
 
@@ -121,8 +130,6 @@ def gui():
     plugins = Plugins(config, gui_name="qt")
     plugin = plugins.get("inbound_liquidity")
     assert plugin is not None, "the plugin is not installed in this Electrum"
-    # The plugin's own opt-in prompt is a third modal; answer it in advance.
-    config.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = True
 
     from electrum.daemon import Daemon
     daemon = Daemon(config, listen_jsonrpc=False, start_network=False)

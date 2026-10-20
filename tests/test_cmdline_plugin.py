@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import cmdline  # type: ignore  # noqa: E402
@@ -29,6 +31,9 @@ def _plugin() -> "cmdline.Plugin":
     p = object.__new__(cmdline.Plugin)
     p.logger = logging.getLogger("test.inbound_liquidity.cmdline")
     p.config = SimpleNamespace()
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

@@ -20,6 +20,8 @@ from typing import List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -44,6 +46,7 @@ def _plugin(*, manual_run_only: bool = False,
     p.logger = logging.getLogger("test.inbound_liquidity.manual_run_only")
     p.config = SimpleNamespace(
         INBOUND_LIQUIDITY_MANUAL_RUN_ONLY=manual_run_only)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p.read_config = lambda wallet=None: SimpleNamespace(automation_enabled=automation_enabled)
     # Connected, synced, peers dialed: isolate the guard from the readiness gate.
     # ``_evaluate`` consults ``_readiness_block`` (None == ready); the terminal
@@ -65,6 +68,9 @@ def _plugin(*, manual_run_only: bool = False,
 
     p._run_decision = _run_decision
     p._called = called  # type: ignore[attr-defined]
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 

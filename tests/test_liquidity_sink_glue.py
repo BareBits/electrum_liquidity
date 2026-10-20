@@ -36,6 +36,8 @@ from typing import Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -115,6 +117,9 @@ def _plugin(*, max_fee_pct: float = 0.9, **config_over) -> LiquidityPlugin:
     async def _fake_reverse_swap(wallet, action, state=None, transport=None):
         p.swapped.append(action)
     p._reverse_swap = _fake_reverse_swap
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_over)
     return p
 
 
@@ -532,6 +537,7 @@ def test_read_config_carries_the_sink_settings() -> None:
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=f"  {SINK} ",
                             INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS=True)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     cfg = p.read_config(wallet)
     assert cfg.liquidity_sink_address == SINK      # trimmed on the way in
     assert cfg.disable_submarine_swaps is True
@@ -541,6 +547,7 @@ def test_read_config_defaults_the_sink_off_on_an_older_config() -> None:
     # A config predating these settings must read as "off", not raise on a tick.
     p = _plugin()
     p.config = _full_config()
+    seed_settings(p)   # the swapped-in config is what its wallets read
     cfg = p.read_config(wallet)
     assert cfg.liquidity_sink_address == ""
     assert cfg.disable_submarine_swaps is False
@@ -550,6 +557,7 @@ def test_read_config_carries_the_defer_until_goal_switch() -> None:
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK,
                             INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL=False)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     assert p.read_config(wallet).defer_sink_until_goal is False
 
 
@@ -561,6 +569,7 @@ def test_defer_until_goal_defaults_ON_on_an_older_config() -> None:
     # way, for the pure tests; read_config always passes this explicitly.)
     p = _plugin()
     p.config = _full_config(INBOUND_LIQUIDITY_SINK_ADDRESS=SINK)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     assert p.read_config(wallet).defer_sink_until_goal is True
 
 

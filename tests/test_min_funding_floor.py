@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 IL = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import LiquidityPlugin  # type: ignore  # noqa: E402
@@ -22,6 +24,13 @@ def _plugin(**config) -> LiquidityPlugin:
     p = object.__new__(LiquidityPlugin)
     p.logger = logging.getLogger("test.inbound_liquidity.floor")
     p.config = SimpleNamespace(**config)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config)
+    # The channel-funding floor is derived from the OPEN wallets (it is one
+    # constant per process), so this plugin needs one for the configured
+    # min-on-chain to count at all.
+    p.settings(wallet)
     return p
 
 

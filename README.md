@@ -68,7 +68,9 @@ ceilings, diagnostics, etc.).
 **Settings are per wallet.** Open two wallets in one Electrum and each gets its
 own **Liquidity** tab with its own settings: how much inbound that wallet wants,
 what it will pay for it, and whether it is armed at all are properties of the
-wallet, not of the installation. See [Per-wallet settings](#per-wallet-settings).
+wallet, not of the installation. A wallet reads only what has been set *on it*,
+and the shipped default for everything else. See
+[Per-wallet settings](#per-wallet-settings).
 
 | Setting | Tab | Meaning | Default |
 |---|---|---|---|
@@ -764,22 +766,26 @@ and every open wallet gets its own **Liquidity** tab. Changing a setting on one
 wallet changes nothing for any other — including the **ENABLED/DISABLED** arm
 switch, so one armed wallet cannot arm the rest.
 
-A setting a wallet has never been given a value for reads the
-**installation-wide default**: the `plugins.inbound_liquidity.*` config key, as
-set by `electrum setconfig` (or left at the shipped default). So the two levels
-are:
+A wallet reads exactly two things:
 
-| Level | Where | Set by | Applies to |
-|---|---|---|---|
-| wallet | the wallet file | the Liquidity tab, `inbound_liquidity_set_setting` | that wallet only |
-| installation | Electrum's config | `electrum setconfig plugins.inbound_liquidity.<key>` | every wallet without a value of its own |
+| | |
+|---|---|
+| its **own** stored value | set from the Liquidity tab, or `inbound_liquidity_set_setting` |
+| failing that, the setting's **shipped default** | the value in the table above |
+
+Nothing else — in particular **`electrum setconfig
+plugins.inbound_liquidity.<key>` does not reach any wallet.** That is
+deliberate: a value a wallet was never given must not arrive from the
+installation and start moving its funds. (`plugins.inbound_liquidity.enabled`
+is still a config key; that is Electrum's own "is this plugin loaded", not a
+setting of the plugin.)
 
 **Resetting.** *Advanced → Reset this wallet to defaults* discards everything
-stored for that wallet, putting it back on the installation defaults. No other
-wallet is touched, and nothing about channels, swaps or funds changes.
+stored for that wallet, putting it back on the shipped defaults. No other wallet
+is touched, and nothing about channels, swaps or funds changes.
 
-**Headless / CLI.** `setconfig` sets the installation default, which a wallet
-with its own value ignores — so there are per-wallet equivalents:
+**Headless / CLI.** `setconfig` cannot set these, so there are per-wallet
+commands:
 
 ```bash
 electrum inbound_liquidity_get_settings   -w /path/to/wallet
@@ -791,7 +797,8 @@ electrum inbound_liquidity_reset_settings -w /path/to/wallet
 The setting name is accepted with or without the `INBOUND_LIQUIDITY_` prefix and
 is case-insensitive; values are checked against the setting's declared type
 (booleans take `true/false/yes/no/on/off/1/0`). Each returns the wallet's
-settings as they read afterwards.
+settings as they read afterwards. The commands need the wallet open (they go
+through the running daemon), which is also how a change takes effect at once.
 
 **Three exceptions**, where what the setting controls is one thing per *process*
 rather than one per wallet — Python's logging configuration, and Electrum's
@@ -804,6 +811,14 @@ answer so one wallet cannot override another's:
 | `log_capture_ln`, `log_capture_debug` | on if **any** open wallet asks for it |
 | `log_buffer_lines` | the **largest** any open wallet asks for |
 | `min_onchain_to_open_sat` (as it lowers the channel-funding floor) | the **lowest** across open wallets — the floor is a permission, and each wallet is still held to its own value by the engine |
+
+Note what that last row does and does not mean. A wallet with a *higher*
+`min_onchain_to_open_sat` is unaffected by another wallet's lower one: the engine
+gates each wallet's opens on that wallet's own value. What the lowered floor
+changes is what Electrum *permits* — so while a wallet configured below
+Electrum's stock `MIN_FUNDING_SAT` is open, a channel you open **by hand** in
+another wallet's window can also go below it. That constant is one per process,
+with no per-wallet form.
 
 ## Layout
 
@@ -848,6 +863,11 @@ done automatically (`e2e/rig/services.ensure_plugin_installed()` +
 the shipped default) so it doesn't race the rig's own channel setup — flip the
 large **ENABLED/DISABLED** slider at the top of the **Liquidity** tab's Settings
 sub-tab to arm it (it applies immediately, no **Apply** needed).
+
+That `enabled` key is a *config* key (Electrum's own "is this plugin loaded").
+The plugin's own settings are per wallet, so the rig applies them through
+`inbound_liquidity_set_setting` once the client daemon has its wallet open —
+see `services.apply_client_plugin_settings`.
 
 Note: on the rig's small (0.02 BTC) channels a reverse swap's **effective all-in
 cost** (provider percentage + provider mining fee + on-chain claim fee, as a

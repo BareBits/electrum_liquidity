@@ -1481,22 +1481,26 @@ SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
 # what it will pay for it, and whether it is armed at all are properties of that
 # wallet, not of the installation.
 #
-# So a setting now has two levels, and WalletSettings is the one place that
+# So a wallet reads exactly two things, and WalletSettings is the one place that
 # resolves them:
 #
 #   * the WALLET's own value, in its wallet file under SETTINGS_DB_KEY, next to
-#     the other per-wallet stores. Every write goes here -- which is the whole
-#     point: changing a setting on one open wallet can no longer move another.
-#   * the INSTALLATION's value, i.e. the ConfigVar in Electrum's config, used
-#     for any setting this wallet has never been given one of. It is the default
-#     for new and untouched wallets, and remains the lever for configuring the
-#     plugin from outside the GUI -- ``electrum setconfig``, which is how the
-#     headless/regtest paths set the plugin up before any wallet is open.
+#     the other per-wallet stores. Every write goes here.
+#   * failing that, the setting's SHIPPED DEFAULT, i.e. the ConfigVar's declared
+#     default.
 #
-# A wallet is therefore self-contained for everything its owner has actually
-# set, and tracks the installation default for the rest. ``reset_settings``
-# clears a wallet's own values and puts it back on the defaults; the per-wallet
-# CLI commands (``inbound_liquidity_set_setting``) write the wallet level.
+# Nothing else. In particular a wallet does NOT read the process-wide config
+# value for a setting: ``electrum setconfig plugins.inbound_liquidity.<key>``
+# does not reach any wallet. That is deliberate. A wallet's liquidity policy --
+# how much inbound it wants, what it will pay for it, whether it is armed at all
+# -- is a property of that wallet, and a value it was never given must not
+# arrive from somewhere else and start moving its funds. The ConfigVars survive
+# as the DECLARATION of each setting: its name, type, shipped default and
+# description, and the registry this module reads to know what a setting is.
+#
+# Setting a wallet's values without the GUI is what the per-wallet CLI commands
+# are for (``inbound_liquidity_set_setting`` and friends); ``reset_settings``
+# clears a wallet's own values and puts it back on the shipped defaults.
 SETTINGS_DB_KEY = "inbound_liquidity_settings"
 
 # Bumped only for a change that needs the store rewritten.
@@ -1509,9 +1513,6 @@ _SETTINGS_VERSION_FIELD = "_v"
 
 _CONFIG_PREFIX = "INBOUND_LIQUIDITY_"
 
-# Sentinel for "the config has no such attribute at all", which is a different
-# answer from "it has it, and the value is None".
-_MISSING = object()
 
 
 @functools.lru_cache(maxsize=1)
@@ -1635,21 +1636,19 @@ class WalletSettings:
             field = _settings_field(name)
             if field in store:
                 return store[field]
-            # Not set for this wallet: fall back to the installation-wide value.
-            # On a real SimpleConfig that is the ConfigVar's own default unless
-            # the config has been given a value, which is exactly the layering
-            # described at the top of this section.
+            # Never set for this wallet, so the shipped default -- NOT the
+            # process-wide config value. See the note at the top of this
+            # section: a setting this wallet was never given must not arrive
+            # from the installation and start moving its funds.
             #
-            # A config object that does not carry the setting at all answers
-            # with the declared default rather than raising. That keeps this
-            # total for every declared setting -- which the call sites rely on,
-            # since many read settings on paths (a repaint, a tick) that must
-            # not be able to fail -- and it is what the `getattr(config, X,
-            # default)` reads these replaced did.
-            value = getattr(plugin.config, name, _MISSING)
-            if value is _MISSING:
-                return config_var_default(plugin.config, name)
-            return value
+            # Total for every declared setting, because the call sites rely on
+            # it: settings are read on paths that must not be able to fail (a
+            # status-bar repaint, a keystroke in the Send tab, every tick).
+            return config_var_default(plugin.config, name)
+        # Anything that is not one of this plugin's settings is Electrum's own
+        # (the base unit, fee settings, the data dir), and belongs to the
+        # config. That is what makes this view a drop-in for ``self.config`` at
+        # the call sites.
         return getattr(plugin.config, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -1967,9 +1966,9 @@ class LiquidityPlugin(BasePlugin):
         the alternative is one bad wallet file deciding the floor for every
         other wallet.
 
-        With no wallet open it is the installation-wide value, which is the only
-        answer available then -- and the right one: that is what the next wallet
-        to open will read for this setting unless it has one of its own."""
+        With no wallet open it is the shipped default, which is the only answer
+        available then -- and the right one: that is what the next wallet to
+        open will read for this setting unless it has one of its own."""
         out: List[int] = []
         for view in self._open_settings_views():
             try:
@@ -1978,7 +1977,7 @@ class LiquidityPlugin(BasePlugin):
                 out.append(stock)
         if not out:
             try:
-                out.append(int(self._installation_setting(
+                out.append(int(self._default_setting(
                     "INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT")))
             except (TypeError, ValueError):
                 out.append(stock)
@@ -2514,8 +2513,8 @@ class LiquidityPlugin(BasePlugin):
     # turned off the capture a user had switched on to diagnose the first.
     def log_buffer_lines(self) -> int:
         """Log-tab buffer size now in force: the largest any open wallet asks
-        for, clamped to the supported range. The installation-wide value when no
-        wallet is open (see :meth:`_configured_min_funding_sats`)."""
+        for, clamped to the supported range. The shipped default when no wallet
+        is open (see :meth:`_configured_min_funding_sats`)."""
         sizes: List[int] = []
         for view in self._open_settings_views():
             try:
@@ -2523,25 +2522,22 @@ class LiquidityPlugin(BasePlugin):
             except Exception:
                 continue    # a wallet with an unreadable value simply abstains
         if not sizes:
-            return clamp_max_lines(self._installation_setting(
+            return clamp_max_lines(self._default_setting(
                 "INBOUND_LIQUIDITY_LOG_BUFFER_LINES"))
         return max(sizes)
 
-    def _installation_setting(self, name: str) -> Any:
-        """A setting's installation-wide value -- the level a wallet without one
-        of its own reads (see WalletSettings). Used by the process-wide
-        settings when there is no wallet to ask."""
-        value = getattr(self.config, name, _MISSING)
-        if value is _MISSING:
-            return config_var_default(self.config, name)
-        return value
+    def _default_setting(self, name: str) -> Any:
+        """A setting's shipped default. What the process-wide settings answer
+        with when there is no wallet open to ask (see WalletSettings: a wallet
+        that has never been given a value reads this too)."""
+        return config_var_default(self.config, name)
 
     def _any_wallet_wants(self, name: str) -> bool:
         """Whether any open wallet has the named (boolean) setting switched on.
-        Falls back to the installation-wide value with no wallet open."""
+        Falls back to the shipped default with no wallet open."""
         views = self._open_settings_views()
         if not views:
-            return bool(self._installation_setting(name))
+            return bool(self._default_setting(name))
         for view in views:
             try:
                 if bool(getattr(view, name)):
@@ -2811,11 +2807,11 @@ class LiquidityPlugin(BasePlugin):
 
     def reset_settings(self, wallet: 'Abstract_Wallet') -> None:
         """Drop every value this wallet has of its own, so all of its settings
-        go back to answering from the installation-wide defaults."""
+        go back to answering from the shipped defaults."""
         self._save_settings(wallet, {})
         self._settings_cache[wallet] = {}
         self.logger.info(f"settings for {_wallet_basename(wallet)} reset to the "
-                         f"installation defaults")
+                         f"shipped defaults")
         self._on_setting_changed(wallet, None)
 
     def apply_process_wide_settings(self) -> None:
@@ -2849,8 +2845,8 @@ class LiquidityPlugin(BasePlugin):
 
     def settings_as_dict(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
         """Every setting's effective value for this wallet -- its own where it
-        has one, the installation default otherwise -- keyed by the unprefixed
-        name. What the CLI's getter returns."""
+        has one, the shipped default otherwise -- keyed by the unprefixed name.
+        What the CLI's getter returns."""
         view = self.settings(wallet)
         return {_settings_field(name): getattr(view, name)
                 for name in sorted(_plugin_config_vars())}

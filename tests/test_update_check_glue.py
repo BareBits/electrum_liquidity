@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins import inbound_liquidity as pkg  # type: ignore  # noqa: E402
@@ -56,6 +58,9 @@ def _plugin(*, version: str = "0.1.14", **config_overrides: Any) -> LiquidityPlu
     p._plugin_version_cache = version      # pin the "running" version
     p.statuses: List[str] = []
     p.on_status_changed = lambda wallet, status: p.statuses.append(status)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_overrides)
     return p
 
 
@@ -112,7 +117,7 @@ def test_update_status_reports_up_to_date_and_behind() -> None:
     assert p.update_status(wallet) == "version 0.1.14 (up to date)"
     assert p.update_available(wallet) is False
 
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = "0.1.15"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION", "0.1.15")
     assert p.update_available(wallet) is True
     assert p.update_status(wallet) == "update available: 0.1.15 (running 0.1.14)"
 
@@ -120,7 +125,7 @@ def test_update_status_reports_up_to_date_and_behind() -> None:
 def test_release_url_falls_back_to_the_releases_page() -> None:
     p = _plugin()
     assert p.latest_release_url(wallet) == UPDATE_RELEASES_URL
-    p.config.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = "https://example.invalid/r/1"
+    p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LATEST_URL", "https://example.invalid/r/1")
     assert p.latest_release_url(wallet) == "https://example.invalid/r/1"
 
 
@@ -203,7 +208,7 @@ def test_an_available_update_is_logged_once_per_version(caplog) -> None:
     _stub_fetch(p, ReleaseInfo(version="0.1.15", url="https://x/rel"))
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
-            p.config.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0   # force it due
+            p.set_setting(wallet, "INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS", 0.0)   # force it due
             asyncio.run(p._maybe_check_for_update(wallet))
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1

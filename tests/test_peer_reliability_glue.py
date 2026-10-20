@@ -18,6 +18,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.lnutil import HtlcLog  # type: ignore  # noqa: E402
@@ -93,6 +95,9 @@ def _plugin(**config_overrides) -> LiquidityPlugin:
     )
     cfg.update(config_overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **config_overrides)
     return p
 
 
@@ -154,7 +159,7 @@ def test_peer_penalties_mapping_and_disabled() -> None:
     p, w = _plugin(), _FakeWallet()
     p._record_peer_fault(w, NODE_A, "x", hard=False)
     assert p._peer_penalties(w)[NODE_A.lower()] == pytest.approx(0.5, abs=1e-3)
-    p.config.INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED = False
+    p.set_setting(w, "INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED", False)
     assert p._peer_penalties(w) == {}
 
 

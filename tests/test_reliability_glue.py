@@ -16,6 +16,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -67,6 +69,9 @@ def _plugin() -> LiquidityPlugin:
     # One-slot per-channel dedupe for declines the executor writes itself.
     p._last_exec_decline_sig = {}
     p.config = SimpleNamespace()  # getattr defaults kick in
+    # Settings are per wallet now; hand this plugin's wallets what its
+    # config carries -- see conftest.seed_settings.
+    seed_settings(p)
     return p
 
 
@@ -142,6 +147,7 @@ def test_apply_reliability_penalties_folds_decayed_penalty() -> None:
 def test_apply_reliability_penalties_disabled_is_noop() -> None:
     p, w = _plugin(), _FakeWallet()
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_ENABLED=False)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p._record_provider_fault(w, NPUB, "x")
     offers = [ProviderOffer(npub=NPUB, percentage_fee=0.3, mining_fee_sat=0,
                             min_amount_sat=1, max_reverse_sat=10**9)]
@@ -425,6 +431,7 @@ def test_aging_is_skipped_when_decay_is_disabled() -> None:
     # forgive, so escalation must keep compounding.
     p, w = _plugin(), _FakeWallet()
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=0.0)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p._record_provider_fault(w, NPUB, "x")
     _backdate(p, w, NPUB, 365 * 86400)
     p._record_provider_fault(w, NPUB, "y")
@@ -456,6 +463,7 @@ def test_prune_keeps_an_idle_row_that_still_carries_a_penalty() -> None:
     # it would silently pardon the provider, so idleness alone is not enough.
     p, w = _plugin(), _FakeWallet()
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p._save_reliability(w, {
         NPUB: {"consecutive_faults": 3, "fault_count": 3,
                "last_fault_ts": time.time() - 100 * 86400},
@@ -471,6 +479,7 @@ def test_prune_is_not_a_wipe_when_reliability_is_switched_off() -> None:
     p, w = _plugin(), _FakeWallet()
     p.config = SimpleNamespace(INBOUND_LIQUIDITY_RELIABILITY_ENABLED=False,
                                INBOUND_LIQUIDITY_RELIABILITY_HALFLIFE_HOURS=24 * 365.0)
+    seed_settings(p)   # the swapped-in config is what its wallets read
     p._save_reliability(w, {
         NPUB: {"consecutive_faults": 3, "fault_count": 3,
                "last_fault_ts": time.time() - 100 * 86400},

@@ -397,7 +397,7 @@ def test_a_goal_change_still_lands_while_the_list_is_stale(qapp) -> None:
     _patched_update_status(window)
     assert _amount_of(button._list, ONCHAIN_BLUE) == 10
 
-    p.config.INBOUND_LIQUIDITY_GOAL_SAT = 25
+    p.set_setting(w, "INBOUND_LIQUIDITY_GOAL_SAT", 25)
     _patched_update_status(window)
     assert _amount_of(button._list, ONCHAIN_BLUE) == 25
     assert _amount_of(button._list, COLOR_CONFIRMED) == 75
@@ -416,7 +416,7 @@ def test_turning_the_goal_off_restores_the_stock_slices(qapp) -> None:
     _patched_update_status(window)
     assert _amount_of(button._list, COLOR_CONFIRMED) == 90
 
-    p.config.INBOUND_LIQUIDITY_GOAL_SAT = 0
+    p.set_setting(w, "INBOUND_LIQUIDITY_GOAL_SAT", 0)
     _patched_update_status(window)
     assert _amount_of(button._list, COLOR_CONFIRMED) == 100
     assert all(c not in qt_mod.COLOR_GOAL_BUFFER_ALL

@@ -2,10 +2,11 @@
 what stays process-wide.
 
 Before this, every setting lived in Electrum's process-wide config, so two
-wallets open in one Electrum shared a single liquidity policy. Now a setting has
-two levels -- the wallet's own value (in its wallet file) and the
-installation-wide default (the ConfigVar) -- and these tests pin both the
-layering and the isolation that was the point of it.
+wallets open in one Electrum shared a single liquidity policy. Now a wallet
+reads exactly two things: its OWN stored value, or the setting's shipped
+default. Nothing arrives from the process-wide config -- these tests pin that
+too, because it is the whole point: a value a wallet was never given must not
+turn up from elsewhere and start moving its funds.
 
 Glue-level: the real plugin package on a LiquidityPlugin built without
 BasePlugin.__init__, against dict-backed fake wallets.
@@ -18,9 +19,14 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.simple_config import SimpleConfig  # type: ignore  # noqa: E402
+
+from electrum.plugins.inbound_liquidity.log_buffer import (  # type: ignore  # noqa: E402
+    clamp_max_lines,
+)
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     DEFAULT_LIQUIDITY_GOAL_SAT,
@@ -67,6 +73,14 @@ class _Config:
 
 
 def _plugin(**config_values: Any) -> LiquidityPlugin:
+    """A plugin whose config carries ``config_values``.
+
+    Deliberately does NOT use ``conftest.seed_settings``: that helper exists so
+    the other modules can keep configuring a plugin the way they were written,
+    by pushing their fake config's values into each wallet's store. This module
+    is the one that tests what the production code does with a config, so
+    seeding would hide exactly what it is here to pin.
+    """
     p = object.__new__(LiquidityPlugin)
     p.logger = logging.getLogger("test.inbound_liquidity.settings")
     p.config = _Config(**config_values)
@@ -79,20 +93,28 @@ def test_an_untouched_wallet_reads_the_shipped_default() -> None:
     assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
-def test_an_untouched_wallet_reads_the_installation_value() -> None:
-    """The installation-wide config is the default for a wallet with no value of
-    its own -- which is what keeps `electrum setconfig` meaningful for setting
-    the plugin up before any wallet is open."""
-    p, w = _plugin(INBOUND_LIQUIDITY_GOAL_SAT=750_000), _FakeWallet()
-    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == 750_000
+def test_the_process_wide_config_never_reaches_a_wallet() -> None:
+    """`electrum setconfig plugins.inbound_liquidity.<key>` configures nothing.
+
+    The sharp end of the isolation: a wallet that was never given a value reads
+    the SHIPPED default, not whatever the installation happens to say. Were it
+    otherwise, changing one config key would move every wallet that had not
+    overridden it -- including its fee ceiling and whether it is armed.
+    """
+    p, w = _plugin(INBOUND_LIQUIDITY_GOAL_SAT=750_000,
+                   INBOUND_LIQUIDITY_AUTOMATION_ENABLED=True,
+                   INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT=99.0), _FakeWallet()
+    assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == DEFAULT_LIQUIDITY_GOAL_SAT
+    assert p.read_config(w).automation_enabled is False
+    assert p.read_config(w).max_swap_fee_pct == config_var_default(
+        p.config, "INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT")
 
 
-def test_a_wallets_own_value_wins_over_the_installation_value() -> None:
+def test_a_write_goes_to_the_wallet_and_leaves_the_config_alone() -> None:
     p, w = _plugin(INBOUND_LIQUIDITY_GOAL_SAT=750_000), _FakeWallet()
     p.set_setting(w, "INBOUND_LIQUIDITY_GOAL_SAT", 25_000)
     assert p.settings(w).INBOUND_LIQUIDITY_GOAL_SAT == 25_000
-    # ... and the installation value is untouched, so it is still the default
-    # for every other wallet.
+    # The config is not where settings live, in either direction.
     assert p.config.INBOUND_LIQUIDITY_GOAL_SAT == 750_000
 
 
@@ -247,12 +269,13 @@ def test_a_bool_is_not_accepted_as_a_number() -> None:
 
 # --- reset ----------------------------------------------------------------
 def test_reset_drops_the_wallets_own_values_only() -> None:
-    p = _plugin(INBOUND_LIQUIDITY_MAX_CHANNELS=7)
+    p = _plugin()
+    shipped = config_var_default(p.config, "INBOUND_LIQUIDITY_MAX_CHANNELS")
     a, b = _FakeWallet("a"), _FakeWallet("b")
     p.set_setting(a, "INBOUND_LIQUIDITY_MAX_CHANNELS", 1)
     p.set_setting(b, "INBOUND_LIQUIDITY_MAX_CHANNELS", 2)
     p.reset_settings(a)
-    assert p.settings(a).INBOUND_LIQUIDITY_MAX_CHANNELS == 7   # back to the default
+    assert p.settings(a).INBOUND_LIQUIDITY_MAX_CHANNELS == shipped
     assert p.settings(b).INBOUND_LIQUIDITY_MAX_CHANNELS == 2   # untouched
     assert dict(a.db.get(SETTINGS_DB_KEY)) == {"_v": SETTINGS_STORE_VERSION}
 
@@ -354,14 +377,15 @@ def test_the_log_buffer_takes_the_largest_across_open_wallets() -> None:
     assert p.log_buffer_lines() == 5_000
 
 
-def test_the_process_wide_settings_fall_back_to_the_installation_value() -> None:
-    """With no wallet open there is nothing to ask, and the installation value is
+def test_the_process_wide_settings_fall_back_to_the_shipped_default() -> None:
+    """With no wallet open there is nothing to ask, and the shipped default is
     both the only answer available and the right one -- it is what the next
-    wallet to open will read."""
+    wallet to open will read unless it has a value of its own."""
     p = _plugin(INBOUND_LIQUIDITY_LOG_BUFFER_LINES=777,
                 INBOUND_LIQUIDITY_LOG_CAPTURE_LN=True)
-    assert p.log_buffer_lines() == 777
-    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_LN") is True
+    assert p.log_buffer_lines() == clamp_max_lines(
+        config_var_default(p.config, "INBOUND_LIQUIDITY_LOG_BUFFER_LINES"))
+    assert p._any_wallet_wants("INBOUND_LIQUIDITY_LOG_CAPTURE_LN") is False
 
 
 def test_reading_a_setting_does_not_change_a_process_wide_constant(restore_floor) -> None:
@@ -436,10 +460,10 @@ def test_the_cli_getter_reports_the_wallets_effective_settings() -> None:
 
 
 def test_the_cli_reset_clears_the_wallet() -> None:
-    p, w = _plugin(INBOUND_LIQUIDITY_GOAL_SAT=5_000), _FakeWallet()
+    p, w = _plugin(), _FakeWallet()
     p.set_setting(w, "GOAL_SAT", 11_000)
     out = _run("reset_settings", p, wallet=w)
-    assert out["GOAL_SAT"] == 5_000
+    assert out["GOAL_SAT"] == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
 # --- the layering stays the layering -------------------------------------
@@ -461,8 +485,7 @@ def test_no_module_reads_a_plugin_setting_off_the_shared_config() -> None:
     root = pathlib.Path(pkg.__file__).parent
     # The functions allowed to reach the shared config: the settings layer and
     # the process-wide settings that have no single wallet to ask.
-    allowed = {"_installation_setting", "config_var_default", "__getattr__",
-               "__setattr__"}
+    allowed = {"config_var_default", "__getattr__", "__setattr__"}
     offenders: List[str] = []
     for path in sorted(root.glob("*.py")):
         current = ""

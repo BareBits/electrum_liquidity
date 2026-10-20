@@ -22,6 +22,8 @@ from typing import Dict, List
 
 import pytest
 
+from conftest import seed_settings  # noqa: E402
+
 pkg = pytest.importorskip("electrum.plugins.inbound_liquidity")
 
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
@@ -145,6 +147,9 @@ def _plugin(**overrides) -> LiquidityPlugin:
     )
     cfg.update(overrides)
     p.config = SimpleNamespace(**cfg)
+    # Settings are per wallet now, so the same kwargs are given to every wallet
+    # this plugin sees -- see conftest.seed_settings.
+    seed_settings(p, **overrides)
     return p
 
 
@@ -185,9 +190,13 @@ def test_garbage_goal_falls_back_to_the_shipped_default() -> None:
     assert p.read_config(wallet).liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
-def test_missing_config_var_falls_back_to_the_shipped_default() -> None:
+def test_a_wallet_that_was_never_given_a_goal_reads_the_shipped_default() -> None:
+    """Deleting the ConfigVar used to be how "a config predating this setting"
+    was expressed. A wallet does not read the config at all now, so the case it
+    stood for -- nothing stored for this wallet -- is simply a wallet with an
+    empty store."""
     p = _plugin()
-    del p.config.INBOUND_LIQUIDITY_GOAL_SAT
+    p._settings_cache = {}          # no seed: this wallet has nothing stored
     assert p.read_config(wallet).liquidity_goal_sat == DEFAULT_LIQUIDITY_GOAL_SAT
 
 
