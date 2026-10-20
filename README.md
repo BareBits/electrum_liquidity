@@ -758,6 +758,38 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+### Reading the provider and partner tables
+
+Both list tabs — **Swap providers** and **Channel partners** — sort on any
+column. Click a header to sort by it, click the same header again to reverse.
+The tables are sorted on the **values**, not the text in the cells, so
+`1,900,000` does not land between `12` and `2`, `2d ago` sorts older than
+`3h ago`, and ticking **Preferred** on a row moves it where you can see it. A
+provider that is offline (advertising no terms) sorts to the bottom on whichever
+term you ordered by, rather than to the top of half of them.
+
+Sorting is a way to **read** the table and nothing more. In particular, the
+preferred channel partners are a *try-order* — the plugin opens to the first one
+that accepts — and re-sorting the table to inspect a penalty column does not
+re-prioritise them. Until you click a header, both tables keep their natural
+order: discovered providers before history-only ones, and peers you have a live
+channel with before peers you only have a fault record for.
+
+The **Channel partners** tab leads with a **Node name** column: the alias the
+peer announces over Lightning gossip, which is the same name Electrum's own
+**Channels** tab shows — the plugin asks Electrum the same question
+(`lnworker.lnpeermgr.get_node_alias`). It reads `—` whenever this wallet has not
+been told a name, and with gossip off — Electrum's default — that is most peers,
+because trampoline routing downloads no node announcements. Turn gossip on and
+the names fill in. The node id is still there in the next column, and hovering
+the name shows both in full.
+
+An alias is chosen by the remote node, so it is treated as untrusted text:
+control characters and line breaks (which would spill a row over its neighbours)
+are collapsed to spaces, the invisible padding and bidi overrides that let one
+alias render as a copy of another node's are dropped, and the result is bounded
+at 32 characters.
+
 ## Per-wallet settings
 
 Every setting is stored **in the wallet file** (under
@@ -794,11 +826,14 @@ electrum inbound_liquidity_set_setting    automation_enabled true -w /path/to/wa
 electrum inbound_liquidity_reset_settings -w /path/to/wallet
 ```
 
-The setting name is accepted with or without the `INBOUND_LIQUIDITY_` prefix and
-is case-insensitive; values are checked against the setting's declared type
-(booleans take `true/false/yes/no/on/off/1/0`). Each returns the wallet's
-settings as they read afterwards. The commands need the wallet open (they go
-through the running daemon), which is also how a change takes effect at once.
+The setting name is accepted with or without the `INBOUND_LIQUIDITY_` prefix,
+by the name in the table above (the tail of its config key), and
+case-insensitively — so the liquidity goal answers to `liquidity_goal_sat`,
+`goal_sat` and `INBOUND_LIQUIDITY_GOAL_SAT` alike. Values are checked against
+the setting's declared type (booleans take `true/false/yes/no/on/off/1/0`).
+Each returns the wallet's settings as they read afterwards. The commands need
+the wallet open (they go through the running daemon), which is also how a
+change takes effect at once.
 
 **Three exceptions**, where what the setting controls is one thing per *process*
 rather than one per wallet — Python's logging configuration, and Electrum's
