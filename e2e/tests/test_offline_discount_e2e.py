@@ -14,13 +14,15 @@ Scenario (driven only by the live plugin's own event loop and the real
   * PARTNER is then killed. Three channels now have a dead peer, but only ONE of
     them was opened by the plugin, and only that one is discounted -- the
     decision log's own ``effective_channels`` is asserted to drop by exactly one.
+    The evidence is the OFFLINE STREAK: offline auto-close is switched off for
+    this test, so the watchdog's close intent cannot be what frees the slot.
   * That freed slot is spent on a replacement, which must go to PARTNER2: the
     dead peer is excluded from partner selection even though
     ``one_channel_per_peer`` is off, because re-opening to a node that has gone
     dark would buy nothing.
-  * The dead channel is still OPEN while this happens (the force-close horizon is
-    set days out), which is the whole point: the wallet does not have to wait out
-    the auto-close to regain its ability to receive.
+  * The dead channel is still OPEN while this happens -- with auto-close off
+    nothing will ever close it -- which is the whole point: the wallet does not
+    have to wait out the auto-close to regain its ability to receive.
   * Finally the ``offline_open_allowance`` cap is asserted: the wallet settles at
     ``max_channels + 1`` channels and the next open is declined naming the
     allowance, rather than opening one replacement per dead channel.
@@ -28,12 +30,11 @@ Scenario (driven only by the live plugin's own event loop and the real
 Two things are NOT covered here, deliberately, and both are covered by the unit
 suites instead:
 
-  * the discount's second prong (peer offline now AND >= 2 recorded offline
-    faults). Offline faults are rate-limited to one per peer per 24h, so
-    reaching two takes two days of wall clock -- untestable in a rig run. Pinned
-    in ``tests/test_offline_channel_discount.py`` (the rule) and
-    ``tests/test_offline_discount_glue.py`` (the tally, its rate limit and its
-    reset when the peer comes back).
+  * the discount's other prong, the auto-close watchdog's close intent. It waits
+    on a sustained uptime RATIO under the floor, which cannot cross until the
+    outage has crowded out ~90% of the trailing window -- hours of rig time even
+    at a shrunken window, and it is switched off here precisely so the streak is
+    provably what acts. Pinned in ``tests/test_offline_channel_discount.py``.
   * the ALLOWANCE branch of the open decline. This topology discounts exactly
     one channel, so once its replacement is open the effective count is back at
     ``max_channels`` and the ceiling is what binds; the allowance only becomes
@@ -85,11 +86,9 @@ BASELINE_CHANNELS = 3
 MAX_CHANNELS = BASELINE_CHANNELS + 1
 # ...and how far the discount may push past it.
 OFFLINE_OPEN_ALLOWANCE = 1
-# Tiny uptime window (~130s) so a killed peer is committed to closing in minutes,
-# but a force-close horizon DAYS out so the dead channel is still OPEN while the
-# replacement is opened -- that is exactly what this test is about.
-UPTIME_WINDOW_DAYS = 130.0 / 86400.0
-FORCE_CLOSE_DAYS = 5.0
+# Treat a peer as gone after 90s instead of the shipped 4h, so the streak crosses
+# inside a rig run. Expressed in HOURS, as the setting is.
+DISCOUNT_AFTER_HOURS = 90.0 / 3600.0
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
 
@@ -152,9 +151,16 @@ def _plugin_opened() -> List[str]:
     return raw if isinstance(raw, list) else []
 
 
-def _close_intents() -> Dict:
-    raw = _wallet_db().get("inbound_liquidity_close_intent", {})
+def _offline_streaks() -> Dict:
+    raw = _wallet_db().get("inbound_liquidity_offline_streak", {})
     return raw if isinstance(raw, dict) else {}
+
+
+def _streak_sec(cid: str) -> float:
+    try:
+        return float((_offline_streaks().get(cid) or {}).get("offline_sec", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _decision_log() -> List[Dict]:
@@ -263,15 +269,13 @@ def test_offline_channel_frees_a_slot_for_a_replacement(rig):
     _setcfg("plugins.inbound_liquidity.swap_trigger_sat", "9999999999")
     _setcfg("plugins.inbound_liquidity.swap_trigger_pct", "100")
     _setcfg("plugins.inbound_liquidity.liquidity_goal_sat", "0")
-    # Auto-close ON (its close intent is the discount's evidence) but with the
-    # force-close horizon days out, so the dead channel stays OPEN for the whole
-    # test and the replacement is demonstrably opened ALONGSIDE it.
-    _setcfg("plugins.inbound_liquidity.offline_autoclose_enabled", "true")
-    _setcfg_float("plugins.inbound_liquidity.offline_uptime_window_days",
-                  UPTIME_WINDOW_DAYS)
-    _setcfg("plugins.inbound_liquidity.offline_min_uptime_pct", "10")
-    _setcfg_float("plugins.inbound_liquidity.offline_force_close_days",
-                  FORCE_CLOSE_DAYS)
+    # Auto-close OFF, deliberately. It is the discount's OTHER prong, so leaving
+    # it on would make this test unable to say which prong freed the slot -- and
+    # with it off nothing will ever close the dead channel, so "the replacement
+    # was opened alongside a channel that still exists" is unambiguous.
+    _setcfg("plugins.inbound_liquidity.offline_autoclose_enabled", "false")
+    _setcfg_float("plugins.inbound_liquidity.offline_discount_after_hours",
+                  DISCOUNT_AFTER_HOURS)
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
 
     # --- the plugin fills the last slot ----------------------------------
@@ -297,10 +301,14 @@ def test_offline_channel_frees_a_slot_for_a_replacement(rig):
     # --- the peer dies ----------------------------------------------------
     stop_daemon(PARTNER)
 
-    # The watchdog commits to closing the plugin channel (uptime below the
-    # floor). That intent is the discount's evidence.
-    assert _wait_until(lambda: plugin_cid in _close_intents(), rig=rig, timeout=300), \
-        "watchdog never committed a close intent for the offline plugin channel"
+    # The offline streak accrues past the threshold. That streak -- not a close
+    # intent, which is switched off -- is the discount's evidence here.
+    assert _wait_until(
+        lambda: _streak_sec(plugin_cid) >= DISCOUNT_AFTER_HOURS * 3600.0,
+        rig=rig, timeout=300), (
+        "the offline streak never crossed the threshold; "
+        f"got {_streak_sec(plugin_cid)}s of "
+        f"{DISCOUNT_AFTER_HOURS * 3600.0}s")
 
     # --- the freed slot is spent on a replacement, to the LIVE peer -------
     assert _wait_until(lambda: _live_channels() >= MAX_CHANNELS + 1,
@@ -315,7 +323,7 @@ def test_offline_channel_frees_a_slot_for_a_replacement(rig):
     # The dead channel is still open: this was an extra channel alongside it, not
     # a slot that the auto-close had already given back.
     assert _state_of(plugin_cid) not in CLOSING_STATES, \
-        "the dead channel should still be OPEN (force-close horizon is days out)"
+        "the dead channel should still be OPEN (auto-close is off for this test)"
 
     # --- SCOPE: only the plugin's dead channel is discounted --------------
     # Three channels have a dead peer by now (the two baseline ones plus the

@@ -3,11 +3,12 @@
 The rule: a PLUGIN-OPENED channel whose peer has gone dark stops occupying a
 channel slot, so the plugin may open a replacement without waiting out the
 auto-close watchdog's force-close horizon (and a CSV timelock after it). The
-evidence is either the watchdog's own close intent, or the peer being offline now
-with at least ``OFFLINE_DISCOUNT_MIN_FAULTS`` recorded offline faults. The
-resulting overshoot is capped by ``offline_open_allowance``.
+evidence is either a contiguous run of OBSERVED offline time past
+``offline_discount_after_sec``, or the watchdog's own close intent. The resulting
+overshoot is capped by ``offline_open_allowance``.
 
-Exercised here: the predicate (every prong and every guard against it), the
+Exercised here: the offline-streak accumulator (accrual, the sample-gap cap, the
+reset on recovery), the predicate (every prong and every guard against it), the
 effective count, the shared ``has_room_for_another_channel`` bound, and the fact
 that all THREE rules that ask about room -- the open rule, the liquidity goal and
 the undersized-channel replacement rule -- agree with it. Pure engine: no
@@ -25,8 +26,8 @@ from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
     DeclineRecord,
     LiquidityConfig,
     LiquiditySnapshot,
-    OFFLINE_DISCOUNT_MIN_FAULTS,
     OpenChannelAction,
+    UPTIME_MAX_SAMPLE_GAP_SEC,
     channel_is_offline_discounted,
     discounted_channel_count,
     effective_channel_count,
@@ -34,12 +35,17 @@ from liquidity_manager import (  # type: ignore  (added to sys.path by conftest)
     has_room_for_another_channel,
     liquidity_goal_met,
     offline_discount_applies,
+    offline_streak_sec,
+    record_offline_streak,
 )
 
 GOAL = 500_000
 # Enough on-chain to fund a channel at the goal plus the reserve, so neither the
 # funding floor nor the min-to-open gate is ever the thing under test.
 RICH_ONCHAIN = GOAL + 10_000
+HOUR = 3600.0
+# The shipped threshold, in seconds.
+DISCOUNT_AFTER = 4 * HOUR
 
 
 def make_config(**overrides) -> LiquidityConfig:
@@ -51,12 +57,16 @@ def make_config(**overrides) -> LiquidityConfig:
         max_swap_fee_pct=0.9,
         swap_trigger_pct=25.0,
         swap_trigger_sat=25_000,
-        # The shipped default; the dataclass default is 0 (= feature off) so that
-        # every pre-existing pure test keeps its original behaviour.
+        # The shipped defaults. Both dataclass defaults are 0 (= feature off) so
+        # that every pre-existing pure test keeps its original behaviour.
         offline_open_allowance=1,
+        offline_discount_after_sec=DISCOUNT_AFTER,
     )
     base.update(overrides)
     return LiquidityConfig(**base)
+
+
+CFG = make_config()
 
 
 def make_channel(**overrides) -> ChannelSnapshot:
@@ -77,9 +87,9 @@ def make_channel(**overrides) -> ChannelSnapshot:
 
 
 def dead_channel(**overrides) -> ChannelSnapshot:
-    """A plugin-opened channel whose peer is gone with enough offline faults to
-    be discounted via the fault prong."""
-    base = dict(is_active=False, offline_fault_count=OFFLINE_DISCOUNT_MIN_FAULTS)
+    """A plugin-opened channel whose peer has been gone long enough to be
+    discounted via the streak prong."""
+    base = dict(is_active=False, offline_streak_sec=DISCOUNT_AFTER)
     base.update(overrides)
     return make_channel(**base)
 
@@ -108,32 +118,111 @@ def open_declines(result) -> List[DeclineRecord]:
     return [d for d in result.declines if d.kind == "open"]
 
 
+# --- the offline-streak accumulator ---------------------------------------
+def test_first_offline_sample_accrues_nothing() -> None:
+    # We have no idea how long the peer had already been gone before we first
+    # looked, so the clock must start now rather than in the past.
+    acc = record_offline_streak(None, now=1000.0, online=False)
+    assert offline_streak_sec(acc) == 0.0
+    assert acc["last_ts"] == 1000.0
+
+
+def test_streak_accrues_between_samples() -> None:
+    acc = record_offline_streak(None, now=0.0, online=False)
+    acc = record_offline_streak(acc, now=600.0, online=False)
+    acc = record_offline_streak(acc, now=1200.0, online=False)
+    assert offline_streak_sec(acc) == 1200.0
+
+
+def test_streak_sample_gap_is_capped() -> None:
+    # A long gap is OUR downtime (wallet shut, network down), not the peer's
+    # absence, so only the cap is credited -- the same protection the uptime
+    # ratio has. This is what stops a wallet closed over a weekend from waking up
+    # convinced every peer has been gone for days.
+    acc = record_offline_streak(None, now=0.0, online=False)
+    acc = record_offline_streak(acc, now=10 * HOUR, online=False)
+    assert offline_streak_sec(acc) == UPTIME_MAX_SAMPLE_GAP_SEC
+
+
+def test_online_sample_ends_the_streak() -> None:
+    acc = record_offline_streak(None, now=0.0, online=False)
+    acc = record_offline_streak(acc, now=600.0, online=False)
+    assert record_offline_streak(acc, now=1200.0, online=True) is None
+
+
+def test_streak_restarts_from_zero_after_recovery() -> None:
+    # Not resumed: a peer that came back and dropped out again has to earn the
+    # whole threshold afresh, so flapping never accumulates its way past it.
+    acc = record_offline_streak(None, now=0.0, online=False)
+    acc = record_offline_streak(acc, now=3 * HOUR, online=False)
+    acc = record_offline_streak(acc, now=3 * HOUR + 1, online=True)
+    assert acc is None
+    acc = record_offline_streak(acc, now=4 * HOUR, online=False)
+    assert offline_streak_sec(acc) == 0.0
+
+
+def test_streak_survives_hand_edited_garbage() -> None:
+    assert offline_streak_sec({"offline_sec": "not-a-number"}) == 0.0
+    assert offline_streak_sec(None) == 0.0
+    assert offline_streak_sec({}) == 0.0
+    acc = record_offline_streak({"offline_sec": "x", "last_ts": "y"},
+                                now=100.0, online=False)
+    assert offline_streak_sec(acc) == 0.0
+
+
+def test_streak_ignores_a_clock_that_went_backwards() -> None:
+    acc = record_offline_streak(None, now=1000.0, online=False)
+    acc = record_offline_streak(acc, now=500.0, online=False)
+    assert offline_streak_sec(acc) == 0.0
+
+
 # --- the predicate: what earns a discount ---------------------------------
 def test_healthy_channel_is_never_discounted() -> None:
-    assert not channel_is_offline_discounted(make_channel())
+    assert not channel_is_offline_discounted(make_channel(), CFG)
 
 
-def test_offline_with_enough_faults_is_discounted() -> None:
-    assert channel_is_offline_discounted(dead_channel())
+def test_offline_past_the_threshold_is_discounted() -> None:
+    assert channel_is_offline_discounted(dead_channel(), CFG)
 
 
-def test_one_offline_fault_is_not_enough() -> None:
-    # "More than one fault" -- a single 24h outage is a blip, not a dead peer.
+def test_offline_below_the_threshold_is_not_enough() -> None:
+    # A peer restart, a node upgrade, an hour of ISP trouble: all of these must
+    # ride out without costing a replacement channel.
     assert not channel_is_offline_discounted(
-        make_channel(is_active=False, offline_fault_count=1))
-
-
-def test_faults_without_being_offline_now_is_not_enough() -> None:
-    # History alone never discounts: the peer is answering us right now, so
-    # whatever it did last week, its channel is working.
+        make_channel(is_active=False, offline_streak_sec=DISCOUNT_AFTER - 1), CFG)
     assert not channel_is_offline_discounted(
-        make_channel(is_active=True, offline_fault_count=50))
+        make_channel(is_active=False, offline_streak_sec=HOUR), CFG)
+
+
+def test_streak_without_being_offline_now_is_not_enough() -> None:
+    # The streak is only as fresh as the last sample. A peer that has answered
+    # since must not be discounted on a stale clock.
+    assert not channel_is_offline_discounted(
+        make_channel(is_active=True, offline_streak_sec=10 * DISCOUNT_AFTER), CFG)
+
+
+def test_zero_threshold_disables_the_streak_prong() -> None:
+    cfg = make_config(offline_discount_after_sec=0.0)
+    assert not channel_is_offline_discounted(dead_channel(), cfg)
+    # ...but the close intent still counts.
+    assert channel_is_offline_discounted(
+        make_channel(is_active=False, close_intent=True), cfg)
+
+
+def test_a_longer_threshold_is_honoured() -> None:
+    cfg = make_config(offline_discount_after_sec=12 * HOUR)
+    assert not channel_is_offline_discounted(dead_channel(), cfg)
+    assert channel_is_offline_discounted(
+        make_channel(is_active=False, offline_streak_sec=12 * HOUR), cfg)
 
 
 def test_close_intent_alone_is_enough() -> None:
-    # The watchdog has committed on uptime evidence; no fault tally needed.
+    # The watchdog has committed on uptime-ratio evidence; no streak needed. This
+    # is the prong that catches a FLAKY peer -- one reconnecting for a moment
+    # every hour never builds a contiguous streak, but its ratio stays low.
     assert channel_is_offline_discounted(
-        make_channel(is_active=False, close_intent=True, offline_fault_count=0))
+        make_channel(is_active=False, close_intent=True, offline_streak_sec=0.0),
+        CFG)
 
 
 def test_close_intent_discounts_even_while_peer_is_momentarily_active() -> None:
@@ -141,57 +230,47 @@ def test_close_intent_discounts_even_while_peer_is_momentarily_active() -> None:
     # and the watchdog cancels its own intent when the ratio does recover -- so
     # while the intent stands, the slot is spent.
     assert channel_is_offline_discounted(
-        make_channel(is_active=True, close_intent=True))
+        make_channel(is_active=True, close_intent=True), CFG)
 
 
 def test_user_opened_channel_is_never_discounted() -> None:
     # The plugin never closes a hand-opened channel, so discounting one would put
     # the wallet permanently over its ceiling.
     assert not channel_is_offline_discounted(
-        dead_channel(is_plugin_opened=False))
+        dead_channel(is_plugin_opened=False), CFG)
     assert not channel_is_offline_discounted(
-        make_channel(is_plugin_opened=False, close_intent=True, is_active=False))
+        make_channel(is_plugin_opened=False, close_intent=True, is_active=False),
+        CFG)
 
 
 def test_pending_channel_is_never_discounted() -> None:
-    # THE regression guard: a pre-OPEN channel reads inactive by construction,
-    # and its peer may carry offline faults from an earlier channel. Without the
-    # pending exclusion every in-flight open would discount itself and the plugin
-    # would open channels in a loop.
+    # THE regression guard: a pre-OPEN channel reads inactive by construction.
+    # Without the pending exclusion an in-flight open could discount itself and
+    # the plugin would open channels in a loop.
+    assert not channel_is_offline_discounted(dead_channel(is_pending=True), CFG)
     assert not channel_is_offline_discounted(
-        dead_channel(is_pending=True))
-    assert not channel_is_offline_discounted(
-        make_channel(is_pending=True, is_active=False, close_intent=True))
+        make_channel(is_pending=True, is_active=False, close_intent=True), CFG)
 
 
-def test_min_faults_threshold_is_overridable() -> None:
-    chan = make_channel(is_active=False, offline_fault_count=3)
-    assert channel_is_offline_discounted(chan, min_offline_faults=3)
-    assert not channel_is_offline_discounted(chan, min_offline_faults=4)
-
-
-def test_min_faults_of_zero_still_requires_one_fault() -> None:
-    # A degenerate threshold must not discount a channel with no evidence at all.
+def test_negative_threshold_cannot_discount_anything() -> None:
+    # Only reachable from a hand-edited config.
     assert not offline_discount_applies(
         is_plugin_opened=True, is_pending=False, is_active=False,
-        close_intent=False, offline_fault_count=0, min_offline_faults=0)
-    assert offline_discount_applies(
-        is_plugin_opened=True, is_pending=False, is_active=False,
-        close_intent=False, offline_fault_count=1, min_offline_faults=0)
+        close_intent=False, offline_streak_sec=0.0, discount_after_sec=-5.0)
 
 
 # --- counting --------------------------------------------------------------
 def test_effective_count_excludes_discounted() -> None:
     snap = make_snapshot([make_channel(), dead_channel(channel_id="bb" * 32)])
     assert len(snap.channels) == 2
-    assert effective_channel_count(snap) == 1
-    assert discounted_channel_count(snap) == 1
+    assert effective_channel_count(snap, CFG) == 1
+    assert discounted_channel_count(snap, CFG) == 1
 
 
 def test_effective_count_equals_raw_count_when_nothing_is_dead() -> None:
     snap = make_snapshot([make_channel(), make_channel(channel_id="bb" * 32)])
-    assert effective_channel_count(snap) == len(snap.channels) == 2
-    assert discounted_channel_count(snap) == 0
+    assert effective_channel_count(snap, CFG) == len(snap.channels) == 2
+    assert discounted_channel_count(snap, CFG) == 0
 
 
 # --- has_room: the two bounds ---------------------------------------------
@@ -209,7 +288,7 @@ def test_allowance_caps_the_overshoot() -> None:
     # replacement is allowed -- not two.
     cfg = make_config(max_channels=2, offline_open_allowance=1)
     two_dead = [dead_channel(), dead_channel(channel_id="bb" * 32)]
-    assert effective_channel_count(make_snapshot(two_dead)) == 0
+    assert effective_channel_count(make_snapshot(two_dead), cfg) == 0
     assert has_room_for_another_channel(make_snapshot(two_dead), cfg)
     # ...and once that replacement exists, the real count is at 2 + 1.
     with_replacement = two_dead + [make_channel(channel_id="cc" * 32)]
@@ -234,8 +313,6 @@ def test_zero_allowance_turns_the_discount_off() -> None:
 
 
 def test_negative_allowance_cannot_tighten_the_ceiling() -> None:
-    # Only reachable from a hand-edited config; must not make the ceiling
-    # stricter than max_channels.
     cfg = make_config(max_channels=2, offline_open_allowance=-5)
     one = make_snapshot([make_channel()])
     assert has_room_for_another_channel(one, cfg)
@@ -279,7 +356,6 @@ def test_open_rule_names_the_allowance_when_that_is_the_binding_bound() -> None:
 
 
 def test_no_decline_logged_when_there_are_simply_no_funds() -> None:
-    # Waiting for funds is not a near miss, discount or no discount.
     cfg = make_config(max_channels=2)
     snap = make_snapshot([make_channel(), make_channel(channel_id="bb" * 32)],
                          onchain_spendable_sat=1_000)
@@ -295,11 +371,19 @@ def test_discount_does_not_bypass_the_daily_open_ceiling() -> None:
     assert any("daily open ceiling" in d.reason for d in open_declines(result))
 
 
+def test_a_brief_outage_does_not_buy_a_channel() -> None:
+    # End to end on the thing the threshold exists to prevent: an hour of absence
+    # under a 4h threshold changes nothing about what the plugin does.
+    cfg = make_config(max_channels=2)
+    blip = make_channel(channel_id="bb" * 32, is_active=False,
+                        offline_streak_sec=HOUR)
+    result = evaluate(make_snapshot([make_channel(), blip]), cfg)
+    assert not opens(result)
+    assert any("at max channels" in d.reason for d in open_declines(result))
+
+
 # --- the liquidity goal agrees with the open rule -------------------------
 def test_goal_reads_unmet_while_a_dead_channel_is_discounted() -> None:
-    # A slot has freed up, so another satoshi can still buy a channel: the
-    # build-out is not done, and (with defer_sink_until_goal on) the sink stays
-    # held back while the replacement is funded.
     cfg = make_config(max_channels=2, liquidity_goal_sat=GOAL)
     snap = make_snapshot([make_channel(), dead_channel(channel_id="bb" * 32)])
     assert not liquidity_goal_met(snap, cfg)
@@ -324,14 +408,12 @@ def test_goal_still_met_when_every_channel_is_healthy_and_at_the_goal() -> None:
 # --- the replacement rule agrees too -------------------------------------
 def test_undersized_replacement_pauses_while_a_slot_is_free() -> None:
     # The open rule has room to open alongside, so closing a healthy undersized
-    # channel to "make room" would be gratuitous -- and would spend a close on
-    # room we already have.
+    # channel to "make room" would be gratuitous.
     cfg = make_config(max_channels=2, liquidity_goal_sat=GOAL)
     undersized = make_channel(capacity_sat=100_000, remote_sat=100_000)
     snap = make_snapshot([undersized, dead_channel(channel_id="bb" * 32)])
     result = evaluate(snap, cfg)
     assert not closes(result)
-    # ...and the open the room was freed for is the action that does happen.
     assert len(opens(result)) == 1
 
 
@@ -352,8 +434,7 @@ def test_dead_channel_is_never_the_undersized_close_candidate() -> None:
                       offline_open_allowance=0)
     dead_undersized = dead_channel(capacity_sat=100_000, remote_sat=100_000)
     snap = make_snapshot([dead_undersized, make_channel(channel_id="bb" * 32)])
-    result = evaluate(snap, cfg)
-    assert not closes(result)
+    assert not closes(evaluate(snap, cfg))
 
 
 # --- no behaviour change when nothing is dead ----------------------------
@@ -364,3 +445,18 @@ def test_counting_is_unchanged_for_a_wallet_with_healthy_channels(allowance) -> 
     two = make_snapshot([make_channel(), make_channel(channel_id="bb" * 32)])
     assert has_room_for_another_channel(one, cfg)
     assert not has_room_for_another_channel(two, cfg)
+
+
+def test_shipped_defaults_are_off_in_the_dataclass() -> None:
+    # Both knobs default to 0 in the dataclass so that pure tests and
+    # non-populating callers see pre-feature behaviour; read_config always passes
+    # the user's real values.
+    bare = LiquidityConfig(
+        automation_enabled=True, min_onchain_to_open_sat=60_000,
+        onchain_reserve_sat=10_000, max_channels=2, max_swap_fee_pct=0.9,
+        swap_trigger_pct=25.0, swap_trigger_sat=25_000)
+    assert bare.offline_open_allowance == 0
+    assert bare.offline_discount_after_sec == 0.0
+    dead = make_snapshot([make_channel(), dead_channel(channel_id="bb" * 32)])
+    assert effective_channel_count(dead, bare) == 2
+    assert not has_room_for_another_channel(dead, bare)

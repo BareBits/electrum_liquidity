@@ -2701,6 +2701,13 @@ class Plugin(LiquidityPlugin):
             (_("Offline auto-close: force-close after trying to close (days)"),
              'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', float,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, val))),
+            # How long a peer must be gone before its channel stops occupying a
+            # slot. Sits immediately above the allowance, which bounds what that
+            # discount is allowed to buy.
+            (_("Treat a channel as offline after (hours, 0 = off)"),
+             'INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS',
+                                 max(0.0, float(val)))),
             # How far the offline discount may push the real channel count over
             # the maximum. 0 switches the discount off, so an offline channel
             # keeps occupying its slot as it did before the feature existed.

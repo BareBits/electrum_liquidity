@@ -346,6 +346,80 @@ def deadline_reached(marked_ts: Optional[float], now: float,
     return (now - marked_ts) >= deadline_sec
 
 
+# --- how long has this peer been gone? ------------------------------------
+# A contiguous run of OBSERVED offline time per channel, which is what the
+# channel-ceiling discount below measures "the peer is gone" with.
+#
+# Deliberately not wall-clock-since-first-offline: that would charge the peer for
+# our own downtime (a wallet closed over a weekend would come back convinced
+# every peer had been gone for days). Each sample interval is capped at
+# ``UPTIME_MAX_SAMPLE_GAP_SEC`` exactly as :func:`record_uptime_sample` caps its
+# own, so the streak only ever counts time we were actually watching.
+#
+# Deliberately not the uptime RATIO either, even though one is already
+# maintained. The ratio answers "is this peer reliable over the long run", which
+# is the right question for spending a force-close on it and the wrong one for
+# "has it been gone long enough to stop reserving a slot for it": a peer that was
+# up for days before dying keeps a healthy ratio for most of the trailing window,
+# so the ratio cannot cross its floor until the outage has crowded out ~90% of
+# the window (~43h at the shipped 2-day window). The streak crosses a few hours
+# in, and the two stay independent -- the close keeps its conservative evidence
+# while the ceiling gets a prompt one.
+#
+# Any online observation ENDS the streak: the accumulator is dropped entirely
+# (``None``), so a peer that comes back starts from nothing rather than resuming
+# a half-finished clock. An un-observed reading (network down, startup grace --
+# see ``classify_peer_observation``) leaves it exactly as it was.
+#
+# PURE: the glue reads the clock, passes ``now`` in, and persists the returned
+# accumulator as JSON in wallet.db (shape: ``{"offline_sec": float,
+# "last_ts": float}``).
+def record_offline_streak(acc: Optional[Mapping], now: float, online: bool, *,
+                         max_gap_sec: float = UPTIME_MAX_SAMPLE_GAP_SEC
+                         ) -> Optional[dict]:
+    """Fold one peer-reachability observation into the offline-streak
+    accumulator. Returns a NEW accumulator, or ``None`` when the peer is online
+    (the streak is over and the record should be forgotten).
+
+    The interval since the previous sample is added only when there IS a previous
+    sample, so the first offline observation contributes nothing: we have no idea
+    how long the peer had already been gone before we first looked, and guessing
+    would make the clock start in the past.
+    """
+    if online:
+        return None
+    offline_sec = 0.0
+    last_ts = None
+    if acc:
+        try:
+            offline_sec = max(0.0, float(acc.get("offline_sec", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            offline_sec = 0.0
+        try:
+            last_ts = float(acc["last_ts"]) if acc.get("last_ts") is not None else None
+        except (TypeError, ValueError):
+            last_ts = None
+    if last_ts is not None and now > last_ts:
+        offline_sec += min(now - last_ts, max_gap_sec)
+    return {"offline_sec": offline_sec, "last_ts": now}
+
+
+def offline_streak_sec(acc: Optional[Mapping]) -> float:
+    """Observed contiguous offline seconds in ``acc``; 0 for no record.
+
+    Reports what was accumulated up to the last sample rather than extrapolating
+    to ``now``: the next sample adds that interval itself, and a read-time
+    estimate would let the snapshot cross the threshold before the persisted
+    clock agrees.
+    """
+    if not acc:
+        return 0.0
+    try:
+        return max(0.0, float(acc.get("offline_sec", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # --- offline channels do not occupy a channel slot ------------------------
 # ``max_channels`` is a budget for channels that can actually RECEIVE, so a
 # channel whose peer has gone dark should not hold a slot hostage for the days
@@ -357,35 +431,42 @@ def deadline_reached(marked_ts: Optional[float], now: float,
 # The evidence is deliberately two-pronged, because the two prongs fail in
 # opposite directions:
 #
-#   * a CLOSE INTENT from the offline auto-close watchdog -- the strongest
-#     evidence there is (a sustained uptime ratio under the floor, with a
-#     confidence gate), and it self-cancels the moment the peer recovers. But it
-#     only exists when offline auto-close is enabled.
-#   * ``offline_fault_count`` >= OFFLINE_DISCOUNT_MIN_FAULTS *and* the peer is
-#     offline right now. The glue records at most one "peer offline" fault per
-#     peer per 24h and clears the tally when the peer is next seen online, so
-#     two faults means roughly two days of being gone rather than a blip. This
-#     prong keeps working with auto-close turned off.
+#   * the peer has been observed OFFLINE, contiguously, for at least
+#     ``offline_discount_after_sec`` (see :func:`record_offline_streak`). This is
+#     the prompt one -- a few hours by default -- and it works whether or not
+#     offline auto-close is enabled.
+#   * a CLOSE INTENT from the offline auto-close watchdog. Slower to arrive (it
+#     waits on a sustained uptime ratio under the floor), but it is independent
+#     evidence held in a different store, and it also covers the FLAKY peer the
+#     streak cannot see: a node that reconnects for a minute every hour never
+#     builds a contiguous streak, yet its uptime ratio stays under the floor and
+#     the watchdog commits. Keeping both means neither failure mode is blind.
 #
 # Both prongs require the channel to be PLUGIN-OPENED (a channel the user opened
 # by hand is the user's business -- the plugin will never close it, so
 # discounting it would put the wallet permanently over the ceiling) and require
 # it to not be PENDING. The pending exclusion matters more than it looks: a
 # pre-OPEN channel reads ``is_active is False`` (``lnchannel.is_active`` is
-# hardcoded to ``state == OPEN``), and its peer may well carry offline faults
-# from an earlier channel -- without this guard every in-flight open would
-# discount itself and the plugin would open channels in a loop.
+# hardcoded to ``state == OPEN``), so without this guard every in-flight open
+# would discount itself and the plugin would open channels in a loop.
+#
+# NB on what is NOT a prong any more: this rule used to accept ">= 2 recorded
+# 'peer offline' faults". Those faults are rate-limited to one per peer per 24h
+# and their tally is cleared on any online observation, so two of them required
+# 24h of uninterrupted absence -- which necessarily CONTAINS a multi-hour
+# contiguous streak. The streak prong therefore subsumes it entirely at any
+# sane threshold, and a clause that can never be the deciding one is worse than
+# no clause. The fault tally itself is still recorded (it feeds the auto-ban
+# tally and the partner ranking); it just no longer decides this.
 #
 # The overshoot is bounded separately, by ``offline_open_allowance`` -- see
 # :func:`has_room_for_another_channel`.
-OFFLINE_DISCOUNT_MIN_FAULTS: int = 2
 
 
 def offline_discount_applies(*, is_plugin_opened: bool, is_pending: bool,
                              is_active: bool, close_intent: bool,
-                             offline_fault_count: int,
-                             min_offline_faults: int = OFFLINE_DISCOUNT_MIN_FAULTS
-                             ) -> bool:
+                             offline_streak_sec: float,
+                             discount_after_sec: float) -> bool:
     """Whether one channel's slot is discounted from the channel ceiling.
 
     Takes plain scalars rather than a :class:`ChannelSnapshot` so the glue can
@@ -393,6 +474,10 @@ def offline_discount_applies(*, is_plugin_opened: bool, is_pending: bool,
     replacement from being opened back to the node that went dark) without
     having to build a snapshot. :func:`channel_is_offline_discounted` is the
     snapshot-shaped wrapper.
+
+    A ``discount_after_sec`` of 0 or less disables the streak prong (the close
+    intent still applies), which is what a wallet that wants the pre-feature
+    behaviour from this half of the rule gets.
     """
     if not is_plugin_opened or is_pending:
         return False
@@ -403,36 +488,43 @@ def offline_discount_applies(*, is_plugin_opened: bool, is_pending: bool,
         # a moment does not lift its uptime ratio above the floor, and the
         # watchdog cancels its own intent the moment the ratio does recover.
         return True
-    return (not is_active) and offline_fault_count >= max(1, min_offline_faults)
+    if discount_after_sec <= 0:
+        return False
+    # ``is_active`` is re-checked rather than trusted to the streak alone: the
+    # streak is only as fresh as the last sample, so a peer that reconnected
+    # since then must not be discounted on a stale clock. (The glue drops the
+    # accumulator on the next tick; this makes the rule right in between.)
+    return (not is_active) and offline_streak_sec >= discount_after_sec
 
 
-def channel_is_offline_discounted(chan: 'ChannelSnapshot', *,
-                                  min_offline_faults: int = OFFLINE_DISCOUNT_MIN_FAULTS
-                                  ) -> bool:
+def channel_is_offline_discounted(chan: 'ChannelSnapshot',
+                                  config: 'LiquidityConfig') -> bool:
     """:func:`offline_discount_applies` for a :class:`ChannelSnapshot`."""
     return offline_discount_applies(
         is_plugin_opened=chan.is_plugin_opened,
         is_pending=chan.is_pending,
         is_active=chan.is_active,
         close_intent=chan.close_intent,
-        offline_fault_count=chan.offline_fault_count,
-        min_offline_faults=min_offline_faults,
+        offline_streak_sec=chan.offline_streak_sec,
+        discount_after_sec=config.offline_discount_after_sec,
     )
 
 
-def effective_channel_count(snapshot: 'LiquiditySnapshot') -> int:
+def effective_channel_count(snapshot: 'LiquiditySnapshot',
+                            config: 'LiquidityConfig') -> int:
     """How many channels actually occupy a slot against ``max_channels``.
 
     Every non-closed channel, minus the offline-discounted ones. This -- never
     ``len(snapshot.channels)`` -- is what the ceiling is measured against.
     """
     return sum(1 for c in snapshot.channels
-               if not channel_is_offline_discounted(c))
+               if not channel_is_offline_discounted(c, config))
 
 
-def discounted_channel_count(snapshot: 'LiquiditySnapshot') -> int:
+def discounted_channel_count(snapshot: 'LiquiditySnapshot',
+                             config: 'LiquidityConfig') -> int:
     """How many channels are currently discounted, for decline/log text."""
-    return len(snapshot.channels) - effective_channel_count(snapshot)
+    return len(snapshot.channels) - effective_channel_count(snapshot, config)
 
 
 def has_room_for_another_channel(snapshot: 'LiquiditySnapshot',
@@ -459,7 +551,7 @@ def has_room_for_another_channel(snapshot: 'LiquiditySnapshot',
     disagree with another about whether there is room -- the churn loop those
     docstrings warn about stays unrepresentable.
     """
-    if effective_channel_count(snapshot) >= config.max_channels:
+    if effective_channel_count(snapshot, config) >= config.max_channels:
         return False
     allowance = max(0, int(config.offline_open_allowance))
     return len(snapshot.channels) < config.max_channels + allowance
@@ -1144,11 +1236,12 @@ class ChannelSnapshot:
     # channel (the glue's persisted close intent). Its slot is already spent, so
     # it stops counting toward the ceiling. Defaults False.
     close_intent: bool = False
-    # How many separate "peer offline" faults this channel's PEER has to its
-    # name. The glue records at most one per peer per 24h and clears the tally
-    # when the peer is next observed online, so this counts days-gone rather than
-    # blips. Defaults 0 (no history = the channel counts in full).
-    offline_fault_count: int = 0
+    # Observed contiguous seconds this channel's peer has been offline (see
+    # :func:`record_offline_streak`). The glue samples it once per tick, caps each
+    # interval so our own downtime is not charged to the peer, and resets it to
+    # nothing the moment the peer answers again. Defaults 0.0 (no streak = the
+    # channel counts in full).
+    offline_streak_sec: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1350,6 +1443,22 @@ class LiquidityConfig:
     # only by pure tests and non-populating callers, where it preserves the
     # pre-feature behaviour they were written against (0 = discounting off).
     offline_open_allowance: int = 0
+    # How long a peer must be observed contiguously offline before its channel
+    # stops occupying a slot (see :func:`offline_discount_applies`). Seconds, so
+    # the engine never has to know the setting is expressed in hours.
+    #
+    # Shipped at a few hours: comfortably longer than a peer restart, a node
+    # upgrade or a home-connection outage, because the cost of being wrong is
+    # asymmetric. A premature discount buys a replacement channel -- a funding
+    # fee -- and if the peer then comes back, the wallet sits above its ceiling
+    # with an extra channel NO rule will close (the replacement rule only acts on
+    # an undersized channel, and a healthy one at the goal is not that). The
+    # close intent, by contrast, cancels itself on recovery; an open cannot be
+    # un-opened.
+    #
+    # Same dataclass-vs-shipped split as above: 0 here disables the streak prong,
+    # so pure tests and non-populating callers keep prior behaviour.
+    offline_discount_after_sec: float = 0.0
     # Provider selection over the nostr-discovered offers:
     #   * preferred_npubs -- if non-empty, ONLY these providers are ever used
     #     (a strict whitelist; if none are currently available, no swap is made).
@@ -2187,7 +2296,7 @@ def _decide_channel_open(
     if not has_room_for_another_channel(snapshot, config):
         if snapshot.onchain_spendable_sat < config.min_onchain_to_open_sat:
             return None, None
-        effective = effective_channel_count(snapshot)
+        effective = effective_channel_count(snapshot, config)
         discounted = len(snapshot.channels) - effective
         if effective >= config.max_channels:
             reason = (
@@ -2278,10 +2387,10 @@ def _decide_channel_open(
             reason=(
                 f"on-chain spendable {snapshot.onchain_spendable_sat} >= "
                 f"min {config.min_onchain_to_open_sat} and "
-                f"{effective_channel_count(snapshot)} < {config.max_channels} channels"
-                + (f" ({discounted_channel_count(snapshot)} offline channel(s) "
+                f"{effective_channel_count(snapshot, config)} < {config.max_channels} channels"
+                + (f" ({discounted_channel_count(snapshot, config)} offline channel(s) "
                    f"discounted from the count)"
-                   if discounted_channel_count(snapshot) else "")
+                   if discounted_channel_count(snapshot, config) else "")
                 + (f"; funding capped at the {cap} sat max channel size"
                    if capped else "")
             ),
@@ -2626,7 +2735,7 @@ def _decide_undersized_closes(
         return None, [DeclineRecord(
             kind="close",
             amount_sat=funding_sat,
-            reason=(f"at max channels ({effective_channel_count(snapshot)}) with "
+            reason=(f"at max channels ({effective_channel_count(snapshot, config)}) with "
                     f"funds to reach the {config.liquidity_goal_sat} sat liquidity "
                     f"goal, but no undersized channel can be replaced right now"),
             detail="; ".join([f"{funding_sat} sat available to fund a replacement"]

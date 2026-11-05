@@ -103,7 +103,9 @@ from .liquidity_manager import (
     liquidity_goal_met,
     normalize_node_id,
     offline_discount_applies,
+    offline_streak_sec,
     order_channel_partners,
+    record_offline_streak,
     record_uptime_sample,
     record_wedge_strike,
     reliability_penalty_pct,
@@ -788,13 +790,17 @@ RELIABILITY_DB_KEY = "inbound_liquidity_provider_reliability"
 # last_reason}. ``hard_fault_count`` (force-close / repeated open failure) is the
 # tally the auto-ban threshold reads; soft faults only feed the decaying penalty.
 PEER_RELIABILITY_DB_KEY = "inbound_liquidity_peer_reliability"
-# Field within a peer's reliability row: how many times this peer has been
-# observed GONE (one "peer offline" fault per 24h at most -- see the rate limit
+# Field within a peer's reliability row: how many DAYS this peer has been
+# observed gone (one "peer offline" fault per 24h at most -- see the rate limit
 # in _scan_channel_health), cleared the moment the peer is next seen online.
-# Read by the channel-ceiling discount (liquidity_manager.offline_discount_applies)
-# as its "this is a sustained outage, not a blip" evidence. Kept separate from
-# ``hard_fault_count``, which never ages or clears because it answers a different
-# question (how many times has this peer wronged us, for the auto-ban).
+#
+# Diagnostic only. It decides nothing: the channel-ceiling discount reads the
+# per-channel offline STREAK instead (CHANNEL_OFFLINE_STREAK_DB_KEY), which
+# measures the same absence in hours rather than days. What this field is for is
+# reading a wallet file and seeing at a glance how long a peer has been down.
+# Kept separate from ``hard_fault_count``, which never clears because it answers
+# a different question (how many times has this peer wronged us, for the
+# auto-ban).
 PEER_OFFLINE_FAULTS_FIELD = "offline_fault_count"
 # ...and the rate-limit stamp that goes with it.
 PEER_OFFLINE_FAULT_TS_FIELD = "last_offline_fault_ts"
@@ -1025,6 +1031,13 @@ CHANNEL_UPTIME_DB_KEY = "inbound_liquidity_channel_uptime"
 # {"marked_ts": float, "reason": str}. The "trying to close since T" clock the
 # force-close deadline is measured from; survives restarts.
 CLOSE_INTENT_DB_KEY = "inbound_liquidity_close_intent"
+# Per-channel offline streaks (see liquidity_manager.record_offline_streak):
+# channel_id(hex) -> {"offline_sec": float, "last_ts": float}. How long each
+# peer has been contiguously observed offline, which is the prompt half of the
+# channel-ceiling discount. An entry exists only while its peer is offline: the
+# first online observation drops it. Persisted so the clock survives a restart
+# (the sample-gap cap keeps the restart gap itself from counting).
+CHANNEL_OFFLINE_STREAK_DB_KEY = "inbound_liquidity_offline_streak"
 # Per-channel wedged-open strike accumulators (see
 # liquidity_manager.record_wedge_strike): channel_id(hex) ->
 # {"strikes": int, "first_ts": float, "last_ts": float}. Persisted so the strike
@@ -1061,6 +1074,17 @@ DEFAULT_OFFLINE_FORCE_CLOSE_DAYS = 7.0
 # ability to receive without risking a burst of opens when several peers go dark
 # together (or when one flaky hub many channels point at has an outage).
 DEFAULT_OFFLINE_OPEN_ALLOWANCE = 1
+# How long a peer must be observed contiguously offline before its channel stops
+# counting toward max_channels. HOURS (float, so tests can use sub-minute values).
+#
+# Four hours clears every transient absence worth tolerating -- a peer restart, a
+# node upgrade, a home connection dropping for an hour -- while still restoring
+# the wallet's ability to receive the same day. Shorter is tempting and
+# asymmetrically risky: see the note on
+# ``LiquidityConfig.offline_discount_after_sec`` for why a premature discount
+# leaves behind a channel nothing will close. 0 disables this prong, leaving the
+# auto-close watchdog's close intent as the only evidence.
+DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS = 4.0
 # Don't re-launch a cooperative close on the same channel more often than this
 # (a cooperative close is async and can take minutes; each tick would otherwise
 # pile on another attempt).
@@ -1496,6 +1520,17 @@ SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS = ConfigVar(
                         "days without success (the peer never agreed / stayed offline), it force-closes "
                         "the channel. This broadcasts a transaction, incurs a mining fee, and timelocks "
                         "your funds. Counts against the daily channel-close ceiling."))
+SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS = ConfigVar(
+    'plugins.inbound_liquidity.offline_discount_after_hours',
+    default=DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Treat a channel as offline after (hours)"),
+    long_desc=lambda: _("How long a channel's peer must be continuously unreachable before the "
+                        "channel stops counting toward the maximum number of channels, so a "
+                        "replacement can be opened without waiting for the dead one to close. Only "
+                        "time while this wallet was actually running and online counts. Keep this "
+                        "comfortably longer than a peer restart: if the peer comes back after a "
+                        "replacement was opened, the wallet is left holding an extra channel. 0 "
+                        "switches this off and leaves the auto-close watchdog as the only trigger."))
 SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE = ConfigVar(
     'plugins.inbound_liquidity.offline_open_allowance',
     default=DEFAULT_OFFLINE_OPEN_ALLOWANCE, type_=int, plugin=_PLUGIN_NAME,
@@ -3025,6 +3060,7 @@ class LiquidityPlugin(BasePlugin):
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(wallet),
             offline_open_allowance=self._offline_open_allowance(wallet),
+            offline_discount_after_sec=self._offline_discount_after_sec(wallet),
             liquidity_goal_sat=self._liquidity_goal_sat(wallet),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
@@ -3216,6 +3252,14 @@ class LiquidityPlugin(BasePlugin):
     # snapshot); the close ceiling is enforced here in the watchdog.
     def _max_opens_per_day(self, wallet: 'Abstract_Wallet') -> int:
         return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY))
+
+    def _offline_discount_after_sec(self, wallet: 'Abstract_Wallet') -> float:
+        """How long this wallet treats a peer as merely absent before its channel
+        stops occupying a slot. Hours in the setting, seconds to the engine;
+        floored at 0, which disables the streak prong."""
+        return max(0.0, float(getattr(
+            self.settings(wallet), "INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS",
+            DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS)) * 3600.0)
 
     def _offline_open_allowance(self, wallet: 'Abstract_Wallet') -> int:
         """How far over ``max_channels`` the offline discount may take this
@@ -3941,20 +3985,19 @@ class LiquidityPlugin(BasePlugin):
         """Forget a peer's offline tally because it has just been seen online.
         Returns True if anything was cleared (so the caller can log it once).
 
-        This is what keeps the channel-ceiling discount a statement about the
-        PRESENT. The tally is evidence that a peer is gone; a peer answering us
-        again refutes it, and leaving the count standing would mean a node that
-        had a bad fortnight last month gets its channel discounted the instant it
-        blips -- opening a replacement for a channel that is perfectly healthy.
+        The tally counts days this peer has been gone, so a peer answering us
+        again refutes it: left standing, the count would read as an outage still
+        in progress for the rest of the wallet's life.
+
+        Clearing the rate-limit STAMP along with it is the part that affects
+        behaviour. Without that, a peer that recovers and drops out again hours
+        later would be silenced by the previous outage's stamp and not faulted at
+        all until a full 24h had passed since the earlier fault.
 
         Note what this deliberately does NOT clear: ``hard_fault_count`` (the
         auto-ban tally, which is meant to accumulate for the life of the wallet)
         and the decaying ``consecutive_faults`` penalty, which heals on its own
-        schedule and only affects try-ORDER. A peer that flaps hard enough to
-        keep resetting this tally is caught by the other prong of the discount
-        anyway: its uptime ratio stays under the floor, so the auto-close
-        watchdog commits a close intent, and an intent is discount enough on its
-        own.
+        schedule and only affects try-ORDER.
         """
         node_id = normalize_node_id(node_id)
         if not node_id:
@@ -4511,6 +4554,8 @@ class LiquidityPlugin(BasePlugin):
         close_capped_logged = self._close_capped_logged.setdefault(wallet, set())
         strikes = self._load_json_dict(wallet, WEDGE_STRIKES_DB_KEY)
         strikes_changed = False
+        streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
+        streaks_changed = False
         first_scan = wallet not in self._known_chan_states
         known = self._known_chan_states.setdefault(wallet, {})
         try:
@@ -4518,6 +4563,9 @@ class LiquidityPlugin(BasePlugin):
         except Exception:
             return
         live_ids = set()
+        # Channels currently OPEN -- the only ones an offline streak is kept for
+        # (a pre-OPEN or closing channel has no slot to discount).
+        open_ids = set()
         for chan in channels:
             cid = chan.channel_id.hex()
             live_ids.add(cid)
@@ -4526,6 +4574,8 @@ class LiquidityPlugin(BasePlugin):
             except Exception:
                 node_id = ""
             state = chan.get_state()
+            if state == ChannelState.OPEN:
+                open_ids.add(cid)
             # Closing/closed? A remote force-close leaves us <= OPEN but with an
             # unconfirmed closing txid (mirrors get_state_for_GUI).
             remote_fc = (state <= ChannelState.OPEN
@@ -4550,12 +4600,29 @@ class LiquidityPlugin(BasePlugin):
             # may simply not have been dialed yet (startup grace) or the network
             # is down (shutdown), so a healthy peer is never faulted for our own
             # transitional state; only a genuine offline (False) faults.
-            # An observed-ONLINE reading clears the offline tally, which is what
-            # lets a recovered peer's channel occupy its slot again (see
-            # _clear_peer_offline_faults). Only a definite reading moves
-            # anything: None (not observed) leaves the tally exactly as it was.
+            # This is the ONE place a peer-reachability observation is folded
+            # into the offline streak the channel-ceiling discount reads -- the
+            # autoclose watchdog observes the same peers a moment later in the
+            # same tick, and sampling the streak there as well would stamp
+            # ``last_ts`` twice per tick.
+            #
+            # An observed-ONLINE reading both ends the streak and clears the
+            # offline fault tally, which is what lets a recovered peer's channel
+            # occupy its slot again. Only a definite reading moves anything: None
+            # (not observed -- network down, or inside the startup grace) leaves
+            # both exactly as they were, so our own downtime neither accrues
+            # against the peer nor forgives it.
             if state == ChannelState.OPEN:
                 observed = self._observe_peer(wallet, chan, now)
+                if observed is not None:
+                    updated = record_offline_streak(
+                        streaks.get(cid), now, observed)
+                    if updated is None:
+                        if streaks.pop(cid, None) is not None:
+                            streaks_changed = True
+                    elif updated != streaks.get(cid):
+                        streaks[cid] = updated
+                        streaks_changed = True
                 if observed is False:
                     self._record_peer_fault(
                         wallet, node_id, "peer offline", hard=True,
@@ -4617,6 +4684,14 @@ class LiquidityPlugin(BasePlugin):
             strikes_changed = True
         if strikes_changed:
             self._save_json(wallet, WEDGE_STRIKES_DB_KEY, strikes)
+        # Same for the offline streaks, plus any channel that has left OPEN: once
+        # it is closing there is no slot left to discount, and keeping the clock
+        # running would let a reused channel id inherit a stale streak.
+        for gone in [c for c in streaks if c not in open_ids]:
+            del streaks[gone]
+            streaks_changed = True
+        if streaks_changed:
+            self._save_json(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY, streaks)
 
     # --- offline-channel auto-close --------------------------------------
     # Applies ONLY to channels the plugin opened (see PLUGIN_OPENED_CHANNELS_DB_KEY).
@@ -5482,7 +5557,7 @@ class LiquidityPlugin(BasePlugin):
         # liquidity_manager.offline_discount_applies), read ONCE per snapshot
         # rather than per channel: both are whole-wallet JSON blobs.
         close_intents = self._load_json_dict(wallet, CLOSE_INTENT_DB_KEY)
-        peer_rel = self._load_peer_reliability(wallet)
+        offline_streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
         for chan in lnworker.channels.values():
             # Skip dead channels. Electrum keeps CLOSED/REDEEMED channel records
             # in ``lnworker.channels`` indefinitely (they are only dropped when the
@@ -5535,19 +5610,10 @@ class LiquidityPlugin(BasePlugin):
             # stops the engine from mislabelling our just-issued swap as a "possible
             # stuck payment" while its on-chain funding confirms.
             unsettled_is_swap = has_unsettled and self._chan_unsettled_is_swap(chan, sm)
-            # Offline-discount inputs. Read defensively -- a channel whose
-            # node_id accessor raises simply carries no offline history, which
-            # leaves it counting toward the ceiling in full (the safe direction:
-            # it cannot manufacture a channel open).
+            # Offline-discount inputs. A channel with no streak record simply
+            # carries 0, which leaves it counting toward the ceiling in full --
+            # the safe direction, since it cannot manufacture a channel open.
             cid_hex = chan.channel_id.hex()
-            try:
-                peer_stats = peer_rel.get(normalize_node_id(chan.node_id.hex()), {})
-            except Exception:
-                peer_stats = {}
-            try:
-                offline_faults = int(peer_stats.get(PEER_OFFLINE_FAULTS_FIELD, 0) or 0)
-            except (TypeError, ValueError):
-                offline_faults = 0
             channels.append(ChannelSnapshot(
                 channel_id=chan.channel_id.hex(),
                 short_id=str(chan.short_channel_id) if chan.short_channel_id else chan.channel_id.hex()[:8],
@@ -5563,7 +5629,7 @@ class LiquidityPlugin(BasePlugin):
                 frozen_by_user=self._chan_frozen_by_user(chan),
                 is_pending=is_pending,
                 close_intent=cid_hex in close_intents,
-                offline_fault_count=offline_faults,
+                offline_streak_sec=offline_streak_sec(offline_streaks.get(cid_hex)),
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
@@ -5823,14 +5889,16 @@ class LiquidityPlugin(BasePlugin):
         """
         return (
             snapshot.onchain_spendable_sat,
-            # The offline-discount inputs are included: crossing the fault
-            # threshold (or the watchdog committing a close intent) is exactly
-            # the moment a channel stops occupying a slot, and the open it frees
-            # must not wait out a backoff that thinks nothing has changed.
+            # The moment a channel stops occupying a slot is included, because
+            # the open it frees must not wait out a backoff that thinks nothing
+            # has changed. Deliberately the DERIVED verdict and not the raw
+            # ``offline_streak_sec``: the streak grows on every tick while a peer
+            # is down, so including it would make this signature differ on every
+            # tick of an outage and the backoff would never engage.
             tuple((ch.channel_id, ch.capacity_sat, ch.local_sat, ch.remote_sat,
                    ch.spendable_local_sat, ch.is_active, ch.has_unsettled_htlcs,
                    ch.unsettled_is_swap, ch.is_plugin_opened, ch.is_pending,
-                   ch.close_intent, ch.offline_fault_count)
+                   ch.close_intent, channel_is_offline_discounted(ch, config))
                   for ch in snapshot.channels),
             snapshot.pending_channel_count,
             snapshot.pending_open_freeze_count,
@@ -8156,7 +8224,8 @@ class LiquidityPlugin(BasePlugin):
             return frozenset()
         plugin_opened = self._plugin_opened_channels(wallet)
         close_intents = self._load_json_dict(wallet, CLOSE_INTENT_DB_KEY)
-        peer_rel = self._load_peer_reliability(wallet)
+        streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
+        discount_after_sec = self._offline_discount_after_sec(wallet)
         pending_states = (ChannelState.PREOPENING, ChannelState.OPENING,
                           ChannelState.FUNDED)
         out: set = set()
@@ -8172,17 +8241,13 @@ class LiquidityPlugin(BasePlugin):
                 continue
             if not node_id:
                 continue
-            try:
-                faults = int((peer_rel.get(node_id) or {}).get(
-                    PEER_OFFLINE_FAULTS_FIELD, 0) or 0)
-            except (TypeError, ValueError):
-                faults = 0
             if offline_discount_applies(
                     is_plugin_opened=cid_hex in plugin_opened,
                     is_pending=state in pending_states,
                     is_active=is_active,
                     close_intent=cid_hex in close_intents,
-                    offline_fault_count=faults):
+                    offline_streak_sec=offline_streak_sec(streaks.get(cid_hex)),
+                    discount_after_sec=discount_after_sec):
                 out.add(node_id)
         return frozenset(out)
 
@@ -8382,7 +8447,7 @@ class LiquidityPlugin(BasePlugin):
             # count minus the offline-discounted ones. Dumped next to the raw
             # count because the pair is the whole answer to "I am at max
             # channels, why did it open another one?" (and its inverse).
-            "effective_channels": effective_channel_count(snapshot),
+            "effective_channels": effective_channel_count(snapshot, config),
             "pending_channel_count": snapshot.pending_channel_count,
             "pending_open_freeze_count": snapshot.pending_open_freeze_count,
             "inflight_swap_count": snapshot.inflight_swap_count,
@@ -8434,9 +8499,10 @@ class LiquidityPlugin(BasePlugin):
                     "is_active": c.is_active,
                     "is_plugin_opened": c.is_plugin_opened,
                     # Why this channel does (or does not) hold a slot, and the
-                    # evidence behind it.
-                    "offline_discounted": channel_is_offline_discounted(c),
-                    "offline_fault_count": c.offline_fault_count,
+                    # evidence behind it: how long its peer has been observed
+                    # gone, and whether the auto-close watchdog has committed.
+                    "offline_discounted": channel_is_offline_discounted(c, config),
+                    "offline_streak_sec": int(c.offline_streak_sec),
                     "close_intent": c.close_intent,
                 }
                 for c in snapshot.channels
