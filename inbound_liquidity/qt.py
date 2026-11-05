@@ -1452,6 +1452,14 @@ class Plugin(LiquidityPlugin):
         lines.append(_("channels: {} total, {} active, {} pending open").format(
             state.get("num_channels", "?"), state.get("active_channels", "?"),
             state.get("pending_channel_count", "?")))
+        # Only worth a line when it differs from the raw count, which is exactly
+        # when it explains something ("at max channels, yet it opened another").
+        effective = state.get("effective_channels")
+        total = state.get("num_channels")
+        if effective is not None and effective != total:
+            lines.append(_("counted against max_channels: {} ({} offline "
+                           "channel(s) discounted)").format(
+                effective, (total - effective) if isinstance(total, int) else "?"))
         lines.append(_("reverse swaps in flight: {}").format(state.get("inflight_swap_count", "?")))
         fee = state.get("swap_percentage_fee")
         lines.append(_("provider: fee {}%, min {} sat, max {} sat, mining {} sat, claim {} sat").format(
@@ -2693,6 +2701,20 @@ class Plugin(LiquidityPlugin):
             (_("Offline auto-close: force-close after trying to close (days)"),
              'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', float,
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS', max(0.0, val))),
+            # How long a peer must be gone before its channel stops occupying a
+            # slot. Sits immediately above the allowance, which bounds what that
+            # discount is allowed to buy.
+            (_("Treat a channel as offline after (hours, 0 = off)"),
+             'INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS', float,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS',
+                                 max(0.0, float(val)))),
+            # How far the offline discount may push the real channel count over
+            # the maximum. 0 switches the discount off, so an offline channel
+            # keeps occupying its slot as it did before the feature existed.
+            (_("Extra channels while replacing offline ones (0 = off)"),
+             'INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE', int,
+             lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE',
+                                 max(0, int(val)))),
         ]
         field_rows = []  # (edit, attr, parser, setter, label)
         for (label, attr, parser, setter) in fields:
