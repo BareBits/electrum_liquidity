@@ -346,6 +346,125 @@ def deadline_reached(marked_ts: Optional[float], now: float,
     return (now - marked_ts) >= deadline_sec
 
 
+# --- offline channels do not occupy a channel slot ------------------------
+# ``max_channels`` is a budget for channels that can actually RECEIVE, so a
+# channel whose peer has gone dark should not hold a slot hostage for the days
+# it takes the auto-close watchdog to get rid of it (up to the force-close
+# horizon, plus a CSV timelock if it ends in a force-close). Such a channel is
+# DISCOUNTED: it still exists, but it stops counting toward the ceiling, so the
+# plugin may open a replacement alongside it.
+#
+# The evidence is deliberately two-pronged, because the two prongs fail in
+# opposite directions:
+#
+#   * a CLOSE INTENT from the offline auto-close watchdog -- the strongest
+#     evidence there is (a sustained uptime ratio under the floor, with a
+#     confidence gate), and it self-cancels the moment the peer recovers. But it
+#     only exists when offline auto-close is enabled.
+#   * ``offline_fault_count`` >= OFFLINE_DISCOUNT_MIN_FAULTS *and* the peer is
+#     offline right now. The glue records at most one "peer offline" fault per
+#     peer per 24h and clears the tally when the peer is next seen online, so
+#     two faults means roughly two days of being gone rather than a blip. This
+#     prong keeps working with auto-close turned off.
+#
+# Both prongs require the channel to be PLUGIN-OPENED (a channel the user opened
+# by hand is the user's business -- the plugin will never close it, so
+# discounting it would put the wallet permanently over the ceiling) and require
+# it to not be PENDING. The pending exclusion matters more than it looks: a
+# pre-OPEN channel reads ``is_active is False`` (``lnchannel.is_active`` is
+# hardcoded to ``state == OPEN``), and its peer may well carry offline faults
+# from an earlier channel -- without this guard every in-flight open would
+# discount itself and the plugin would open channels in a loop.
+#
+# The overshoot is bounded separately, by ``offline_open_allowance`` -- see
+# :func:`has_room_for_another_channel`.
+OFFLINE_DISCOUNT_MIN_FAULTS: int = 2
+
+
+def offline_discount_applies(*, is_plugin_opened: bool, is_pending: bool,
+                             is_active: bool, close_intent: bool,
+                             offline_fault_count: int,
+                             min_offline_faults: int = OFFLINE_DISCOUNT_MIN_FAULTS
+                             ) -> bool:
+    """Whether one channel's slot is discounted from the channel ceiling.
+
+    Takes plain scalars rather than a :class:`ChannelSnapshot` so the glue can
+    ask the same question about a live Electrum channel (it does, to keep the
+    replacement from being opened back to the node that went dark) without
+    having to build a snapshot. :func:`channel_is_offline_discounted` is the
+    snapshot-shaped wrapper.
+    """
+    if not is_plugin_opened or is_pending:
+        return False
+    if close_intent:
+        # The watchdog has committed: this channel is going away whatever the
+        # peer does from here, so its slot is already spent. Deliberately NOT
+        # also requiring ``not is_active`` -- a peer that blips back online for
+        # a moment does not lift its uptime ratio above the floor, and the
+        # watchdog cancels its own intent the moment the ratio does recover.
+        return True
+    return (not is_active) and offline_fault_count >= max(1, min_offline_faults)
+
+
+def channel_is_offline_discounted(chan: 'ChannelSnapshot', *,
+                                  min_offline_faults: int = OFFLINE_DISCOUNT_MIN_FAULTS
+                                  ) -> bool:
+    """:func:`offline_discount_applies` for a :class:`ChannelSnapshot`."""
+    return offline_discount_applies(
+        is_plugin_opened=chan.is_plugin_opened,
+        is_pending=chan.is_pending,
+        is_active=chan.is_active,
+        close_intent=chan.close_intent,
+        offline_fault_count=chan.offline_fault_count,
+        min_offline_faults=min_offline_faults,
+    )
+
+
+def effective_channel_count(snapshot: 'LiquiditySnapshot') -> int:
+    """How many channels actually occupy a slot against ``max_channels``.
+
+    Every non-closed channel, minus the offline-discounted ones. This -- never
+    ``len(snapshot.channels)`` -- is what the ceiling is measured against.
+    """
+    return sum(1 for c in snapshot.channels
+               if not channel_is_offline_discounted(c))
+
+
+def discounted_channel_count(snapshot: 'LiquiditySnapshot') -> int:
+    """How many channels are currently discounted, for decline/log text."""
+    return len(snapshot.channels) - effective_channel_count(snapshot)
+
+
+def has_room_for_another_channel(snapshot: 'LiquiditySnapshot',
+                                 config: 'LiquidityConfig') -> bool:
+    """Whether one more channel could be opened right now, as far as the channel
+    ceiling is concerned (funds, the funding floor and the daily ceiling are
+    separate questions -- see :func:`_decide_channel_open`).
+
+    TWO bounds, and both have to hold:
+
+      * the EFFECTIVE count (offline-discounted channels excluded) is below
+        ``max_channels`` -- the ceiling itself; and
+      * the REAL count (every non-closed channel, discounted or not) is below
+        ``max_channels + offline_open_allowance`` -- a hard cap on how far
+        discounting may push the wallet over its own ceiling. Without it, every
+        peer going dark at once would multiply opens: two dead peers under a
+        ceiling of two would discount to zero and buy two replacements, and if
+        both peers then came back the wallet would hold four channels under a
+        ceiling of two. An allowance of 0 therefore turns discounting off
+        entirely, which is its kill switch.
+
+    This single function is what the open rule, :func:`liquidity_goal_met` and
+    :func:`_decide_undersized_closes` all consult, so none of the three can
+    disagree with another about whether there is room -- the churn loop those
+    docstrings warn about stays unrepresentable.
+    """
+    if effective_channel_count(snapshot) >= config.max_channels:
+        return False
+    allowance = max(0, int(config.offline_open_allowance))
+    return len(snapshot.channels) < config.max_channels + allowance
+
+
 # --- wedged channel-open remediation --------------------------------------
 # A channel stuck in a pre-OPEN state (PREOPENING/OPENING/FUNDED) may simply be
 # waiting for its funding tx to confirm, or its peer may have vanished mid-
@@ -1009,6 +1128,27 @@ class ChannelSnapshot:
     # so the two get different decline reasons. Meaningless unless
     # ``is_frozen_for_sending`` is set.
     frozen_by_user: bool = False
+    # --- offline-discount inputs (see offline_discount_applies) -----------
+    # Appended at the end of the dataclass deliberately: several test modules
+    # build a ChannelSnapshot positionally, and inserting a field mid-list would
+    # silently re-bind their arguments.
+    #
+    # Whether the channel's funding is broadcast/negotiated but the channel is
+    # not yet OPEN (PREOPENING/OPENING/FUNDED). Such a channel always counts
+    # toward the ceiling in full, whatever its peer looks like -- it reads
+    # inactive by construction, so discounting it would let every in-flight open
+    # discount itself. Defaults False (= "a real channel") so the pure tests and
+    # any non-populating caller keep prior behaviour.
+    is_pending: bool = False
+    # Whether the offline auto-close watchdog has COMMITTED to closing this
+    # channel (the glue's persisted close intent). Its slot is already spent, so
+    # it stops counting toward the ceiling. Defaults False.
+    close_intent: bool = False
+    # How many separate "peer offline" faults this channel's PEER has to its
+    # name. The glue records at most one per peer per 24h and clears the tally
+    # when the peer is next observed online, so this counts days-gone rather than
+    # blips. Defaults 0 (no history = the channel counts in full).
+    offline_fault_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1198,6 +1338,18 @@ class LiquidityConfig:
     # via ``LiquiditySnapshot.opens_last_24h``. The matching close ceiling is
     # enforced entirely in the glue (closes are not engine-decided actions).
     max_opens_per_day: int = 0
+    # How far the offline discount may push the wallet over ``max_channels``.
+    # A channel whose peer has gone dark stops occupying a slot (see
+    # :func:`offline_discount_applies`), but the REAL channel count is still
+    # capped at ``max_channels + offline_open_allowance`` -- so N dead peers buy
+    # at most this many replacements, not N of them.
+    #
+    # NB: the dataclass default is 0 while the SHIPPED default is 1, the same
+    # split as ``manage_plugin_opened_only`` and for the same reason:
+    # ``read_config`` always passes the user's value explicitly, so 0 is seen
+    # only by pure tests and non-populating callers, where it preserves the
+    # pre-feature behaviour they were written against (0 = discounting off).
+    offline_open_allowance: int = 0
     # Provider selection over the nostr-discovered offers:
     #   * preferred_npubs -- if non-empty, ONLY these providers are ever used
     #     (a strict whitelist; if none are currently available, no swap is made).
@@ -2023,20 +2175,46 @@ def channel_funding_sat(snapshot: LiquiditySnapshot,
 def _decide_channel_open(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
 ) -> Tuple[Optional[OpenChannelAction], Optional[DeclineRecord]]:
-    # Rule: never open more than `max_channels` (count everything not yet closed).
-    # Only a *near miss* (we had the funds to open) is worth logging as a decline.
-    if len(snapshot.channels) >= config.max_channels:
-        if snapshot.onchain_spendable_sat >= config.min_onchain_to_open_sat:
-            return None, DeclineRecord(
-                kind="open",
-                reason=(
-                    f"at max channels ({len(snapshot.channels)} >= "
-                    f"{config.max_channels}); not opening despite "
-                    f"{snapshot.onchain_spendable_sat} sat on-chain"
-                ),
-                amount_sat=snapshot.onchain_spendable_sat,
+    # Rule: never open more than `max_channels`. Channels are counted by
+    # :func:`effective_channel_count` -- everything not yet closed, except the
+    # offline-discounted ones, whose peers have gone dark and whose slots are
+    # therefore not really in use (see :func:`offline_discount_applies`). A
+    # second, absolute bound caps how far that discount may push the real channel
+    # count over the ceiling. Both live in
+    # :func:`has_room_for_another_channel`, which the goal and replacement rules
+    # consult too; the two are re-derived here only to name the right one in the
+    # decline. Only a *near miss* (we had the funds to open) is logged.
+    if not has_room_for_another_channel(snapshot, config):
+        if snapshot.onchain_spendable_sat < config.min_onchain_to_open_sat:
+            return None, None
+        effective = effective_channel_count(snapshot)
+        discounted = len(snapshot.channels) - effective
+        if effective >= config.max_channels:
+            reason = (
+                f"at max channels ({effective} >= {config.max_channels}); "
+                f"not opening despite {snapshot.onchain_spendable_sat} sat on-chain"
             )
-        return None, None
+            if discounted:
+                reason += (f" ({discounted} offline channel(s) already "
+                           f"discounted from the count)")
+        else:
+            # Room by the ceiling, but the real channel count is at
+            # ``max_channels + offline_open_allowance``. Said out loud because no
+            # amount of waiting for funds resolves it -- only the dead channels
+            # finishing their close, or a bigger allowance, will.
+            reason = (
+                f"{discounted} offline channel(s) are discounted from the "
+                f"{config.max_channels}-channel ceiling, but the wallet already "
+                f"holds {len(snapshot.channels)} channel(s) -- the limit of "
+                f"{config.max_channels} + {max(0, int(config.offline_open_allowance))} "
+                f"offline-replacement allowance; not opening despite "
+                f"{snapshot.onchain_spendable_sat} sat on-chain"
+            )
+        return None, DeclineRecord(
+            kind="open",
+            reason=reason,
+            amount_sat=snapshot.onchain_spendable_sat,
+        )
     # Rule: never open a channel with < X on-chain funds. This is just "waiting
     # for funds", not a near miss, so it is not logged as a decline.
     if snapshot.onchain_spendable_sat < config.min_onchain_to_open_sat:
@@ -2100,7 +2278,10 @@ def _decide_channel_open(
             reason=(
                 f"on-chain spendable {snapshot.onchain_spendable_sat} >= "
                 f"min {config.min_onchain_to_open_sat} and "
-                f"{len(snapshot.channels)} < {config.max_channels} channels"
+                f"{effective_channel_count(snapshot)} < {config.max_channels} channels"
+                + (f" ({discounted_channel_count(snapshot)} offline channel(s) "
+                   f"discounted from the count)"
+                   if discounted_channel_count(snapshot) else "")
                 + (f"; funding capped at the {cap} sat max channel size"
                    if capped else "")
             ),
@@ -2122,8 +2303,8 @@ def liquidity_goal_met(snapshot: LiquiditySnapshot,
     replacing one that does not -- see :func:`_decide_undersized_closes`). So the
     build-out is done exactly when neither of those moves is left:
 
-      * we hold ``max_channels`` channels -- below the ceiling, on-chain funds
-        can still open another one alongside; and
+      * there is no room for another channel -- below the ceiling, on-chain funds
+        can still open one alongside; and
       * no PLUGIN-OPENED channel is under the goal -- each of those is still
         replaceable by a bigger one, which is again what on-chain funds buy.
 
@@ -2132,16 +2313,21 @@ def liquidity_goal_met(snapshot: LiquiditySnapshot,
     closed by the plugin, so a small one would otherwise hold the gate shut
     forever with no action able to open it.
 
-    Channels are counted exactly as the open rule counts them (everything not yet
-    closed, including one whose close is settling), so the two rules cannot
-    disagree about whether there is room for another channel.
+    "Room" is :func:`has_room_for_another_channel`, exactly as the open rule asks
+    it, so the two rules cannot disagree. That also pins the interaction with the
+    offline discount in both directions: a dead peer's channel stops counting, so
+    the build-out reads UNMET again and (with ``defer_sink_until_goal`` on) the
+    sink is held back while the replacement is funded -- but once the
+    offline-replacement allowance is exhausted, no further open is possible and
+    the goal reads MET again rather than deferring the sink forever behind a
+    channel the plugin is not allowed to open.
 
     A goal of 0 disables the goal itself, and with it this gate: there is no
     build-out to wait for, so the answer is "met".
     """
     if config.liquidity_goal_sat <= 0:
         return True
-    if len(snapshot.channels) < config.max_channels:
+    if has_room_for_another_channel(snapshot, config):
         return False
     return all(c.capacity_sat >= config.liquidity_goal_sat
                for c in snapshot.channels if c.is_plugin_opened)
@@ -2306,7 +2492,12 @@ def _decide_undersized_closes(
 
       1. a liquidity goal is configured (0 = rule disabled);
       2. we are AT the channel ceiling -- below it, a bigger channel can simply
-         be opened alongside, so closing anything would be gratuitous;
+         be opened alongside, so closing anything would be gratuitous. Asked via
+         :func:`has_room_for_another_channel`, the same question the open rule
+         asks, so an offline-discounted channel cannot make the open rule think
+         there is room while this rule thinks there is not (which would close a
+         healthy channel the open rule had already decided to replace
+         alongside);
       3. what a new channel would be funded with (:func:`channel_funding_sat` --
          on-chain spendable minus the reserve, capped by ``max_channel_size_sat``)
          reaches the goal and clears the funding floor -- so the replacement is
@@ -2336,7 +2527,7 @@ def _decide_undersized_closes(
     """
     if config.liquidity_goal_sat <= 0:
         return None, []
-    if len(snapshot.channels) < config.max_channels:
+    if has_room_for_another_channel(snapshot, config):
         return None, []
     # Gate 5 is tested before gate 3 so that gate 3's declines only ever fire when
     # there is actually something to replace. Both are pure predicates on the same
@@ -2435,9 +2626,9 @@ def _decide_undersized_closes(
         return None, [DeclineRecord(
             kind="close",
             amount_sat=funding_sat,
-            reason=(f"at max channels ({len(snapshot.channels)}) with funds to "
-                    f"reach the {config.liquidity_goal_sat} sat liquidity goal, "
-                    f"but no undersized channel can be replaced right now"),
+            reason=(f"at max channels ({effective_channel_count(snapshot)}) with "
+                    f"funds to reach the {config.liquidity_goal_sat} sat liquidity "
+                    f"goal, but no undersized channel can be replaced right now"),
             detail="; ".join([f"{funding_sat} sat available to fund a replacement"]
                              + blocked),
         )]
