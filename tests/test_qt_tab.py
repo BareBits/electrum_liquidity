@@ -128,6 +128,16 @@ class _FakeConfig:
         self.INBOUND_LIQUIDITY_UPDATE_LAST_CHECK_TS = 0.0
         self.INBOUND_LIQUIDITY_UPDATE_LATEST_VERSION = ""
         self.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ""
+        self.INBOUND_LIQUIDITY_TRAMPOLINE_WARNED = False
+        # Electrum's own routing switch, which this plugin reads (but never owns)
+        # to warn about trampoline mode. Note the inverted sense: False is
+        # trampoline, True is gossip.
+        #
+        # Set to gossip here, which is NOT Electrum's shipped default, so that the
+        # trampoline banner and its one-time dialog stay out of every test that is
+        # about something else. The tests that are about them say so by flipping
+        # this (see test_trampoline_warning_qt).
+        self.LIGHTNING_USE_GOSSIP = True
 
 
 class _FakeStatusBar:

@@ -31,6 +31,28 @@ from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: igno
 )
 
 
+# Fields a row carries that are NOT a verdict about the provider: the Attempts
+# tally and its timestamp, which exist purely so the Providers tab can show how
+# often we turned to a provider at all (see _record_provider_attempt). Several
+# tests below assert that some outcome was not charged to the provider, and
+# "nothing at all was written" used to be a fine proxy for that -- it no longer
+# is, because merely trying a provider now writes this much.
+_NON_VERDICT_FIELDS = ("attempt_count", "last_attempt_ts")
+
+
+def _verdicts(plugin, wallet) -> Dict[str, Dict]:
+    """The reliability store with the display-only attempt fields stripped, i.e.
+    only what the ranking can actually read. Empty rows drop out, so a provider
+    we merely tried disappears and `== {}` again means "nobody was blamed or
+    credited"."""
+    out: Dict[str, Dict] = {}
+    for npub, stats in plugin._load_reliability(wallet).items():
+        kept = {k: v for k, v in stats.items() if k not in _NON_VERDICT_FIELDS}
+        if kept:
+            out[npub] = kept
+    return out
+
+
 class _FakeDB:
     def __init__(self) -> None:
         self._d: Dict[str, object] = {}
@@ -200,7 +222,7 @@ def test_reverse_swap_decline_is_not_a_fault() -> None:
     p, sm = _plugin(), _swap_manager(lambda **kw: _raise(**kw))
     w = _FakeWallet(sm)
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
-    assert p._load_reliability(w) == {}     # no fault recorded
+    assert _verdicts(p, w) == {}            # no fault recorded
 
 
 def test_reverse_swap_rpc_error_is_a_soft_fault() -> None:
@@ -235,7 +257,7 @@ def test_reverse_swap_unhostable_amount_is_skipped_not_a_fault() -> None:
     w = _FakeWallet(sm)
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
     assert attempted == []                   # reverse_swap never attempted
-    assert p._load_reliability(w) == {}      # provider not penalised
+    assert _verdicts(p, w) == {}             # provider not penalised
 
 
 def test_reverse_swap_internal_error_is_not_a_fault() -> None:
@@ -246,7 +268,7 @@ def test_reverse_swap_internal_error_is_not_a_fault() -> None:
     p, sm = _plugin(), _swap_manager(lambda **kw: _raise(**kw))
     w = _FakeWallet(sm)
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
-    assert p._load_reliability(w) == {}      # provider not penalised for our bug
+    assert _verdicts(p, w) == {}             # provider not penalised for our bug
 
 
 def test_reverse_swap_timeout_is_a_fault(monkeypatch) -> None:
@@ -279,7 +301,7 @@ def test_reverse_swap_no_funding_tracks_pending() -> None:
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
     pending = p._load_pending_swaps(w)
     assert "ph123" in pending and pending["ph123"]["npub"] == NPUB
-    assert NPUB not in p._load_reliability(w)        # no success yet
+    assert NPUB not in _verdicts(p, w)              # no success yet
 
 
 # --- stuck-swap reconciliation --------------------------------------------

@@ -99,6 +99,7 @@ and the shipped default for everything else. See
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
 | `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once, by dialog, the first time the plugin loads. Nothing is ever downloaded or installed | `false` |
+| `trampoline_warned` | — | Bookkeeping, not a preference: whether this wallet has been told that trampoline routing undercuts the plugin. Set once the dialog has been answered, either way, so the question is asked once per wallet and never again. See [Trampoline routing](#trampoline-routing) | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
 (bounded by what Electrum can actually *send* over the channel, minus any
@@ -758,6 +759,68 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+### Unsaved changes
+
+Four sub-tabs hold their edits until you press **Apply**: **Settings**, **Swap
+providers**, **Channel partners** and **Advanced**. That is deliberate — several
+of those fields are cross-validated against each other, and half of them move
+money — but it means a typed value and a saved value look identical on screen.
+
+So the tab says which it is. While anything on it differs from what the wallet
+has stored, **Click APPLY to save changes** appears under the status line, and
+goes away when you apply it (or when you type the old value back — undoing your
+own edit leaves nothing to save). A configuration warning already on that line
+keeps its place *above* the hint rather than being hidden by it; a stale
+*"Settings saved."* does not, because it stopped being true.
+
+Navigating away with edits outstanding asks what to do about them — both between
+these sub-tabs and when you leave the **Liquidity** tab for one of Electrum's
+own, in which case every dirty sub-tab is named, not just the one in front of
+you:
+
+- **Apply changes** runs that tab's Apply, validation included. If a value is
+  refused, you land back on the tab with the reason on screen, rather than
+  walking away believing it saved.
+- **Ignore** leaves them unsaved and leaves them **in the fields** — nothing is
+  discarded. You are not asked about that same set of pending edits again; edit
+  something further and you are.
+
+The three tabs that rebuild themselves from the wallet on ordinary events
+(channel updates, provider refreshes) no longer overwrite edits in flight: the
+live columns keep refreshing, the fields and tick-boxes you are working in do
+not move.
+
+### Trampoline routing
+
+Electrum finds Lightning routes one of two ways: download the network gossip and
+path-find locally, or hand the payment to a **trampoline** node. Trampoline is
+Electrum's default, and it is the worse half of the bargain for this plugin:
+
+- **it costs more** — the trampoline node's fee rides on top of the route's, and
+  every reverse swap and every sink payment the plugin makes pays it;
+- **it is centralised** — a handful of nodes carry the payments, and a channel
+  can only be opened to one of them at all;
+- **it blinds the plugin** — the node aliases on the **Channel partners** tab
+  come from gossip, so most peers show no name, and the peer suggestions a
+  channel open walks come from the same place.
+
+So the first time a managed wallet loads while trampoline is on, the plugin says
+so once and offers to switch: *"Yes, switch to full gossip mode (suggested)"* or
+*"No"*. Answering it either way is remembered per wallet (`trampoline_warned`),
+so you are not asked again — opening a second wallet is a second person to tell,
+and is asked separately.
+
+Saying yes does exactly what Electrum's own **Preferences** switch does: turns
+off trampoline, turns on gossip and starts the sync. The routing mode itself is
+Electrum's process-wide setting, not a per-wallet one, so it applies to every
+wallet; only the record of having asked is per wallet.
+
+Because that dialog is shown only once, a **standing banner** at the top of the
+**Settings** tab says the same thing for as long as the condition holds, with a
+**Switch to full gossip mode** button beside it. It appears if you decline, if
+you dismiss the dialog, and if you switch back to trampoline later from
+Electrum's Preferences.
+
 ### Reading the provider and partner tables
 
 Both list tabs — **Swap providers** and **Channel partners** — sort on any
@@ -781,8 +844,30 @@ peer announces over Lightning gossip, which is the same name Electrum's own
 (`lnworker.lnpeermgr.get_node_alias`). It reads `—` whenever this wallet has not
 been told a name, and with gossip off — Electrum's default — that is most peers,
 because trampoline routing downloads no node announcements. Turn gossip on and
-the names fill in. The node id is still there in the next column, and hovering
+the names fill in — see [Trampoline routing](#trampoline-routing), which offers
+to do exactly that. The node id is still there in the next column, and hovering
 the name shows both in full.
+
+The **Swap providers** tab carries two tallies side by side, which answer
+different questions and are easy to conflate:
+
+- **Attempts** — how many times the plugin *turned to* this provider for a swap.
+  Counted once per provider per cascade, so a provider retried at a smaller size
+  after a failed payment counts once, not twice; a provider that then turned out
+  to be unreachable still counts, because we did try it.
+- **Successes** — how many of those it actually delivered, i.e. produced an
+  on-chain funding output for.
+
+Both are display only — neither feeds the ranking, which reads the **Faults**
+and **Penalty %** columns instead. Together they distinguish the two states that
+used to look identical: a provider nobody has ever tried (`0 / 0`), and one
+tried repeatedly that never delivers (`0 / 7`). **Reset stats** clears them along
+with the rest of the row.
+
+The **Channel partners** table lists **peers we have seen or tried** — not a
+list of candidates to pick from. That is peers you hold a channel with *and*
+peers you only have a fault history for, which is where to look after a failed
+open. A node that is not listed at all goes in the **Preferred partners** box.
 
 An alias is chosen by the remote node, so it is treated as untrusted text:
 control characters and line breaks (which would spill a row over its neighbours)

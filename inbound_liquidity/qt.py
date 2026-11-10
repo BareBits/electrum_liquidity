@@ -22,6 +22,7 @@ from electrum.gui.qt.util import read_QIcon
 from electrum.gui.qt.amountedit import AmountEdit, BTCAmountEdit
 
 import asyncio
+import contextlib
 import html
 import logging
 import re
@@ -779,6 +780,265 @@ def _install_send_tab_warning(grid: QGridLayout,
     return refresh
 
 
+# --- unsaved changes on an Apply-gated settings tab ------------------------
+# Four of the Liquidity tab's sub-tabs (Settings, Swap providers, Channel
+# partners, Advanced) hold their edits until an Apply button is pressed. That is
+# the right design -- several of these fields are cross-validated against each
+# other, and half of them move money -- but it has the failure mode every such
+# form has: a user types a value, reads it back on screen, switches tab, and the
+# wallet never saw it. Nothing on screen distinguished "20000, saved" from
+# "20000, typed and about to be lost".
+#
+# So the three pieces below. A tab declares what its Apply-gated widgets are
+# (_DirtyTracker), the hint appears under its status label the moment any of them
+# diverges from what is stored (_StatusLine), and leaving the tab with edges
+# outstanding asks what to do about them (_UnsavedGuard, on the Plugin).
+#
+# Deliberately NOT covered: the controls that apply the instant they are touched
+# -- the Automation switch, "Manual run only", "Only manage channels the plugin
+# opened", the two liquidity-sink switches, and the Log tab's capture switches.
+# They are already saved, so showing "click APPLY" next to one of them would be
+# a lie, and asking to save it on the way out would be asking about nothing.
+_APPLY_HINT_COLOR = "#d29922"
+
+
+class _StatusLine:
+    """One settings tab's status area: the tab's own message, plus an "unsaved
+    changes" hint beneath it.
+
+    Two labels rather than one. A red validation error or configuration warning
+    and the amber hint can then be on screen together without either having to
+    hide the other, and -- since each label still carries a plain string and a
+    stylesheet colour -- without turning every caller's message into rich text
+    that would have to be escaped on the way in and parsed on the way out.
+
+    The two kinds of message are treated differently when the tab goes dirty:
+
+      * a SUCCESS ("Settings saved.") is cleared. It stopped being true the
+        moment the user typed again, and leaving it sitting above "click APPLY to
+        save changes" would put two contradictory sentences on screen.
+      * a WARNING is kept, above the hint. It describes a configuration that is
+        still in force -- "nothing can drain a channel until you set a sink" does
+        not stop being the case because there is now also something unsaved --
+        and it is the more important of the two.
+    """
+
+    HINT_TEXT = _("Click APPLY to save changes")
+
+    def __init__(self, message_label: QLabel, hint_label: QLabel) -> None:
+        self._message = message_label
+        self._hint = hint_label
+        self._sticky = False        # is the current message a warning?
+        # Tracked here rather than read back off the widget: Qt's isVisible() is
+        # "actually on screen", which is False for every widget whose window has
+        # not been shown -- so a label we have explicitly put up would report
+        # itself hidden while the tab is being built, and in any offscreen
+        # rendering of it.
+        self._showing_hint = False
+        self._hint.setStyleSheet(f"color: {_APPLY_HINT_COLOR};")
+        self._hint.setVisible(False)
+
+    def set_message(self, text: str, *, color: str = "", sticky: bool = False) -> None:
+        """Show one of the tab's own messages. ``sticky`` marks it as a warning,
+        i.e. one that survives the tab going dirty."""
+        self._message.setStyleSheet(f"color: {color};" if color else "")
+        self._message.setText(text)
+        self._sticky = bool(sticky and text)
+
+    def set_saved(self, text: str) -> None:
+        """Report a successful save: green, and cleared if the user edits again."""
+        self.set_message(text, color="green", sticky=False)
+
+    def set_error(self, text: str) -> None:
+        """Report a refused value: red, and kept if the user edits again (they are
+        about to -- the error is telling them what to change)."""
+        self.set_message(text, color="red", sticky=True)
+
+    def set_dirty(self, dirty: bool) -> None:
+        self._showing_hint = bool(dirty)
+        self._hint.setVisible(self._showing_hint)
+        if dirty and not self._sticky:
+            # Drop a stale "saved" line; keep a warning (see the class docstring).
+            self._message.setText("")
+            self._message.setStyleSheet("")
+
+    def text(self) -> str:
+        """Everything the status area currently says, hint included. The one
+        reader a test (or a screenshot caption) wants; the two labels are an
+        implementation detail of how it is painted."""
+        parts = [self._message.text()]
+        if self._showing_hint:
+            parts.append(self._hint.text())
+        return "\n".join(p for p in parts if p)
+
+
+class _DirtyTracker:
+    """Whether one Apply-gated settings tab has edits the wallet has not seen.
+
+    The tab hands over a ``snapshot`` callable returning a hashable summary of
+    every Apply-gated widget on it, and the signals that mean "one of those may
+    have changed". Dirty is then simply ``snapshot() != baseline``, where the
+    baseline is re-taken whenever the tab is known to agree with storage (after a
+    build, after a successful Apply, after a repopulate that was allowed to
+    overwrite the fields).
+
+    Comparing a snapshot against a baseline, rather than setting a flag from the
+    change signals, is what makes this honest in the cases that matter: typing a
+    character and deleting it again leaves the tab clean, and a repopulate that
+    re-renders the same stored values does not invent a change.
+
+    ``acknowledge`` records the exact snapshot the user chose to keep unsaved, so
+    that answering "Ignore" once is not re-asked on every subsequent tab switch
+    -- while any *further* edit produces a different snapshot and asks again.
+    """
+
+    def __init__(self, name: str, snapshot: Callable[[], Tuple],
+                 status: Optional[_StatusLine] = None) -> None:
+        self.name = name
+        self._snapshot = snapshot
+        # Public: the tracker is what decides when the hint goes up, so it owns
+        # this tab's status area as far as anything outside is concerned.
+        self.status = status
+        self._baseline: Tuple = ()
+        self._acked: Optional[Tuple] = None
+        self._muted = False
+        self.reset()
+
+    # --- the tab tells us when it agrees with storage -------------------
+    def reset(self) -> None:
+        """Declare the widgets to match what is stored: re-baseline, forget any
+        acknowledgement, and clear the hint."""
+        try:
+            self._baseline = self._snapshot()
+        except RuntimeError:
+            return      # the tab's widgets are gone (wallet closed mid-refresh)
+        self._acked = None
+        self._render()
+
+    @contextlib.contextmanager
+    def muted(self):
+        """Suppress re-checks for the duration of a block that rewrites widgets
+        itself (a repopulate, a reload). Without this, every ``setText`` inside
+        would fire a change signal and be measured against a baseline that the
+        same block is in the middle of replacing."""
+        before, self._muted = self._muted, True
+        try:
+            yield
+        finally:
+            self._muted = before
+
+    # --- queries --------------------------------------------------------
+    def is_dirty(self) -> bool:
+        try:
+            return self._snapshot() != self._baseline
+        except RuntimeError:
+            return False        # widgets gone; nothing to save
+        except Exception:
+            # A snapshot must never be the reason a tab or a tab switch breaks.
+            return False
+
+    def needs_prompt(self) -> bool:
+        """Dirty, and not something the user has already said to leave unsaved."""
+        if not self.is_dirty():
+            return False
+        try:
+            return self._snapshot() != self._acked
+        except Exception:
+            return False
+
+    def acknowledge(self) -> None:
+        """Remember this exact set of pending edits as one the user chose to keep
+        unsaved, so leaving the tab again does not re-ask about it."""
+        try:
+            self._acked = self._snapshot()
+        except Exception:
+            self._acked = None
+
+    # --- plumbing -------------------------------------------------------
+    def watch(self, *signals) -> None:
+        """Re-check whenever any of these signals fires."""
+        for signal in signals:
+            if signal is None:
+                continue
+            try:
+                signal.connect(self._on_changed)
+            except Exception:
+                # A widget whose signal we cannot connect simply does not drive
+                # the live hint; the snapshot comparison still catches it on the
+                # way out of the tab.
+                continue
+
+    def _on_changed(self, *_args) -> None:
+        if self._muted:
+            return
+        self._render()
+
+    def refresh_hint(self) -> None:
+        """Re-render the hint from the current snapshot. Needed after a block that
+        ran under :meth:`muted` and left the tab dirty -- the change signals that
+        would normally have driven the hint were suppressed."""
+        self._render()
+
+    def _render(self) -> None:
+        if self.status is not None:
+            self.status.set_dirty(self.is_dirty())
+
+
+class _ApplyPane:
+    """One Apply-gated sub-tab, as the unsaved-changes guard sees it: a name to
+    put in a dialog, the widget that identifies it in the QTabWidget, a tracker
+    that says whether it has pending edits, and the Apply the dialog can press on
+    the user's behalf (returning whether the save went through)."""
+
+    def __init__(self, name: str, widget: QWidget, tracker: _DirtyTracker,
+                 apply: Callable[[], bool]) -> None:
+        self.name = name
+        self.widget = widget
+        self.tracker = tracker
+        self.apply = apply
+
+
+def _ask_two_choices(window: 'ElectrumWindow', *, title: str, text: str,
+                     accept_label: str, reject_label: str) -> Optional[bool]:
+    """Ask a two-button question whose buttons are not "Yes" and "No".
+
+    Electrum's ``question()`` hard-codes those two words, and neither question
+    this plugin asks here reads as a yes/no: the answers are "Apply changes" vs
+    "Ignore", and "switch to gossip" vs "leave it alone". ``msg_box`` does take
+    custom buttons, so this wraps that.
+
+    The reject button is given Qt's RejectRole, which makes it what Escape and
+    the window's close button resolve to. That is the safe answer for both
+    callers: Escape keeps your unsaved edits (Ignore does not discard them), and
+    Escape leaves your Lightning routing exactly as you had it.
+
+    Returns True for accept, False for reject, or None if no dialog could be put
+    up at all -- which the callers treat as "do not act", never as consent.
+    """
+    from PyQt6.QtWidgets import QMessageBox, QPushButton
+    msg_box = getattr(window, "msg_box", None)
+    if msg_box is None:
+        # A window too old to have msg_box still gets asked the question, in the
+        # wrong words, rather than silently not being asked at all.
+        ask = getattr(window, "question", None)
+        if ask is None:
+            return None
+        try:
+            return bool(ask(text, title=title))
+        except Exception:
+            return None
+    accept_btn = QPushButton(accept_label)
+    reject_btn = QPushButton(reject_label)
+    try:
+        answer = msg_box(
+            QMessageBox.Icon.Question, None, title, text,
+            buttons=[(accept_btn, QMessageBox.ButtonRole.AcceptRole, 1),
+                     (reject_btn, QMessageBox.ButtonRole.RejectRole, 0)])
+    except Exception:
+        return None
+    return answer == 1
+
+
 def _wrapped_label(text: str) -> QLabel:
     """A QLabel whose (often multi-paragraph) text wraps to the panel width
     instead of being clipped at the right edge."""
@@ -820,6 +1080,8 @@ class _TabState:
         self.repopulate_partners: Callable[[], None] = lambda: None
         self.set_status: Callable[[str], None] = lambda status: None
         self.set_locked: Callable[[bool], None] = lambda locked: None
+        self.drop_unsaved_guard: Callable[[], None] = lambda: None
+        self.panes: List['_ApplyPane'] = []
         for key, value in handles.items():
             setattr(self, key, value)
 
@@ -940,6 +1202,7 @@ class Plugin(LiquidityPlugin):
             self.logger.debug("could not refresh the balance chart after load")
         self._register_closing_warning(window, wallet)
         self._maybe_prompt_update_opt_in(window, wallet)
+        self._maybe_warn_trampoline(window, wallet)
 
     def _register_closing_warning(self, window: 'ElectrumWindow',
                                   wallet: 'Abstract_Wallet') -> None:
@@ -1128,6 +1391,66 @@ class Plugin(LiquidityPlugin):
         if enable:
             # Don't make the user wait for the next heartbeat to learn the answer.
             self._request_update_check(wallet)
+
+    def _maybe_warn_trampoline(self, window: 'ElectrumWindow',
+                               wallet: 'Abstract_Wallet') -> None:
+        """Tell the user ONCE that trampoline routing undercuts this plugin, and
+        offer to switch to gossip.
+
+        Why it is worth a dialog rather than only a line of documentation: on
+        trampoline (Electrum's default) every swap and every sink payment carries
+        a trampoline node's fee on top of the route's, a channel can only be
+        opened to one of a handful of central nodes, and the node aliases this
+        plugin shows come from gossip the wallet is not downloading. A user can
+        reasonably run the plugin for weeks without discovering any of that.
+
+        Asked once per wallet and then never again, however it was answered: the
+        flag records that the conversation happened, not what was decided, so a
+        user who wants trampoline is not re-asked every time they open the wallet.
+        The standing banner on the Settings tab is what remains afterwards.
+
+        Never blocks or breaks wallet load -- a failure to show the dialog leaves
+        the flag unset, so the question is simply put again next time.
+        """
+        if wallet not in self.wallets:
+            # Not a wallet this plugin manages (no Lightning, or offline). Its
+            # routing mode is then none of our business.
+            return
+        c = self.settings(wallet)
+        if bool(getattr(c, 'INBOUND_LIQUIDITY_TRAMPOLINE_WARNED', False)):
+            return
+        if not self.trampoline_routing_active():
+            # Already on gossip. Deliberately NOT marked as warned: if they
+            # switch to trampoline later, that is the moment this is worth
+            # saying, and it should still be sayable then.
+            return
+        answer = _ask_two_choices(
+            window,
+            title=_("Trampoline routing is enabled"),
+            text=_(
+                "Warning: Trampoline routing is enabled (and gossip is "
+                "disabled). Trampoline routing is more expensive, more "
+                "centralized, and makes this plugin less useful. Turn it off and "
+                "turn on gossip?"),
+            accept_label=_("Yes, switch to full gossip mode (suggested)"),
+            reject_label=_("No"))
+        if answer is None:
+            self.logger.debug(
+                "could not show the trampoline-routing warning; will re-ask")
+            return
+        c.INBOUND_LIQUIDITY_TRAMPOLINE_WARNED = True
+        if not answer:
+            self.logger.info("user kept trampoline routing")
+            return
+        if self.switch_to_gossip_routing(wallet):
+            # The banner reads the config, so it has to be told to look again.
+            state = self._tabs.get(wallet)
+            refresh_banner = getattr(state, "refresh_trampoline_banner", None)
+            if refresh_banner is not None:
+                try:
+                    refresh_banner()
+                except Exception:
+                    self.logger.debug("could not refresh the trampoline banner")
 
     @hook
     def create_send_tab(self, grid: QGridLayout) -> None:
@@ -1421,6 +1744,15 @@ class Plugin(LiquidityPlugin):
         state = self._tabs.pop(wallet, None)
         if state is None:
             return
+        # The unsaved-changes guard is connected to the MAIN window's tab bar,
+        # which outlives this tab. Left connected, it would keep a dead tab's
+        # widgets alive and ask about them on every tab switch for the rest of the
+        # session. (The sub-tab connection needs no such care -- it dies with the
+        # QTabWidget it belongs to.)
+        try:
+            state.drop_unsaved_guard()
+        except Exception:
+            self.logger.debug("could not disconnect the unsaved-changes guard")
         try:
             i = state.window.tabs.indexOf(state.container)
             if i != -1:
@@ -1882,6 +2214,162 @@ class Plugin(LiquidityPlugin):
         return tab, _refresh_all
 
     # --- tab construction -------------------------------------------------
+    # --- unsaved-changes guard --------------------------------------------
+    def _resolve_unsaved(self, window: 'ElectrumWindow',
+                         panes: List['_ApplyPane']) -> Optional['_ApplyPane']:
+        """Ask what to do about panes holding edits, and do it.
+
+        Returns the pane whose Apply was REFUSED (so the caller can put the user
+        back in front of it, where the error message is), or None when it is fine
+        to leave -- which covers "applied cleanly", "the user chose to ignore it",
+        and "no dialog could be shown".
+
+        Nothing here discards an edit. "Ignore" means exactly that: the typed
+        values stay in the widgets, and the tracker records this particular set as
+        one the user has already answered for, so switching tabs again does not
+        re-ask. Editing further produces a different snapshot and asks again.
+        """
+        pending = [p for p in panes if p.tracker.needs_prompt()]
+        if not pending:
+            return None
+        names = ", ".join(p.name for p in pending)
+        if len(pending) == 1:
+            text = _("You have unsaved changes on the {name} tab.").format(
+                name=pending[0].name)
+        else:
+            text = _("You have unsaved changes on these tabs: {names}.").format(
+                names=names)
+        answer = _ask_two_choices(
+            window,
+            title=_("Unsaved changes"),
+            text=text + "\n\n" + _(
+                "Apply them now, or ignore them and leave them unsaved?"),
+            accept_label=_("Apply changes"),
+            reject_label=_("Ignore"))
+        if answer is None:
+            # No dialog could be put up. Letting the tab change go through is the
+            # only option that does not trap the user on this tab; the edits are
+            # still in the widgets, and the hint is still under them.
+            self.logger.debug("could not ask about unsaved changes; leaving them")
+            return None
+        if not answer:
+            for pane in pending:
+                pane.tracker.acknowledge()
+            return None
+        for pane in pending:
+            try:
+                saved = pane.apply()
+            except Exception:
+                self.logger.exception(f"could not apply the {pane.name} tab")
+                return pane
+            if not saved:
+                # A value was refused. Its own status label now says which and
+                # why, so send the user there rather than reporting it twice.
+                return pane
+        return None
+
+    def _install_unsaved_guard(self, window: 'ElectrumWindow',
+                               wallet: 'Abstract_Wallet', container: QWidget,
+                               tabs: QTabWidget,
+                               panes: List['_ApplyPane']) -> Callable[[], None]:
+        """Warn about unsaved edits when a tab carrying them is navigated away
+        from -- both between the plugin's own sub-tabs and when the whole
+        Liquidity tab is left for one of Electrum's.
+
+        Hung off ``currentChanged`` rather than filtering the click or key that
+        caused it: that signal is the one place every route into a tab converges
+        (mouse, keyboard, ``setCurrentIndex`` from our own code), and anything
+        earlier would have to be reimplemented for each. The cost is that the
+        switch has already happened by the time we ask -- which is why "Ignore"
+        keeps the edits and why only a REFUSED apply navigates back.
+
+        Returns a callable that undoes the main-window connection; the sub-tab
+        one dies with the widget.
+        """
+        # `busy` keeps our own corrective setCurrentIndex from re-entering this.
+        sub = {"index": tabs.currentIndex(), "busy": False}
+        by_widget = {p.widget: p for p in panes}
+
+        def pane_at(index: int) -> Optional['_ApplyPane']:
+            if index < 0:
+                return None
+            return by_widget.get(tabs.widget(index))
+
+        def on_sub_tab_changed(index: int) -> None:
+            prev, sub["index"] = sub["index"], index
+            if sub["busy"] or prev == index:
+                return
+            pane = pane_at(prev)
+            if pane is None:
+                return      # left a read-only tab (a log view); nothing to save
+            sub["busy"] = True
+            try:
+                refused = self._resolve_unsaved(window, [pane])
+                if refused is not None:
+                    tabs.setCurrentIndex(prev)
+                    sub["index"] = prev
+            except Exception:
+                self.logger.exception("the unsaved-changes guard failed")
+            finally:
+                sub["busy"] = False
+
+        tabs.currentChanged.connect(on_sub_tab_changed)
+
+        # --- and the same question when the Liquidity tab itself is left ---
+        main_tabs = getattr(window, "tabs", None)
+        if main_tabs is None:
+            return lambda: None
+        main = {"index": -1, "busy": False}
+
+        def on_main_tab_changed(index: int) -> None:
+            prev, main["index"] = main["index"], index
+            if main["busy"] or prev == index:
+                return
+            try:
+                left_us = prev >= 0 and main_tabs.widget(prev) is container
+            except RuntimeError:
+                return      # the window is going away
+            if not left_us:
+                return
+            # Every sub-tab is checked, not just the visible one: a user can leave
+            # edits on Advanced, switch to Settings, and then leave the plugin
+            # entirely, and all of it is about to go unsaved together.
+            main["busy"] = True
+            try:
+                refused = self._resolve_unsaved(window, panes)
+                if refused is not None:
+                    main_tabs.setCurrentIndex(prev)
+                    main["index"] = prev
+                    # ...and put the refused tab in front, since that is where the
+                    # message explaining the refusal is.
+                    #
+                    # Under the SUB-tab guard's busy flag as well: this is our own
+                    # corrective navigation, and it must not be mistaken for the
+                    # user leaving whichever sub-tab happened to be on screen.
+                    i = tabs.indexOf(refused.widget)
+                    if i != -1:
+                        sub["busy"] = True
+                        try:
+                            tabs.setCurrentIndex(i)
+                            sub["index"] = i
+                        finally:
+                            sub["busy"] = False
+            except Exception:
+                self.logger.exception("the unsaved-changes guard failed")
+            finally:
+                main["busy"] = False
+
+        main_tabs.currentChanged.connect(on_main_tab_changed)
+
+        def disconnect() -> None:
+            try:
+                main_tabs.currentChanged.disconnect(on_main_tab_changed)
+            except Exception:
+                # Already gone (window closing), which is the outcome we wanted.
+                pass
+
+        return disconnect
+
     def _build_liquidity_tab(self, window: 'ElectrumWindow', wallet: 'Abstract_Wallet'):
         """Build the top-level Liquidity tab widget and return
         ``(container, handles)`` — the handles dict becomes the :class:`_TabState`
@@ -1897,6 +2385,47 @@ class Plugin(LiquidityPlugin):
         vbox = QVBoxLayout(settings_tab)
 
         c = self.settings(wallet)
+
+        # --- trampoline-routing banner (above everything else) ------------
+        # The one-time dialog (see _maybe_warn_trampoline) is asked once per
+        # wallet and then never again, whichever way it was answered. That is what
+        # was asked for, and it leaves a gap: a user who clicked "No" -- or who
+        # dismissed the dialog, or who switched back to trampoline afterwards --
+        # has no indication that the plugin is working with one hand tied. So the
+        # standing banner, which is not a nag (no dialog, no repetition) but is
+        # always true while the condition holds, and carries the remedy next to
+        # the diagnosis exactly as the "Unlock wallet…" button does.
+        trampoline_banner = _wrapped_label(_(
+            "Trampoline routing is on and gossip is off, so this plugin is less "
+            "effective: swaps and sink payments cost more, channels can only be "
+            "opened to a few central nodes, and peer names are unavailable."))
+        trampoline_banner.setStyleSheet(f"color: {_APPLY_HINT_COLOR};")
+        trampoline_btn = QPushButton(_("Switch to full gossip mode"))
+        trampoline_btn.setToolTip(_(
+            "Turn off trampoline routing and sync the Lightning network gossip, "
+            "so routes are found locally. This is Electrum's own setting (the "
+            "same one in Preferences); it applies to every wallet, and the first "
+            "sync uses some bandwidth and disk."))
+
+        def _refresh_trampoline_banner() -> None:
+            on = self.trampoline_routing_active()
+            trampoline_banner.setVisible(on)
+            trampoline_btn.setVisible(on)
+
+        def on_switch_to_gossip() -> None:
+            if not self.switch_to_gossip_routing(wallet):
+                status.set_error(_("Could not switch on gossip routing."))
+                return
+            _refresh_trampoline_banner()
+            status.set_saved(_("Gossip routing enabled; trampoline is off."))
+
+        trampoline_btn.clicked.connect(on_switch_to_gossip)
+        trampoline_row = QHBoxLayout()
+        trampoline_row.addWidget(trampoline_btn)
+        trampoline_row.addStretch(1)
+        vbox.addWidget(trampoline_banner)
+        vbox.addLayout(trampoline_row)
+        _refresh_trampoline_banner()
 
         # --- master ENABLED/DISABLED slider -------------------------------
         # The big, obvious arm switch for all automation. It is DISABLED by
@@ -2109,6 +2638,9 @@ class Plugin(LiquidityPlugin):
         # which looks the typed values up by label -- so these two are named.
         min_onchain_label_text = _("Min on-chain to open a channel (sat)")
         max_size_label_text = _("Max channel size (sat, 0 = no limit)")
+        # Named for the same reason the three above are: the tooltip table below
+        # is keyed by label text, so any row that wants one needs a name.
+        dev_fee_label_text = _("Dev fee (%, 0–{:g}; 0 = off)").format(DEV_FEE_MAX_PCT)
         # (label, current value as text, parser, setter) for each tunable kept on
         # the main Settings tab. Power-user knobs (on-chain reserve, reliability
         # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
@@ -2141,7 +2673,7 @@ class Plugin(LiquidityPlugin):
             # Optional development fee, charged on the on-chain amount received
             # from plugin-initiated reverse swaps (clamped to 0..DEV_FEE_MAX_PCT).
             # The payout address is fixed (not user-editable) — see __init__.py.
-            (_("Dev fee (%, 0–{:g}; 0 = off)").format(DEV_FEE_MAX_PCT),
+            (dev_fee_label_text,
              str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
                                max(0.0, min(float(v), DEV_FEE_MAX_PCT)))),
@@ -2155,6 +2687,26 @@ class Plugin(LiquidityPlugin):
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
         tooltips = {
+            # Hovering the dev-fee row should answer "what is this charging me,
+            # on what, and where does it go" without sending anyone to the
+            # README. Condensed from the ConfigVar's long_desc (see __init__.py),
+            # which is the canonical wording.
+            dev_fee_label_text: _(
+                "An optional contribution to this plugin's development, taken as "
+                "a share of what the plugin drains out of a channel.\n\n"
+                "It is charged only on drains the plugin performs itself — the "
+                "on-chain amount a reverse swap returns, or the amount paid to "
+                "your liquidity sink. Your own payments are never touched, and "
+                "nothing is charged when the plugin does nothing.\n\n"
+                "The fee accrues until at least {thr} sat is owed, then is paid "
+                "automatically over Lightning to the payout address, at most "
+                "{cap} sat per rolling 24 hours. Range 0–{max:g}%; set it to 0 to "
+                "switch it off entirely.").format(
+                    thr=f"{DEV_FEE_PAYOUT_THRESHOLD_SAT:,}",
+                    cap=f"{DEV_FEE_DAILY_CAP_SAT:,}", max=DEV_FEE_MAX_PCT),
+            sink_label_text: _(
+                "Instead of doing a swap-out to obtain inbound liquidity, "
+                "utilize a liquidity sink instead"),
             max_size_label_text: _(
                 "Never fund a single channel with more than this.\n\n"
                 "The plugin opens channels with the maximum available on-chain "
@@ -2296,10 +2848,12 @@ class Plugin(LiquidityPlugin):
         def _show_sink_warning() -> None:
             warning = _sink_only_warning()
             if warning:
-                status_label.setStyleSheet("color: red;")
-                status_label.setText(warning)
+                # Sticky: a configuration that leaves nothing able to drain a
+                # channel stays on screen even once there are also unsaved edits
+                # below it (see _StatusLine).
+                status.set_error(warning)
             else:
-                status_label.setText("")
+                status.set_message("")
 
         def on_defer_sink(checked: bool) -> None:
             setattr(c, 'INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL', bool(checked))
@@ -2317,11 +2871,10 @@ class Plugin(LiquidityPlugin):
         # Live read-out of the dev-fee ledger: sats owed (accrued, not yet paid)
         # and sats paid out in the trailing 24h (against the daily cap).
         dev_fee_label = QLabel("")
-        dev_fee_label.setToolTip(_(
-            "Dev fee accrues on the on-chain amount received from reverse swaps "
-            "the plugin initiates. It is paid automatically to the payout address "
-            "once at least {thr} sat is owed, capped at {cap} sat per rolling "
-            "24 hours.").format(thr=DEV_FEE_PAYOUT_THRESHOLD_SAT, cap=DEV_FEE_DAILY_CAP_SAT))
+        # The same explanation as the dev-fee input row above: the two widgets are
+        # one section as far as a user hovering over it is concerned, and they
+        # should not have to find the right half of it to get an answer.
+        dev_fee_label.setToolTip(tooltips[dev_fee_label_text])
 
         def _refresh_dev_fee_label() -> None:
             try:
@@ -2338,11 +2891,32 @@ class Plugin(LiquidityPlugin):
         vbox.addWidget(dev_fee_label)
 
         status_label = QLabel("")
+        hint_label = QLabel(_StatusLine.HINT_TEXT)
+        status = _StatusLine(status_label, hint_label)
         vbox.addWidget(status_label)
+        vbox.addWidget(hint_label)
+
+        # --- unsaved-changes tracking --------------------------------------
+        # The goal is snapshotted as its PARSED sat amount rather than as the text
+        # in the box, because that box is re-rendered from storage whenever the
+        # user changes Electrum's base unit (see _reload_goal): 0.0002 BTC and
+        # 20000 sat are the same stored setting, and switching between the two
+        # displays is not an edit. Every other field is its text, which is exactly
+        # what Apply will parse.
+        def _settings_snapshot() -> Tuple:
+            return (tuple(edit.text() for edit, _p, _s, _l in edits),
+                    goal_e.get_amount())
+
+        dirty = _DirtyTracker(_("Settings"), _settings_snapshot, status)
+        dirty.watch(*(edit.textChanged for edit, _p, _s, _l in edits))
+        dirty.watch(goal_e.textChanged)
 
         apply_btn = primary_button(_("Apply"))
 
-        def on_apply() -> None:
+        def on_apply() -> bool:
+            """Validate and persist the form. Returns whether anything was saved,
+            so the unsaved-changes guard can tell a refused value (stay on this
+            tab and show why) from a successful save."""
             # Parse and validate everything before persisting anything.
             parsed = []
             by_label = {}    # label -> parsed value, for the cross-field checks
@@ -2351,9 +2925,8 @@ class Plugin(LiquidityPlugin):
                 try:
                     value = parser(text) if parser is not str else text
                 except ValueError:
-                    status_label.setStyleSheet("color: red;")
-                    status_label.setText(_("Invalid value for: {}").format(label))
-                    return
+                    status.set_error(_("Invalid value for: {}").format(label))
+                    return False
                 parsed.append((setter, value))
                 by_label[label] = value
                 # A sink address that cannot be resolved to an LNURL-pay target is
@@ -2363,11 +2936,10 @@ class Plugin(LiquidityPlugin):
                 # turned off.
                 if label == sink_label_text and text and \
                         self._resolve_lnurl_pay_url(text) is None:
-                    status_label.setStyleSheet("color: red;")
-                    status_label.setText(_(
+                    status.set_error(_(
                         "Not a Lightning address, LNURL or LNURL-pay URL: {}").format(
                             text[:60]))
-                    return
+                    return False
             # The goal comes from the amount widget (already in sat). An empty or
             # unparseable field is an error rather than "0": silently reading a
             # cleared box as 0 would DISABLE the feature, which is not something a
@@ -2375,9 +2947,8 @@ class Plugin(LiquidityPlugin):
             # turns it off.
             goal_amount = goal_e.get_amount()
             if goal_amount is None or int(goal_amount) < 0:
-                status_label.setStyleSheet("color: red;")
-                status_label.setText(_("Invalid value for: {}").format(goal_label_text))
-                return
+                status.set_error(_("Invalid value for: {}").format(goal_label_text))
+                return False
             parsed.append((lambda v: setattr(c, 'INBOUND_LIQUIDITY_GOAL_SAT', v),
                            int(goal_amount)))
             # --- max channel size, cross-checked against the rest of the form --
@@ -2386,10 +2957,9 @@ class Plugin(LiquidityPlugin):
             # judged on the pair they actually typed.
             max_size = int(by_label.get(max_size_label_text, 0))
             if max_size < 0:
-                status_label.setStyleSheet("color: red;")
-                status_label.setText(_("Value cannot be negative: {}").format(
+                status.set_error(_("Value cannot be negative: {}").format(
                     max_size_label_text))
-                return
+                return False
             if max_size > 0:
                 # Below the goal, every channel the plugin opened would be
                 # undersized the moment it existed. The engine declines to act on
@@ -2398,25 +2968,23 @@ class Plugin(LiquidityPlugin):
                 # user can see both numbers at once.
                 goal_sat = int(goal_amount)
                 if 0 < goal_sat and max_size < goal_sat:
-                    status_label.setStyleSheet("color: red;")
-                    status_label.setText(_(
+                    status.set_error(_(
                         "Max channel size ({size} sat) is below the liquidity goal "
                         "({goal} sat): every channel opened would immediately count "
                         "as undersized. Raise the max channel size or lower the "
                         "goal.").format(size=max_size, goal=goal_sat))
-                    return
+                    return False
                 # Below the funding floor, no channel can be opened at all. The
                 # floor tracks min-on-chain-to-open, which is also on this form, so
                 # ask what it will be once this click is applied.
                 floor = self.effective_min_funding_sat(
                     wallet, by_label.get(min_onchain_label_text))
                 if max_size < floor:
-                    status_label.setStyleSheet("color: red;")
-                    status_label.setText(_(
+                    status.set_error(_(
                         "Max channel size ({size} sat) is below the channel-funding "
                         "floor ({floor} sat): no channel could be opened at all.").format(
                             size=max_size, floor=floor))
-                    return
+                    return False
             # (Automation on/off is owned by the slider above and applied
             # immediately, so the Apply button never touches it. The feature
             # toggles and tuning knobs live on the Advanced sub-tab.)
@@ -2430,20 +2998,26 @@ class Plugin(LiquidityPlugin):
             # a lowered floor keeps matching the (new) configured value at once.
             # (The batch already did this; kept for a caller that bypasses it.)
             self._enforce_min_funding_floor()
-            self._reload_settings_fields(wallet, edits, _sync_toggle_from_config)
-            _reload_goal()
+            # Muted: both of these rewrite the very widgets the tracker is
+            # watching, and they are writing the values just persisted -- so the
+            # re-baseline below is the only verdict that should come out of it.
+            with dirty.muted():
+                self._reload_settings_fields(wallet, edits, _sync_toggle_from_config)
+                _reload_goal()
             _refresh_dev_fee_label()
+            # The form now matches the wallet, so there is nothing outstanding --
+            # including any edit the user had previously chosen to leave unsaved.
+            dirty.reset()
             # Saving a sink setting that leaves nothing able to drain a channel
             # (no sink at all, or a sink held back until the goal, with swaps
             # disabled either way) is legal but inert; say so instead of
             # reporting a bare success.
             warning = _sink_only_warning()
             if warning:
-                status_label.setStyleSheet("color: red;")
-                status_label.setText(_("Settings saved.") + " " + warning)
-                return
-            status_label.setStyleSheet("color: green;")
-            status_label.setText(_("Settings saved."))
+                status.set_error(_("Settings saved.") + " " + warning)
+                return True
+            status.set_saved(_("Settings saved."))
+            return True
 
         apply_btn.clicked.connect(on_apply)
 
@@ -2472,15 +3046,18 @@ class Plugin(LiquidityPlugin):
         tabs.addTab(settings_tab, _("Settings"))
 
         # --- Swap providers sub-tab ---------------------------------------
-        providers_tab, repopulate_providers = self._build_providers_tab(wallet)
+        providers_tab, repopulate_providers, providers_pane = \
+            self._build_providers_tab(wallet)
         tabs.addTab(providers_tab, _("Swap providers"))
 
         # --- Channel partners sub-tab -------------------------------------
-        partners_tab, repopulate_partners = self._build_channel_partners_tab(wallet)
+        partners_tab, repopulate_partners, partners_pane = \
+            self._build_channel_partners_tab(wallet)
         tabs.addTab(partners_tab, _("Channel partners"))
 
         # --- Advanced sub-tab (last config tab, before the read-only logs) -
-        advanced_tab, repopulate_advanced = self._build_advanced_tab(window, wallet)
+        advanced_tab, repopulate_advanced, advanced_pane = \
+            self._build_advanced_tab(window, wallet)
         tabs.addTab(advanced_tab, _("Advanced"))
 
         # --- Decision-log sub-tabs ----------------------------------------
@@ -2495,8 +3072,19 @@ class Plugin(LiquidityPlugin):
         log_tab, refresh_log = self._build_log_tab(wallet)
         tabs.addTab(log_tab, _("Log"))
 
+        # --- unsaved-changes guard over all four Apply-gated sub-tabs ------
+        # Every pane in one list, in tab order, so the guard below can ask "which
+        # of these has outstanding edits" without knowing anything about them.
+        panes = [
+            _ApplyPane(_("Settings"), settings_tab, dirty, on_apply),
+            providers_pane, partners_pane, advanced_pane,
+        ]
+        drop_unsaved_guard = self._install_unsaved_guard(
+            window, wallet, container, tabs, panes)
+
         def refresh() -> None:
             _sync_toggle_from_config()
+            _refresh_trampoline_banner()
             # Re-read the manual-run-only checkbox without re-firing its handler.
             manual_only_cb.blockSignals(True)
             manual_only_cb.setChecked(bool(getattr(c, 'INBOUND_LIQUIDITY_MANUAL_RUN_ONLY', False)))
@@ -2539,6 +3127,12 @@ class Plugin(LiquidityPlugin):
             "set_status": _set_tick_status,
             "set_locked": _set_locked,
             "unlock_button": unlock_btn,
+            "sub_tabs": tabs,
+            "panes": panes,
+            "drop_unsaved_guard": drop_unsaved_guard,
+            "refresh_trampoline_banner": _refresh_trampoline_banner,
+            "trampoline_banner": trampoline_banner,
+            "trampoline_button": trampoline_btn,
         }
 
     # --- advanced sub-tab -------------------------------------------------
@@ -2548,7 +3142,8 @@ class Plugin(LiquidityPlugin):
         (rolling-24h) action ceilings (a runaway guard), the power-user tuning
         knobs (on-chain reserve, reliability tuning, offline auto-close, log
         retention) moved off the main Settings tab, and the reset-to-defaults
-        button. Returns (widget, repopulate).
+        button. Returns ``(widget, repopulate, pane)`` -- the pane being this
+        tab's entry in the unsaved-changes guard (see :class:`_ApplyPane`).
 
         Takes the window because the reset asks for confirmation first, and the
         confirmation is a modal on the window that owns this tab.
@@ -2725,20 +3320,56 @@ class Plugin(LiquidityPlugin):
             row += 1
         v.addLayout(grid)
 
-        status = QLabel("")
-        v.addWidget(status)
+        status_label = QLabel("")
+        hint_label = QLabel(_StatusLine.HINT_TEXT)
+        status = _StatusLine(status_label, hint_label)
+        v.addWidget(status_label)
+        v.addWidget(hint_label)
+
+        # --- unsaved-changes tracking --------------------------------------
+        # Every widget on this tab waits for Apply, so the snapshot is simply all
+        # of them.
+        def _advanced_snapshot() -> Tuple:
+            return (tuple(cb.isChecked() for cb, _a in checkboxes),
+                    tuple(edit.text() for edit, _a, _d, _u, _k in ceiling_rows),
+                    tuple(edit.text() for edit, _a, _p, _s, _l in field_rows))
+
+        dirty = _DirtyTracker(_("Advanced"), _advanced_snapshot, status)
+        dirty.watch(*(cb.toggled for cb, _a in checkboxes))
+        dirty.watch(*(edit.textChanged for edit, _a, _d, _u, _k in ceiling_rows))
+        dirty.watch(*(edit.textChanged for edit, _a, _p, _s, _l in field_rows))
 
         def repopulate() -> None:
-            for cb, attr in checkboxes:
-                cb.setChecked(bool(getattr(c, attr)))
-            for edit, attr, default, usage, kind in ceiling_rows:
-                edit.setText(str(getattr(c, attr, default)))
-                used = self._count_actions_last_24h(wallet, kind)
-                usage.setText(_("{} in last 24h").format(used))
-            for edit, attr, parser, setter, label in field_rows:
-                edit.setText(str(getattr(c, attr)))
+            # This runs on ordinary wallet events (see the Liquidity tab's
+            # refresh), not only when the tab is opened -- so while the user has
+            # edits in flight it must not reach into the fields and overwrite
+            # them. A channel update arriving mid-sentence used to silently revert
+            # whatever was being typed here.
+            #
+            # The read-only 24h usage read-outs are refreshed either way: they
+            # report what the wallet has done, which has nothing to do with what
+            # is pending in the form.
+            keep_edits = dirty.is_dirty()
+            with dirty.muted():
+                if not keep_edits:
+                    for cb, attr in checkboxes:
+                        cb.setChecked(bool(getattr(c, attr)))
+                for edit, attr, default, usage, kind in ceiling_rows:
+                    if not keep_edits:
+                        edit.setText(str(getattr(c, attr, default)))
+                    used = self._count_actions_last_24h(wallet, kind)
+                    usage.setText(_("{} in last 24h").format(used))
+                if not keep_edits:
+                    for edit, attr, parser, setter, label in field_rows:
+                        edit.setText(str(getattr(c, attr)))
+            if not keep_edits:
+                # The fields were just re-rendered from storage, so they agree
+                # with it by construction.
+                dirty.reset()
 
-        def on_apply() -> None:
+        def on_apply() -> bool:
+            """Validate and persist this tab. Returns whether anything was saved
+            -- see the Settings tab's on_apply."""
             # Validate everything before persisting anything.
             parsed_ceilings = []
             for edit, attr, default, usage, kind in ceiling_rows:
@@ -2746,13 +3377,11 @@ class Plugin(LiquidityPlugin):
                 try:
                     value = int(text)
                 except ValueError:
-                    status.setStyleSheet("color: red;")
-                    status.setText(_("Invalid value: {}").format(text))
-                    return
+                    status.set_error(_("Invalid value: {}").format(text))
+                    return False
                 if value < 0:
-                    status.setStyleSheet("color: red;")
-                    status.setText(_("Value cannot be negative: {}").format(text))
-                    return
+                    status.set_error(_("Value cannot be negative: {}").format(text))
+                    return False
                 parsed_ceilings.append((attr, value))
             parsed_fields = []
             for edit, attr, parser, setter, label in field_rows:
@@ -2760,9 +3389,8 @@ class Plugin(LiquidityPlugin):
                 try:
                     parsed_fields.append((setter, parser(text)))
                 except ValueError:
-                    status.setStyleSheet("color: red;")
-                    status.setText(_("Invalid value for: {}").format(label))
-                    return
+                    status.set_error(_("Invalid value for: {}").format(label))
+                    return False
             # One batch for the whole form: see the note on the Settings tab's
             # Apply. This tab carries two dozen fields, so it matters most here.
             with self.settings_batch(wallet):
@@ -2772,9 +3400,13 @@ class Plugin(LiquidityPlugin):
                     setattr(c, attr, cb.isChecked())
                 for setter, value in parsed_fields:
                     setter(value)
+            # Clean by the time repopulate runs, so it re-renders every field from
+            # the clamped stored values (which is how a user sees their 999-day log
+            # retention come back as 90) and re-baselines.
+            dirty.reset()
             repopulate()
-            status.setStyleSheet("color: green;")
-            status.setText(_("Advanced settings saved."))
+            status.set_saved(_("Advanced settings saved."))
+            return True
 
         # --- back to the defaults -----------------------------------------
         # Settings are this wallet's own, which raises a question the plugin
@@ -2803,6 +3435,11 @@ class Plugin(LiquidityPlugin):
             if not confirmed:
                 return
             self.reset_settings(wallet)
+            # Cleared BEFORE the refresh below, not after: the refresh runs this
+            # tab's repopulate, which deliberately leaves the fields alone while
+            # they are dirty. The user has just asked for the defaults, so any
+            # pending edit is exactly what must NOT be preserved here.
+            dirty.reset()
             # Every field on every sub-tab is now stale, so refresh the whole
             # tab rather than this one's fields: the Settings tab's slider and
             # amount box read the same store.
@@ -2814,8 +3451,7 @@ class Plugin(LiquidityPlugin):
                     self.logger.exception("could not refresh the tab after a reset")
             else:
                 repopulate()
-            status.setStyleSheet("color: green;")
-            status.setText(_("Settings reset to the defaults."))
+            status.set_saved(_("Settings reset to the defaults."))
 
         reset_btn.clicked.connect(on_reset)
 
@@ -2829,17 +3465,31 @@ class Plugin(LiquidityPlugin):
         v.addStretch(1)
 
         repopulate()
-        return tab, repopulate
+        dirty.reset()
+        return tab, repopulate, _ApplyPane(_("Advanced"), tab, dirty, on_apply)
 
     # --- providers sub-tab ------------------------------------------------
     _PREF_COL = 6
     _BAN_COL = 7
-    _FAULTS_COL = 9
+    # Successes and Attempts answer two different questions and are easy to
+    # conflate, so they sit side by side: how many swaps this provider actually
+    # completed, and how many times we turned to it at all (once per cascade --
+    # see _record_provider_attempt). Successes <= Attempts always holds.
+    _SUCCESS_COL = 8
+    _ATTEMPTS_COL = 9
+    _FAULTS_COL = 10
+    # Named rather than written as literals at the set_sort_key calls below:
+    # inserting Attempts shifted three of these by one, and the only thing that
+    # noticed was a test asserting on column 11 by number.
+    _PENALTY_COL = 11
+    _LAST_FAULT_COL = 12
 
     def _build_providers_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Providers sub-tab: a live list of nostr-discovered swap
         providers with Preferred / Banned toggles, plus free-text npub fields for
-        providers that are not currently online. Returns (widget, repopulate_fn).
+        providers that are not currently online. Returns
+        ``(widget, repopulate_fn, pane)`` -- the pane being this tab's entry in
+        the unsaved-changes guard (see :class:`_ApplyPane`).
         """
         tab = QWidget()
         v = QVBoxLayout(tab)
@@ -2851,13 +3501,16 @@ class Plugin(LiquidityPlugin):
             "Providers that time out, error, or leave swaps stuck earn a "
             "decaying reliability penalty (added to their cost for ranking only, "
             "so a flaky provider falls behind reliable ones but is still used if "
-            "it is the only option). “Reset stats” clears a provider's history.")))
+            "it is the only option). “Reset stats” clears a provider's history.\n"
+            "“Attempts” counts the swaps we turned to a provider for; "
+            "“Successes” counts the ones it actually delivered.")))
 
         tree = QTreeWidget()
         tree.setHeaderLabels([
             _("Provider (npub)"), _("Fee %"), _("Mining (sat)"), _("Min (sat)"),
             _("Max (sat)"), _("PoW"), _("Preferred"), _("Banned"),
-            _("OK"), _("Faults"), _("Penalty %"), _("Last fault")])
+            _("Successes"), _("Attempts"), _("Faults"), _("Penalty %"),
+            _("Last fault")])
         tree.setRootIsDecorated(False)
         tree.setColumnWidth(0, 180)
         tree.setToolTip(_("Click a column header to sort by it; click the same "
@@ -2878,8 +3531,53 @@ class Plugin(LiquidityPlugin):
         grid.addWidget(ban_edit, 1, 1)
         v.addLayout(grid)
 
-        status = QLabel("")
-        v.addWidget(status)
+        status_label = QLabel("")
+        hint_label = QLabel(_StatusLine.HINT_TEXT)
+        status = _StatusLine(status_label, hint_label)
+        v.addWidget(status_label)
+        v.addWidget(hint_label)
+
+        # --- unsaved-changes tracking --------------------------------------
+        # The tab's state is the two text boxes plus which rows are ticked. Only
+        # the TICKED npubs are snapshotted, not every row: the provider list is
+        # live (nostr discovery adds and drops rows under the user), and a row
+        # appearing is not an edit the user made.
+        def _row_npubs(col: int) -> Tuple[str, ...]:
+            out = []
+            for i in range(tree.topLevelItemCount()):
+                it = tree.topLevelItem(i)
+                npub = it.data(0, Qt.ItemDataRole.UserRole)
+                if npub and it.checkState(col) == Qt.CheckState.Checked:
+                    out.append(str(npub))
+            return tuple(sorted(out))
+
+        def _listed_npubs() -> set:
+            """Every npub currently on screen, ticked or not."""
+            out = set()
+            for i in range(tree.topLevelItemCount()):
+                npub = tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)
+                if npub:
+                    out.add(str(npub))
+            return out
+
+        def _ticks_to_carry(col: int, typed: set) -> set:
+            """Which npubs should come out of a dirty rebuild ticked in ``col``.
+
+            The row's OWN state wins for any provider already on screen, which is
+            what makes unticking survive: a union with the text box would read the
+            stored list -- which still names the provider the user just unticked --
+            and silently put the tick back. The text box only decides rows that
+            are not listed yet, i.e. ones this rebuild is about to add.
+            """
+            listed = _listed_npubs()
+            return set(_row_npubs(col)) | {n for n in typed if n not in listed}
+
+        def _providers_snapshot() -> Tuple:
+            return (pref_edit.toPlainText(), ban_edit.toPlainText(),
+                    _row_npubs(self._PREF_COL), _row_npubs(self._BAN_COL))
+
+        dirty = _DirtyTracker(_("Swap providers"), _providers_snapshot, status)
+        dirty.watch(pref_edit.textChanged, ban_edit.textChanged, tree.itemChanged)
 
         def load_text_from_config() -> None:
             c = self.settings(wallet)
@@ -2887,10 +3585,37 @@ class Plugin(LiquidityPlugin):
             ban_edit.setPlainText(", ".join(sorted(_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS))))
 
         def repopulate() -> None:
-            load_text_from_config()
-            pref = _parse_npub_set(pref_edit.toPlainText())
-            ban = _parse_npub_set(ban_edit.toPlainText())
+            # Called on ordinary wallet events and after every provider refresh,
+            # so -- as on the Advanced tab -- it must not overwrite edits in
+            # flight. The rows are rebuilt either way (their fee/penalty/attempt
+            # columns are live data the user wants current); what changes while
+            # dirty is where the tick-boxes get their state from: the user's own
+            # current ticks, carried across the rebuild, rather than storage.
+            keep_edits = dirty.is_dirty()
+            if keep_edits:
+                pref = _ticks_to_carry(self._PREF_COL,
+                                       set(_parse_npub_set(pref_edit.toPlainText())))
+                ban = _ticks_to_carry(self._BAN_COL,
+                                      set(_parse_npub_set(ban_edit.toPlainText())))
+            else:
+                load_text_from_config()
+                pref = set(_parse_npub_set(pref_edit.toPlainText()))
+                ban = set(_parse_npub_set(ban_edit.toPlainText()))
             rel = self.provider_reliability_rows(wallet)
+            # Muted for the whole rebuild: clearing and refilling the tree fires
+            # itemChanged for every row, and measuring dirtiness halfway through
+            # a rebuild reads a half-empty tree.
+            with dirty.muted():
+                _rebuild_rows(rel, pref, ban)
+            if keep_edits:
+                # Nothing was saved and the ticks were carried across, so the tab
+                # is still dirty -- but the tracker's change signals were muted
+                # through the rebuild, so ask it to re-render the hint.
+                dirty.refresh_hint()
+            else:
+                dirty.reset()
+
+        def _rebuild_rows(rel, pref, ban) -> None:
             tree.clear()
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
@@ -2898,7 +3623,9 @@ class Plugin(LiquidityPlugin):
             def add_row(npub, cells, *, checkable, r, offer=None):
                 pen = r.get("penalty_pct", 0.0)
                 item = SortableTreeItem(cells + [
-                    str(r.get("success_count", 0)), str(r.get("fault_count", 0)),
+                    str(r.get("success_count", 0)),
+                    str(r.get("attempt_count", 0)),
+                    str(r.get("fault_count", 0)),
                     f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))],
                     # Declared even for the offline rows, which carry no box:
                     # they then sort as "not ticked" rather than as text.
@@ -2921,12 +3648,14 @@ class Plugin(LiquidityPlugin):
                     for col in (1, 2, 3, 5):
                         item.set_sort_key(col, float("inf"))
                     item.set_sort_key(4, float("-inf"))
-                item.set_sort_key(8, int(r.get("success_count", 0) or 0))
-                item.set_sort_key(9, int(r.get("fault_count", 0) or 0))
-                item.set_sort_key(10, float(pen or 0.0))
+                item.set_sort_key(self._SUCCESS_COL, int(r.get("success_count", 0) or 0))
+                item.set_sort_key(self._ATTEMPTS_COL, int(r.get("attempt_count", 0) or 0))
+                item.set_sort_key(self._FAULTS_COL, int(r.get("fault_count", 0) or 0))
+                item.set_sort_key(self._PENALTY_COL, float(pen or 0.0))
                 # The age column reads "3h ago"/"—"; sort it by the timestamp
                 # it was rendered from, with "never faulted" (0) sorting first.
-                item.set_sort_key(11, float(r.get("last_fault_ts", 0.0) or 0.0))
+                item.set_sort_key(self._LAST_FAULT_COL,
+                                  float(r.get("last_fault_ts", 0.0) or 0.0))
                 if checkable:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(self._PREF_COL, checked if npub in pref else unchecked)
@@ -2959,7 +3688,11 @@ class Plugin(LiquidityPlugin):
             # order the user last clicked a header for.
             sorter.reapply()
 
-        def on_apply() -> None:
+        def on_apply() -> bool:
+            """Persist the preferred/banned lists. Returns whether anything was
+            saved -- see the Settings tab's on_apply. Nothing here can fail
+            validation (an unparseable npub is simply not a member of the set), so
+            this one always reports success."""
             # Seed from the text fields (so offline npubs survive), then fold in
             # the per-row checkbox states for the discovered providers.
             pref = set(_parse_npub_set(pref_edit.toPlainText()))
@@ -2982,18 +3715,19 @@ class Plugin(LiquidityPlugin):
             with self.settings_batch(wallet):       # one write for both lists
                 c.INBOUND_LIQUIDITY_PREFERRED_NPUBS = ", ".join(sorted(pref))
                 c.INBOUND_LIQUIDITY_BANNED_NPUBS = ", ".join(sorted(ban))
+            # Clean before repopulate, so it re-renders the text boxes from the
+            # just-persisted (normalised, deduplicated) lists and re-baselines.
+            dirty.reset()
             repopulate()
-            status.setStyleSheet("color: green;")
-            status.setText(_("Providers saved."))
+            status.set_saved(_("Providers saved."))
+            return True
 
         def on_refresh() -> None:
             loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
             if loop is None:
-                status.setStyleSheet("color: red;")
-                status.setText(_("Cannot refresh: wallet is offline."))
+                status.set_error(_("Cannot refresh: wallet is offline."))
                 return
-            status.setStyleSheet("")
-            status.setText(_("Refreshing providers…"))
+            status.set_message(_("Refreshing providers…"))
 
             def done(_fut) -> None:
                 if self.signals is not None:
@@ -3012,12 +3746,11 @@ class Plugin(LiquidityPlugin):
             if sel:
                 npub = sel[0].data(0, Qt.ItemDataRole.UserRole)
                 self.clear_provider_reliability(wallet, npub)
-                status.setText(_("Reliability stats cleared for {}.").format(
+                status.set_saved(_("Reliability stats cleared for {}.").format(
                     self._abbrev(npub, 12, 6) or npub))
             else:
                 self.clear_provider_reliability(wallet)
-                status.setText(_("All reliability stats cleared."))
-            status.setStyleSheet("color: green;")
+                status.set_saved(_("All reliability stats cleared."))
             repopulate()
 
         btn_row = QHBoxLayout()
@@ -3035,7 +3768,9 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(apply_btn)
         v.addLayout(btn_row)
 
-        return tab, repopulate
+        repopulate()
+        dirty.reset()
+        return tab, repopulate, _ApplyPane(_("Swap providers"), tab, dirty, on_apply)
 
     # --- channel partners sub-tab -----------------------------------------
     # Column 0 is the human-readable node name; the node id follows it. The
@@ -3050,9 +3785,10 @@ class Plugin(LiquidityPlugin):
 
     def _build_channel_partners_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Channel partners sub-tab: a strict-mode toggle, a list of the
-        nodes we already have channels with (each with Preferred / Banned toggles),
-        and free-text fields for partners we are not yet connected to. Returns
-        (widget, repopulate_fn).
+        peers we have seen or tried (each with Preferred / Banned toggles), and
+        free-text fields for partners that are not listed. Returns
+        ``(widget, repopulate_fn, pane)`` -- the pane being this tab's entry in
+        the unsaved-changes guard (see :class:`_ApplyPane`).
 
         Channel partners are Lightning node ids (not nostr npubs): preferred ones
         are tried first, in order, before Electrum's suggested peer; banned ones
@@ -3067,10 +3803,9 @@ class Plugin(LiquidityPlugin):
             "falling back to those suggestions. “Banned” partners (node id, or "
             "node_id@host:port) are never opened to.")))
         v.addWidget(_wrapped_label(_(
-            "The rows below are the peers you ALREADY have a channel with (plus any "
-            "with a fault history) — they are not a list of candidates. Tick a row to "
-            "prefer/ban that node; a node you are not connected to yet goes in the "
-            "“Preferred partners” box.")))
+            "These rows below are peers we have seen or tried — they are not a list "
+            "of candidates. Tick a row to prefer/ban that node; a node that is not "
+            "listed goes in the “Preferred partners” box.")))
         v.addWidget(_wrapped_label(_(
             "“Node name” is the alias the peer announces over Lightning gossip, the "
             "same name Electrum's own Channels tab shows. It reads “—” when this "
@@ -3125,8 +3860,50 @@ class Plugin(LiquidityPlugin):
         grid.addWidget(ban_edit, 1, 1)
         v.addLayout(grid)
 
-        status = QLabel("")
-        v.addWidget(status)
+        status_label = QLabel("")
+        hint_label = QLabel(_StatusLine.HINT_TEXT)
+        status = _StatusLine(status_label, hint_label)
+        v.addWidget(status_label)
+        v.addWidget(hint_label)
+
+        # --- unsaved-changes tracking --------------------------------------
+        # As on the Providers tab: the two text boxes, the two switches, and which
+        # rows are ticked -- ticked node ids only, since the row set itself grows
+        # as peers are met and that is not an edit.
+        def _row_ids(col: int) -> Tuple[str, ...]:
+            out = []
+            for i in range(tree.topLevelItemCount()):
+                it = tree.topLevelItem(i)
+                nid = it.data(0, Qt.ItemDataRole.UserRole)
+                if nid and it.checkState(col) == Qt.CheckState.Checked:
+                    out.append(str(nid).lower())
+            return tuple(sorted(out))
+
+        def _listed_ids() -> set:
+            """Every node id currently on screen, ticked or not."""
+            out = set()
+            for i in range(tree.topLevelItemCount()):
+                nid = tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole)
+                if nid:
+                    out.add(str(nid).lower())
+            return out
+
+        def _ticks_to_carry(col: int, typed: set) -> set:
+            """Which node ids should come out of a dirty rebuild ticked in ``col``.
+            See the Providers tab's twin: the row's own state wins, so unticking a
+            listed peer is not undone by the stored list that still names it."""
+            listed = _listed_ids()
+            return set(_row_ids(col)) | {n for n in typed if n not in listed}
+
+        def _partners_snapshot() -> Tuple:
+            return (pref_edit.toPlainText(), ban_edit.toPlainText(),
+                    strict_cb.isChecked(), one_per_peer_cb.isChecked(),
+                    _row_ids(self._PARTNER_PREF_COL),
+                    _row_ids(self._PARTNER_BAN_COL))
+
+        dirty = _DirtyTracker(_("Channel partners"), _partners_snapshot, status)
+        dirty.watch(pref_edit.textChanged, ban_edit.textChanged,
+                    strict_cb.toggled, one_per_peer_cb.toggled, tree.itemChanged)
 
         def load_text_from_config() -> None:
             c = self.settings(wallet)
@@ -3136,10 +3913,34 @@ class Plugin(LiquidityPlugin):
             one_per_peer_cb.setChecked(bool(c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER))
 
         def repopulate() -> None:
-            load_text_from_config()
-            pref_ids = {normalize_node_id(p) for p in _parse_partner_list(pref_edit.toPlainText())}
-            ban_ids = _parse_banned_partners(ban_edit.toPlainText())
+            # See the Providers tab's repopulate: this fires on ordinary wallet
+            # events, so while there are edits in flight the rows are still
+            # rebuilt (names, penalties and fault ages are live data) but the
+            # tick-boxes keep the user's own state rather than reverting to
+            # storage.
+            keep_edits = dirty.is_dirty()
+            if keep_edits:
+                pref_ids = _ticks_to_carry(
+                    self._PARTNER_PREF_COL,
+                    {normalize_node_id(p)
+                     for p in _parse_partner_list(pref_edit.toPlainText())})
+                ban_ids = _ticks_to_carry(
+                    self._PARTNER_BAN_COL,
+                    set(_parse_banned_partners(ban_edit.toPlainText())))
+            else:
+                load_text_from_config()
+                pref_ids = {normalize_node_id(p)
+                            for p in _parse_partner_list(pref_edit.toPlainText())}
+                ban_ids = set(_parse_banned_partners(ban_edit.toPlainText()))
             rel = self.peer_reliability_rows(wallet)
+            with dirty.muted():
+                _rebuild_rows(rel, pref_ids, ban_ids)
+            if keep_edits:
+                dirty.refresh_hint()
+            else:
+                dirty.reset()
+
+        def _rebuild_rows(rel, pref_ids, ban_ids) -> None:
             tree.clear()
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
@@ -3202,7 +4003,10 @@ class Plugin(LiquidityPlugin):
             # order the user last clicked a header for.
             sorter.reapply()
 
-        def on_apply() -> None:
+        def on_apply() -> bool:
+            """Persist the partner lists and the two switches. Returns whether
+            anything was saved -- see the Settings tab's on_apply. Always True:
+            an unparseable partner string simply does not join the list."""
             # Seed from the text fields (so not-yet-connected partners survive),
             # then fold in the per-row checkbox states for current peers.
             preferred = _parse_partner_list(pref_edit.toPlainText())
@@ -3236,9 +4040,12 @@ class Plugin(LiquidityPlugin):
                 c.INBOUND_LIQUIDITY_BANNED_PARTNERS = ", ".join(sorted(banned))
                 c.INBOUND_LIQUIDITY_PARTNERS_STRICT = strict_cb.isChecked()
                 c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER = one_per_peer_cb.isChecked()
+            # Clean before repopulate, so it re-renders from what was persisted
+            # (normalised, deduplicated, banned-minus-preferred) and re-baselines.
+            dirty.reset()
             repopulate()
-            status.setStyleSheet("color: green;")
-            status.setText(_("Channel partners saved."))
+            status.set_saved(_("Channel partners saved."))
+            return True
 
         def on_reset_stats() -> None:
             # Clear the selected peer's reliability history, or all if none is
@@ -3247,12 +4054,11 @@ class Plugin(LiquidityPlugin):
             if sel:
                 nid = sel[0].data(0, Qt.ItemDataRole.UserRole)
                 self.clear_peer_reliability(wallet, nid)
-                status.setText(_("Reliability stats cleared for {}.").format(
+                status.set_saved(_("Reliability stats cleared for {}.").format(
                     self._abbrev(nid, 12, 6) or nid))
             else:
                 self.clear_peer_reliability(wallet)
-                status.setText(_("All channel-peer reliability stats cleared."))
-            status.setStyleSheet("color: green;")
+                status.set_saved(_("All channel-peer reliability stats cleared."))
             repopulate()
 
         btn_row = QHBoxLayout()
@@ -3267,7 +4073,9 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(apply_btn)
         v.addLayout(btn_row)
 
-        return tab, repopulate
+        repopulate()
+        dirty.reset()
+        return tab, repopulate, _ApplyPane(_("Channel partners"), tab, dirty, on_apply)
 
     def _reload_settings_fields(self, wallet: 'Abstract_Wallet', edits,
                                 sync_toggle: Optional[Callable[[], None]] = None) -> None:
