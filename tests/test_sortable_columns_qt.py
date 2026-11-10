@@ -234,8 +234,8 @@ def test_the_last_fault_column_sorts_by_age_not_by_its_label(qapp) -> None:
     p._tabs[wallet].refresh()
     tree = _tree(p, wallet, PROVIDERS_TAB)
     # Premise: the three cells really do read as the ages claimed.
-    assert set(_column(tree, 11)) == {"—", "3h ago", "2d ago"}
-    _click_header(tree, 11)                     # Last fault
+    assert set(_column(tree, p._LAST_FAULT_COL)) == {"—", "3h ago", "2d ago"}
+    _click_header(tree, p._LAST_FAULT_COL)      # Last fault
     assert _ids(tree) == ["npubNEVER", "npubDAYS", "npubHOURS"]
 
 

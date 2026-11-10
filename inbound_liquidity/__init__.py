@@ -783,7 +783,16 @@ def _plain_json_copy(value: Any) -> Any:
 # JSON-plain list of entry dicts; see `_log_entry`).
 LOG_DB_KEY = "inbound_liquidity_decision_log"
 # Per-wallet provider reliability history: npub -> {consecutive_faults,
-# fault_count, success_count, last_fault_ts, last_success_ts, last_reason}.
+# fault_count, success_count, attempt_count, last_fault_ts, last_success_ts,
+# last_attempt_ts, last_reason}.
+#
+# ``attempt_count`` is display-only -- nothing in the ranking reads it. It
+# answers the one question the fault/success tallies cannot: how often did we
+# *try* this provider at all? A provider with 0 successes and 0 faults has
+# either never been reached for or been declined on price every time, and those
+# look identical without this. Counted once per provider per cascade (see
+# ``_walk_provider_cascade``), so the size ladder retrying one provider at three
+# amounts is one attempt, matching how a payment-failure fault is charged.
 RELIABILITY_DB_KEY = "inbound_liquidity_provider_reliability"
 # Per-wallet channel-peer reliability history: node_id(hex) -> {consecutive_faults,
 # fault_count, hard_fault_count, success_count, last_fault_ts, last_success_ts,
@@ -1579,6 +1588,20 @@ SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
     'plugins.inbound_liquidity.update_latest_url',
     default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Release page for the latest release seen"))
+# --- trampoline warning ---------------------------------------------------
+# Whether this wallet has been told that trampoline routing undercuts the
+# plugin. Asked once and then never again, however the user answered -- hence a
+# flag of its own rather than inferring "already asked" from the routing mode
+# (which a user is entitled to leave exactly as it was).
+#
+# Per-wallet like every other setting here, even though the routing mode it
+# talks about is process-wide (Electrum's own LIGHTNING_USE_GOSSIP): the flag
+# records that a conversation was had with the person using THIS wallet, and
+# opening a second wallet is a second person to tell.
+SimpleConfig.INBOUND_LIQUIDITY_TRAMPOLINE_WARNED = ConfigVar(
+    'plugins.inbound_liquidity.trampoline_warned',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Trampoline-routing warning has been shown"))
 
 
 # --- per-wallet settings ---------------------------------------------------
@@ -2536,6 +2559,75 @@ class LiquidityPlugin(BasePlugin):
             return (f"update available: {self.latest_known_version(wallet)} "
                     f"(running {running})")
         return f"version {running} (up to date)"
+
+    # --- routing mode (trampoline vs gossip) ------------------------------
+    # Electrum offers two ways to find a Lightning route: download the network
+    # gossip and path-find locally, or hand the payment to a trampoline node and
+    # let it route. Trampoline is Electrum's default, and it is the worse half of
+    # the bargain for this plugin specifically:
+    #
+    #   * it costs more -- the trampoline node's fee rides on top of the route's,
+    #     and every reverse swap and every sink payment the plugin makes pays it;
+    #   * it is centralised -- a handful of hard-coded nodes carry the payments,
+    #     and a channel can only be opened to one of them at all;
+    #   * it blinds the parts of this plugin that read the graph. Node aliases on
+    #     the Channel partners tab come from gossip, so most peers show no name;
+    #     and the peer suggestions a channel open walks come from the same place.
+    #
+    # Hence the one-time warning in qt.py. Note the inverted sense of Electrum's
+    # own ConfigVar: LIGHTNING_USE_GOSSIP False *is* trampoline mode, so the two
+    # halves of "trampoline is on and gossip is off" are a single condition.
+    def trampoline_routing_active(self) -> bool:
+        """Whether Lightning payments are routed through trampoline nodes rather
+        than over locally-synced gossip. Reads Electrum's process-wide config, not
+        a per-wallet setting -- the routing mode belongs to the installation."""
+        try:
+            return not bool(self.config.LIGHTNING_USE_GOSSIP)
+        except Exception:
+            # A config object without the var (a stub, an older Electrum) is not
+            # grounds for claiming the user is on trampoline and nagging them.
+            return False
+
+    def switch_to_gossip_routing(self, wallet: 'Abstract_Wallet') -> bool:
+        """Turn gossip routing on (i.e. turn trampoline off), and start syncing.
+
+        Does exactly what Electrum's own Preferences switch does
+        (``gui/qt/settings_dialog.py``): flip the ConfigVar, bring the gossip
+        machinery up on the running network, and fire the two callbacks whose
+        listeners render the result. Kept here rather than in qt.py so it is one
+        implementation for the GUI and the headless command alike, and so it can
+        be tested without a Qt event loop.
+
+        Returns True if the config now says gossip. Starting the sync is
+        best-effort: a wallet with no network (offline mode) still gets the
+        setting, and picks the gossip up on its next start -- which is better
+        than refusing to change a preference because the network is down.
+        """
+        try:
+            self.config.LIGHTNING_USE_GOSSIP = True
+        except Exception:
+            self.logger.exception("could not switch on gossip routing")
+            return False
+        network = getattr(wallet, "network", None)
+        if network is not None:
+            try:
+                network.start_gossip()
+            except Exception:
+                # The setting is saved either way; say so rather than reporting a
+                # failure the user would read as "nothing happened".
+                self.logger.exception(
+                    "gossip is enabled but could not be started now; "
+                    "it will start with the next Electrum run")
+        try:
+            from electrum import util as _util
+            _util.trigger_callback('ln_gossip_sync_progress')
+            _util.trigger_callback('channels_updated', wallet)
+        except Exception:
+            self.logger.debug("could not fire the post-gossip-switch callbacks")
+        self.logger.info("switched Lightning routing from trampoline to gossip")
+        self._diag_event(wallet, category="lifecycle", kind="config",
+                         reason="switched routing from trampoline to gossip")
+        return True
 
     def _request_update_check(self, wallet: 'Abstract_Wallet') -> None:
         """Fire the (self-throttling) update check on the network's asyncio loop.
@@ -3626,13 +3718,30 @@ class LiquidityPlugin(BasePlugin):
         raw = db.get(RELIABILITY_DB_KEY, {}) if db is not None else {}
         return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
-    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
+    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict],
+                          *, write_to_disk: bool = True) -> None:
+        """Persist the provider reliability store.
+
+        ``write_to_disk=False`` puts the value in the wallet db without forcing a
+        write of the whole wallet file. The value is visible to every reader
+        immediately (and ``put`` marks the db modified, so the next save of any
+        kind flushes it); what is given up is only that an abrupt kill could lose
+        the last few updates.
+
+        That is the right trade for the Attempts tally and the wrong one for a
+        fault or a success: those change how providers are RANKED, so losing one
+        changes what the plugin does next, while losing a display counter changes
+        a number on a tab. The cascade walks several providers per swap and this
+        is on that path -- a full wallet-file write per provider, to bump
+        something that decides nothing, is not worth it.
+        """
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
         try:
             db.put(RELIABILITY_DB_KEY, data)
-            wallet.save_db()
+            if write_to_disk:
+                wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist provider reliability: {e!r}", exc_info=True)
 
@@ -3752,6 +3861,30 @@ class LiquidityPlugin(BasePlugin):
                         hard=False, soft=soft)
         self.on_log_changed(wallet)
 
+    def _record_provider_attempt(self, wallet: 'Abstract_Wallet', npub: str) -> None:
+        """Note that we tried to swap with this provider.
+
+        Display only -- see RELIABILITY_DB_KEY. It deliberately records nothing
+        the ranking can read: no ``consecutive_faults``, no penalty, no verdict
+        about the provider at all. Trying somebody is not evidence against them.
+
+        Called once per provider per cascade, at the moment we first turn to it,
+        so it counts a provider that then turned out to be unreachable as well as
+        one that produced a swap. Both are attempts; which kind it was is what the
+        Successes and Faults columns beside it are for.
+        """
+        if not npub:
+            return  # single-provider / URL mode has no per-provider identity
+        data = self._load_reliability(wallet)
+        s = data.get(npub, {})
+        s["attempt_count"] = int(s.get("attempt_count", 0) or 0) + 1
+        s["last_attempt_ts"] = time.time()
+        data[npub] = s
+        # Deliberately not flushed to disk -- see _save_reliability. This runs
+        # once per provider inside the swap cascade, and a cosmetic tally does
+        # not justify a wallet-file write there.
+        self._save_reliability(wallet, data, write_to_disk=False)
+
     def _record_provider_success(self, wallet: 'Abstract_Wallet', npub: str) -> None:
         if not npub:
             return
@@ -3798,8 +3931,14 @@ class LiquidityPlugin(BasePlugin):
         now = time.time()
         keep: Dict[str, Dict] = {}
         for npub, stats in data.items():
+            # An attempt counts as activity even though it is display-only: a
+            # provider we keep turning to but that never completes a swap and
+            # never cleanly faults (declined on price, say) would otherwise have
+            # its row pruned and its Attempts tally silently reset to 0 under a
+            # user who is watching that number to decide whether to ban it.
             last_active = max(float(stats.get("last_fault_ts", 0.0) or 0.0),
-                              float(stats.get("last_success_ts", 0.0) or 0.0))
+                              float(stats.get("last_success_ts", 0.0) or 0.0),
+                              float(stats.get("last_attempt_ts", 0.0) or 0.0))
             idle = now - last_active > RELIABILITY_ROW_MAX_IDLE_SEC
             penalty = self._provider_penalty(wallet, npub, stats, params, now)
             if idle and penalty < RELIABILITY_PRUNE_MIN_PENALTY_PCT:
@@ -3838,8 +3977,12 @@ class LiquidityPlugin(BasePlugin):
                 "consecutive_faults": int(stats.get("consecutive_faults", 0)),
                 "fault_count": int(stats.get("fault_count", 0)),
                 "success_count": int(stats.get("success_count", 0)),
+                # Absent from every row written before this field existed, so it
+                # reads 0 there rather than breaking the tab.
+                "attempt_count": int(stats.get("attempt_count", 0) or 0),
                 "last_fault_ts": float(stats.get("last_fault_ts", 0.0) or 0.0),
                 "last_success_ts": float(stats.get("last_success_ts", 0.0) or 0.0),
+                "last_attempt_ts": float(stats.get("last_attempt_ts", 0.0) or 0.0),
                 "last_reason": stats.get("last_reason"),
                 "penalty_pct": self._provider_penalty(wallet, npub, stats, params, now),
             }
@@ -6615,6 +6758,10 @@ class LiquidityPlugin(BasePlugin):
         # THIS cascade. The ladder means one provider can appear at several sizes;
         # the fault belongs to the provider, so it is charged at most once here.
         charged_npubs: Set[str] = set()
+        # Providers whose Attempts tally has already been bumped for this cascade,
+        # for the same reason: the ladder lists one provider at several sizes, and
+        # turning to it once is one attempt however many amounts we then try.
+        attempted_npubs: Set[str] = set()
         async with session as tr:
             for index, (attempt, offer) in enumerate(attempts, start=1):
                 if self._stop_cascade_for_shutdown(wallet, action, total - index + 1):
@@ -6631,6 +6778,13 @@ class LiquidityPlugin(BasePlugin):
                         source=attempt.npub,
                         detail=f"{remaining} rung(s) untried after {index - 1} attempt(s)")
                     break
+                # Bumped here, before the first rung runs, rather than after the
+                # walk: the cascade can leave by half a dozen paths (commit,
+                # abort, shutdown, deadline) and "we turned to this provider" is
+                # already true by the time any of them is taken.
+                if attempt.npub and attempt.npub not in attempted_npubs:
+                    attempted_npubs.add(attempt.npub)
+                    self._record_provider_attempt(wallet, attempt.npub)
                 rungs = self._attempt_rungs(attempt)
                 stop = False
                 # Whether any rung for THIS entry died with a failed Lightning
