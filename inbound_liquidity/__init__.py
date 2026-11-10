@@ -3718,13 +3718,30 @@ class LiquidityPlugin(BasePlugin):
         raw = db.get(RELIABILITY_DB_KEY, {}) if db is not None else {}
         return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
-    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
+    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict],
+                          *, write_to_disk: bool = True) -> None:
+        """Persist the provider reliability store.
+
+        ``write_to_disk=False`` puts the value in the wallet db without forcing a
+        write of the whole wallet file. The value is visible to every reader
+        immediately (and ``put`` marks the db modified, so the next save of any
+        kind flushes it); what is given up is only that an abrupt kill could lose
+        the last few updates.
+
+        That is the right trade for the Attempts tally and the wrong one for a
+        fault or a success: those change how providers are RANKED, so losing one
+        changes what the plugin does next, while losing a display counter changes
+        a number on a tab. The cascade walks several providers per swap and this
+        is on that path -- a full wallet-file write per provider, to bump
+        something that decides nothing, is not worth it.
+        """
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
         try:
             db.put(RELIABILITY_DB_KEY, data)
-            wallet.save_db()
+            if write_to_disk:
+                wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist provider reliability: {e!r}", exc_info=True)
 
@@ -3863,7 +3880,10 @@ class LiquidityPlugin(BasePlugin):
         s["attempt_count"] = int(s.get("attempt_count", 0) or 0) + 1
         s["last_attempt_ts"] = time.time()
         data[npub] = s
-        self._save_reliability(wallet, data)
+        # Deliberately not flushed to disk -- see _save_reliability. This runs
+        # once per provider inside the swap cascade, and a cosmetic tally does
+        # not justify a wallet-file write there.
+        self._save_reliability(wallet, data, write_to_disk=False)
 
     def _record_provider_success(self, wallet: 'Abstract_Wallet', npub: str) -> None:
         if not npub:

@@ -57,9 +57,31 @@ class _FakeDB:
 
 def _wallet(sm, ln_payment: str = "failed") -> SimpleNamespace:
     """The failover module's wallet, plus the storage the attempt tally needs:
-    its own wallet has no db, so the real recorder has nowhere to write."""
-    return SimpleNamespace(lnworker=_LnWorker(sm, ln_payment),
-                           db=_FakeDB(), save_db=lambda: None)
+    its own wallet has no db, so the real recorder has nowhere to write.
+
+    ``saved`` counts wallet-file writes, so a test can tell "put it in the db"
+    from "flush the whole wallet to disk"."""
+    w = SimpleNamespace(lnworker=_LnWorker(sm, ln_payment), db=_FakeDB(), saved=0)
+
+    def _save_db() -> None:
+        w.saved += 1
+
+    w.save_db = _save_db
+    return w
+
+
+def _real_recorders(p):
+    """Undo the failover module's stubbing of the fault/success recorders.
+
+    That module replaces them with list-appenders so its tests can assert on who
+    was blamed; a test about what they PERSIST has to reach the real ones. They
+    are instance attributes shadowing the class methods, so deleting them is
+    enough. (``_record_provider_attempt`` is never stubbed, so it needs none of
+    this.)
+    """
+    for name in ("_record_provider_fault", "_record_provider_success"):
+        p.__dict__.pop(name, None)
+    return p
 
 
 def _attempts(p, w) -> Dict[str, int]:
@@ -96,6 +118,34 @@ def test_recording_an_attempt_increments_and_stamps() -> None:
     row = p._load_reliability(w)[A]
     assert row["attempt_count"] == 2
     assert row["last_attempt_ts"] == pytest.approx(time.time(), abs=30)
+
+
+def test_recording_an_attempt_does_not_write_the_wallet_file() -> None:
+    # This runs once per provider INSIDE the swap cascade. A fault or a success
+    # earns a flush because it changes how providers are ranked; a display-only
+    # tally does not, and a full wallet-file write per provider on that path is
+    # a cost the number does not justify.
+    p = _plugin()
+    w = _wallet(_SM({}))
+    w.saved = 0
+    p._record_provider_attempt(w, A)
+    assert w.saved == 0
+    # ...and it is readable straight away regardless, which is the whole point
+    # of putting it in the db without flushing.
+    assert _attempts(p, w) == {A: 1}
+
+
+def test_a_fault_and_a_success_still_write_the_wallet_file() -> None:
+    # The other side of that trade: these two decide what the plugin does next,
+    # so losing one to an abrupt kill would change behaviour, not a label.
+    p = _real_recorders(_plugin())
+    w = _wallet(_SM({}))
+    w.saved = 0
+    p._record_provider_fault(w, A, "init timeout")
+    assert w.saved >= 1
+    before = w.saved
+    p._record_provider_success(w, A)
+    assert w.saved > before
 
 
 def test_an_attempt_is_not_a_verdict() -> None:
