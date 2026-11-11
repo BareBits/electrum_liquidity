@@ -848,8 +848,43 @@ the names fill in — see [Trampoline routing](#trampoline-routing), which offer
 to do exactly that. The node id is still there in the next column, and hovering
 the name shows both in full.
 
-The **Swap providers** tab carries two tallies side by side, which answer
-different questions and are easy to conflate:
+The **Swap providers** tab likewise leads with a **Provider name** column — but
+a provider's name is a very different kind of thing from a peer's, and worth a
+paragraph before you rely on it.
+
+A swap offer carries **no name at all**. Electrum's provider announcement (a
+nostr `kind 30315` event) holds fees, limits, relays and a proof-of-work nonce,
+and nothing else — which is why this tab showed a bare npub for so long. What a
+provider *can* do is publish an ordinary **nostr profile** (`kind 0`) under the
+same key it signs its offers with, and that profile may carry a name. So the
+plugin looks one up for every provider it discovers, and shows it here.
+
+Three things follow, all of them worth knowing:
+
+- **Most providers have no name.** Publishing a profile is optional and separate
+  from running a swapserver, so `—` in this column is the normal case, not a
+  failure. The lookup is also strictly cosmetic: it is bounded to a few seconds,
+  it runs on a relay session the plugin already has open, and if it fails or
+  times out you lose a name and nothing else — never a swap.
+- **A name is not an identity.** Nothing verifies it. Any key can publish any
+  name, including one already used by a provider you trust. The **npub** in the
+  next column is the real identity, and it is what the preferred and banned
+  lists, the reliability history and the swap addressing all match on — a name
+  decides nothing anywhere in the plugin.
+- **Clashes are flagged.** If two providers on the list publish the same name,
+  both rows are marked **⚠** and hovering either says so. That is the
+  impersonation case made visible rather than left for you to notice.
+
+Hovering a name shows where it came from, along with the full npub. Sorting by
+this column orders by the name itself (so the ⚠ marker does not shuffle
+anything, and two rows claiming one name stay adjacent); providers with no name
+sort to the bottom either way. A name is cached per wallet, so it survives a
+restart and still shows for a provider that has since gone offline — the rows
+built from reliability history alone, which by definition advertise nothing.
+**Refresh** re-reads every discovered provider's profile.
+
+The tab also carries two tallies side by side, which answer different questions
+and are easy to conflate:
 
 - **Attempts** — how many times the plugin *turned to* this provider for a swap.
   Counted once per provider per cascade, so a provider retried at a smaller size
@@ -947,6 +982,7 @@ inbound_liquidity/
   manifest.json         plugin metadata (available_for: qt, cmdline)
   __init__.py           ConfigVars + base plugin: per-wallet settings store, event wiring, snapshot,
                         executor, decision-log store, dev fee, daily ceilings, offline auto-close,
+                        the provider display-name (nostr kind-0) lookup and its cache,
                         MIN_FUNDING_SAT floor override, and the inbound_liquidity_* CLI commands
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
@@ -996,6 +1032,63 @@ dominate at small amounts. With the default `max_swap_fee_pct = 0.9` the plugin
 will correctly **decline** those as uneconomical; raise **"Max fee to move LN →
 on-chain"** on the **Liquidity → Settings** tab (e.g. to 10, then **Apply**) to
 watch swaps actually execute against the rig provider.
+
+## Handling untrusted input
+
+Most of what this plugin acts on comes from somebody else: a swap provider's
+nostr announcement, a Lightning peer's gossip, GitHub's release feed. None of it
+is trustworthy, so each kind is gated at the boundary and, separately, rendered
+safely wherever it is shown.
+
+| Source | What arrives | Gate |
+|---|---|---|
+| nostr offer | fees, limits, PoW | `validate_offer` — typed, finite, bounded, non-negative |
+| nostr offer | provider identity | `clean_npub` / `looks_like_hex_pubkey` — bech32 / 64-hex shape |
+| nostr offer | announced relays | `clean_relay_urls` — hygiene only; see the note below |
+| nostr kind 0 | provider display name | `parse_provider_name` → `clean_display_name` |
+| nostr DM | provider error replies | `scrub_text` before logging; never stored or shown |
+| Lightning gossip | peer node alias | `clean_display_name` |
+| Lightning / swap | fault reasons | `scrub_text`, bounded, on write **and** on read |
+| GitHub | release tag, URL | `extract_release` — version rebuilt from digits, `https://` only |
+
+Two rules run through all of it.
+
+**The gate makes the value inert; the sink makes it inert *on screen*.** These
+are different jobs. A name may legitimately contain `<` or `&`, so the sanitiser
+keeps them — which means every widget that displays outside text has to not
+interpret them. Qt makes that easy to get wrong: `QLabel` defaults to
+`Qt.AutoText` and silently switches to HTML for anything that looks like markup,
+and `QToolTip` always interprets rich text with no per-item opt-out. So the
+status line is pinned to `PlainText`, and every tooltip built from outside data
+goes through `_literal_tooltip`, which escapes it and wraps it in markup we
+wrote. The table cells were already safe — the item delegate draws plain text.
+
+**An identity is never a name.** Ranking, the preferred/banned lists, fault
+attribution and swap addressing all key on the npub or node id. A display name
+decides nothing, anywhere, because anyone can publish any name — including one
+already used by a provider you trust. Where two providers do claim one name, the
+Swap providers tab marks both ⚠ rather than leaving you to spot it.
+
+**A provider's announced relays are not a threat.** The table lists
+`clean_relay_urls` for completeness, but it is the odd one out: following those
+relays is the *mechanism*. A provider has to be able to say where it can be
+reached, and subscribing there is how we hear it — it learns nothing by that
+which sending it a swap request does not already tell it. That function exists
+only because those strings are also logged and written to disk (Electrum
+persists them to `recent_swapserver_relays` and reloads them at startup), and
+because a malformed offer should not put a non-string or an embedded newline
+into a connect list. It drops what cannot be dialled and bounds what is kept;
+the provider's choice of host, port, path, query or userinfo is passed through
+untouched.
+
+Two things deliberately *not* done:
+
+- a nostr `nip05` address is not shown, because showing an unverified one as if
+  it were authenticated would be worse than showing nothing, and verifying it
+  means an HTTPS request to a provider-chosen domain — which would tell that
+  domain you are shopping for swaps;
+- a provider is not judged on its relay list. Where it publishes is its own
+  business.
 
 ## Tests
 

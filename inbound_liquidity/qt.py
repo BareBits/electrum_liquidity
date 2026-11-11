@@ -828,6 +828,27 @@ class _StatusLine:
     def __init__(self, message_label: QLabel, hint_label: QLabel) -> None:
         self._message = message_label
         self._hint = hint_label
+        # Both labels render their text LITERALLY. A QLabel defaults to
+        # Qt.AutoText, which sniffs each string with `mightBeRichText()` and
+        # silently switches to HTML for anything that looks like markup -- so a
+        # message is plain text only for as long as no caller interpolates
+        # something containing a tag.
+        #
+        # One now does: the Providers tab names the provider whose stats were
+        # just cleared, and a provider's display name comes from its own nostr
+        # profile. "<b>", "<br>", and "<a href=…>" all survive the name
+        # sanitiser (they are ordinary printable characters, and a legitimate
+        # name may contain "<" or "&"), so an AutoText label would let a
+        # provider style, re-link or restructure a sentence that is confirming a
+        # destructive action. Sanitising guarantees the text is inert; this
+        # guarantees it is *displayed* inert, which is the half the sanitiser
+        # cannot do from where it sits.
+        #
+        # Set here rather than at that one call site so it holds for all thirty
+        # callers and for the next one, and so the class's promise of "a plain
+        # string and a stylesheet colour" is enforced instead of assumed.
+        for label in (self._message, self._hint):
+            label.setTextFormat(Qt.TextFormat.PlainText)
         self._sticky = False        # is the current message a warning?
         # Tracked here rather than read back off the widget: Qt's isVisible() is
         # "actually on screen", which is False for every widget whose window has
@@ -1120,6 +1141,38 @@ def _safe_filename(wallet: 'Abstract_Wallet') -> str:
         name = ""
     cleaned = _UNSAFE_FILENAME_RE.sub("_", name or "").strip("._")
     return cleaned or "wallet"
+
+
+# Sort key for a provider that publishes no name, so those rows land after every
+# named one however the column is ordered. `_sort_tuple` compares string keys
+# casefolded, and no real name can reach here containing U+FFFF: it is not
+# printable, so `clean_display_name` strips it out.
+_NO_NAME_SORT_KEY = "\uffff"
+
+# Longest tooltip we will build out of outside text. A tooltip is a floating
+# window sized to its content, so an unbounded one is a screenful.
+MAX_TOOLTIP_CHARS = 400
+
+
+def _literal_tooltip(text: object) -> str:
+    """A tooltip that renders ``text`` exactly as written.
+
+    Needed because QToolTip interprets rich text and -- unlike QLabel -- offers
+    no per-item PlainText switch: Qt decides per string, via
+    ``mightBeRichText()``. Every tooltip the plugin builds from outside data
+    (a peer's gossip alias, a node id, a provider's fault reason) would
+    otherwise become markup the moment that data contained a tag, which is how
+    "02aa\u2026" becomes a clickable link to somewhere else.
+
+    So the text is escaped and the result deliberately IS rich text -- markup we
+    wrote, wrapping characters that can no longer be markup. ``white-space:
+    pre-wrap`` keeps the newlines that separate a tooltip's lines, which plain
+    rich text would collapse to spaces.
+    """
+    body = "" if text is None else str(text)
+    if len(body) > MAX_TOOLTIP_CHARS:
+        body = body[:MAX_TOOLTIP_CHARS - 1] + "\u2026"
+    return f"<div style='white-space:pre-wrap'>{html.escape(body)}</div>"
 
 
 def _fmt_age(ts: float) -> str:
@@ -3469,20 +3522,29 @@ class Plugin(LiquidityPlugin):
         return tab, repopulate, _ApplyPane(_("Advanced"), tab, dirty, on_apply)
 
     # --- providers sub-tab ------------------------------------------------
-    _PREF_COL = 6
-    _BAN_COL = 7
+    # Every column is named, and nothing below addresses one by literal number.
+    # That matters more here than tidiness: the Preferred/Banned check states are
+    # read and written BY INDEX, so an off-by-one bans the provider the user
+    # meant to prefer. Adding the name column at 0 shifted all twelve of these,
+    # which is exactly the hazard the Channel partners tab already warns about.
+    _PROVIDER_NAME_COL = 0
+    _NPUB_COL = 1
+    _FEE_COL = 2
+    _MINING_COL = 3
+    _MIN_COL = 4
+    _MAX_COL = 5
+    _POW_COL = 6
+    _PREF_COL = 7
+    _BAN_COL = 8
     # Successes and Attempts answer two different questions and are easy to
     # conflate, so they sit side by side: how many swaps this provider actually
     # completed, and how many times we turned to it at all (once per cascade --
     # see _record_provider_attempt). Successes <= Attempts always holds.
-    _SUCCESS_COL = 8
-    _ATTEMPTS_COL = 9
-    _FAULTS_COL = 10
-    # Named rather than written as literals at the set_sort_key calls below:
-    # inserting Attempts shifted three of these by one, and the only thing that
-    # noticed was a test asserting on column 11 by number.
-    _PENALTY_COL = 11
-    _LAST_FAULT_COL = 12
+    _SUCCESS_COL = 9
+    _ATTEMPTS_COL = 10
+    _FAULTS_COL = 11
+    _PENALTY_COL = 12
+    _LAST_FAULT_COL = 13
 
     def _build_providers_tab(self, wallet: 'Abstract_Wallet'):
         """Build the Providers sub-tab: a live list of nostr-discovered swap
@@ -3504,15 +3566,26 @@ class Plugin(LiquidityPlugin):
             "it is the only option). “Reset stats” clears a provider's history.\n"
             "“Attempts” counts the swaps we turned to a provider for; "
             "“Successes” counts the ones it actually delivered.")))
+        v.addWidget(_wrapped_label(_(
+            "“Provider name” is the name a provider publishes for itself in its "
+            "nostr profile. It reads “—” for a provider that publishes none, "
+            "which is most of them — a swap offer carries no name, so the name "
+            "is a separate, optional thing a provider may advertise.\n"
+            "Treat it as a label, never as proof of identity: nothing verifies "
+            "it, and anyone can publish any name, including one already used by "
+            "a provider you trust. A name shared by two providers on this list "
+            "is marked ⚠. The npub beside it is the real identity, and it is "
+            "what the preferred and banned lists match on.")))
 
         tree = QTreeWidget()
         tree.setHeaderLabels([
-            _("Provider (npub)"), _("Fee %"), _("Mining (sat)"), _("Min (sat)"),
-            _("Max (sat)"), _("PoW"), _("Preferred"), _("Banned"),
-            _("Successes"), _("Attempts"), _("Faults"), _("Penalty %"),
-            _("Last fault")])
+            _("Provider name"), _("Provider (npub)"), _("Fee %"),
+            _("Mining (sat)"), _("Min (sat)"), _("Max (sat)"), _("PoW"),
+            _("Preferred"), _("Banned"), _("Successes"), _("Attempts"),
+            _("Faults"), _("Penalty %"), _("Last fault")])
         tree.setRootIsDecorated(False)
-        tree.setColumnWidth(0, 180)
+        tree.setColumnWidth(self._PROVIDER_NAME_COL, 160)
+        tree.setColumnWidth(self._NPUB_COL, 180)
         tree.setToolTip(_("Click a column header to sort by it; click the same "
                           "header again to reverse the order."))
         sorter = SortableHeader(tree)
@@ -3619,35 +3692,77 @@ class Plugin(LiquidityPlugin):
             tree.clear()
             checked = Qt.CheckState.Checked
             unchecked = Qt.CheckState.Unchecked
+            # Self-published names, and which of them more than one provider on
+            # this list claims. A name is not an identity (see the help text):
+            # the clash is computed over every row about to be shown, so an
+            # impersonator is flagged whether it is advertising right now or
+            # only present as fault history.
+            names = self.provider_names(wallet)
+            shown_npubs = {o.npub for o in self.discovered_providers(wallet)}
+            shown_npubs.update(rel)
+            claim_counts: Dict[str, int] = {}
+            for npub in shown_npubs:
+                name = names.get(npub)
+                if name:
+                    claim_counts[name] = claim_counts.get(name, 0) + 1
 
             def add_row(npub, cells, *, checkable, r, offer=None):
                 pen = r.get("penalty_pct", 0.0)
-                item = SortableTreeItem(cells + [
-                    str(r.get("success_count", 0)),
-                    str(r.get("attempt_count", 0)),
-                    str(r.get("fault_count", 0)),
-                    f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))],
+                name = names.get(npub, "")
+                disputed = claim_counts.get(name, 0) > 1
+                item = SortableTreeItem(
+                    [f"⚠ {name}" if disputed else (name or "—")] + cells + [
+                        str(r.get("success_count", 0)),
+                        str(r.get("attempt_count", 0)),
+                        str(r.get("fault_count", 0)),
+                        f"{pen:.2f}", _fmt_age(r.get("last_fault_ts", 0.0))],
                     # Declared even for the offline rows, which carry no box:
                     # they then sort as "not ticked" rather than as text.
                     checkbox_cols=(self._PREF_COL, self._BAN_COL))
                 item.setData(0, Qt.ItemDataRole.UserRole, npub)
                 # Sort on the values, not on their formatted text: "1,900,000"
                 # compares as a string between "12" and "2".
-                item.set_sort_key(0, npub)
+                item.set_sort_key(self._NPUB_COL, npub)
+                # Sort by the name itself, so the ⚠ marker does not reorder the
+                # column and the clashing rows land next to each other. Unnamed
+                # providers sort last (see _NO_NAME_SORT_KEY).
+                item.set_sort_key(self._PROVIDER_NAME_COL,
+                                  name.casefold() if name else _NO_NAME_SORT_KEY)
+                # Through `_literal_tooltip` like every other tooltip built
+                # from data we did not author. An npub that came off an offer
+                # is `clean_npub`-gated and cannot hold a tag -- but one of
+                # these rows is keyed by the reliability store instead, which
+                # is a wallet-file field and so is only as well-formed as the
+                # file. Not worth depending on a regex two modules away.
+                item.setToolTip(self._NPUB_COL, _literal_tooltip(npub))
+                if disputed:
+                    item.setToolTip(self._PROVIDER_NAME_COL, _literal_tooltip(_(
+                        "Another provider on this list publishes this same "
+                        "name. A nostr profile name is self-assigned and "
+                        "unverified — check the npub before preferring one.")))
+                elif name:
+                    item.setToolTip(self._PROVIDER_NAME_COL, _literal_tooltip(_(
+                        "Published by the provider itself in its nostr "
+                        "profile; nothing verifies it.\n{}").format(npub)))
+                else:
+                    item.setToolTip(self._PROVIDER_NAME_COL, _literal_tooltip(_(
+                        "This provider publishes no nostr profile name.\n{}"
+                    ).format(npub)))
                 if offer is not None:
-                    item.set_sort_key(1, float(offer.percentage_fee))
-                    item.set_sort_key(2, int(offer.mining_fee_sat))
-                    item.set_sort_key(3, int(offer.min_amount_sat))
-                    item.set_sort_key(4, int(offer.max_reverse_sat))
-                    item.set_sort_key(5, int(offer.pow_bits))
+                    item.set_sort_key(self._FEE_COL, float(offer.percentage_fee))
+                    item.set_sort_key(self._MINING_COL, int(offer.mining_fee_sat))
+                    item.set_sort_key(self._MIN_COL, int(offer.min_amount_sat))
+                    item.set_sort_key(self._MAX_COL, int(offer.max_reverse_sat))
+                    item.set_sort_key(self._POW_COL, int(offer.pow_bits))
                 else:
                     # An offline provider advertises no terms. Sort it to the
                     # WORST end of each of them, so ordering by any term keeps
                     # the usable providers together at the top: worst is the
                     # largest fee/mining/min/PoW, and the smallest max.
-                    for col in (1, 2, 3, 5):
+                    for col in (self._FEE_COL, self._MINING_COL,
+                                self._MIN_COL, self._POW_COL):
                         item.set_sort_key(col, float("inf"))
-                    item.set_sort_key(4, float("-inf"))
+                    item.set_sort_key(self._MAX_COL, float("-inf"))
                 item.set_sort_key(self._SUCCESS_COL, int(r.get("success_count", 0) or 0))
                 item.set_sort_key(self._ATTEMPTS_COL, int(r.get("attempt_count", 0) or 0))
                 item.set_sort_key(self._FAULTS_COL, int(r.get("fault_count", 0) or 0))
@@ -3662,7 +3777,7 @@ class Plugin(LiquidityPlugin):
                     item.setCheckState(self._BAN_COL, checked if npub in ban else unchecked)
                 reason = r.get("last_reason")
                 if reason:
-                    item.setToolTip(self._FAULTS_COL, str(reason))
+                    item.setToolTip(self._FAULTS_COL, _literal_tooltip(reason))
                 add_sortable_row(tree, item)
 
             discovered = set()
@@ -3746,8 +3861,13 @@ class Plugin(LiquidityPlugin):
             if sel:
                 npub = sel[0].data(0, Qt.ItemDataRole.UserRole)
                 self.clear_provider_reliability(wallet, npub)
+                # Name the provider the way its row does, but never *instead* of
+                # the npub: this message confirms a destructive action, and two
+                # providers can publish the same name.
+                shown = self._abbrev(npub, 12, 6) or npub
+                name = self.provider_name(wallet, npub)
                 status.set_saved(_("Reliability stats cleared for {}.").format(
-                    self._abbrev(npub, 12, 6) or npub))
+                    f"{name} ({shown})" if name else shown))
             else:
                 self.clear_provider_reliability(wallet)
                 status.set_saved(_("All reliability stats cleared."))
@@ -3965,7 +4085,8 @@ class Plugin(LiquidityPlugin):
                 if alias:
                     # The cell is elided at the column width, and the full node
                     # id is abbreviated in the next one; show both in full here.
-                    item.setToolTip(self._PARTNER_NAME_COL, f"{alias}\n{nid}")
+                    item.setToolTip(self._PARTNER_NAME_COL,
+                                    _literal_tooltip(f"{alias}\n{nid}"))
                 # Sort on the values, not on their formatted text. An unnamed
                 # peer sorts after every named one either way round: "—" would
                 # otherwise interleave with the names by codepoint.
@@ -3985,7 +4106,7 @@ class Plugin(LiquidityPlugin):
                     item.setCheckState(self._PARTNER_PREF_COL, checked if low in pref_ids else unchecked)
                     item.setCheckState(self._PARTNER_BAN_COL, checked if low in ban_ids else unchecked)
                 if reason:
-                    item.setToolTip(self._PARTNER_FAULTS_COL, str(reason))
+                    item.setToolTip(self._PARTNER_FAULTS_COL, _literal_tooltip(reason))
                 add_sortable_row(tree, item)
 
             current = set()
