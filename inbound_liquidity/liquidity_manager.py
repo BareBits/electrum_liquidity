@@ -17,6 +17,7 @@
 #     balance is later reverse-swapped out, that capacity becomes pure inbound.
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -104,6 +105,190 @@ def clean_npub(raw: Optional[str]) -> str:
     caller can drop the offer without attributing anything to it."""
     s = (raw or "").strip()
     return s if _NPUB_RE.match(s) else ""
+
+
+# --- display names --------------------------------------------------------
+# A name that arrives from a party we do not control -- a channel peer's gossip
+# ``node_announcement`` alias, a swap provider's nostr kind-0 profile -- is
+# untrusted DISPLAY input. Nothing stops it carrying control characters, line
+# breaks, or zero-width/bidi padding, which in a table cell means a row that
+# spills over its neighbours, or a name that renders as a convincing copy of
+# another party's. Keep such a name printable, single-line and bounded.
+
+# Cap for a Lightning node alias. BOLT 7 already caps the wire field at 32
+# bytes; this bounds what we RENDER, independent of that.
+MAX_NODE_ALIAS_CHARS: int = 32
+# Cap for a swap provider's nostr profile name. Nostr imposes no limit at all,
+# so this is the only thing standing between a provider and a name as wide as
+# the table.
+MAX_PROVIDER_NAME_CHARS: int = 32
+
+
+def clean_display_name(raw: Optional[object], *,
+                       max_chars: int = MAX_NODE_ALIAS_CHARS) -> str:
+    """Make an untrusted name safe to put in a widget: drop control and
+    zero-width characters, collapse all whitespace to single spaces, and bound
+    the length. Returns ``""`` for anything that cleans down to nothing.
+
+    Pure, so the hostile-input cases are unit-testable without a GUI.
+    """
+    if not raw:
+        return ""
+    try:
+        text = str(raw)
+    except Exception:  # noqa: BLE001  (a __str__ that raises must not cost a row)
+        return ""
+    # `isprintable` is False for every control character (newline, tab, NUL)
+    # AND for the invisible formatting ones a name has no legitimate use for
+    # -- zero-width space, soft hyphen, and the bidi overrides that let a
+    # name render as a reversed copy of another's. The ASCII space is
+    # printable, so ordinary multi-word names survive.
+    #
+    # Whitespace-like characters become a space rather than vanishing, so a
+    # line break between two words does not weld them together; the zero-width
+    # ones are deleted, since they sit INSIDE a word to disguise it. Then all
+    # runs of whitespace collapse to one.
+    text = "".join(
+        ch if ch.isprintable() else (" " if ch.isspace() else "")
+        for ch in text)
+    text = " ".join(text.split())
+    if max_chars >= 1 and len(text) > max_chars:
+        text = text[:max_chars - 1] + "…"
+    return text
+
+
+# Hard bound on the kind-0 payload we will even attempt to parse. A provider's
+# profile event is an arbitrary-length string from an untrusted party, and the
+# JSON parse is the expensive step -- so the cheap length check comes first. Sized
+# far above any honest profile (a name, a nip05, an about line, a picture URL).
+MAX_PROFILE_CONTENT_CHARS: int = 8192
+# The kind-0 fields that may hold a human-readable name, in the order we prefer
+# them. NIP-01 specifies ``name``; most clients also write ``display_name`` and
+# treat it as the one meant for display, so it wins. ``displayName`` is the
+# camelCase spelling some older clients emitted.
+_PROFILE_NAME_FIELDS: Tuple[str, ...] = ("display_name", "displayName", "name")
+
+
+def parse_provider_name(content: Optional[object]) -> str:
+    """The display name out of a nostr kind-0 profile's ``content``, or ``""``.
+
+    ``content`` is the raw JSON string a provider published under its own
+    pubkey. Every part of it is attacker-controlled, so this returns ``""``
+    rather than raising for: an over-long payload, non-JSON, JSON that is not an
+    object, a missing/blank name field, a name that is not a string (a nested
+    object or a number is not a name), and a name that sanitises down to
+    nothing.
+
+    Note what a name from here is NOT: it is self-asserted and unverified.
+    Nothing in this engine may key a decision off it -- ranking, the
+    preferred/banned lists and swap addressing all ride on the npub.
+    """
+    if not content:
+        return ""
+    text = content if isinstance(content, str) else None
+    if text is None:
+        return ""
+    if len(text) > MAX_PROFILE_CONTENT_CHARS:
+        return ""
+    try:
+        profile = json.loads(text)
+    except (ValueError, TypeError, RecursionError):
+        return ""
+    if not isinstance(profile, dict):
+        return ""
+    for field_name in _PROFILE_NAME_FIELDS:
+        value = profile.get(field_name)
+        # Only a string is a name. A dict/list/number here is either a
+        # malformed profile or an attempt to get `str()` of a structure into
+        # the table, and "{'a': 1}" is not a name either way.
+        if not isinstance(value, str):
+            continue
+        name = clean_display_name(value, max_chars=MAX_PROVIDER_NAME_CHARS)
+        if name:
+            return name
+    return ""
+
+
+# --- provider-announced relay URLs ----------------------------------------
+# A provider's nostr announcement carries the relays it publishes on, and the
+# transport follows them so our subscriptions reach the relays its replies go
+# out on (see ``TargetedNostrTransport.update_relays``).
+#
+# To be clear about what this is and is not: following those relays IS the
+# mechanism. A provider has to be able to say where it can be reached, and
+# subscribing there is how we hear it -- so a provider naming relays we then
+# connect to is the protocol working, not a risk to be defended against. It
+# learns nothing by it that sending it a swap request does not already tell it.
+#
+# This is therefore input HYGIENE, not a security boundary. It exists for two
+# narrow reasons, both about what happens to these strings besides being
+# dialled:
+#
+#   * they are logged, and they are written to disk -- Electrum JSON-dumps them
+#     to ``recent_swapserver_relays`` and reloads them at startup
+#     (``_store_last_swapserver_relays``). This plugin's standing rule is that
+#     text from outside is scrubbed before it reaches a log line or storage
+#     (see ``scrub_text``), and a relay URL is no exception;
+#   * a malformed offer should not put a non-string, an unbounded string, or an
+#     entry with an embedded newline into a connect list.
+#
+# What it deliberately does NOT do is second-guess a provider's choice of host.
+# Credentials in a URL (``user:pass@host``) are the provider's own, for its own
+# relay; rejecting them would drop a working relay to prevent nothing.
+MAX_RELAY_URLS: int = 10
+MAX_RELAY_URL_CHARS: int = 200
+# Nostr speaks WebSocket and nothing else, so another scheme cannot be dialled
+# whatever it is. Dropping those here (and saying so once in the log) beats
+# handing them to the relay manager to fail on repeatedly.
+_RELAY_SCHEMES: Tuple[str, ...] = ("ws://", "wss://")
+
+
+def clean_relay_urls(raw: Optional[Sequence[object]]) -> Tuple[str, ...]:
+    """The usable WebSocket relay URLs out of a provider's announced list.
+
+    Keeps order and drops duplicates, so the provider's own preference survives
+    while the list stays bounded. A URL is kept if it is a string, is within
+    ``MAX_RELAY_URL_CHARS``, carries no whitespace or control characters,
+    begins with ``ws://``/``wss://``, and has something after the scheme. At
+    most ``MAX_RELAY_URLS`` survive. Anything else about the URL -- host, port,
+    path, query, userinfo -- is the provider's business and is passed through.
+
+    Returns an empty tuple for anything unusable, which the caller must read as
+    "this provider announced no relays we can follow" rather than as an error.
+
+    Pure, so the awkward cases are unit-testable without a relay.
+    """
+    if not raw:
+        return ()
+    try:
+        entries = list(raw)
+    except TypeError:
+        return ()
+    out: List[str] = []
+    seen: Set[str] = set()
+    for entry in entries:
+        if len(out) >= MAX_RELAY_URLS:
+            break
+        if not isinstance(entry, str):
+            continue
+        url = entry.strip()
+        if not url or len(url) > MAX_RELAY_URL_CHARS:
+            continue
+        # `split()` on no argument splits on EVERY kind of whitespace, so this
+        # catches an embedded newline or tab as well as a space.
+        if len(url.split()) != 1:
+            continue
+        if not all(ch.isprintable() for ch in url):
+            continue
+        lowered = url.lower()
+        scheme = next((s for s in _RELAY_SCHEMES if lowered.startswith(s)), None)
+        if scheme is None or len(url) <= len(scheme):
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(url)
+    return tuple(out)
 
 
 def count_within_window(timestamps: Sequence[float], now: float,

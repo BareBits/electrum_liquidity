@@ -167,19 +167,19 @@ def test_providers_keep_their_discovery_order_until_a_header_is_clicked(qapp) ->
 
 
 def test_sorting_by_fee_orders_by_the_number_not_the_text(qapp) -> None:
-    _p, _w, tree = _providers_plugin()
-    _click_header(tree, 1)                      # Fee %
+    p, _w, tree = _providers_plugin()
+    _click_header(tree, p._FEE_COL)
     assert _ids(tree)[:3] == ["npubCHEAP", "npubMID", "npubDEAR"]
 
 
 def test_a_sat_column_does_not_sort_by_its_thousands_separators(qapp) -> None:
     # "1,900,000" sorts between "100,000" and "20,000" as TEXT. This is the
     # column the formatting actually breaks.
-    _p, _w, tree = _providers_plugin()
-    _click_header(tree, 4)                      # Max (sat), ascending
+    p, _w, tree = _providers_plugin()
+    _click_header(tree, p._MAX_COL)             # Max (sat), ascending
     # Ignore the offline row (no advertised max); the three real offers are
     # what this is about.
-    advertised = [c for c in _column(tree, 4) if c]
+    advertised = [c for c in _column(tree, p._MAX_COL) if c]
     assert advertised == ["90,000", "250,000", "1,900,000"]
 
 
@@ -187,27 +187,27 @@ def test_an_offline_provider_sinks_to_the_bottom_whichever_term_is_sorted(qapp) 
     # It advertises nothing, so it is never the answer to "who is cheapest" or
     # "who takes the largest swap" -- on either term, in the direction that
     # puts the best first.
-    _p, _w, tree = _providers_plugin()
-    _click_header(tree, 1)                      # Fee %, ascending = best first
+    p, _w, tree = _providers_plugin()
+    _click_header(tree, p._FEE_COL)             # ascending = best first
     assert _ids(tree)[-1] == "npubGONE"
-    _click_header(tree, 4)                      # Max (sat)
-    _click_header(tree, 4)                      # ...descending = best first
+    _click_header(tree, p._MAX_COL)
+    _click_header(tree, p._MAX_COL)             # ...descending = best first
     assert _ids(tree)[-1] == "npubGONE"
 
 
 def test_clicking_the_same_header_twice_reverses_the_order(qapp) -> None:
-    _p, _w, tree = _providers_plugin()
-    _click_header(tree, 1)
+    p, _w, tree = _providers_plugin()
+    _click_header(tree, p._FEE_COL)
     ascending = _ids(tree)
-    _click_header(tree, 1)
+    _click_header(tree, p._FEE_COL)
     assert _ids(tree) == list(reversed(ascending))
 
 
 def test_clicking_a_different_header_starts_ascending_again(qapp) -> None:
-    _p, _w, tree = _providers_plugin()
-    _click_header(tree, 1)
-    _click_header(tree, 1)                      # now descending on Fee %
-    _click_header(tree, 2)                      # Mining (sat)
+    p, _w, tree = _providers_plugin()
+    _click_header(tree, p._FEE_COL)
+    _click_header(tree, p._FEE_COL)             # now descending on Fee %
+    _click_header(tree, p._MINING_COL)
     assert tree.header().sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
     assert _ids(tree)[:3] == ["npubCHEAP", "npubMID", "npubDEAR"]
 

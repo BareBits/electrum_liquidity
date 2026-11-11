@@ -121,7 +121,7 @@ def test_an_offline_row_still_lines_up_with_the_headers(qapp):
     p._add_liquidity_tab(window, wallet)
     tree = _tree(p, wallet, PROVIDERS_TAB)
     item = tree.topLevelItem(0)
-    assert item.text(1) == "(offline)"
+    assert item.text(p._FEE_COL) == "(offline)"
     assert item.text(p._SUCCESS_COL) == "2"
     assert item.text(p._ATTEMPTS_COL) == "7"
     assert item.text(p._FAULTS_COL) == "3"

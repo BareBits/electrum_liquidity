@@ -67,6 +67,8 @@ from .liquidity_manager import (
     LiquidityConfig,
     LiquiditySinkAction,
     LiquiditySnapshot,
+    MAX_NODE_ALIAS_CHARS,
+    MAX_PROVIDER_NAME_CHARS,
     MAX_SUGGESTED_PARTNERS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
@@ -86,6 +88,7 @@ from .liquidity_manager import (
     classify_peer_observation,
     classify_pending_freeze,
     clamp_dev_fee_pct,
+    clean_display_name,
     compute_dev_fee,
     coop_before_force_ready,
     count_within_window,
@@ -105,6 +108,7 @@ from .liquidity_manager import (
     offline_discount_applies,
     offline_streak_sec,
     order_channel_partners,
+    parse_provider_name,
     record_offline_streak,
     record_uptime_sample,
     record_wedge_strike,
@@ -189,41 +193,42 @@ def _parse_banned_partners(raw: Optional[str]) -> frozenset:
 
 
 # A node alias is chosen by the remote node and arrives over the wire in its
-# gossip ``node_announcement``, so it is untrusted display input. BOLT 7 caps the
-# field at 32 bytes, but nothing stops a peer filling those bytes with control
-# characters, line breaks or zero-width padding -- which in a table cell means a
-# row that spills over its neighbours, or an alias that renders as a convincing
-# copy of another node's. Keep it to printable, single-line, bounded text.
-MAX_NODE_ALIAS_CHARS = 32
-
-
+# gossip ``node_announcement``, so it is untrusted display input. The sanitiser
+# and its 32-char bound now live in the pure engine as ``clean_display_name`` /
+# ``MAX_NODE_ALIAS_CHARS``, because a swap provider's nostr profile name needs
+# exactly the same treatment (see ``parse_provider_name``) and two copies of a
+# hostile-input filter is one copy too many. Both names are re-exported here:
+# they were part of this module's surface before the move, and the glue tests
+# import them from it.
 def _clean_node_alias(alias: Optional[str]) -> str:
-    """Make an untrusted node alias safe to put in a widget: drop control and
-    zero-width characters, collapse all whitespace to single spaces, and bound
-    the length. Returns '' for anything that cleans down to nothing."""
-    if not alias:
-        return ""
-    try:
-        text = str(alias)
-    except Exception:
-        return ""
-    # `isprintable` is False for every control character (newline, tab, NUL)
-    # AND for the invisible formatting ones an alias has no legitimate use for
-    # -- zero-width space, soft hyphen, and the bidi overrides that let an
-    # alias render as a reversed copy of another node's name. The ASCII space
-    # is printable, so ordinary multi-word names survive.
-    #
-    # Whitespace-like characters become a space rather than vanishing, so a
-    # line break between two words does not weld them together; the zero-width
-    # ones are deleted, since they sit INSIDE a word to disguise it. Then all
-    # runs of whitespace collapse to one.
-    text = "".join(
-        ch if ch.isprintable() else (" " if ch.isspace() else "")
-        for ch in text)
-    text = " ".join(text.split())
-    if len(text) > MAX_NODE_ALIAS_CHARS:
-        text = text[:MAX_NODE_ALIAS_CHARS - 1] + "…"
-    return text
+    """Make an untrusted node alias safe to put in a widget. Thin wrapper over
+    the engine's :func:`clean_display_name`, pinned to the node-alias bound."""
+    return clean_display_name(alias, max_chars=MAX_NODE_ALIAS_CHARS)
+
+
+# Longest fault reason we hand back for display. Reasons are our own templates,
+# but one of them interpolates a scrubbed exception from a swap provider, so the
+# length is not ours to assume.
+MAX_FAULT_REASON_CHARS = 300
+
+
+def _clean_reason(reason: Optional[object]) -> Optional[str]:
+    """A stored fault reason, made safe to display, or ``None`` if there is none.
+
+    ``scrub_text`` rather than ``clean_display_name``: a reason is diagnostic
+    text whose exact bytes matter when reading it back, so control characters
+    are ESCAPED to a visible form (``\\n``, ``\\x1b``) rather than removed. That
+    keeps a CR/LF or ANSI sequence from forging a line or driving a terminal
+    while still showing that it was there.
+
+    Note what this does not do: ``<`` and ``>`` survive, because they are
+    ordinary characters in an error message. Keeping them harmless is the
+    display sink's job -- see ``_literal_tooltip``, which is where these land.
+    """
+    if reason is None:
+        return None
+    cleaned = scrub_text(reason, max_len=MAX_FAULT_REASON_CHARS)
+    return cleaned or None
 
 
 _logger = get_logger(__name__)
@@ -840,6 +845,41 @@ RELIABILITY_ROW_MAX_IDLE_SEC = 90 * 86400.0
 # exactly 0.0: the decay is exponential and lands on denormal floats rather than
 # a clean zero, which would keep idle rows alive forever.
 RELIABILITY_PRUNE_MIN_PENALTY_PCT = 0.001
+# Per-wallet cache of swap providers' human-readable names:
+# npub -> {"name": str, "checked_ts": float}.
+#
+# A provider's offer carries no name at all (``SwapOffer`` is economics, relays,
+# PoW and a pubkey), so the only human-readable identity it can have is a NIP-01
+# kind-0 profile event published under the same pubkey it signs its offers with.
+# This caches what we found there, so a name survives a restart and is still
+# shown for a provider that has since gone offline -- the rows the Providers tab
+# builds from reliability history alone, which by definition advertise nothing.
+#
+# ``name`` is "" for a provider we looked up and that published no usable
+# profile. That is a real cache entry, not a miss: without it, every tick would
+# re-query the (common) no-profile case forever.
+#
+# Display only. Nothing keys off a name: ranking, the preferred/banned lists,
+# fault attribution and swap addressing all ride on the npub, because a kind-0
+# name is self-asserted and two providers may claim the same one.
+PROVIDER_PROFILES_DB_KEY = "inbound_liquidity_provider_profiles"
+# How long a cached name (or looked-and-found-nothing) stays fresh. Profiles
+# change very rarely, so this is long; it exists so that a provider which
+# publishes a profile *after* we first looked is picked up without the user
+# having to press Refresh, and so a renamed provider eventually re-reads.
+PROVIDER_PROFILE_TTL_SEC = 24 * 3600.0
+# Hard cap on rows in that cache, newest-checked kept. Bounds the wallet file
+# against a party that cycles nostr identities: discovery itself is bounded (
+# Electrum keeps at most 20 recent offers), but reliability history accumulates
+# npubs over time and this cache follows it.
+PROVIDER_PROFILE_MAX_ROWS = 200
+# Ceiling on one profile lookup. Deliberately small: a name is cosmetic, and
+# this runs inside an evaluation that may be about to do a swap, so a slow or
+# silent relay must cost us a blank column and nothing else. (aionostr's own
+# ``EOSE_TIMEOUT_SEC`` is 60s, which is the wrong order of magnitude here.)
+PROFILE_FETCH_TIMEOUT_SEC = 5.0
+# NIP-01 kind 0: "user metadata", the event holding a profile's JSON.
+NOSTR_KIND_PROFILE = 0
 # First time (epoch sec) each still-pending reverse swap was observed freezing
 # automation: payment_hash hex -> first_seen_ts. A swap whose funding is broadcast
 # but not yet swept freezes the engine (see the in-flight freeze); this lets a
@@ -3922,9 +3962,17 @@ class LiquidityPlugin(BasePlugin):
 
         Runs on the tick, next to pending-swap reconciliation. Writes only when
         something was actually removed.
+
+        Also prunes the cached display names that hang off these rows, so the two
+        stores shrink together rather than the name cache outliving every row
+        that could have shown it.
         """
         data = self._load_reliability(wallet)
         if not data:
+            # No reliability rows, but a name cache can still hold entries for
+            # providers that are merely discovered -- keep exactly those.
+            self._prune_provider_profiles(
+                wallet, {o.npub for o in self.discovered_providers(wallet)})
             return
         params = dict(self._reliability_params(wallet))
         params["enabled"] = True
@@ -3944,6 +3992,13 @@ class LiquidityPlugin(BasePlugin):
             if idle and penalty < RELIABILITY_PRUNE_MIN_PENALTY_PCT:
                 continue
             keep[npub] = stats
+        # The name cache follows the rows that can display a name: the surviving
+        # reliability rows, plus whoever is advertising right now. Done whether
+        # or not any reliability row was dropped -- a discovered provider can
+        # stop advertising without its reliability row changing at all.
+        self._prune_provider_profiles(
+            wallet,
+            set(keep) | {o.npub for o in self.discovered_providers(wallet)})
         if len(keep) == len(data):
             return
         dropped = len(data) - len(keep)
@@ -3983,10 +4038,258 @@ class LiquidityPlugin(BasePlugin):
                 "last_fault_ts": float(stats.get("last_fault_ts", 0.0) or 0.0),
                 "last_success_ts": float(stats.get("last_success_ts", 0.0) or 0.0),
                 "last_attempt_ts": float(stats.get("last_attempt_ts", 0.0) or 0.0),
-                "last_reason": stats.get("last_reason"),
+                # Scrubbed on the way OUT as well as in: this is a
+                # wallet-file field, so it can predate today's rules or
+                # have been hand-edited, and one of the reasons it holds
+                # is built from a provider-influenced exception.
+                "last_reason": _clean_reason(stats.get("last_reason")),
                 "penalty_pct": self._provider_penalty(wallet, npub, stats, params, now),
             }
         return rows
+
+    # --- provider display names -------------------------------------------
+    # A swap provider's offer has no name in it, so the only human-readable
+    # identity it can have is a nostr kind-0 profile published under the pubkey
+    # it signs its offers with. These read/cache/serve that name. All of it is
+    # cosmetic: see PROVIDER_PROFILES_DB_KEY for why nothing may key off it.
+    def _load_provider_profiles(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
+        db = getattr(wallet, "db", None)
+        raw = db.get(PROVIDER_PROFILES_DB_KEY, {}) if db is not None else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
+
+    def _save_provider_profiles(self, wallet: 'Abstract_Wallet',
+                                data: Dict[str, Dict]) -> None:
+        """Persist the provider-name cache, newest-checked rows first if it has
+        to be trimmed.
+
+        Written WITHOUT forcing a wallet-file write (see ``_save_reliability``
+        for that trade): a display name decides nothing, so an abrupt kill
+        losing the last lookup costs one re-query of a cosmetic field.
+        """
+        db = getattr(wallet, "db", None)
+        if db is None:
+            return  # db-less wallet (unit-test mock); nothing to persist
+        if len(data) > PROVIDER_PROFILE_MAX_ROWS:
+            newest = sorted(
+                data.items(),
+                key=lambda kv: float((kv[1] or {}).get("checked_ts", 0.0) or 0.0),
+                reverse=True)[:PROVIDER_PROFILE_MAX_ROWS]
+            data = dict(newest)
+        try:
+            db.put(PROVIDER_PROFILES_DB_KEY, data)
+        except Exception as e:  # noqa: BLE001  (a name must never break a tick)
+            self.logger.info(f"could not store provider profiles: {e!r}")
+
+    def provider_name(self, wallet: 'Abstract_Wallet', npub: str) -> str:
+        """This provider's self-published display name, or ``""`` if it has none
+        (or none has been looked up yet). Never raises."""
+        if not npub:
+            return ""
+        row = self._load_provider_profiles(wallet).get(npub)
+        if not isinstance(row, dict):
+            return ""
+        return clean_display_name(row.get("name"),
+                                  max_chars=MAX_PROVIDER_NAME_CHARS)
+
+    def provider_names(self, wallet: 'Abstract_Wallet') -> Dict[str, str]:
+        """Every cached provider name, keyed by npub, for the Providers tab.
+        Providers with no name are omitted rather than mapped to ``""``.
+
+        Re-sanitised on the way out, not trusted as stored: the cache is a
+        wallet-file field, and an older plugin build (or a hand-edited wallet)
+        could hold a value that today's bound would reject.
+        """
+        out: Dict[str, str] = {}
+        for npub, row in self._load_provider_profiles(wallet).items():
+            if not isinstance(row, dict):
+                continue
+            name = clean_display_name(row.get("name"),
+                                      max_chars=MAX_PROVIDER_NAME_CHARS)
+            if name:
+                out[npub] = name
+        return out
+
+    @staticmethod
+    def _npub_to_hex(npub: str) -> str:
+        """A provider's npub as its raw 32-byte pubkey hex, or ``""``.
+
+        ``clean_npub`` has already gated the shape, but it does no bech32
+        checksum check (that is aionostr's job, here) -- so a syntactically fine
+        npub can still fail to decode, and must cost a name rather than the
+        whole lookup.
+        """
+        try:
+            import electrum_aionostr as aionostr
+            import electrum_aionostr.util  # noqa: F401  (binds aionostr.util)
+            return aionostr.util.from_nip19(npub)['object'].hex()
+        except Exception:
+            return ""
+
+    async def _refresh_provider_profiles(
+            self, wallet: 'Abstract_Wallet',
+            transport: Optional['SwapServerTransport'],
+            *, force: bool = False) -> None:
+        """Look up the discovered providers' kind-0 display names and cache them.
+
+        ``force`` re-reads every discovered provider (the Providers tab's
+        Refresh button, an explicit user action). Otherwise only providers whose
+        cached entry is missing or older than ``PROVIDER_PROFILE_TTL_SEC`` are
+        queried, so the steady state -- every provider already looked up -- costs
+        no relay traffic and returns before doing any I/O at all.
+
+        Runs on the swap-evaluation path, so it is bounded by
+        ``PROFILE_FETCH_TIMEOUT_SEC`` and swallows everything: a name is
+        cosmetic, and no failure here may delay or break a swap. A partial
+        result is kept (the providers that did answer are cached).
+        """
+        manager = getattr(transport, "relay_manager", None)
+        get_events = getattr(manager, "get_events", None)
+        if get_events is None:
+            return  # URL/HTTP transport, or a session whose relays never came up
+        # Identities only, straight off the transport -- deliberately NOT via
+        # `_offers_from_transport`. That one validates the advertised terms and
+        # records a soft reliability fault for a provider whose terms are
+        # malformed, and it is already called once per tick by `build_snapshot`:
+        # running it again here would charge such a provider two faults per tick
+        # instead of one. A name lookup must not touch the ranking at all.
+        get_recent = getattr(transport, "get_recent_offers", None)
+        if get_recent is None:
+            return
+        try:
+            raw_offers = list(get_recent())
+        except Exception as e:  # noqa: BLE001  (cosmetic; never break the tick)
+            self.logger.info(f"could not read offers for profile lookup: {e!r}")
+            return
+        # A provider whose terms are rejected still has a usable identity, and
+        # still gets a row on the Providers tab -- so it is still worth a name.
+        npubs = {clean_npub(getattr(o, "server_npub", None)) for o in raw_offers}
+        npubs.discard("")
+        if not npubs:
+            return
+        cache = self._load_provider_profiles(wallet)
+        now = time.time()
+
+        def is_stale(npub: str) -> bool:
+            row = cache.get(npub)
+            if not isinstance(row, dict):
+                return True
+            try:
+                checked = float(row.get("checked_ts", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return True     # hand-edited wallet file; look it up again
+            # Anything outside "stamped at some point up to now" is stale: a
+            # NaN (which fails every comparison), and a future stamp from a
+            # clock that moved backwards, would otherwise pin a row as fresh
+            # forever.
+            if not 0.0 < checked <= now:
+                return True
+            return now - checked > PROVIDER_PROFILE_TTL_SEC
+
+        want = npubs if force else {n for n in npubs if is_stale(n)}
+        if not want:
+            return
+        # Query by raw pubkey (what a nostr filter's "authors" holds), keeping a
+        # map back to the npub the cache is keyed by.
+        by_pubkey: Dict[str, str] = {}
+        for npub in sorted(want):
+            pubkey = self._npub_to_hex(npub)
+            if pubkey:
+                by_pubkey[pubkey] = npub
+        if not by_pubkey:
+            return
+        found: Dict[str, Tuple[int, str]] = {}  # pubkey -> (created_at, name)
+        try:
+            await asyncio.wait_for(
+                self._collect_provider_profiles(get_events, by_pubkey, found),
+                timeout=PROFILE_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            # Expected whenever a relay sends no end-of-stored-events marker.
+            # Whatever arrived before the deadline is in `found` and is kept --
+            # UNLESS nothing arrived at all, which is indistinguishable from the
+            # relay never having answered us. Caching that as "none of these
+            # providers has a name" would hide every name for a whole TTL on the
+            # strength of one slow lookup, so treat it as the failure it
+            # probably is and try again next tick.
+            if not found:
+                self.logger.info(
+                    f"provider profile lookup timed out after "
+                    f"{PROFILE_FETCH_TIMEOUT_SEC:.0f}s with no reply; "
+                    f"leaving {len(by_pubkey)} provider(s) to retry")
+                return
+            self.logger.debug(
+                f"provider profile lookup timed out after "
+                f"{PROFILE_FETCH_TIMEOUT_SEC:.0f}s ({len(found)} of "
+                f"{len(by_pubkey)} answered)")
+        except Exception as e:  # noqa: BLE001  (cosmetic; never break the tick)
+            self.logger.info(f"provider profile lookup failed: {e!r}")
+            return
+        # Stamp EVERY provider we asked about, answered or not, so a provider
+        # with no profile is not re-queried on every single tick.
+        checked_ts = time.time()
+        named = 0
+        for pubkey, npub in by_pubkey.items():
+            name = found.get(pubkey, (0, ""))[1]
+            if name:
+                named += 1
+            cache[npub] = {"name": name, "checked_ts": checked_ts}
+        self._save_provider_profiles(wallet, cache)
+        self.logger.debug(
+            f"looked up {len(by_pubkey)} provider profile(s); {named} named")
+
+    @staticmethod
+    async def _collect_provider_profiles(
+            get_events, by_pubkey: Dict[str, str],
+            found: Dict[str, Tuple[int, str]]) -> None:
+        """Drain one kind-0 query into ``found`` (pubkey -> (created_at, name)).
+
+        Split out from its caller so the whole drain can be wrapped in a single
+        ``wait_for``, and so ``found`` keeps the partial result when that
+        deadline fires mid-stream.
+
+        Two guards on each event, both about a hostile or buggy relay:
+
+        * the event's author must be one we asked about. aionostr verifies the
+          Schnorr signature when it builds the ``Event`` (see its
+          ``Event.__init__``), so a relay cannot forge a profile for someone
+          else's pubkey -- but it can volunteer an unrelated author's real
+          profile, and that must not land in another provider's row;
+        * kind 0 is a *replaceable* event, so several relays may each answer with
+          a different vintage of the same profile. Newest ``created_at`` wins.
+        """
+        async for event in get_events(
+                {"kinds": [NOSTR_KIND_PROFILE], "authors": sorted(by_pubkey)},
+                only_stored=True):
+            pubkey = str(getattr(event, "pubkey", "") or "")
+            if pubkey not in by_pubkey:
+                continue
+            try:
+                created_at = int(getattr(event, "created_at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            previous = found.get(pubkey)
+            if previous is not None and previous[0] >= created_at:
+                continue
+            found[pubkey] = (created_at,
+                             parse_provider_name(getattr(event, "content", "")))
+
+    def _prune_provider_profiles(self, wallet: 'Abstract_Wallet',
+                                 keep: Set[str]) -> None:
+        """Drop cached names for providers nothing refers to any more.
+
+        ``keep`` is the set of npubs still worth a row -- the surviving
+        reliability rows plus the currently-discovered providers, i.e. exactly
+        the npubs the Providers tab can put on screen. Writes only when
+        something was actually removed.
+        """
+        cache = self._load_provider_profiles(wallet)
+        if not cache:
+            return
+        kept = {npub: row for npub, row in cache.items() if npub in keep}
+        if len(kept) == len(cache):
+            return
+        self.logger.debug(
+            f"pruned {len(cache) - len(kept)} unreferenced provider name(s)")
+        self._save_provider_profiles(wallet, kept)
 
     # --- channel-peer reliability ----------------------------------------
     # Mirrors the provider reliability store above, but keyed by Lightning node id
@@ -4285,7 +4588,11 @@ class LiquidityPlugin(BasePlugin):
                 "success_count": int(stats.get("success_count", 0)),
                 "last_fault_ts": float(stats.get("last_fault_ts", 0.0) or 0.0),
                 "last_success_ts": float(stats.get("last_success_ts", 0.0) or 0.0),
-                "last_reason": stats.get("last_reason"),
+                # Scrubbed on the way OUT as well as in: this is a
+                # wallet-file field, so it can predate today's rules or
+                # have been hand-edited, and one of the reasons it holds
+                # is built from a provider-influenced exception.
+                "last_reason": _clean_reason(stats.get("last_reason")),
                 "penalty_pct": self._peer_penalty(nid, stats, params, now),
             }
         return rows
@@ -6254,6 +6561,12 @@ class LiquidityPlugin(BasePlugin):
                     self._set_status(wallet, "discovering swap providers")
                     async with self._swap_session(wallet) as transport:
                         snapshot = self.build_snapshot(wallet, transport)
+                        # Fill in any provider display name we have never looked
+                        # up, while a relay session is open anyway. A no-op once
+                        # every discovered provider is cached, which is the
+                        # steady state -- so this costs nothing on the swap path
+                        # except when a provider is new to us.
+                        await self._refresh_provider_profiles(wallet, transport)
                         acted = await self._run_decision(wallet, snapshot, config, transport)
                 else:
                     acted = await self._run_decision(wallet, base, config, None)
@@ -6432,15 +6745,37 @@ class LiquidityPlugin(BasePlugin):
 
     async def refresh_providers(self, wallet: 'Abstract_Wallet') -> List[ProviderOffer]:
         """Open a session, discover providers, cache and return them. Used by the
-        Providers settings tab's refresh button."""
+        Providers settings tab's refresh button.
+
+        Also re-reads every discovered provider's display name. Forced, unlike
+        the evaluation tick's gap-fill: this is the user explicitly asking for
+        the provider list to be brought up to date, which includes a provider
+        that has published or changed a profile since we last looked.
+        """
         async with self._swap_session(wallet) as transport:
             offers = self._offers_from_transport(wallet, transport)
             self._last_offers[wallet] = offers
+            await self._refresh_provider_profiles(wallet, transport, force=True)
             return offers
 
     def discovered_providers(self, wallet: 'Abstract_Wallet') -> List[ProviderOffer]:
-        """Last set of providers discovered on nostr (may be empty)."""
-        return list(self._last_offers.get(wallet, []))
+        """Last set of providers discovered on nostr (may be empty).
+
+        Hardened because this is no longer a GUI-only read: the provider-name
+        cache prune consults it from the tick, where neither failure below may
+        escape into the middle of an evaluation.
+
+        * read through ``_per_wallet_store``, since the glue harnesses build a
+          plugin via ``object.__new__`` without ``BasePlugin.__init__`` and the
+          attribute may not exist at all;
+        * tolerate a wallet that cannot be a dict key. This store is keyed by
+          wallet object, which every real ``Abstract_Wallet`` supports; an
+          unhashable stand-in simply has no discovered offers.
+        """
+        try:
+            return list(self._per_wallet_store("_last_offers").get(wallet, []))
+        except TypeError:
+            return []
 
     @log_exceptions
     async def _execute(self, wallet: 'Abstract_Wallet', action: Action,
