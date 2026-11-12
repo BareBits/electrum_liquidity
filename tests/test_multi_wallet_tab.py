@@ -326,7 +326,10 @@ class _AskingWindow(_FakeWindow):
 
 
 def _advanced_tab(p, wallet):
-    return p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    """Advanced's General pane. Scoped by title through the inner tab bar --
+    see test_qt_tab._advanced_pane for why position is not safe here."""
+    from test_qt_tab import _advanced_pane
+    return _advanced_pane(p, wallet)
 
 
 def _reset_button(p, wallet):

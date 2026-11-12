@@ -195,6 +195,7 @@ class Rig:
 
     # -- lifecycle ----------------------------------------------------------
     def preflight(self) -> None:
+        _disable_usage_stats_by_default()
         killed = self.pm.kill_previous()
         if killed:
             log(f"killed {len(killed)} leftover process(es) from a previous run: {killed}")
@@ -891,8 +892,38 @@ def _ensure_marked() -> None:
     os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
 
 
+# The plugin's usage-reporting kill switch (inbound_liquidity/__init__.py's
+# USAGE_STATS_ENDPOINT_ENV). Spelled out rather than imported: run.py is the
+# rig launcher and must work without importing the plugin package, which needs
+# Electrum on the path.
+USAGE_STATS_ENDPOINT_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT"
+
+
+def _disable_usage_stats_by_default() -> None:
+    """Switch the plugin's usage reporting off for everything this rig spawns,
+    unless the caller has deliberately set the endpoint themselves.
+
+    Belt and braces over a guarantee the plugin already makes: a rig wallet is
+    on regtest, and the plugin refuses to report from regtest at all. This adds
+    the endpoint kill switch on top, so a rig can never contact the real
+    endpoint even if someone sets the regtest override by hand, or if a future
+    change moves the network check.
+
+    `setdefault`, not an assignment, so the usage-statistics e2e test can point
+    the rig at its own local receiver instead -- which is the one case where a
+    rig is supposed to send a report, and it sends it to php -S on loopback.
+
+    Called from ``Rig.preflight`` rather than only from ``main``: every e2e
+    module builds its rig by constructing ``Rig`` directly, so a kill switch
+    that only ran in ``main`` would be absent from exactly the 25 rigs that run
+    unattended. Idempotent, so calling it from both is harmless.
+    """
+    os.environ.setdefault(USAGE_STATS_ENDPOINT_ENV, "disabled")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     _ensure_marked()
+    _disable_usage_stats_by_default()
     args = parse_args(argv)
     if args.blocks < 101:
         log("warning: --blocks < 101 means coinbase coins will not be spendable yet")

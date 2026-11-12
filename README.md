@@ -60,7 +60,8 @@ wallet, applies the rules below, and executes the resulting actions.
 ## Rules (configurable from the Liquidity tab)
 
 The everyday settings live on the **Settings** sub-tab; power-user knobs live on
-the **Advanced** sub-tab, and the partner/provider lists on their own sub-tabs.
+**Advanced → General**, the opt-in reporting controls on **Advanced → Usage
+statistics**, and the partner/provider lists on their own sub-tabs.
 This table lists the most-used settings and their tab — the tabs also carry more
 knobs not shown here (reliability tuning, offline auto-close, daily action
 ceilings, diagnostics, etc.).
@@ -652,7 +653,8 @@ next to a link to the release notes.
 
 It is **off until you say otherwise**. The first time the plugin loads it asks,
 once, with a dialog; whichever way you answer is remembered, and you can change
-it later from **Advanced → Check GitHub for plugin updates**. Declining is
+it later from **Advanced → General → Check GitHub for plugin updates**.
+Declining is
 final — you are not asked again — and a headless (`cmdline`) install, where
 there is no dialog, never checks unless the setting is turned on explicitly.
 
@@ -667,6 +669,100 @@ What it never does is download or install anything. A plugin that can rewrite
 its own code turns a compromised GitHub account — or one intercepted response —
 into code execution against a wallet holding funds. You get a version number and
 a link; updating stays a step you take deliberately.
+
+### Anonymous usage statistics (opt-in)
+
+The plugin can send us a small report so we know how many people run it, which
+settings matter, and how much liquidity it actually provisions. It is **off
+until you choose a level**, and the plugin behaves identically either way.
+
+You are asked once, on a consent screen that shows **the exact report** each
+level would send. That is not a description of the report — the preview is
+rendered by the same function that builds the real one, so what you are shown is
+what would be sent. Pick a level and press *Save my choice*; *Ask me later*
+records nothing at all, and so do Escape and the close button. Change or revoke
+the choice at any time under **Advanced → Usage statistics**, which shows the
+same live preview.
+
+**Never sent, at any level:** your addresses, transactions, invoices, channel
+ids, balances, channel capacities, sink Lightning address, channel peers' node
+ids, providers' npubs, wallet name, file paths, seed or any key material. Where
+a setting *is* an identifier, the report carries only whether it is set, or how
+long a list is — `sink_configured: true`, never the address;
+`preferred_npubs_count: 2`, never the npubs.
+
+The levels are cumulative:
+
+| Level | Name | Adds |
+|---|---|---|
+| 0 | Off | Nothing is sent. The default. |
+| 1 | Count me | A random identifier, the plugin/Electrum/Python versions, OS family, desktop-or-headless, and which network you are on. |
+| 2 | Settings | The settings you chose, as numbers and booleans: goal, channel limits, fee ceiling, swap triggers, daily ceilings, dev-fee percentage, feature toggles. |
+| 3 | Liquidity | Lifetime totals — channels opened and closed, sats funded, swaps completed, sats swapped, sink payments, sats sunk, dev fee paid — plus how many channels are open now and how many the plugin manages. |
+
+Level 3 is **running totals and counts only**. A lifetime total says what the
+plugin did; a balance would say what your wallet holds, and that is never
+reported. Those lifetime counters are new in this version, so they start at zero
+on upgrade — there is no pruned history to backfill from, and inventing one
+would be a guess presented as a measurement. They accrue locally from then on
+whether or not you ever opt in, and are only ever *transmitted* at level 3.
+
+**The identifier** is a random UUIDv4 minted the moment you opt in. It is not
+derived from your wallet, its keys, its seed or its path, so nobody — us
+included — can work backwards from it, and a wallet that never opts in never has
+one. Opting out keeps it locally so a later re-opt-in is the same install rather
+than a second one.
+
+**Scope is per wallet**, like every other setting here: you are asked for each
+wallet and each reports separately. A three-wallet user therefore appears as
+three installs. That was a deliberate trade — accurate consent over an accurate
+user count — because the alternative would have made this the one setting that
+is not a property of the wallet it belongs to, and would have let one wallet's
+choice start reporting on another's behalf.
+
+**Cadence and transport:** one report on opting in, then one a week, through
+Electrum's configured proxy like every other HTTP call the wallet makes. A
+failed attempt backs off an hour rather than a week. The endpoint is
+`getbarebits.com/liqanalytics/report.php` — a path of its own, so these reports
+never mingle with the sister software's.
+
+Our side sees the IP the request came from, as any HTTPS server does. It is used
+for a per-address rate limit (held two hours at most) and to resolve a country
+in memory; only the two-letter country is stored with the report, never the
+address.
+
+**Two independent ways nothing is sent**, each sufficient on its own:
+
+- `ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT=disabled` switches reporting off
+  for the whole installation, whatever any wallet has chosen. For packagers and
+  managed deployments.
+- **Regtest is suppressed outright.** A regtest wallet is a test fixture, not a
+  user, and counting rigs as installs would corrupt the very numbers this
+  exists to produce. The rig's own e2e test overrides this with an env-only
+  escape hatch that ships off, so it can exercise a real send against a local
+  copy of the receiver.
+
+**How the promise is enforced rather than just made.** The complete per-level
+field list is one allowlist in `inbound_liquidity/usage_stats.py`; the builder
+intersects its output with it, so a field added by mistake is not sent. The
+receiver in `scripts/analytics-endpoint/` enforces its own copy of the same list
+and *refuses* a report carrying anything else, so even a client bug could not
+widen what is collected. The tests assert the two lists agree field for field,
+and separately build a level-3 report from a wallet deliberately stuffed with
+addresses, txids, channel ids, node ids, npubs and balances, failing if any of
+them turns up anywhere in the result.
+
+Full detail, including what the dev fee and update check disclose, is in
+[PRIVACY.md](PRIVACY.md).
+
+Headless installs have no consent screen, so they never report unless opted in
+explicitly:
+
+```bash
+electrum inbound_liquidity_set_setting usage_stats_level 2 -w <wallet>
+electrum inbound_liquidity_usage_stats_status -w <wallet>
+electrum inbound_liquidity_usage_stats_preview 3 -w <wallet>   # shows, sends nothing
+```
 
 ### Decision log
 
@@ -932,7 +1028,7 @@ installation and start moving its funds. (`plugins.inbound_liquidity.enabled`
 is still a config key; that is Electrum's own "is this plugin loaded", not a
 setting of the plugin.)
 
-**Resetting.** *Advanced → Reset this wallet to defaults* discards everything
+**Resetting.** *Advanced → General → Reset this wallet to defaults* discards everything
 stored for that wallet, putting it back on the shipped defaults. No other wallet
 is touched, and nothing about channels, swaps or funds changes.
 
@@ -985,8 +1081,11 @@ inbound_liquidity/
                         the provider display-name (nostr kind-0) lookup and its cache,
                         MIN_FUNDING_SAT floor override, and the inbound_liquidity_* CLI commands
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
+  usage_stats.py        PURE opt-in usage-report builder (no Electrum imports) — the per-level field
+                        allowlist, build_payload(), and the preview the consent screen shows
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
-                        Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs),
+                        Channel partners / Advanced [General | Usage statistics] /
+                        Actions / Declines / Faults / Log sub-tabs),
                         plus the grafts onto Electrum's own GUI: the Channels tab's "Managed by"
                         column, the balance pie chart's liquidity-goal-buffer slice, and the
                         Send tab's inline buffer warning
@@ -998,7 +1097,15 @@ inbound_liquidity/
 tests/                  pure-engine unit tests + Electrum-glue tests covering the rules engine,
                         per-wallet settings, decision log, provider/peer reliability, dev fee, daily
                         caps, offline auto-close, startup readiness, diagnostics, the Qt tab (incl.
-                        one tab per open wallet), and the funding floor
+                        one tab per open wallet), the funding floor, and the opt-in usage
+                        statistics (engine, glue, consent screen, and that the shipped PHP
+                        receiver enforces the same allowlist)
+scripts/
+  analytics-endpoint/   the receiving end of the opt-in usage statistics: report.php (validates
+                        against its own copy of the per-level allowlist and stores one row per
+                        install), common.php, summary.php, import-geo.php (the DB-IP
+                        IP-to-country table). Deployed to getbarebits.com/liqanalytics/
+PRIVACY.md              what is and is not sent, for all three network flows
 ```
 
 The decision logic lives in `liquidity_manager.py` as a pure function

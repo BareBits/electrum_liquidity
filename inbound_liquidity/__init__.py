@@ -11,10 +11,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import importlib
 import json
 import math
 import os
 import pkgutil
+import platform
+import re
 import sys
 import threading
 import time
@@ -126,6 +129,22 @@ from .liquidity_manager import (
     wallet_readiness_block,
 )
 from .diag_log import DiagLog
+# Bound as a MODULE rather than flattened into this namespace: every reference
+# below reads `usage_stats.build_payload` / `usage_stats.LEVEL_OFF`, which keeps
+# it obvious at the call site that a value is part of the reporting contract
+# rather than an ordinary local helper, and keeps generic names like `is_due`
+# and `parse_response` out of a namespace that already carries 70 imported ones.
+#
+# NOT `from . import usage_stats`, which looks equivalent and is not: that form
+# asks the import machinery for the fully-qualified
+# "electrum_external_plugins.inbound_liquidity.usage_stats", which walks the
+# dotted path from a top-level `electrum_external_plugins` that does not exist
+# on sys.path under a zip install -- ModuleNotFoundError, crashing Electrum on
+# install (exactly the hazard the compat shim above exists for, and caught by
+# tests/test_external_zip_load.py). `import_module` with a RELATIVE name
+# resolves against the parent already in sys.modules, like the
+# `from .liquidity_manager import ...` form above.
+usage_stats = importlib.import_module(".usage_stats", __package__)
 from .log_buffer import (
     DEFAULT_MAX_LINES as DEFAULT_LOG_BUFFER_LINES,
     LogCapture,
@@ -748,6 +767,30 @@ UPDATE_CHECK_TIMEOUT_SEC = 15.0
 # make the wallet buffer an unbounded body.
 UPDATE_CHECK_MAX_BYTES = 512 * 1024
 
+# --- anonymous usage statistics -------------------------------------------
+# Where an opted-in wallet POSTs its report. A path of its own, distinct from
+# the sister software's `/analytics/` endpoint, so the two data sets stay
+# separate and neither can be polluted by the other's reports.
+USAGE_STATS_URL = "https://getbarebits.com/liqanalytics/report.php"
+# Env override, which is also the kill switch. Setting it to any of the
+# disabling words below stops every report at the source, whatever a wallet has
+# opted into -- the rig sets it, and it is the documented way for a packager or
+# a user to switch reporting off for a whole installation.
+USAGE_STATS_ENDPOINT_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT"
+USAGE_STATS_DISABLING_WORDS = frozenset({"", "disabled", "off", "0", "none", "no"})
+# Reporting is suppressed outright on regtest: a regtest wallet is a test
+# fixture, not a user, and counting rigs as installs would corrupt the very
+# numbers this feature exists to produce. The rig's own e2e test needs to
+# exercise a REAL send over the real daemon, so it sets this escape hatch --
+# which ships off, is read only from the environment, and is the exact
+# counterpart of the sister software's `SafeHttp::privateEndpointsAllowed()`
+# (test rigs point at 127.0.0.1 while production is https).
+USAGE_STATS_ALLOW_REGTEST_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ALLOW_REGTEST"
+# A report is ~1-2 KB; the reply is `{"ok":true}`. Both bounded, and the read
+# capped, for the same reason as the update check.
+USAGE_STATS_TIMEOUT_SEC = 15.0
+USAGE_STATS_MAX_BYTES = 16 * 1024
+
 
 def _plain_json_copy(value: Any) -> Any:
     """Rebuild ``value`` out of plain dicts/lists, recursively.
@@ -1099,6 +1142,35 @@ WEDGE_STRIKES_DB_KEY = "inbound_liquidity_wedge_strikes"
 # liquidity_manager.coop_before_force_ready) for EVERY close path, so the rule
 # cannot be bypassed by adding a new caller.
 CLOSE_ATTEMPT_DB_KEY = "inbound_liquidity_close_attempts"
+
+# --- lifetime usage totals -------------------------------------------------
+# Monotonic per-wallet counters of what this plugin has actually done: channels
+# opened and closed, sats funded into them, swaps completed and sats moved, sink
+# payments made, dev fee paid. Only ever incremented, never pruned.
+#
+# Why a dedicated store rather than deriving these from existing state: nothing
+# already kept can answer "how much liquidity has this plugin provisioned over
+# its life". The decision log is pruned by the retention setting, the action
+# timestamps are pruned to a rolling 24h (they exist to enforce the daily
+# ceilings), and the dev-fee ledger is a *balance owed* that is drawn down on
+# every payout. All three are the wrong shape for a lifetime total by design.
+#
+# These accrue from upgrade onward regardless of the usage-statistics opt-in:
+# they are ordinary local bookkeeping, shown in the GUI, and are only ever
+# TRANSMITTED if the user chooses level 3. Counting only while opted in would
+# make level 3 report zeros for its first week and would mean the consent
+# screen's preview could not show real numbers. Existing wallets start at zero
+# on upgrade -- there is no historical data to backfill from, and inventing one
+# from the pruned log would be a guess presented as a measurement.
+USAGE_TOTALS_DB_KEY = "inbound_liquidity_usage_totals"
+# The counter names, which are deliberately IDENTICAL to the matching
+# `usage_stats.UsageSnapshot` field names, so there is no translation table
+# between what is counted and what is reported.
+USAGE_TOTAL_FIELDS: Tuple[str, ...] = (
+    "channels_opened_total", "channels_closed_total", "force_closes_total",
+    "sats_funded_total", "swaps_completed_total", "sats_swapped_total",
+    "sink_payments_total", "sats_sunk_total", "dev_fee_paid_total_sat",
+)
 
 # Offline auto-close defaults (all editable from the Settings tab). Times are in
 # DAYS and stored as floats so tests can set sub-minute values.
@@ -1628,6 +1700,56 @@ SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
     'plugins.inbound_liquidity.update_latest_url',
     default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Release page for the latest release seen"))
+
+# --- anonymous usage statistics -------------------------------------------
+# The opt-in report described in `usage_stats.py`. Off by default, and nothing
+# leaves the wallet until the user picks a level on the consent screen.
+#
+# Per-wallet like every other setting here. The consequence is deliberate and
+# worth stating: a user running three wallets is three consent decisions and
+# three install ids, so they appear in the data as three installs. The
+# alternative -- one installation-wide identity -- would count users more
+# accurately but would make this the one setting that is NOT a property of the
+# wallet it belongs to, and would let one wallet's choice start reporting on
+# another's behalf. Accurate consent beat accurate counting.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LEVEL = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_level',
+    default=usage_stats.LEVEL_OFF, type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Anonymous usage statistics level"),
+    long_desc=lambda: _("How much anonymous usage information this wallet sends: "
+                        "0 = nothing (the default), 1 = that the wallet exists and what "
+                        "it runs, 2 = plus the settings chosen, 3 = plus lifetime "
+                        "liquidity totals. Never includes addresses, transactions, "
+                        "balances or key material."))
+# Whether the question has been put to the user yet. Separate from the level so
+# "declined" (level 0, prompted) and "not asked" (level 0, not prompted) stay
+# distinguishable -- otherwise the consent screen would reappear forever for
+# anyone who said no. Same reasoning as UPDATE_CHECK_PROMPTED above.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_prompted',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Usage-statistics consent has been offered"))
+# The random UUIDv4 minted the moment this wallet opts in -- never derived from
+# anything (see usage_stats.new_install_id). Kept when the user opts back out,
+# so a later re-opt-in is the same install rather than a second one; a wallet
+# that never opts in never has one at all.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_install_id',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Random identifier sent with usage statistics"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_sent_ts',
+    default=0.0, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Last usage report accepted (epoch seconds)"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_attempt_ts',
+    default=0.0, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Last usage report attempted (epoch seconds)"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_error',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Why the last usage report did not land"))
+
 # --- trampoline warning ---------------------------------------------------
 # Whether this wallet has been told that trampoline routing undercuts the
 # plugin. Asked once and then never again, however the user answered -- hence a
@@ -2100,6 +2222,15 @@ class LiquidityPlugin(BasePlugin):
         # gates: whether a newer plugin exists has nothing to do with whether
         # this wallet is armed, synced, or funded. A no-op unless enabled.
         self._request_update_check(wallet)
+        # Opt-in usage report, on the same terms and for the same reason: it is
+        # about the installation, not about this wallet's readiness to act, and
+        # it self-throttles to one a week. A no-op unless the user opted in.
+        #
+        # This is the ONLY place a report is scheduled on its own -- the GUI's
+        # two call sites are both "the user just chose a level, send one now".
+        # So a headless install, or any wallet between restarts, reports from
+        # here or not at all.
+        self._request_usage_report(wallet)
 
     def _start_heartbeat(self, wallet: 'Abstract_Wallet') -> None:
         """Launch the per-wallet heartbeat loop on the network's asyncio loop, if
@@ -2129,6 +2260,15 @@ class LiquidityPlugin(BasePlugin):
                     return
                 except Exception as e:
                     self.logger.info(f"update check tick error: {e!r}")
+                # Self-throttled to once a WEEK; same reasoning as above -- this
+                # is only the clock that lets a wallet which is never restarted
+                # reach its next slot. A no-op unless the user opted in.
+                try:
+                    await self._maybe_send_usage_report(wallet)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    self.logger.info(f"usage report tick error: {e!r}")
                 try:
                     await self._evaluate(wallet)
                 except asyncio.CancelledError:
@@ -2791,6 +2931,417 @@ class LiquidityPlugin(BasePlugin):
             self.logger.info("update check: no usable release in the reply; skipping")
         return release
 
+    # --- anonymous usage statistics ---------------------------------------
+    #
+    # The glue half of `usage_stats.py`: it reads this wallet's settings and
+    # state, hands the pure module an already-coarsened snapshot, and makes the
+    # HTTP request. Every identifier is reduced to a boolean or a count HERE, on
+    # the way into the snapshot, so nothing identifying ever reaches the module
+    # that builds the payload (see UsageSnapshot's note).
+    #
+    # Three independent gates must all be open before anything is sent, and any
+    # one of them closed means silence:
+    #   1. the user picked a level (level 0 / never prompted -> nothing);
+    #   2. the endpoint is not switched off (the env kill switch);
+    #   3. the wallet is not on regtest (unless the rig's explicit override).
+
+    def usage_stats_endpoint(self) -> str:
+        """The endpoint a report would go to: the env override if set, else the
+        shipped default."""
+        override = os.environ.get(USAGE_STATS_ENDPOINT_ENV)
+        if override is not None:
+            return override.strip()
+        return USAGE_STATS_URL
+
+    def usage_stats_endpoint_disabled(self) -> bool:
+        """Whether reporting is switched off for this whole installation."""
+        return self.usage_stats_endpoint().lower() in USAGE_STATS_DISABLING_WORDS
+
+    @staticmethod
+    def _usage_stats_allow_regtest() -> bool:
+        """Whether the regtest suppression has been explicitly overridden.
+
+        Read from the environment only -- deliberately not a setting, so it
+        cannot be turned on from the GUI, cannot be persisted into a wallet
+        file, and leaves no way for a shipped build to start reporting regtest
+        wallets. The rig's e2e test is the only thing that sets it.
+        """
+        return (os.environ.get(USAGE_STATS_ALLOW_REGTEST_ENV, "").strip().lower()
+                in {"1", "true", "yes", "on"})
+
+    def usage_stats_network_name(self) -> str:
+        """This installation's network as the report names it, or "other"."""
+        try:
+            from electrum import constants
+            name = str(getattr(constants.net, "NET_NAME", "") or "")
+        except Exception:
+            return "other"
+        return name if name in usage_stats.NETWORKS else "other"
+
+    def usage_stats_network_suppressed(self) -> bool:
+        """True when this network must not report at all. See the constant."""
+        if self.usage_stats_network_name() != "regtest":
+            return False
+        return not self._usage_stats_allow_regtest()
+
+    def usage_stats_blocked_reason(self) -> Optional[str]:
+        """Why no report can leave this installation regardless of the opt-in,
+        or None when nothing is in the way. Phrased for a GUI label."""
+        if self.usage_stats_endpoint_disabled():
+            return _("Reporting is switched off for this installation "
+                     "({}).").format(USAGE_STATS_ENDPOINT_ENV)
+        if self.usage_stats_network_suppressed():
+            return _("This wallet is on regtest, so nothing is reported.")
+        return None
+
+    def usage_stats_level(self, wallet: 'Abstract_Wallet') -> int:
+        """This wallet's chosen level, validated. Anything unrecognised (a
+        hand-edited wallet file, a level from a future version) reads as OFF:
+        the safe answer for an unparseable consent record is "no consent"."""
+        try:
+            raw = self.settings(wallet).INBOUND_LIQUIDITY_USAGE_STATS_LEVEL
+        except Exception:
+            return usage_stats.LEVEL_OFF
+        try:
+            level = int(raw)
+        except (TypeError, ValueError):
+            return usage_stats.LEVEL_OFF
+        return level if level in usage_stats.LEVELS else usage_stats.LEVEL_OFF
+
+    def usage_stats_prompted(self, wallet: 'Abstract_Wallet') -> bool:
+        return bool(getattr(self.settings(wallet),
+                            'INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED', False))
+
+    def usage_stats_install_id(self, wallet: 'Abstract_Wallet') -> Optional[str]:
+        """This wallet's install id, or None if it has never opted in."""
+        raw = getattr(self.settings(wallet),
+                      'INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID', '')
+        return raw if usage_stats.is_install_id(raw) else None
+
+    def _ensure_usage_install_id(self, wallet: 'Abstract_Wallet') -> str:
+        """This wallet's install id, minting one if it has none.
+
+        Minted at opt-in rather than at install: a wallet that never opts in
+        never has an identifier at all, so there is nothing to leak, nothing to
+        correlate, and nothing to explain away. A re-opt-in reuses the existing
+        id so the receiver's one-row-per-install view does not grow a phantom
+        second install for the same wallet.
+        """
+        existing = self.usage_stats_install_id(wallet)
+        if existing is not None:
+            return existing
+        minted = usage_stats.new_install_id()
+        self.settings(wallet).INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID = minted
+        return minted
+
+    def set_usage_stats_choice(self, wallet: 'Abstract_Wallet', level: int, *,
+                               mark_prompted: bool = True) -> int:
+        """Record the user's consent choice and return the level stored.
+
+        Opting in mints the install id. Opting out keeps the id and the
+        prompted flag: "they said no" has to be remembered, or the consent
+        screen would ask again at every start.
+        """
+        if not usage_stats.is_valid_choice(level):
+            raise ValueError(f"not a usage-statistics level: {level!r}")
+        c = self.settings(wallet)
+        if level != usage_stats.LEVEL_OFF:
+            self._ensure_usage_install_id(wallet)
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LEVEL = int(level)
+        if mark_prompted:
+            c.INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED = True
+        self.logger.info(
+            "usage statistics " + (f"enabled at level {level}" if level
+                                   else "declined / switched off"))
+        return int(level)
+
+    def build_usage_snapshot(self, wallet: 'Abstract_Wallet') -> 'usage_stats.UsageSnapshot':
+        """Everything a report may contain, gathered off this wallet.
+
+        Total and non-raising: a report is a courtesy, and a missing attribute
+        on an odd wallet (or a stub in a test) must degrade one field rather
+        than abort the report. Hence the `getattr(..., default)` style
+        throughout, and the broad guards around the counted collections.
+
+        Note what is NOT read here: no address, no channel id, no peer node id,
+        no npub, no balance. The configured sink address and channel peer are
+        reduced to booleans, and the partner/provider preference lists to their
+        lengths, before anything leaves this method.
+        """
+        c = self.settings(wallet)
+
+        def _flag(name: str, default: bool = False) -> bool:
+            return bool(getattr(c, name, default))
+
+        def _num(name: str, default: int = 0) -> int:
+            try:
+                return int(getattr(c, name, default) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _pct(name: str, default: float = 0.0) -> float:
+            try:
+                return float(getattr(c, name, default) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _listed(name: str) -> int:
+            """How many entries a comma/whitespace-separated preference list
+            holds. The COUNT only -- the members are node ids and npubs."""
+            try:
+                raw = str(getattr(c, name, '') or '')
+            except Exception:
+                return 0
+            return len([part for part in re.split(r"[,\s]+", raw) if part.strip()])
+
+        # Live channel counts (not amounts). Guarded because a wallet without
+        # Lightning, or one still starting up, has no channels mapping at all.
+        channels_open_now = 0
+        channels_managed_now = 0
+        try:
+            lnworker = getattr(wallet, "lnworker", None)
+            channels = dict(getattr(lnworker, "channels", {}) or {}) if lnworker else {}
+            managed = self._plugin_opened_channels(wallet)
+            for chan_id, chan in channels.items():
+                if getattr(chan, "is_closed", lambda: False)():
+                    continue
+                channels_open_now += 1
+                try:
+                    if chan_id.hex() in managed:
+                        channels_managed_now += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.info(f"could not count channels for the usage report: {e!r}")
+
+        totals = self._load_usage_totals(wallet)
+
+        return usage_stats.UsageSnapshot(
+            # --- level 1 -----------------------------------------------------
+            plugin_version=self.plugin_version() or "unknown",
+            electrum_version=self._electrum_version(),
+            python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+            os_family=self._os_family(),
+            gui_kind=self._gui_kind(),
+            network=self.usage_stats_network_name(),
+            # --- level 2: the settings chosen --------------------------------
+            automation_enabled=_flag('INBOUND_LIQUIDITY_AUTOMATION_ENABLED'),
+            manual_run_only=_flag('INBOUND_LIQUIDITY_MANUAL_RUN_ONLY'),
+            liquidity_goal_sat=_num('INBOUND_LIQUIDITY_GOAL_SAT'),
+            max_channels=_num('INBOUND_LIQUIDITY_MAX_CHANNELS'),
+            max_channel_size_sat=_num('INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT'),
+            min_onchain_to_open_sat=_num('INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT'),
+            onchain_reserve_sat=_num('INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT'),
+            max_swap_fee_pct=_pct('INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT'),
+            swap_trigger_pct=_pct('INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT'),
+            swap_trigger_sat=_num('INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT'),
+            min_swap_sat=_num('INBOUND_LIQUIDITY_MIN_SWAP_SAT'),
+            min_outbound_sat=_num('INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT'),
+            max_opens_per_day=_num('INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY'),
+            max_closes_per_day=_num('INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY'),
+            dev_fee_pct=_pct('INBOUND_LIQUIDITY_DEV_FEE_PCT'),
+            # Configured-or-not, never the value. These two are the only
+            # settings in the report that hold an identifier at all.
+            sink_configured=bool(str(
+                getattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', '') or '').strip()),
+            channel_peer_configured=bool(str(
+                getattr(c, 'INBOUND_LIQUIDITY_CHANNEL_PEER', '') or '').strip()),
+            defer_sink_until_goal=_flag('INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL'),
+            disable_submarine_swaps=_flag('INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS'),
+            manage_plugin_opened_only=_flag('INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY'),
+            one_channel_per_peer=_flag('INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER'),
+            partners_strict=_flag('INBOUND_LIQUIDITY_PARTNERS_STRICT'),
+            reliability_enabled=_flag('INBOUND_LIQUIDITY_RELIABILITY_ENABLED'),
+            peer_reliability_enabled=_flag('INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
+            auto_remediate_stuck_open=_flag('INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
+            offline_autoclose_enabled=_flag('INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
+            update_check_enabled=_flag('INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED'),
+            show_goal_in_piechart=_flag('INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART'),
+            diag_log_enabled=_flag('INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
+            preferred_partners_count=_listed('INBOUND_LIQUIDITY_PREFERRED_PARTNERS'),
+            banned_partners_count=_listed('INBOUND_LIQUIDITY_BANNED_PARTNERS'),
+            preferred_npubs_count=_listed('INBOUND_LIQUIDITY_PREFERRED_NPUBS'),
+            banned_npubs_count=_listed('INBOUND_LIQUIDITY_BANNED_NPUBS'),
+            # --- level 3: what the plugin actually provisioned ---------------
+            channels_opened_total=totals["channels_opened_total"],
+            channels_closed_total=totals["channels_closed_total"],
+            force_closes_total=totals["force_closes_total"],
+            sats_funded_total=totals["sats_funded_total"],
+            swaps_completed_total=totals["swaps_completed_total"],
+            sats_swapped_total=totals["sats_swapped_total"],
+            sink_payments_total=totals["sink_payments_total"],
+            sats_sunk_total=totals["sats_sunk_total"],
+            dev_fee_paid_total_sat=totals["dev_fee_paid_total_sat"],
+            channels_open_now=channels_open_now,
+            channels_managed_now=channels_managed_now,
+        )
+
+    @staticmethod
+    def _electrum_version() -> str:
+        try:
+            from electrum.version import ELECTRUM_VERSION
+            return str(ELECTRUM_VERSION)
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _os_family() -> str:
+        """A coarse OS family from a fixed set. The family, not the release: the
+        full platform string carries kernel and distribution detail that is both
+        fingerprint-y and useless for counting."""
+        try:
+            system = platform.system()
+        except Exception:
+            return "other"
+        if system in usage_stats.OS_FAMILIES:
+            return system
+        return "BSD" if "bsd" in str(system).lower() else "other"
+
+    def _gui_kind(self) -> str:
+        """Which front end is running, read off this instance's own module.
+
+        Electrum instantiates the plugin as ``<gui_name>.Plugin``, so the
+        subclass's module IS the answer -- no extra plumbing, and it cannot go
+        stale the way a hand-set attribute could.
+        """
+        module = str(type(self).__module__ or "")
+        if module.endswith(".qt"):
+            return "qt"
+        if module.endswith(".cmdline"):
+            return "cmdline"
+        return "other"
+
+    def usage_stats_preview(self, wallet: 'Abstract_Wallet', level: int, *,
+                            now: Optional[float] = None) -> str:
+        """Pretty JSON of exactly what ``level`` would send for this wallet.
+
+        What the consent screen and the settings tab display. Routed through the
+        same builder the real report uses, with this wallet's real install id
+        when it has one, so the preview is the report rather than a mock-up.
+        """
+        return usage_stats.preview_json(
+            level, self.build_usage_snapshot(wallet),
+            now=now if now is not None else time.time(),
+            install_id=self.usage_stats_install_id(wallet))
+
+    def usage_stats_status(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
+        """State for the settings tab and the headless status command."""
+        c = self.settings(wallet)
+        return {
+            "level": self.usage_stats_level(wallet),
+            "prompted": self.usage_stats_prompted(wallet),
+            "install_id": self.usage_stats_install_id(wallet),
+            "endpoint": None if self.usage_stats_endpoint_disabled()
+                        else self.usage_stats_endpoint(),
+            "blocked_reason": self.usage_stats_blocked_reason(),
+            "network": self.usage_stats_network_name(),
+            "last_sent_ts": float(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS', 0.0) or 0.0),
+            "last_attempt_ts": float(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS', 0.0) or 0.0),
+            "last_error": str(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR', '') or ''),
+            "interval_days": int(usage_stats.SEND_INTERVAL_SEC // 86_400),
+        }
+
+    def _request_usage_report(self, wallet: 'Abstract_Wallet', *,
+                              force: bool = False) -> None:
+        """Fire the (self-throttling) usage report on the network's asyncio loop.
+
+        Fire-and-forget for the same reason as the update check: this is a
+        courtesy report to a server that has nothing to do with running the
+        wallet, and neither wallet startup nor a heartbeat tick may wait on it
+        or fail because of it.
+        """
+        loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._maybe_send_usage_report(wallet, force=force), loop)
+        except Exception as e:
+            self.logger.info(f"could not schedule the usage report: {e!r}")
+
+    async def _maybe_send_usage_report(self, wallet: 'Abstract_Wallet', *,
+                                       force: bool = False) -> bool:
+        """Send this wallet's usage report if one is due. Returns whether the
+        receiver accepted it.
+
+        ``force`` skips the cadence check (used right after opting in, so the
+        user does not wait a week to see the feature work) but NOT any of the
+        three gates: a forced report still will not go out from a wallet that
+        has not opted in, on a disabled endpoint, or on regtest.
+
+        As with the update check, the attempt timestamp is stamped BEFORE the
+        request. An endpoint that is down therefore backs off for an hour rather
+        than being retried on every single heartbeat.
+        """
+        level = self.usage_stats_level(wallet)
+        if level == usage_stats.LEVEL_OFF:
+            return False
+        blocked = self.usage_stats_blocked_reason()
+        if blocked is not None:
+            self.logger.info(f"usage report not sent: {blocked}")
+            return False
+        c = self.settings(wallet)
+        now = time.time()
+        if not force and not usage_stats.is_due(
+                now=now,
+                last_sent_ts=float(
+                    getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS', 0.0) or 0.0),
+                last_attempt_ts=float(
+                    getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS', 0.0) or 0.0)):
+            return False
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS = now
+
+        payload = usage_stats.build_payload(
+            level, self.build_usage_snapshot(wallet),
+            now=now, install_id=self._ensure_usage_install_id(wallet))
+        try:
+            await self._post_usage_report(wallet, payload)
+        except asyncio.CancelledError:
+            raise
+        except usage_stats.UsageReportRejected as e:
+            c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = str(e)
+            self.logger.info(f"usage report not accepted: {e}")
+            return False
+        except Exception as e:
+            # Scrubbed: the text can include a hostname or an error string from
+            # whatever answered, and it lands in a log line and a GUI label.
+            message = scrub_text(f"{type(e).__name__}: {e}")[:200]
+            c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = message
+            self.logger.info(f"usage report failed: {message}")
+            return False
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS = now
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = ''
+        self.logger.info(
+            f"usage report accepted (level {level}, {len(payload['properties'])} fields)")
+        return True
+
+    async def _post_usage_report(self, wallet: 'Abstract_Wallet',
+                                 payload: Dict[str, Any]) -> None:
+        """POST one report, raising :class:`usage_stats.UsageReportRejected`
+        unless the receiver accepted it.
+
+        Routed through ``make_aiohttp_session`` so it honours the wallet's proxy
+        -- a Tor user's usage report must not be the one request that leaks
+        their IP -- with the same short timeout and read cap as the update
+        check.
+        """
+        proxy = getattr(getattr(wallet, "network", None), "proxy", None)
+        headers = {"User-Agent": "Electrum-inbound-liquidity-usage-stats",
+                   "Content-Type": "application/json",
+                   "Accept": "application/json"}
+        body = usage_stats.encode_payload(payload)
+        async with make_aiohttp_session(proxy, headers=headers,
+                                        timeout=USAGE_STATS_TIMEOUT_SEC) as session:
+            async with session.post(self.usage_stats_endpoint(), data=body) as response:
+                raw = await self._read_capped(response.content, USAGE_STATS_MAX_BYTES + 1)
+                status = response.status
+        if len(raw) > USAGE_STATS_MAX_BYTES:
+            raise usage_stats.UsageReportRejected("the endpoint replied with too much data")
+        usage_stats.parse_response(status, raw)
+
     # --- live log capture -------------------------------------------------
     #
     # These three settings are per-wallet like all the others, but what they
@@ -3449,6 +4000,69 @@ class LiquidityPlugin(BasePlugin):
         data[kind] = tss
         self._save_action_timestamps(wallet, data)
 
+    # --- lifetime usage totals -------------------------------------------
+    # See USAGE_TOTALS_DB_KEY. Plain monotonic counters; the only consumers are
+    # the GUI and (if the user opts in at level 3) the usage report.
+    def _load_usage_totals(self, wallet: 'Abstract_Wallet') -> Dict[str, int]:
+        """This wallet's lifetime totals, every field present and non-negative.
+
+        Total over USAGE_TOTAL_FIELDS so callers never have to handle a missing
+        key: the store did not exist before this feature, and every wallet
+        upgrading into it reads as all-zeros rather than as a dict of absences.
+        A hand-edited or corrupt value reads as 0 for that field alone rather
+        than discarding the rest.
+        """
+        db = getattr(wallet, "db", None)
+        raw = db.get(USAGE_TOTALS_DB_KEY, {}) if db is not None else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        out: Dict[str, int] = {}
+        for field in USAGE_TOTAL_FIELDS:
+            try:
+                out[field] = max(0, int(raw.get(field, 0) or 0))
+            except (TypeError, ValueError):
+                out[field] = 0
+        return out
+
+    def _bump_usage_totals(self, wallet: 'Abstract_Wallet', **deltas: int) -> None:
+        """Add to this wallet's lifetime totals and persist.
+
+        Never raises. Every caller sits on a path that has ALREADY committed
+        funds -- a channel just opened, a swap just funded, a sink payment just
+        settled -- and on those paths an exception would lose the record of the
+        thing that just happened (see the comment at the channel-open site). A
+        counter is not worth that, so a failure here is logged and dropped.
+
+        An unknown counter name is a programming error and is rejected loudly in
+        the log rather than silently creating a field nothing reports.
+        """
+        try:
+            unknown = sorted(set(deltas) - set(USAGE_TOTAL_FIELDS))
+            if unknown:
+                self.logger.error(f"unknown usage-total counters ignored: {unknown}")
+            totals = self._load_usage_totals(wallet)
+            changed = False
+            for field, delta in deltas.items():
+                if field in unknown:
+                    continue
+                try:
+                    step = int(delta)
+                except (TypeError, ValueError):
+                    continue
+                if step <= 0:
+                    continue        # monotonic: these only ever go up
+                totals[field] = totals[field] + step
+                changed = True
+            if not changed:
+                return
+            db = getattr(wallet, "db", None)
+            if db is None:
+                return              # db-less wallet (unit-test mock)
+            db.put(USAGE_TOTALS_DB_KEY, totals)
+            wallet.save_db()
+        except Exception as e:
+            self.logger.info(f"could not record usage totals: {e!r}")
+
     def _within_close_cap(self, wallet: 'Abstract_Wallet',
                           now: Optional[float] = None) -> bool:
         """True if a channel close is still allowed under the rolling-24h close
@@ -3721,6 +4335,7 @@ class LiquidityPlugin(BasePlugin):
             remaining = max(0, self._load_dev_fee_owed(wallet) - pay_sat)
             self._save_dev_fee_owed(wallet, remaining)
             self._record_dev_fee_payment(wallet, pay_sat)
+            self._bump_usage_totals(wallet, dev_fee_paid_total_sat=int(pay_sat))
             self.logger.info(
                 f"dev-fee payout of {pay_sat} sat settled to {address}; "
                 f"{remaining} sat still owed")
@@ -4779,9 +5394,11 @@ class LiquidityPlugin(BasePlugin):
                 # completion, so accrue its dev fee now (once -- the record is then
                 # dropped).
                 self._record_provider_success(wallet, npub)
+                basis_sat = int(info.get("fee_basis_sat", 0) or 0)
                 self._accrue_dev_fee(
-                    wallet, int(info.get("fee_basis_sat", 0) or 0),
-                    source=f"swap {ph_hex[:10]}…")
+                    wallet, basis_sat, source=f"swap {ph_hex[:10]}…")
+                self._bump_usage_totals(wallet, swaps_completed_total=1,
+                                        sats_swapped_total=basis_sat)
                 del data[ph_hex]
                 changed = True
             elif now - started_ts > PENDING_SWAP_MAX_AGE_SEC:
@@ -5525,6 +6142,7 @@ class LiquidityPlugin(BasePlugin):
         if on_force_closed is not None:
             on_force_closed()
         self._record_action_event(wallet, "close")
+        self._bump_usage_totals(wallet, channels_closed_total=1, force_closes_total=1)
         attempted = int(rec.get("coop_attempts", 0) or 0)
         why = (f"after {attempted} cooperative close attempt(s)" if attempted
                else "peer was never reachable to close cooperatively")
@@ -5575,6 +6193,7 @@ class LiquidityPlugin(BasePlugin):
                 f"{node_id[:12]}… ({reason}; peer is currently reachable)")
             await lnworker.close_channel(chan_id)
             self._record_action_event(wallet, "close")
+            self._bump_usage_totals(wallet, channels_closed_total=1)
             self.logger.info(f"cooperatively closed channel {cid[:12]}…")
             self._log_action(
                 wallet, kind="close", amount_sat=None,
@@ -6894,6 +7513,11 @@ class LiquidityPlugin(BasePlugin):
             # Count this open toward the rolling-24h open ceiling.
             self._bookkeep("open against the daily ceiling",
                            self._record_action_event, wallet, "open")
+            # ...and toward the lifetime totals (the "how much liquidity did
+            # this plugin provision" figures).
+            self._bookkeep("open against the lifetime totals",
+                           self._bump_usage_totals, wallet,
+                           channels_opened_total=1, sats_funded_total=int(funding_sat))
             self._bookkeep(
                 "open in the decision log", self._log_action,
                 wallet, kind="open", amount_sat=funding_sat,
@@ -7624,6 +8248,12 @@ class LiquidityPlugin(BasePlugin):
             # them.
             self._record_provider_success(wallet, npub)
             self._accrue_dev_fee(wallet, expected_onchain_sat, source=action.short_id)
+            # Lifetime totals. Measured on the NET ON-CHAIN amount received --
+            # the same basis the dev fee is charged on, and the one figure the
+            # late-reconciliation path (_reconcile_pending_swaps) also has, so
+            # both swap-completion sites count the same quantity.
+            self._bump_usage_totals(wallet, swaps_completed_total=1,
+                                    sats_swapped_total=int(expected_onchain_sat))
             # This channel just worked, so forget whatever failure we last recorded
             # for it: a recurrence after a success is news, not a repeat.
             self._last_exec_decline_sig.pop(action.channel_id, None)
@@ -8409,6 +9039,8 @@ class LiquidityPlugin(BasePlugin):
             # which is what the dev fee is charged on -- here on the amount sent,
             # the sink's equivalent of a swap's net on-chain receipt.
             self._accrue_dev_fee(wallet, amount_sat, source=action.short_id)
+            self._bump_usage_totals(wallet, sink_payments_total=1,
+                                    sats_sunk_total=int(amount_sat))
             self._log_action(
                 wallet, kind="sink", amount_sat=amount_sat,
                 source=action.short_id, dest=action.address,
@@ -9217,6 +9849,33 @@ def _register_commands() -> None:
         arg:str:value:The new value, parsed against the setting's declared type. Booleans accept true/false/yes/no/on/off/1/0
         """
         return plugin.set_setting(wallet, str(name).strip().upper(), value)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def usage_stats_status(self, plugin=None, wallet=None) -> Dict[str, Any]:
+        """
+        Show this wallet's anonymous-usage-statistics state: the chosen level,
+        the random identifier (if it has ever opted in), when a report was last
+        sent or last failed, and whether anything can be sent at all.
+
+        Read-only -- it never opts a wallet in. The level is an ordinary
+        setting, so `inbound_liquidity_set_setting usage_stats_level 2` is how
+        a headless install opts in (the GUI's consent screen is the same
+        choice, with previews).
+        """
+        return plugin.usage_stats_status(wallet)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def usage_stats_preview(self, level, plugin=None, wallet=None) -> str:
+        """
+        Show exactly what this wallet WOULD send at a given level, without
+        sending anything or changing any setting.
+
+        Rendered by the same code that builds the real report, so this is the
+        report rather than a description of one.
+
+        arg:str:level:1 (count me), 2 (plus settings) or 3 (plus liquidity totals)
+        """
+        return plugin.usage_stats_preview(wallet, int(level))
 
     @plugin_command('w', _PLUGIN_NAME)
     async def reset_settings(self, plugin=None, wallet=None) -> Dict[str, Any]:

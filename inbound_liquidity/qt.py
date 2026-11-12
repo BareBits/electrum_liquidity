@@ -5,14 +5,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTabWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+    QRadioButton, QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from electrum.i18n import _
@@ -36,7 +37,9 @@ from . import (
     PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
 )
-from .liquidity_manager import BufferSplit, normalize_node_id, split_goal_buffer
+from .liquidity_manager import (
+    BufferSplit, normalize_node_id, scrub_text, split_goal_buffer,
+)
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
 from .qt_widgets import (
     SortableHeader, SortableTreeItem, ToggleSwitch, add_sortable_row,
@@ -801,6 +804,13 @@ def _install_send_tab_warning(grid: QGridLayout,
 # a lie, and asking to save it on the way out would be asking about nothing.
 _APPLY_HINT_COLOR = "#d29922"
 
+# Where the usage-statistics consent screen and settings pane send a user who
+# wants the full story. The repo's own PRIVACY.md, on the branch the releases
+# are cut from, so it matches the running version rather than whatever `main`
+# says today.
+_USAGE_PRIVACY_URL = (
+    "https://github.com/BareBits/electrum_liquidity/blob/beta/PRIVACY.md")
+
 
 class _StatusLine:
     """One settings tab's status area: the tab's own message, plus an "unsaved
@@ -1006,17 +1016,46 @@ class _DirtyTracker:
 
 
 class _ApplyPane:
-    """One Apply-gated sub-tab, as the unsaved-changes guard sees it: a name to
-    put in a dialog, the widget that identifies it in the QTabWidget, a tracker
-    that says whether it has pending edits, and the Apply the dialog can press on
-    the user's behalf (returning whether the save went through)."""
+    """One Apply-gated settings pane, as the unsaved-changes guard sees it: a
+    name to put in a dialog, the widget that identifies it, a tracker that says
+    whether it has pending edits, and the Apply the dialog can press on the
+    user's behalf (returning whether the save went through).
+
+    ``host`` and ``focus`` exist for NESTED panes. The Advanced tab carries an
+    inner tab bar (General / Usage statistics), so two panes live inside one
+    entry of the outer tab bar. The guard identifies a pane by the outer tab it
+    is reached through -- its ``host`` -- because that is the only widget the
+    outer QTabWidget knows about; a nested pane's own widget is not
+    ``tabs.widget(i)`` for any ``i``, so keying on it would make the guard
+    silently blind to those edits (it would look up the pane, find nothing, and
+    conclude there was nothing to save). ``focus`` brings a nested pane back
+    into view when its Apply is refused, since that is where the message
+    explaining the refusal is.
+
+    For an ordinary top-level pane both are omitted and ``host`` is the widget
+    itself, which is exactly the old behaviour.
+    """
 
     def __init__(self, name: str, widget: QWidget, tracker: _DirtyTracker,
-                 apply: Callable[[], bool]) -> None:
+                 apply: Callable[[], bool], *,
+                 host: Optional[QWidget] = None,
+                 focus: Optional[Callable[[], None]] = None) -> None:
         self.name = name
         self.widget = widget
         self.tracker = tracker
         self.apply = apply
+        self.host = host if host is not None else widget
+        self.focus = focus
+
+    def bring_into_view(self) -> None:
+        """Show this pane, if it needs an extra step to be visible. Never
+        raises: this is a courtesy on an error path."""
+        if self.focus is None:
+            return
+        try:
+            self.focus()
+        except Exception:
+            pass
 
 
 def _ask_two_choices(window: 'ElectrumWindow', *, title: str, text: str,
@@ -1066,6 +1105,49 @@ def _wrapped_label(text: str) -> QLabel:
     label = QLabel(text)
     label.setWordWrap(True)
     return label
+
+
+def _fit_to_screen(widget: QWidget, *, margin: int = 80) -> None:
+    """Shrink ``widget`` so it fits the screen it will appear on.
+
+    Qt will happily give a dialog whatever size its layout asks for, including
+    one taller than the display -- and a modal whose buttons are below the
+    bottom edge cannot be dismissed at all on a window manager without
+    keyboard-driven moves. Best-effort and silent: a screen we cannot measure
+    just leaves the requested size alone.
+    """
+    try:
+        screen = widget.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        widget.resize(min(widget.width(), max(320, available.width() - margin)),
+                      min(widget.height(), max(320, available.height() - margin)))
+    except Exception:
+        pass
+
+
+def _bullet_labels(items: Sequence[str], *, indent: int = 18,
+                   color: str = "gray") -> List[QLabel]:
+    """One wrapped, indented "• item" label per item.
+
+    One label per bullet rather than a single label holding "\\n".join(...):
+    a QLabel wraps to its own left edge, so in the joined form the second line
+    of a long bullet starts back at column zero and the list stops reading as a
+    list. ``setIndent`` applies to every line of a left-aligned label, so each
+    bullet's continuation stays under its own text.
+
+    Used by both the usage-statistics consent dialog and the settings pane, so
+    the same list cannot end up formatted two different ways.
+    """
+    labels: List[QLabel] = []
+    for item in items:
+        label = _wrapped_label(f"• {item}")
+        label.setIndent(indent)
+        if color:
+            label.setStyleSheet(f"color: {color};")
+        labels.append(label)
+    return labels
 
 
 class _Signals(QObject):
@@ -1214,6 +1296,10 @@ class Plugin(LiquidityPlugin):
         # The persisted flag records the *answer*; this guards against opening a
         # second wallet stacking a second dialog before the first is answered.
         self._update_opt_in_asked: bool = False
+        # Same guard for the usage-statistics consent screen, for the same
+        # reason -- and more so here, since that dialog is a long one to find
+        # stacked twice.
+        self._usage_consent_asked: bool = False
         # One Send-tab buffer-warning refresher per open wallet. Keyed by wallet
         # rather than window because that is the key the buffer itself is looked
         # up by, and Electrum opens one window per wallet.
@@ -1256,6 +1342,9 @@ class Plugin(LiquidityPlugin):
         self._register_closing_warning(window, wallet)
         self._maybe_prompt_update_opt_in(window, wallet)
         self._maybe_warn_trampoline(window, wallet)
+        # Last of the one-time prompts: it is the longest, and it is the one
+        # whose honest default (off) costs the user nothing if they close it.
+        self._maybe_prompt_usage_consent(window, wallet)
 
     def _register_closing_warning(self, window: 'ElectrumWindow',
                                   wallet: 'Abstract_Wallet') -> None:
@@ -1444,6 +1533,193 @@ class Plugin(LiquidityPlugin):
         if enable:
             # Don't make the user wait for the next heartbeat to learn the answer.
             self._request_update_check(wallet)
+
+    def _maybe_prompt_usage_consent(self, window: 'ElectrumWindow',
+                                    wallet: 'Abstract_Wallet') -> None:
+        """Offer the anonymous-usage-statistics choice ONCE, with previews.
+
+        Everything about this is built around not manufacturing consent:
+
+          * The dialog opens on **Off**. The only way to end up sharing anything
+            is to deliberately select a level and press Save, so an impatient
+            Return or a reflexive click leaves reporting off.
+          * The **preview is live** and shows THIS wallet's real values, built by
+            the same function that builds the real report. Clicking through the
+            levels shows exactly what each one would send, before committing.
+          * **"Ask me later" stores nothing**, so closing the dialog (or
+            pressing Escape, which resolves to it) is not recorded as a refusal
+            and is not treated as agreement either. Pressing Save IS recorded,
+            in both directions, so a deliberate "no" is final.
+          * Skipped entirely when nothing could be sent anyway -- reporting
+            switched off for the installation, or a regtest wallet. Asking for
+            permission we could not act on is just noise.
+
+        Never blocks or breaks wallet load: any failure leaves the flag unset
+        (so the question comes back next time) and nothing else.
+        """
+        from . import usage_stats
+
+        if self.usage_stats_prompted(wallet):
+            return
+        if self.usage_stats_level(wallet) != usage_stats.LEVEL_OFF:
+            return      # already switched on from Advanced; nothing to ask
+        if self.usage_stats_blocked_reason() is not None:
+            return      # nothing could be sent regardless; see the docstring
+        if self._usage_consent_asked:
+            return      # a second wallet opening in the same session
+        self._usage_consent_asked = True
+        try:
+            chosen = self._ask_usage_consent(window, wallet)
+        except Exception:
+            # A prompt is a convenience; never let it break loading a wallet.
+            self.logger.exception("could not show the usage-statistics consent screen")
+            self._usage_consent_asked = False
+            return
+        if chosen is None:
+            self.logger.info("usage-statistics consent deferred ('ask me later')")
+            return
+        self.set_usage_stats_choice(wallet, chosen)
+        if chosen != usage_stats.LEVEL_OFF:
+            # Don't make the user wait a week to see that it works.
+            self._request_usage_report(wallet, force=True)
+        # The Advanced tab's usage pane may already be built and showing the old
+        # value, so bring it in line with what was just chosen.
+        state = self._tabs.get(wallet)
+        if state is not None:
+            try:
+                state.refresh()
+            except Exception:
+                self.logger.debug("could not refresh the tab after the consent choice")
+
+    def _ask_usage_consent(self, window: 'ElectrumWindow',
+                           wallet: 'Abstract_Wallet') -> Optional[int]:
+        """Put the consent dialog up. Returns the chosen level (0 for "no
+        thanks"), or None for "ask me later" / no answer."""
+        from electrum.gui.qt.util import WindowModalDialog
+        from . import usage_stats
+
+        descriptions = usage_stats.level_descriptions()
+        dialog = WindowModalDialog(window, _("Help improve this plugin?"))
+        # Wide enough that a 50-field JSON preview is readable without the user
+        # having to resize the dialog to find out what they are agreeing to.
+        dialog.setMinimumWidth(620)
+
+        # The content -- four options with their bullets, plus a preview of a
+        # 50-field report -- is taller than a short laptop screen. So it lives
+        # in a scroll area, with the BUTTONS OUTSIDE it: a consent dialog whose
+        # "No thanks" has fallen off the bottom of the screen is not one, and
+        # a modal the user cannot dismiss is worse than the feature is worth.
+        outer = QVBoxLayout(dialog)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        layout.addWidget(_wrapped_label(_(
+            "Would you help us understand how many people run the Inbound "
+            "Liquidity plugin, which settings matter, and how much liquidity it "
+            "actually provisions?\n\n"
+            "This is entirely optional and OFF unless you choose otherwise. The "
+            "plugin behaves exactly the same either way. If you say yes, this "
+            "wallet sends one small report now and then one a week.")))
+
+        layout.addWidget(_wrapped_label(_("We never send, at any level:")))
+        for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
+            layout.addWidget(label)
+
+        privacy = _wrapped_label("")
+        privacy.setTextFormat(Qt.TextFormat.RichText)
+        privacy.setOpenExternalLinks(True)
+        privacy.setText(
+            f'<a href="{_USAGE_PRIVACY_URL}">{html.escape(_("Read the privacy policy"))}</a>')
+        layout.addWidget(privacy)
+
+        layout.addWidget(QLabel(_("Choose how much to share:")))
+        group = QButtonGroup(dialog)
+        group.setExclusive(True)
+        buttons: List[Tuple[QRadioButton, int]] = []
+
+        off_button = QRadioButton(_("No thanks — send nothing"))
+        off_button.setChecked(True)          # the dialog opens on "off"
+        group.addButton(off_button)
+        buttons.append((off_button, usage_stats.LEVEL_OFF))
+        layout.addWidget(off_button)
+
+        for level in usage_stats.LEVELS:
+            description = descriptions[level]
+            button = QRadioButton(f"{level} · {_(description.title)}")
+            button.setToolTip(_(description.summary))
+            group.addButton(button)
+            buttons.append((button, level))
+            layout.addWidget(button)
+            summary = _wrapped_label(_(description.summary))
+            summary.setIndent(18)
+            summary.setStyleSheet("color: gray;")
+            layout.addWidget(summary)
+            for label in _bullet_labels([_(item) for item in description.items],
+                                        indent=34):
+                layout.addWidget(label)
+
+        layout.addWidget(QLabel(_("Exactly what would be sent:")))
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        preview_font = QFont("monospace")
+        preview_font.setStyleHint(QFont.StyleHint.Monospace)
+        preview.setFont(preview_font)
+        preview.setMinimumHeight(200)
+        layout.addWidget(preview)
+
+        def _selected_level() -> int:
+            for button, level in buttons:
+                if button.isChecked():
+                    return level
+            return usage_stats.LEVEL_OFF
+
+        def _refresh_preview() -> None:
+            level = _selected_level()
+            if level == usage_stats.LEVEL_OFF:
+                preview.setPlainText(_("Nothing is sent."))
+                return
+            try:
+                preview.setPlainText(self.usage_stats_preview(wallet, level))
+            except Exception as e:
+                self.logger.exception("could not build the consent-screen preview")
+                preview.setPlainText(_("Could not build the preview: {}").format(
+                    scrub_text(f"{type(e).__name__}: {e}")[:200]))
+
+        for button, _level in buttons:
+            button.toggled.connect(lambda _checked: _refresh_preview())
+        _refresh_preview()
+
+        layout.addWidget(_wrapped_label(_(
+            "You can change this at any time under the plugin's Advanced "
+            "settings, on the Usage statistics tab.")))
+
+        # "Save" is the accept role, "Ask me later" the reject role -- so
+        # Escape and the title-bar close both resolve to deferring, never to a
+        # recorded answer in either direction.
+        save_button = primary_button(_("Save my choice"))
+        later_button = QPushButton(_("Ask me later"))
+        save_button.clicked.connect(dialog.accept)
+        later_button.clicked.connect(dialog.reject)
+        row = QHBoxLayout()
+        row.addWidget(later_button)
+        row.addStretch(1)
+        row.addWidget(save_button)
+        outer.addLayout(row)      # outside the scroll area: always reachable
+
+        # Open at the content's natural size, but never taller than the screen
+        # it has to fit on (the scroll area absorbs the difference).
+        dialog.resize(680, 900)
+        _fit_to_screen(dialog)
+
+        if not dialog.exec():
+            return None
+        return _selected_level()
 
     def _maybe_warn_trampoline(self, window: 'ElectrumWindow',
                                wallet: 'Abstract_Wallet') -> None:
@@ -2321,6 +2597,56 @@ class Plugin(LiquidityPlugin):
                 return pane
         return None
 
+    def _install_sub_tab_guard(self, window: 'ElectrumWindow', tabs: QTabWidget,
+                               panes: List['_ApplyPane']) -> Dict[str, Any]:
+        """Ask about unsaved edits when a tab of ``tabs`` is navigated away from.
+
+        Factored out of :meth:`_install_unsaved_guard` so the Advanced tab's
+        INNER tab bar gets the same treatment: moving between General and Usage
+        statistics has to ask, exactly as moving between the outer tabs does.
+        The outer call additionally watches the main window; this half only
+        watches one QTabWidget.
+
+        Panes are keyed by ``host`` -- the tab they are reached through -- and a
+        host may hold SEVERAL panes (that is what nesting means), so every pane
+        behind the tab being left is checked together.
+
+        Returns the mutable ``{"index", "busy"}` state, so the caller's own
+        corrective navigation can set ``busy`` and not be mistaken for the user
+        navigating. The signal connection dies with the widget.
+        """
+        sub: Dict[str, Any] = {"index": tabs.currentIndex(), "busy": False}
+        by_host: Dict[QWidget, List['_ApplyPane']] = {}
+        for pane in panes:
+            by_host.setdefault(pane.host, []).append(pane)
+
+        def panes_at(index: int) -> List['_ApplyPane']:
+            if index < 0:
+                return []
+            return by_host.get(tabs.widget(index), [])
+
+        def on_sub_tab_changed(index: int) -> None:
+            prev, sub["index"] = sub["index"], index
+            if sub["busy"] or prev == index:
+                return
+            leaving = panes_at(prev)
+            if not leaving:
+                return      # left a read-only tab (a log view); nothing to save
+            sub["busy"] = True
+            try:
+                refused = self._resolve_unsaved(window, leaving)
+                if refused is not None:
+                    tabs.setCurrentIndex(prev)
+                    sub["index"] = prev
+                    refused.bring_into_view()
+            except Exception:
+                self.logger.exception("the unsaved-changes guard failed")
+            finally:
+                sub["busy"] = False
+
+        tabs.currentChanged.connect(on_sub_tab_changed)
+        return sub
+
     def _install_unsaved_guard(self, window: 'ElectrumWindow',
                                wallet: 'Abstract_Wallet', container: QWidget,
                                tabs: QTabWidget,
@@ -2340,33 +2666,7 @@ class Plugin(LiquidityPlugin):
         one dies with the widget.
         """
         # `busy` keeps our own corrective setCurrentIndex from re-entering this.
-        sub = {"index": tabs.currentIndex(), "busy": False}
-        by_widget = {p.widget: p for p in panes}
-
-        def pane_at(index: int) -> Optional['_ApplyPane']:
-            if index < 0:
-                return None
-            return by_widget.get(tabs.widget(index))
-
-        def on_sub_tab_changed(index: int) -> None:
-            prev, sub["index"] = sub["index"], index
-            if sub["busy"] or prev == index:
-                return
-            pane = pane_at(prev)
-            if pane is None:
-                return      # left a read-only tab (a log view); nothing to save
-            sub["busy"] = True
-            try:
-                refused = self._resolve_unsaved(window, [pane])
-                if refused is not None:
-                    tabs.setCurrentIndex(prev)
-                    sub["index"] = prev
-            except Exception:
-                self.logger.exception("the unsaved-changes guard failed")
-            finally:
-                sub["busy"] = False
-
-        tabs.currentChanged.connect(on_sub_tab_changed)
+        sub = self._install_sub_tab_guard(window, tabs, panes)
 
         # --- and the same question when the Liquidity tab itself is left ---
         main_tabs = getattr(window, "tabs", None)
@@ -2399,7 +2699,13 @@ class Plugin(LiquidityPlugin):
                     # Under the SUB-tab guard's busy flag as well: this is our own
                     # corrective navigation, and it must not be mistaken for the
                     # user leaving whichever sub-tab happened to be on screen.
-                    i = tabs.indexOf(refused.widget)
+                    #
+                    # By HOST, not by widget: a nested pane (Advanced's inner
+                    # tabs) is not an entry in this tab bar, so indexOf on its
+                    # own widget would return -1 and leave the user looking at
+                    # the wrong tab. The host is the outer tab; bring_into_view
+                    # then selects the right inner one.
+                    i = tabs.indexOf(refused.host)
                     if i != -1:
                         sub["busy"] = True
                         try:
@@ -2407,6 +2713,7 @@ class Plugin(LiquidityPlugin):
                             sub["index"] = i
                         finally:
                             sub["busy"] = False
+                    refused.bring_into_view()
             except Exception:
                 self.logger.exception("the unsaved-changes guard failed")
             finally:
@@ -3109,7 +3416,9 @@ class Plugin(LiquidityPlugin):
         tabs.addTab(partners_tab, _("Channel partners"))
 
         # --- Advanced sub-tab (last config tab, before the read-only logs) -
-        advanced_tab, repopulate_advanced, advanced_pane = \
+        # Two panes, not one: Advanced hosts an inner tab bar (General / Usage
+        # statistics) and each inner tab is separately Apply-gated.
+        advanced_tab, repopulate_advanced, advanced_panes = \
             self._build_advanced_tab(window, wallet)
         tabs.addTab(advanced_tab, _("Advanced"))
 
@@ -3125,12 +3434,14 @@ class Plugin(LiquidityPlugin):
         log_tab, refresh_log = self._build_log_tab(wallet)
         tabs.addTab(log_tab, _("Log"))
 
-        # --- unsaved-changes guard over all four Apply-gated sub-tabs ------
+        # --- unsaved-changes guard over every Apply-gated pane -------------
         # Every pane in one list, in tab order, so the guard below can ask "which
         # of these has outstanding edits" without knowing anything about them.
+        # Advanced contributes two (its inner tabs), both hosted by the one
+        # outer tab -- which the guard handles via _ApplyPane.host.
         panes = [
             _ApplyPane(_("Settings"), settings_tab, dirty, on_apply),
-            providers_pane, partners_pane, advanced_pane,
+            providers_pane, partners_pane, *advanced_panes,
         ]
         drop_unsaved_guard = self._install_unsaved_guard(
             window, wallet, container, tabs, panes)
@@ -3191,12 +3502,29 @@ class Plugin(LiquidityPlugin):
     # --- advanced sub-tab -------------------------------------------------
     def _build_advanced_tab(self, window: 'ElectrumWindow',
                             wallet: 'Abstract_Wallet'):
-        """Build the Advanced sub-tab: the feature on/off toggles, the daily
-        (rolling-24h) action ceilings (a runaway guard), the power-user tuning
-        knobs (on-chain reserve, reliability tuning, offline auto-close, log
-        retention) moved off the main Settings tab, and the reset-to-defaults
-        button. Returns ``(widget, repopulate, pane)`` -- the pane being this
-        tab's entry in the unsaved-changes guard (see :class:`_ApplyPane`).
+        """Build the Advanced sub-tab, which hosts an inner tab bar:
+
+          * **General** -- the feature on/off toggles, the daily (rolling-24h)
+            action ceilings (a runaway guard), the power-user tuning knobs
+            (on-chain reserve, reliability tuning, offline auto-close, log
+            retention) moved off the main Settings tab, and the
+            reset-to-defaults button. Everything that was on Advanced before.
+          * **Usage statistics** -- the opt-in anonymous reporting controls, and
+            the live preview of exactly what the chosen level would send.
+
+        Returns ``(widget, repopulate, panes)``. Note the plural: this tab
+        contributes TWO entries to the unsaved-changes guard, one per inner tab,
+        both declaring the returned widget as their ``host`` (see
+        :class:`_ApplyPane` for why the guard needs that).
+
+        General is added to the inner bar FIRST, which is load-bearing beyond
+        appearance: several tests reach this tab's daily-ceiling line edits as
+        ``findChildren(QLineEdit)[:2]``, and that index only holds while
+        General's widgets are constructed and parented ahead of the usage
+        pane's. The usage pane also uses radio buttons rather than check boxes,
+        so ``findChildren(QCheckBox)`` on this tab still returns exactly the
+        feature toggles -- one test flips every one of them off and would
+        otherwise be silently switching off reporting too.
 
         Takes the window because the reset asks for confirmation first, and the
         confirmation is a modal on the window that owns this tab.
@@ -3204,8 +3532,8 @@ class Plugin(LiquidityPlugin):
         from . import DEFAULT_MAX_OPENS_PER_DAY, DEFAULT_MAX_CLOSES_PER_DAY
 
         c = self.settings(wallet)
-        tab = QWidget()
-        v = QVBoxLayout(tab)
+        general = QWidget()
+        v = QVBoxLayout(general)
         v.addWidget(_wrapped_label(_(
             "Advanced settings — feature toggles, runaway-guard ceilings, and "
             "tuning knobs moved off the main Settings tab. The defaults are "
@@ -3519,7 +3847,268 @@ class Plugin(LiquidityPlugin):
 
         repopulate()
         dirty.reset()
-        return tab, repopulate, _ApplyPane(_("Advanced"), tab, dirty, on_apply)
+
+        # --- the inner tab bar ---------------------------------------------
+        # General is parented into the inner bar BEFORE the usage pane is even
+        # built, so it is unambiguously the first subtree a findChildren() walk
+        # over this tab reaches. See the docstring: tests address General's
+        # widgets positionally, and that only holds while this order does.
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        inner = QTabWidget()
+        inner.addTab(general, _("General"))
+        outer.addWidget(inner)
+
+        usage_widget, repopulate_usage, usage_pane_parts = \
+            self._build_usage_stats_pane(window, wallet)
+        inner.addTab(usage_widget, _("Usage statistics"))
+
+        panes = [
+            _ApplyPane(_("Advanced"), general, dirty, on_apply, host=tab,
+                       focus=lambda: inner.setCurrentWidget(general)),
+            _ApplyPane(_("Usage statistics"), usage_widget,
+                       usage_pane_parts["tracker"], usage_pane_parts["apply"],
+                       host=tab,
+                       focus=lambda: inner.setCurrentWidget(usage_widget)),
+        ]
+        # Moving between the two inner tabs asks about unsaved edits too, the
+        # same way moving between the outer tabs does.
+        self._install_sub_tab_guard(window, inner, panes)
+
+        def repopulate_all() -> None:
+            repopulate()
+            repopulate_usage()
+
+        return tab, repopulate_all, panes
+
+    # --- usage-statistics pane (inside Advanced) --------------------------
+    #
+    # The settings half of the opt-in analytics: where a user who answered the
+    # consent screen goes to change their mind, in either direction.
+    #
+    # Deliberate choices here, all for the same reason -- a reporting control
+    # the user does not fully believe is worse than no reporting at all:
+    #
+    #   * RADIO BUTTONS, including an explicit "Off". A level is one choice out
+    #     of four, not three independent switches, and "Off" being a visible
+    #     option (rather than "none of the boxes ticked") makes the current
+    #     state unambiguous. They also keep this pane out of
+    #     ``findChildren(QCheckBox)`` on the Advanced tab -- see the note in
+    #     _build_advanced_tab.
+    #   * The PREVIEW UPDATES AS THE SELECTION MOVES, before anything is saved,
+    #     and shows this wallet's real values rather than a sample. It is
+    #     rendered by `usage_stats_preview`, i.e. by the same builder that makes
+    #     the real report, so it cannot drift from what would actually be sent.
+    #   * Apply-gated like every other settings pane, so moving the radio does
+    #     not silently start reporting; and the unsaved-changes guard covers it,
+    #     so the choice cannot be lost by navigating away.
+    def _build_usage_stats_pane(self, window: 'ElectrumWindow',
+                                wallet: 'Abstract_Wallet'):
+        """Build the Usage statistics pane. Returns ``(widget, repopulate,
+        parts)``, where ``parts`` carries the dirty tracker and the apply
+        callable the surrounding tab needs to register it with the guard."""
+        from . import usage_stats
+
+        descriptions = usage_stats.level_descriptions()
+
+        # Scrollable: the four options with their bullets, plus a preview of a
+        # 50-field report, is taller than the tab at most window sizes, and a
+        # consent control the user has to guess the bottom of is not one.
+        pane = QWidget()
+        outer = QVBoxLayout(pane)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        v.addWidget(_wrapped_label(_(
+            "Help us understand how many people run this plugin, which settings "
+            "matter, and how much liquidity it actually provisions. This is OFF "
+            "by default and entirely optional — the plugin works exactly the "
+            "same either way. If you switch it on, this wallet sends one small "
+            "report now and then one a week.")))
+
+        v.addWidget(_wrapped_label(_("We never send, at any level:")))
+        for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
+            v.addWidget(label)
+
+        privacy_label = _wrapped_label("")
+        privacy_label.setTextFormat(Qt.TextFormat.RichText)
+        privacy_label.setOpenExternalLinks(True)
+        privacy_label.setText(
+            f'<a href="{_USAGE_PRIVACY_URL}">{html.escape(_("Read the privacy policy"))}</a>')
+        v.addWidget(privacy_label)
+
+        # Why nothing can be sent right now, when that is the case (the endpoint
+        # kill switch, or a regtest wallet). Shown even when the user has opted
+        # in, because otherwise this pane would claim to be reporting when it
+        # provably is not.
+        blocked_label = _wrapped_label("")
+        blocked_label.setStyleSheet(f"color: {_APPLY_HINT_COLOR};")
+        v.addWidget(blocked_label)
+
+        # --- the four choices ----------------------------------------------
+        v.addWidget(QLabel(_("How much to share:")))
+        group = QButtonGroup(pane)
+        group.setExclusive(True)
+        buttons: List[Tuple[QRadioButton, int]] = []
+
+        off_button = QRadioButton(_("Off — send nothing (the default)"))
+        off_button.setToolTip(_("No report ever leaves this wallet."))
+        group.addButton(off_button)
+        buttons.append((off_button, usage_stats.LEVEL_OFF))
+        v.addWidget(off_button)
+
+        for level in usage_stats.LEVELS:
+            description = descriptions[level]
+            button = QRadioButton(f"{level} · {_(description.title)}")
+            button.setToolTip(_(description.summary))
+            group.addButton(button)
+            buttons.append((button, level))
+            v.addWidget(button)
+            for label in _bullet_labels([_(item) for item in description.items],
+                                        indent=34):
+                v.addWidget(label)
+
+        # --- the preview ---------------------------------------------------
+        v.addWidget(QLabel(_("Exactly what would be sent:")))
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        preview_font = QFont("monospace")
+        preview_font.setStyleHint(QFont.StyleHint.Monospace)
+        preview.setFont(preview_font)
+        preview.setMinimumHeight(220)
+        v.addWidget(preview)
+
+        status_label = QLabel("")
+        hint_label = QLabel(_StatusLine.HINT_TEXT)
+        status = _StatusLine(status_label, hint_label)
+        report_label = _wrapped_label("")
+        report_label.setStyleSheet("color: gray;")
+        v.addWidget(report_label)
+        v.addWidget(status_label)
+        v.addWidget(hint_label)
+
+        def _selected_level() -> int:
+            for button, level in buttons:
+                if button.isChecked():
+                    return level
+            return usage_stats.LEVEL_OFF
+
+        def _refresh_preview() -> None:
+            """Render the preview for the CURRENTLY SELECTED level, saved or
+            not. Never raises: a preview that cannot be built must not take the
+            settings tab down with it."""
+            level = _selected_level()
+            if level == usage_stats.LEVEL_OFF:
+                preview.setPlainText(
+                    _("Nothing is sent while this is off."))
+                return
+            try:
+                preview.setPlainText(self.usage_stats_preview(wallet, level))
+            except Exception as e:
+                self.logger.exception("could not build the usage-report preview")
+                preview.setPlainText(_("Could not build the preview: {}").format(
+                    scrub_text(f"{type(e).__name__}: {e}")[:200]))
+
+        def _refresh_report_label() -> None:
+            info = self.usage_stats_status(wallet)
+            parts: List[str] = []
+            if info["last_sent_ts"]:
+                parts.append(_("Last report sent {}.").format(
+                    _fmt_time(info["last_sent_ts"])))
+            elif info["level"]:
+                parts.append(_("No report has been sent yet."))
+            if info["last_error"]:
+                parts.append(_("Last attempt failed: {}").format(info["last_error"]))
+            if info["install_id"]:
+                parts.append(_("This wallet's random identifier: {}").format(
+                    info["install_id"]))
+            report_label.setText("  ".join(parts))
+            report_label.setVisible(bool(parts))
+
+        def _refresh_blocked() -> None:
+            reason = self.usage_stats_blocked_reason()
+            blocked_label.setText(reason or "")
+            blocked_label.setVisible(bool(reason))
+
+        for button, _level in buttons:
+            button.toggled.connect(lambda _checked: _refresh_preview())
+
+        def _usage_snapshot() -> Tuple:
+            return (_selected_level(),)
+
+        dirty = _DirtyTracker(_("Usage statistics"), _usage_snapshot, status)
+        dirty.watch(*(button.toggled for button, _level in buttons))
+
+        def repopulate() -> None:
+            """Re-read the stored level into the radios.
+
+            Leaves the selection alone while the pane is dirty, like every other
+            repopulate here: a background refresh must not discard a choice the
+            user has made but not yet applied.
+            """
+            _refresh_blocked()
+            _refresh_report_label()
+            if dirty.is_dirty():
+                return
+            stored = self.usage_stats_level(wallet)
+            for button, level in buttons:
+                if level == stored:
+                    # blockSignals so re-rendering the stored value does not
+                    # look like an edit to the tracker.
+                    button.blockSignals(True)
+                    button.setChecked(True)
+                    button.blockSignals(False)
+            _refresh_preview()
+            dirty.reset()
+
+        def on_apply() -> bool:
+            level = _selected_level()
+            try:
+                self.set_usage_stats_choice(wallet, level)
+            except Exception as e:
+                self.logger.exception("could not save the usage-statistics choice")
+                status.set_error(_("Could not save: {}").format(
+                    scrub_text(f"{type(e).__name__}: {e}")[:200]))
+                return False
+            dirty.reset()
+            _refresh_blocked()
+            _refresh_report_label()
+            _refresh_preview()
+            if level == usage_stats.LEVEL_OFF:
+                status.set_saved(_("Usage statistics are off. Nothing will be sent."))
+                return True
+            # Opting in sends one report straight away rather than at the next
+            # weekly slot, so the choice visibly does something -- and so the
+            # status line below can report a real outcome instead of "no report
+            # has been sent yet" for a week.
+            if self.usage_stats_blocked_reason() is None:
+                self._request_usage_report(wallet, force=True)
+                status.set_saved(_("Sharing at level {}. Sending the first report…"
+                                   ).format(level))
+            else:
+                status.set_saved(_("Saved. Nothing will be sent: {}").format(
+                    self.usage_stats_blocked_reason()))
+            return True
+
+        apply_button = primary_button(_("Apply"))
+        apply_button.clicked.connect(on_apply)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(apply_button)
+        v.addLayout(button_row)
+        v.addStretch(1)
+
+        repopulate()
+        dirty.reset()
+        return pane, repopulate, {"tracker": dirty, "apply": on_apply}
 
     # --- providers sub-tab ------------------------------------------------
     # Every column is named, and nothing below addresses one by literal number.

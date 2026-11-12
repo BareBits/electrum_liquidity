@@ -173,6 +173,32 @@ def _plain_line_edits(widget):
     return [w for w in widget.findChildren(QLineEdit) if type(w) is QLineEdit]
 
 
+def _advanced_pane(plugin, wallet, title="General"):
+    """One of the Advanced tab's inner panes ("General" / "Usage statistics").
+
+    Resolved through the inner tab bar BY TITLE, never by position in a
+    findChildren() walk over the Advanced tab. That distinction is load-bearing:
+    QStackedWidget does not keep its pages in tab order (it raises the visible
+    one), so a positional search over the whole Advanced subtree can hand back
+    the other pane's widgets -- which is exactly how the first version of this
+    nesting broke, by clicking the usage pane's Apply while meaning General's.
+
+    Scoping to one pane also means these tests keep asserting about the pane
+    they are actually named after, rather than about whatever else Advanced
+    happens to host later.
+    """
+    from PyQt6.QtWidgets import QTabWidget
+    advanced = plugin._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    inner = advanced.findChild(QTabWidget)
+    assert inner is not None, "the Advanced tab has no inner tab bar"
+    for index in range(inner.count()):
+        if inner.tabText(index) == title:
+            return inner.widget(index)
+    raise AssertionError(
+        f"no {title!r} pane on Advanced; have "
+        f"{[inner.tabText(i) for i in range(inner.count())]}")
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
@@ -242,6 +268,11 @@ def _make_plugin() -> qt_mod.Plugin:
     p._tick_status = {}
     p.wallets = {}
     p._send_warning_refreshers = {}
+    # The once-per-session prompt guards. Set here because this factory
+    # bypasses __init__ (it builds the plugin without Electrum's constructor
+    # arguments), so anything __init__ would have initialised has to be named.
+    p._update_opt_in_asked = False
+    p._usage_consent_asked = False
     # The Log tab reads both of these; a fresh buffer per plugin keeps tests
     # isolated, and the capture is left detached (no global handler installed).
     p.log_buffer = LogRingBuffer()
@@ -590,7 +621,7 @@ def test_scope_switch_no_longer_on_the_advanced_tab(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
     texts = [cb.text() for cb in advanced_tab.findChildren(QCheckBox)]
     assert not any("plugin opened" in t for t in texts), texts
     # ...and the old wording is gone from the UI entirely.
@@ -734,7 +765,7 @@ def test_advanced_tab_persists_daily_ceilings(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
 
     opens_edit, closes_edit = advanced_tab.findChildren(QLineEdit)[:2]
     opens_edit.setText("7")
@@ -752,7 +783,7 @@ def test_advanced_tab_rejects_invalid_without_persisting(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
 
     opens_edit, closes_edit = advanced_tab.findChildren(QLineEdit)[:2]
     opens_edit.setText("-3")   # negative rejected
@@ -814,7 +845,7 @@ def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
     reserve = _edit_for(advanced_tab, "On-chain reserve")
     retention = _edit_for(advanced_tab, "Keep decision log")
     reserve.setText("7500")
@@ -1317,7 +1348,7 @@ def test_capture_options_moved_off_the_advanced_tab(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
     cb_texts = [cb.text() for cb in advanced_tab.findChildren(QCheckBox)]
     assert not any("capture" in t.lower() for t in cb_texts), cb_texts
     labels = [lbl.text() for lbl in advanced_tab.findChildren(QLabel)]
@@ -1589,7 +1620,7 @@ def test_advanced_tab_exposes_and_persists_the_minimum_swap_size(qapp):
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    advanced_tab = _advanced_pane(p, wallet)
     edit = _edit_for(advanced_tab, "Minimum swap size")
     assert edit.text() == "25000", "the field does not show the shipped default"
 
