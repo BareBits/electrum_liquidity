@@ -296,3 +296,33 @@ def test_env_for_prepends_pythonpath_and_keeps_existing():
     assert env["HOME"] == "/h"
     assert env[trampoline_stub.TRAMPOLINE_JSON_ENV] == str(trampoline_stub.TRAMPOLINE_JSON)
     assert (trampoline_stub.INJECT_DIR / "sitecustomize.py").exists()
+
+
+# --- the rig never reports usage statistics -------------------------------
+#
+# A rig wallet is a test fixture, not a user. The plugin already refuses to
+# report from regtest, so these assert the SECOND, independent guard: the
+# endpoint kill switch, applied to everything a rig spawns.
+
+def test_preflight_switches_usage_reporting_off(monkeypatch):
+    """Applied in `preflight`, not only in `main`, because every e2e module
+    builds its rig by constructing Rig directly -- so a kill switch that only
+    ran in `main` would be missing from exactly the rigs that run unattended."""
+    import run as run_mod
+
+    monkeypatch.delenv(run_mod.USAGE_STATS_ENDPOINT_ENV, raising=False)
+    run_mod._disable_usage_stats_by_default()
+    assert os.environ[run_mod.USAGE_STATS_ENDPOINT_ENV] == "disabled"
+
+
+def test_an_explicit_endpoint_is_left_alone(monkeypatch):
+    """`setdefault`, not an assignment: the usage-statistics e2e test points the
+    rig at its own local receiver, and that is the one case where a rig is
+    supposed to send a report."""
+    import run as run_mod
+
+    monkeypatch.setenv(run_mod.USAGE_STATS_ENDPOINT_ENV,
+                       "http://127.0.0.1:9/report.php")
+    run_mod._disable_usage_stats_by_default()
+    assert os.environ[run_mod.USAGE_STATS_ENDPOINT_ENV] == \
+        "http://127.0.0.1:9/report.php"
