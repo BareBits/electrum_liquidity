@@ -684,9 +684,10 @@ records nothing at all, and so do Escape and the close button. Change or revoke
 the choice at any time under **Advanced → Usage statistics**, which shows the
 same live preview.
 
-**Never sent, at any level:** your addresses, transactions, invoices, channel
-ids, balances, channel capacities, sink Lightning address, channel peers' node
-ids, providers' npubs, wallet name, file paths, seed or any key material. Where
+**Never sent, at any level:** any personally identifiable information,
+including your addresses, transactions, invoices, channel ids, balances,
+channel capacities, sink Lightning address, channel peers' node ids,
+providers' npubs, wallet name, file paths, seed or any key material. Where
 a setting *is* an identifier, the report carries only whether it is set, or how
 long a list is — `sink_configured: true`, never the address;
 `preferred_npubs_count: 2`, never the npubs.

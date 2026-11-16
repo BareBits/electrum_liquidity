@@ -1,6 +1,6 @@
 # Privacy Policy — Inbound Liquidity Manager
 
-_Last updated: November 11, 2026_
+_Last updated: November 12, 2026_
 
 The Inbound Liquidity Manager is an **Electrum plugin** you install and run on your own
 machine. There is no hosted service, we have no access to your wallet, and we cannot read
@@ -35,7 +35,8 @@ preview.
 
 ### We never send, at any level
 
-- Your wallet addresses, or any address you have ever used.
+- Any personally identifiable information including your wallet addresses or any address you
+  have ever used.
 - Your transactions, payments, invoices, or channel ids.
 - Your on-chain or Lightning balances, or your channel capacities.
 - Your sink Lightning address, your chosen channel peers' node ids, or swap providers' npubs.
@@ -86,8 +87,7 @@ accurate consent over an accurate user count.
 ### Cadence, and what our side sees
 
 One report when you opt in, then one a week. Requests go through **Electrum's configured
-proxy**, like every other HTTP call the wallet makes, so a Tor user's usage report is not the
-one request that reveals their IP.
+proxy**, like every other HTTP call the wallet makes.
 
 Because this is an HTTPS request, our server necessarily sees the IP address it came from.
 That IP is used for two things and then forgotten:
