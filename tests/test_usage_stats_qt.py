@@ -203,6 +203,30 @@ def test_the_pane_names_what_is_never_sent(qapp):
         assert subject in lowered, f"the pane does not mention {subject}"
 
 
+def test_the_pane_says_the_choice_is_only_for_this_wallet(qapp):
+    """Same per-wallet caveat as the consent screen. Needed here too, and not
+    only in the dialog: this pane is where a multi-wallet user comes to check
+    what they are sharing, and it is reached per open wallet."""
+    from PyQt6.QtWidgets import QLabel
+    p, wallet = _built()
+    lowered = " ".join(l.text() for l in
+                       _usage_pane(p, wallet).findChildren(QLabel)).lower()
+    assert "per-wallet" in lowered, \
+        "the pane does not say the choice is per wallet"
+    assert "this specific wallet" in lowered
+
+
+def test_the_pane_does_not_call_itself_a_consent_screen(qapp):
+    """The one-time dialog is the consent screen; this is the settings pane the
+    user navigates to afterwards. Calling itself a consent screen would tell a
+    user looking at it that they are being asked, when they are not."""
+    from PyQt6.QtWidgets import QLabel
+    p, wallet = _built()
+    lowered = " ".join(l.text() for l in
+                       _usage_pane(p, wallet).findChildren(QLabel)).lower()
+    assert "consent screen" not in lowered
+
+
 def test_the_pane_links_the_privacy_policy(qapp):
     from PyQt6.QtWidgets import QLabel
     p, wallet = _built()
@@ -614,6 +638,20 @@ def test_the_screen_says_where_to_change_it_later(qapp, monkeypatch):
     _, captured = _prompted(p, monkeypatch, pick=None, accept=False)
     text = " ".join(captured["labels"])
     assert "Advanced" in text and "Usage statistics" in text
+
+
+def test_the_screen_says_the_choice_is_only_for_this_wallet(qapp, monkeypatch):
+    """The level, the identifier and the consent flag are all per-wallet (see
+    the note on INBOUND_LIQUIDITY_USAGE_STATS_LEVEL), so a user running several
+    wallets is asked several times and appears as several installs. That is a
+    surprising enough consequence that the screen has to say so -- otherwise
+    answering once reads as answering for the whole installation."""
+    p = _make_plugin()
+    _, captured = _prompted(p, monkeypatch, pick=None, accept=False)
+    lowered = " ".join(captured["labels"]).lower()
+    assert "per-wallet" in lowered, \
+        "the consent screen does not say the choice is per wallet"
+    assert "this specific wallet" in lowered
 
 
 def test_the_screen_offers_off_plus_the_three_levels(qapp, monkeypatch):

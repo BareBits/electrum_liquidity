@@ -19,6 +19,7 @@ test_usage_stats_receiver.py (that the PHP endpoint enforces the same list)."""
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 
 import pytest
@@ -467,8 +468,41 @@ def test_the_never_sent_list_names_the_things_users_care_about():
     identifiers to counts and booleans."""
     text = " ".join(us.never_sent_items()).lower()
     for subject in ("address", "transaction", "balance", "node id", "npub",
-                    "seed", "wallet name"):
+                    "seed", "wallet name", "personally identifiable"):
         assert subject in text, f"the never-sent list does not mention {subject}"
+
+
+def test_the_never_sent_list_leads_with_the_general_promise():
+    """The list opens with the blanket undertaking rather than with one example
+    of it. The specific items that follow are illustrations of the same promise,
+    so a reader who stops after the first bullet has still been told the thing
+    that matters."""
+    first = us.never_sent_items()[0].lower()
+    assert "personally identifiable information" in first, (
+        "the first never-sent item no longer states the general promise")
+
+
+def test_the_policy_makes_the_same_never_sent_promise_as_the_plugin():
+    """PRIVACY.md keeps its own copy of this list -- it is a standalone document
+    a user reads in a browser, not a rendering of ``never_sent_items()``. Two
+    copies of a privacy promise drift, and the plugin undertaking more than the
+    policy it links to is the direction that actually matters, so the subjects
+    are pinned across both.
+
+    Deliberately a subject check rather than a string comparison: the policy is
+    prose with its own line breaks and Markdown, and holding the two to
+    character equality would fail on a reflowed paragraph that promises exactly
+    the same thing."""
+    policy = (pathlib.Path(__file__).resolve().parent.parent
+              / "PRIVACY.md").read_text(encoding="utf-8")
+    _, _, after = policy.partition("### We never send, at any level")
+    assert after, "PRIVACY.md no longer has a 'We never send' section"
+    section = after.split("###", 1)[0].lower()
+    for subject in ("personally identifiable", "address", "transaction",
+                    "balance", "node id", "npub", "seed", "wallet name"):
+        assert subject in section, (
+            f"PRIVACY.md's never-sent list does not mention {subject}, "
+            f"but the plugin's does")
 
 
 def test_no_allowlisted_property_can_carry_an_identifier_value():

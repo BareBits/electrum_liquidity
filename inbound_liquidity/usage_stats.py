@@ -615,7 +615,8 @@ def never_sent_items() -> Tuple[str, ...]:
     its enforcement, and a reviewer should see them together.
     """
     return (
-        "Your wallet addresses, or any address you have ever used.",
+        "Any personally identifiable information including your wallet "
+        "addresses or any address you have ever used.",
         "Your transactions, payments, invoices or channel ids.",
         "Your on-chain or Lightning balances, or your channel capacities.",
         "Your sink Lightning address, your chosen channel peers' node ids, or "

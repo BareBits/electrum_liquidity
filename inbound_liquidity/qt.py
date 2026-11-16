@@ -1622,9 +1622,12 @@ class Plugin(LiquidityPlugin):
             "Would you help us understand how many people run the Inbound "
             "Liquidity plugin, which settings matter, and how much liquidity it "
             "actually provisions?\n\n"
-            "This is entirely optional and OFF unless you choose otherwise. The "
-            "plugin behaves exactly the same either way. If you say yes, this "
-            "wallet sends one small report now and then one a week.")))
+            "This is entirely optional and completely opt-in. If you choose "
+            "not to participate, no data will be sent to us. The plugin "
+            "behaves exactly the same either way. If you say yes, this wallet "
+            "sends one small report weekly. You can opt in or out on a "
+            "per-wallet basis, this consent screen is only for this specific "
+            "wallet.")))
 
         layout.addWidget(_wrapped_label(_("We never send, at any level:")))
         for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
@@ -3931,7 +3934,9 @@ class Plugin(LiquidityPlugin):
             "matter, and how much liquidity it actually provisions. This is OFF "
             "by default and entirely optional — the plugin works exactly the "
             "same either way. If you switch it on, this wallet sends one small "
-            "report now and then one a week.")))
+            "report now and then one a week, otherwise, it sends nothing. You "
+            "can opt in or out on a per-wallet basis; this choice applies only "
+            "to this specific wallet.")))
 
         v.addWidget(_wrapped_label(_("We never send, at any level:")))
         for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
