@@ -1107,6 +1107,57 @@ def _wrapped_label(text: str) -> QLabel:
     return label
 
 
+def _scrolled(body: QWidget) -> QScrollArea:
+    """``body``, in a vertical scroll area sized to the panel it lands in.
+
+    Every settings pane here holds more than fits in Electrum's window, whose
+    default geometry is 840x400 -- about 290px of tab area. A QTabWidget page
+    that is given less height than its content needs does NOT scroll: Qt
+    distributes the shortfall by shrinking every widget below its sizeHint, and
+    a QLabel handed less height than its text paints that text clipped. So the
+    symptom is a settings screen with the bottom few pixels shaved off every
+    row, and no way to reach the rest of the form. Measured before this helper
+    existed, at the default window size: 14 clipped labels on Settings, 26 on
+    Advanced, and the provider/partner tables squeezed to 26-51px -- a header
+    with no visible rows.
+
+    ``setWidgetResizable(True)`` is what makes this behave at BOTH ends. It
+    resizes the body to ``max(viewport, body.minimumSizeHint)``, so a short
+    window parks the body at its natural height and scrolls, while a tall
+    window hands the body the whole viewport and a stretchy child (the provider
+    and partner tables) still expands to fill it exactly as it did before.
+
+    In practice that makes this a VERTICAL scroll area: because the body is
+    resized to the viewport width, the wrapped labels wrap to the panel instead
+    of demanding width, so there is nothing to scroll sideways and no
+    horizontal bar appears. The provider table -- 14 columns, already scrolling
+    sideways inside itself -- thus keeps sole ownership of horizontal scrolling
+    at any ordinary window size.
+
+    The horizontal policy is still AsNeeded rather than AlwaysOff, though, and
+    that is not an oversight. Some bodies have a minimum width of their own
+    (the Channel partners pane needs 571px, set by the long single-line label
+    on its strict-mode checkbox, which a QCheckBox will not wrap). Narrow the
+    window past that and the body cannot shrink any further, so it genuinely
+    overflows -- AlwaysOff would then hide content with no way to reach it,
+    which is strictly worse than a scrollbar that only appears when the window
+    is too narrow for the pane to fit at all.
+
+    Buttons do NOT belong in here; see the callers, which pin their Apply row
+    outside the returned widget for the same reason the usage-consent dialog
+    does: an Apply below the fold, on a pane whose edits are Apply-gated, is an
+    Apply the user cannot find.
+    """
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(
+        Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setWidget(body)
+    return scroll
+
+
 def _fit_to_screen(widget: QWidget, *, margin: int = 80) -> None:
     """Shrink ``widget`` so it fits the screen it will appear on.
 
@@ -2601,38 +2652,60 @@ class Plugin(LiquidityPlugin):
         return None
 
     def _install_sub_tab_guard(self, window: 'ElectrumWindow', tabs: QTabWidget,
-                               panes: List['_ApplyPane']) -> Dict[str, Any]:
+                               panes: List['_ApplyPane'],
+                               pages: Optional[
+                                   Callable[['_ApplyPane'],
+                                            Sequence[QWidget]]] = None,
+                               ) -> Dict[str, Any]:
         """Ask about unsaved edits when a tab of ``tabs`` is navigated away from.
 
         Factored out of :meth:`_install_unsaved_guard` so the Advanced tab's
-        INNER tab bar gets the same treatment: moving between General and Usage
-        statistics has to ask, exactly as moving between the outer tabs does.
-        The outer call additionally watches the main window; this half only
-        watches one QTabWidget.
+        INNER tab bar gets the same treatment: moving between its panes has to
+        ask, exactly as moving between the outer tabs does. The outer call
+        additionally watches the main window; this half only watches one
+        QTabWidget.
 
-        Panes are keyed by ``host`` -- the tab they are reached through -- and a
-        host may hold SEVERAL panes (that is what nesting means), so every pane
-        behind the tab being left is checked together.
+        ``pages`` maps a pane to the widget(s) OF ``tabs`` it is reached
+        through, and defaults to ``(pane.host,)`` -- which is right for the
+        outer bar, where ``host`` is by definition that bar's own tab. It is
+        NOT right for the inner bar: there ``tabs.widget(i)`` is an inner page
+        while ``host`` is the outer Advanced widget, so the default lookup
+        misses every time and the guard quietly concludes there is nothing to
+        save. (That was a real bug: an edit on Advanced could be abandoned for
+        the Usage statistics pane without a word. Leaving Advanced altogether
+        still asked, via the outer guard, so nothing was ever lost for good.)
+
+        One tab may hold several panes -- that is what nesting means -- and one
+        PANE may equally span several tabs: the Advanced form is three inner
+        tabs sharing a single Apply. So a pane counts as left only if it is not
+        also reachable from the tab being arrived at, which is what keeps
+        General -> Reliability silent while General -> Usage statistics asks.
 
         Returns the mutable ``{"index", "busy"}` state, so the caller's own
         corrective navigation can set ``busy`` and not be mistaken for the user
         navigating. The signal connection dies with the widget.
         """
         sub: Dict[str, Any] = {"index": tabs.currentIndex(), "busy": False}
-        by_host: Dict[QWidget, List['_ApplyPane']] = {}
+        if pages is None:
+            def pages(pane: '_ApplyPane') -> Sequence[QWidget]:
+                return (pane.host,)
+        by_page: Dict[QWidget, List['_ApplyPane']] = {}
         for pane in panes:
-            by_host.setdefault(pane.host, []).append(pane)
+            for page in pages(pane):
+                by_page.setdefault(page, []).append(pane)
 
         def panes_at(index: int) -> List['_ApplyPane']:
             if index < 0:
                 return []
-            return by_host.get(tabs.widget(index), [])
+            return by_page.get(tabs.widget(index), [])
 
         def on_sub_tab_changed(index: int) -> None:
             prev, sub["index"] = sub["index"], index
             if sub["busy"] or prev == index:
                 return
-            leaving = panes_at(prev)
+            # A pane reachable from BOTH tabs has not been left -- see above.
+            arriving = panes_at(index)
+            leaving = [pane for pane in panes_at(prev) if pane not in arriving]
             if not leaving:
                 return      # left a read-only tab (a log view); nothing to save
             sub["busy"] = True
@@ -2744,8 +2817,18 @@ class Plugin(LiquidityPlugin):
         outer.addWidget(tabs)
 
         # --- Settings sub-tab ---------------------------------------------
+        # `settings_tab` is the page the QTabWidget holds and the widget the
+        # unsaved-changes guard keys on; `vbox` fills the part of it that
+        # SCROLLS (see _scrolled). The Apply row and the status footer are added
+        # to `settings_outer` at the end of this method so they stay pinned to
+        # the bottom of the tab while the form scrolls under them -- the footer
+        # carries the tick status and the "Unlock wallet…" button, which are no
+        # use below the fold.
         settings_tab = QWidget()
-        vbox = QVBoxLayout(settings_tab)
+        settings_outer = QVBoxLayout(settings_tab)
+        settings_outer.setContentsMargins(0, 0, 0, 0)
+        settings_body = QWidget()
+        vbox = QVBoxLayout(settings_body)
 
         c = self.settings(wallet)
 
@@ -3253,11 +3336,12 @@ class Plugin(LiquidityPlugin):
         _refresh_dev_fee_label()
         vbox.addWidget(dev_fee_label)
 
+        # Added to the PINNED half of the tab, beside the Apply button, at the
+        # end of this method -- a verdict on the Apply the user just pressed has
+        # to be where they pressed it.
         status_label = QLabel("")
         hint_label = QLabel(_StatusLine.HINT_TEXT)
         status = _StatusLine(status_label, hint_label)
-        vbox.addWidget(status_label)
-        vbox.addWidget(hint_label)
 
         # --- unsaved-changes tracking --------------------------------------
         # The goal is snapshotted as its PARSED sat amount rather than as the text
@@ -3387,25 +3471,37 @@ class Plugin(LiquidityPlugin):
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
-        vbox.addLayout(btn_row)
+
+        # Ends the SCROLLING half. Nothing in the form above expands, so without
+        # a trailing stretch a window taller than the form would have Qt share
+        # the slack out between the rows; with it, the form keeps its natural
+        # size and stays top-aligned.
+        vbox.addStretch(1)
 
         # --- status footer -------------------------------------------------
-        # The stretch goes FIRST so the section is pushed to the bottom edge of
-        # the tab and stays there as the panel is resized, rather than floating
-        # directly under the Apply button on a tall window.
-        vbox.addStretch(1)
+        # Pinned below the scroll area rather than placed after the form, so it
+        # stays on the bottom edge of the tab at every window size. It used to
+        # earn that position with a leading stretch inside the form; now the
+        # scroll area above it is the thing that takes up the slack, and the
+        # stretch it needed went with the form (just above).
         separator = QFrame()
         separator.setFrameShape(QFrame.Shape.HLine)
         separator.setFrameShadow(QFrame.Shadow.Sunken)
-        vbox.addWidget(separator)
-        vbox.addWidget(status_header)
-        vbox.addWidget(tick_status_label)
-        vbox.addWidget(tick_since_label)
-        vbox.addWidget(update_label)
         unlock_row = QHBoxLayout()
         unlock_row.addWidget(unlock_btn)
         unlock_row.addStretch(1)
-        vbox.addLayout(unlock_row)
+
+        # --- assemble: scrolling form, then the pinned Apply and footer -----
+        settings_outer.addWidget(_scrolled(settings_body))
+        settings_outer.addWidget(status_label)
+        settings_outer.addWidget(hint_label)
+        settings_outer.addLayout(btn_row)
+        settings_outer.addWidget(separator)
+        settings_outer.addWidget(status_header)
+        settings_outer.addWidget(tick_status_label)
+        settings_outer.addWidget(tick_since_label)
+        settings_outer.addWidget(update_label)
+        settings_outer.addLayout(unlock_row)
         tabs.addTab(settings_tab, _("Settings"))
 
         # --- Swap providers sub-tab ---------------------------------------
@@ -3508,26 +3604,38 @@ class Plugin(LiquidityPlugin):
         """Build the Advanced sub-tab, which hosts an inner tab bar:
 
           * **General** -- the feature on/off toggles, the daily (rolling-24h)
-            action ceilings (a runaway guard), the power-user tuning knobs
-            (on-chain reserve, reliability tuning, offline auto-close, log
-            retention) moved off the main Settings tab, and the
-            reset-to-defaults button. Everything that was on Advanced before.
+            action ceilings (a runaway guard), and the handful of plain tuning
+            amounts (on-chain reserve, outbound to keep, minimum swap size, log
+            retention).
+          * **Reliability** -- how provider and peer faults are scored: the
+            penalty per fault, its ceiling, how fast it decays, when a swap
+            counts as stuck, and when a peer earns an automatic ban.
+          * **Channel recovery** -- the timeouts that get funds out of a channel
+            that went wrong: wedged and stuck opens, and the offline auto-close.
           * **Usage statistics** -- the opt-in anonymous reporting controls, and
             the live preview of exactly what the chosen level would send.
 
-        Returns ``(widget, repopulate, panes)``. Note the plural: this tab
-        contributes TWO entries to the unsaved-changes guard, one per inner tab,
-        both declaring the returned widget as their ``host`` (see
-        :class:`_ApplyPane` for why the guard needs that).
+        The first three are ONE form in three views: a single dirty tracker, a
+        single Apply and a single Reset, all pinned below the inner tab bar
+        where they are reachable from any of the three. That is deliberate --
+        29 controls that are saved together should not be split into three
+        things to remember to save, and it keeps this tab a single entry in the
+        unsaved-changes guard. The usage pane is genuinely separate (its own
+        tracker and its own Apply), so it stays a second entry.
 
-        General is added to the inner bar FIRST, which is load-bearing beyond
-        appearance: several tests reach this tab's daily-ceiling line edits as
-        ``findChildren(QLineEdit)[:2]``, and that index only holds while
-        General's widgets are constructed and parented ahead of the usage
-        pane's. The usage pane also uses radio buttons rather than check boxes,
-        so ``findChildren(QCheckBox)`` on this tab still returns exactly the
-        feature toggles -- one test flips every one of them off and would
-        otherwise be silently switching off reporting too.
+        Returns ``(widget, repopulate, panes)``. Note the plural: this tab
+        contributes TWO entries to the unsaved-changes guard, both declaring the
+        returned widget as their ``host`` (see :class:`_ApplyPane` for why the
+        guard needs that).
+
+        The three content panes are built and parented in bar order, before the
+        usage pane exists. That is load-bearing beyond appearance: tests reach
+        the daily-ceiling line edits as ``findChildren(QLineEdit)[:2]`` on the
+        General pane, which holds only while the ceilings are the first two
+        edits constructed there. The usage pane also uses radio buttons rather
+        than check boxes, so ``findChildren(QCheckBox)`` over this tab still
+        returns exactly the six feature toggles -- one test flips every one of
+        them off and would otherwise be silently switching off reporting too.
 
         Takes the window because the reset asks for confirmation first, and the
         confirmation is a modal on the window that owns this tab.
@@ -3535,12 +3643,17 @@ class Plugin(LiquidityPlugin):
         from . import DEFAULT_MAX_OPENS_PER_DAY, DEFAULT_MAX_CLOSES_PER_DAY
 
         c = self.settings(wallet)
+
+        # The three content panes. Each is a scrolling body (see _scrolled);
+        # the status line and buttons they share are pinned outside them, at the
+        # end of this method.
         general = QWidget()
         v = QVBoxLayout(general)
         v.addWidget(_wrapped_label(_(
-            "Advanced settings — feature toggles, runaway-guard ceilings, and "
-            "tuning knobs moved off the main Settings tab. The defaults are "
-            "sensible; change them only if you understand the effect.")))
+            "Advanced settings. The defaults are sensible; change them only if "
+            "you understand the effect. Everything on this tab, the Reliability "
+            "tab and the Channel recovery tab is saved together by the Apply "
+            "button below.")))
 
         # --- feature on/off toggles (moved from the Settings tab) ----------
         reliability_cb = QCheckBox(_("Track provider reliability"))
@@ -3596,7 +3709,35 @@ class Plugin(LiquidityPlugin):
             (update_check_cb, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED'),
         ]
 
+        # --- the other two content panes -----------------------------------
+        # Built here, before any tuning field is created, so each pane's grid is
+        # already installed in its pane when the field loop below starts adding
+        # to it. A widget added to an installed layout is parented at once, so
+        # the loop's order IS each pane's child order -- which is what keeps the
+        # positional findChildren() contracts in this method's docstring true.
+        reliability = QWidget()
+        rv = QVBoxLayout(reliability)
+        rv.addWidget(_wrapped_label(_(
+            "How faults are scored. A provider or peer that times out, errors or "
+            "leaves a swap stuck earns a penalty that is added to its cost for "
+            "RANKING only — a flaky provider falls behind reliable ones but is "
+            "still used if it is the only one. The penalty decays with time.")))
+        reliability_grid = QGridLayout()
+        rv.addLayout(reliability_grid)
+
+        recovery = QWidget()
+        cv = QVBoxLayout(recovery)
+        cv.addWidget(_wrapped_label(_(
+            "Timeouts for getting funds back out of a channel that went wrong: a "
+            "channel open that wedges or never confirms, a reverse swap that "
+            "sticks, and a channel whose peer has gone away. A cooperative close "
+            "is always tried first; a force-close broadcasts a transaction and "
+            "incurs a mining fee, so it is the last resort.")))
+        recovery_grid = QGridLayout()
+        cv.addLayout(recovery_grid)
+
         grid = QGridLayout()
+        v.addLayout(grid)
         row = 0
         # --- daily action ceilings (with a live 24h usage read-out) --------
         # Kept as the first two grid rows so their line-edits stay at
@@ -3695,20 +3836,46 @@ class Plugin(LiquidityPlugin):
              lambda val: setattr(c, 'INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE',
                                  max(0, int(val)))),
         ]
+        # `fields` stays ONE list in ONE order: that is the order Apply
+        # validates and persists in, and the order repopulate re-renders in, so
+        # splitting it per pane would split those too. Which pane each row is
+        # DRAWN on is a separate question, answered here. The list is already
+        # grouped by subject, so naming the field that opens each group is
+        # enough to route every row after it -- and if a group's first field is
+        # ever renamed, the whole group lands on the previous pane, which the
+        # pane-membership tests catch at once.
+        RELIABILITY_STARTS_AT = 'INBOUND_LIQUIDITY_RELIABILITY_BASE_PENALTY_PCT'
+        RECOVERY_STARTS_AT = 'INBOUND_LIQUIDITY_STUCK_OPEN_TIMEOUT_MIN'
+        target = grid
+        # General's grid already holds the two ceilings, so it resumes at `row`;
+        # the other two panes start empty.
+        next_row = {grid: row, reliability_grid: 0, recovery_grid: 0}
+        pane_of_grid = {grid: general, reliability_grid: reliability,
+                        recovery_grid: recovery}
+        # Which pane each field ended up on, so a rejected Apply can bring the
+        # offending field into view rather than whichever pane happened to be
+        # showing (see `refused` below).
+        pane_of_field: Dict[str, QWidget] = {}
         field_rows = []  # (edit, attr, parser, setter, label)
         for (label, attr, parser, setter) in fields:
-            grid.addWidget(QLabel(label), row, 0)
+            if attr == RELIABILITY_STARTS_AT:
+                target = reliability_grid
+            elif attr == RECOVERY_STARTS_AT:
+                target = recovery_grid
+            at = next_row[target]
+            target.addWidget(QLabel(label), at, 0)
             edit = QLineEdit(str(getattr(c, attr)))
-            grid.addWidget(edit, row, 1)
+            target.addWidget(edit, at, 1)
             field_rows.append((edit, attr, parser, setter, label))
-            row += 1
-        v.addLayout(grid)
+            pane_of_field[attr] = pane_of_grid[target]
+            next_row[target] = at + 1
 
+        # Shared by all three content panes, and pinned outside them at the end
+        # of this method so the verdict on an Apply is visible from whichever
+        # pane the user pressed it on.
         status_label = QLabel("")
         hint_label = QLabel(_StatusLine.HINT_TEXT)
         status = _StatusLine(status_label, hint_label)
-        v.addWidget(status_label)
-        v.addWidget(hint_label)
 
         # --- unsaved-changes tracking --------------------------------------
         # Every widget on this tab waits for Apply, so the snapshot is simply all
@@ -3751,19 +3918,28 @@ class Plugin(LiquidityPlugin):
                 # with it by construction.
                 dirty.reset()
 
+        # Which content pane holds the field that made the last Apply fail. The
+        # three panes share one Apply, so a refusal has to be able to say WHERE
+        # the bad value is -- the message names the field, but the field may be
+        # on a pane the user is not looking at. Read by `focus` below.
+        refused: Dict[str, Optional[QWidget]] = {"pane": None}
+
         def on_apply() -> bool:
             """Validate and persist this tab. Returns whether anything was saved
             -- see the Settings tab's on_apply."""
             # Validate everything before persisting anything.
+            refused["pane"] = None
             parsed_ceilings = []
             for edit, attr, default, usage, kind in ceiling_rows:
                 text = edit.text().strip()
                 try:
                     value = int(text)
                 except ValueError:
+                    refused["pane"] = general       # the ceilings live there
                     status.set_error(_("Invalid value: {}").format(text))
                     return False
                 if value < 0:
+                    refused["pane"] = general
                     status.set_error(_("Value cannot be negative: {}").format(text))
                     return False
                 parsed_ceilings.append((attr, value))
@@ -3773,6 +3949,7 @@ class Plugin(LiquidityPlugin):
                 try:
                     parsed_fields.append((setter, parser(text)))
                 except ValueError:
+                    refused["pane"] = pane_of_field.get(attr)
                     status.set_error(_("Invalid value for: {}").format(label))
                     return False
             # One batch for the whole form: see the note on the Settings tab's
@@ -3845,39 +4022,78 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
-        v.addLayout(btn_row)
-        v.addStretch(1)
+
+        # Nothing in these three forms expands, so a trailing stretch keeps each
+        # one top-aligned rather than letting Qt share a tall panel's slack out
+        # between the rows.
+        for pane_layout in (v, rv, cv):
+            pane_layout.addStretch(1)
 
         repopulate()
         dirty.reset()
 
         # --- the inner tab bar ---------------------------------------------
-        # General is parented into the inner bar BEFORE the usage pane is even
-        # built, so it is unambiguously the first subtree a findChildren() walk
-        # over this tab reaches. See the docstring: tests address General's
-        # widgets positionally, and that only holds while this order does.
+        # The three content panes are parented into the inner bar in bar order,
+        # before the usage pane is even built, so General is unambiguously the
+        # first subtree a findChildren() walk over this tab reaches. See the
+        # docstring: tests address General's widgets positionally, and that only
+        # holds while this order does.
         tab = QWidget()
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(0, 0, 0, 0)
         inner = QTabWidget()
-        inner.addTab(general, _("General"))
+        # The PAGES are the scroll areas, the bodies are what they hold. Both
+        # are needed below: `focus` has to name a page (setCurrentWidget only
+        # knows about pages), while the Apply logic reasons about bodies.
+        page_of_pane = {body: _scrolled(body)
+                        for body in (general, reliability, recovery)}
+        inner.addTab(page_of_pane[general], _("General"))
+        inner.addTab(page_of_pane[reliability], _("Reliability"))
+        inner.addTab(page_of_pane[recovery], _("Channel recovery"))
         outer.addWidget(inner)
 
         usage_widget, repopulate_usage, usage_pane_parts = \
             self._build_usage_stats_pane(window, wallet)
         inner.addTab(usage_widget, _("Usage statistics"))
 
-        panes = [
-            _ApplyPane(_("Advanced"), general, dirty, on_apply, host=tab,
-                       focus=lambda: inner.setCurrentWidget(general)),
-            _ApplyPane(_("Usage statistics"), usage_widget,
-                       usage_pane_parts["tracker"], usage_pane_parts["apply"],
-                       host=tab,
-                       focus=lambda: inner.setCurrentWidget(usage_widget)),
-        ]
-        # Moving between the two inner tabs asks about unsaved edits too, the
-        # same way moving between the outer tabs does.
-        self._install_sub_tab_guard(window, inner, panes)
+        # The single Apply, Reset and status line the three content panes share,
+        # pinned BELOW the bar so they are in reach from any of them -- and so
+        # that an Apply covering 29 controls is never scrolled out of sight.
+        outer.addWidget(status_label)
+        outer.addWidget(hint_label)
+        outer.addLayout(btn_row)
+
+        def focus_refused() -> None:
+            """Show the pane holding whatever made the last Apply fail, falling
+            back to General when there is nothing more specific to say."""
+            body = refused["pane"] or general
+            inner.setCurrentWidget(page_of_pane.get(body, page_of_pane[general]))
+
+        # ONE pane for all three content tabs: they share a tracker and an
+        # Apply, so to the guard they are one form that happens to be drawn in
+        # three views.
+        advanced_pane = _ApplyPane(_("Advanced"), general, dirty, on_apply,
+                                   host=tab, focus=focus_refused)
+        usage_pane = _ApplyPane(_("Usage statistics"), usage_widget,
+                                usage_pane_parts["tracker"],
+                                usage_pane_parts["apply"], host=tab,
+                                focus=lambda: inner.setCurrentWidget(usage_widget))
+        panes = [advanced_pane, usage_pane]
+
+        # Moving between the inner tabs asks about unsaved edits too, the same
+        # way moving between the outer tabs does -- but it has to be told which
+        # inner pages reach which pane, because `host` here is the outer
+        # Advanced widget and so matches no page of this bar. The Advanced form
+        # names all three of its pages, which is what makes a move between them
+        # a move WITHIN one pane (no question asked); crossing to or from the
+        # usage pane changes which pane is on screen, and does ask.
+        inner_pages = {
+            advanced_pane: tuple(page_of_pane[body] for body in
+                                 (general, reliability, recovery)),
+            usage_pane: (usage_widget,),
+        }
+        self._install_sub_tab_guard(window, inner, panes,
+                                    pages=lambda pane: inner_pages[pane])
 
         def repopulate_all() -> None:
             repopulate()
@@ -3917,17 +4133,17 @@ class Plugin(LiquidityPlugin):
 
         # Scrollable: the four options with their bullets, plus a preview of a
         # 50-field report, is taller than the tab at most window sizes, and a
-        # consent control the user has to guess the bottom of is not one.
+        # consent control the user has to guess the bottom of is not one. This
+        # pane had its own scroll area before the other settings panes did;
+        # _scrolled is that idiom, now shared with them (and vertical-only,
+        # which this pane wants too -- the report preview scrolls sideways
+        # inside itself).
         pane = QWidget()
         outer = QVBoxLayout(pane)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
         body = QWidget()
         v = QVBoxLayout(body)
-        scroll.setWidget(body)
-        outer.addWidget(scroll)
+        outer.addWidget(_scrolled(body))
 
         v.addWidget(_wrapped_label(_(
             "Help us understand how many people run this plugin, which settings "
@@ -4146,9 +4362,20 @@ class Plugin(LiquidityPlugin):
         providers that are not currently online. Returns
         ``(widget, repopulate_fn, pane)`` -- the pane being this tab's entry in
         the unsaved-changes guard (see :class:`_ApplyPane`).
+
+        Two widgets, not one: ``tab`` is the page the QTabWidget holds and the
+        pane the unsaved-changes guard keys on, while ``body`` is the part that
+        scrolls (see :func:`_scrolled`). The buttons and status line are added
+        to ``tab`` directly, so they stay put while the form scrolls under them.
+        Keeping ``tab`` as the page -- rather than making the scroll area the
+        page -- is what lets every caller, every test and the guard go on
+        addressing this tab exactly as before.
         """
         tab = QWidget()
-        v = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        body = QWidget()
+        v = QVBoxLayout(body)
         v.addWidget(_wrapped_label(_(
             "Swaps use the cheapest provider discovered on nostr. Tick "
             "“Preferred” to restrict swaps to only those providers, or "
@@ -4198,11 +4425,12 @@ class Plugin(LiquidityPlugin):
         grid.addWidget(ban_edit, 1, 1)
         v.addLayout(grid)
 
+        # Added to the PINNED half of the tab at the end of this method, not to
+        # the scrolling body: a verdict on the Apply the user just pressed has
+        # to be where they pressed it.
         status_label = QLabel("")
         hint_label = QLabel(_StatusLine.HINT_TEXT)
         status = _StatusLine(status_label, hint_label)
-        v.addWidget(status_label)
-        v.addWidget(hint_label)
 
         # --- unsaved-changes tracking --------------------------------------
         # The tab's state is the two text boxes plus which rows are ticked. Only
@@ -4480,7 +4708,12 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
-        v.addLayout(btn_row)
+
+        # --- assemble: scrolling form, then the pinned status and buttons ---
+        outer.addWidget(_scrolled(body))
+        outer.addWidget(status_label)
+        outer.addWidget(hint_label)
+        outer.addLayout(btn_row)
 
         repopulate()
         dirty.reset()
@@ -4507,9 +4740,15 @@ class Plugin(LiquidityPlugin):
         Channel partners are Lightning node ids (not nostr npubs): preferred ones
         are tried first, in order, before Electrum's suggested peer; banned ones
         are never opened to.
+
+        Split into a scrolling ``body`` and a pinned footer the same way the
+        Swap providers tab is -- see that method for why.
         """
         tab = QWidget()
-        v = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        body = QWidget()
+        v = QVBoxLayout(body)
         v.addWidget(_wrapped_label(_(
             "Channels are opened to peers Electrum suggests by default (several are "
             "tried in turn if one refuses). List “Preferred” partners "
@@ -4574,11 +4813,10 @@ class Plugin(LiquidityPlugin):
         grid.addWidget(ban_edit, 1, 1)
         v.addLayout(grid)
 
+        # Pinned, not scrolled -- see the Swap providers tab.
         status_label = QLabel("")
         hint_label = QLabel(_StatusLine.HINT_TEXT)
         status = _StatusLine(status_label, hint_label)
-        v.addWidget(status_label)
-        v.addWidget(hint_label)
 
         # --- unsaved-changes tracking --------------------------------------
         # As on the Providers tab: the two text boxes, the two switches, and which
@@ -4786,7 +5024,12 @@ class Plugin(LiquidityPlugin):
         btn_row.addWidget(reset_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(apply_btn)
-        v.addLayout(btn_row)
+
+        # --- assemble: scrolling form, then the pinned status and buttons ---
+        outer.addWidget(_scrolled(body))
+        outer.addWidget(status_label)
+        outer.addWidget(hint_label)
+        outer.addLayout(btn_row)
 
         repopulate()
         dirty.reset()

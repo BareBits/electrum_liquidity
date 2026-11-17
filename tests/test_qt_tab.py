@@ -173,30 +173,94 @@ def _plain_line_edits(widget):
     return [w for w in widget.findChildren(QLineEdit) if type(w) is QLineEdit]
 
 
+ADVANCED_CONTENT_PANES = ("General", "Reliability", "Channel recovery")
+
+
+def _advanced_tab(plugin, wallet):
+    """The whole Advanced tab: the inner bar with every pane behind it, plus the
+    Apply, Reset and status line pinned below it.
+
+    This is the handle for anything that spans the Advanced FORM -- its fields
+    are drawn on three inner panes but saved by one Apply, so a test that edits
+    a field and presses Apply needs the tab, not a pane.
+    """
+    from PyQt6.QtWidgets import QTabWidget
+    return plugin._tabs[wallet].container.findChild(QTabWidget).widget(3)
+
+
 def _advanced_pane(plugin, wallet, title="General"):
-    """One of the Advanced tab's inner panes ("General" / "Usage statistics").
+    """One of the Advanced tab's inner panes ("General", "Reliability",
+    "Channel recovery" or "Usage statistics").
 
     Resolved through the inner tab bar BY TITLE, never by position in a
     findChildren() walk over the Advanced tab. That distinction is load-bearing:
     QStackedWidget does not keep its pages in tab order (it raises the visible
     one), so a positional search over the whole Advanced subtree can hand back
-    the other pane's widgets -- which is exactly how the first version of this
+    another pane's widgets -- which is exactly how the first version of this
     nesting broke, by clicking the usage pane's Apply while meaning General's.
 
     Scoping to one pane also means these tests keep asserting about the pane
     they are actually named after, rather than about whatever else Advanced
     happens to host later.
+
+    Returns the pane's BODY, not the scroll area the inner bar holds (the three
+    content panes scroll, so that their text cannot be clipped on a short
+    window). Tests address fields and labels, which live in the body.
     """
-    from PyQt6.QtWidgets import QTabWidget
-    advanced = plugin._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    from PyQt6.QtWidgets import QScrollArea, QTabWidget
+    advanced = _advanced_tab(plugin, wallet)
     inner = advanced.findChild(QTabWidget)
     assert inner is not None, "the Advanced tab has no inner tab bar"
     for index in range(inner.count()):
         if inner.tabText(index) == title:
-            return inner.widget(index)
+            page = inner.widget(index)
+            return page.widget() if isinstance(page, QScrollArea) else page
     raise AssertionError(
         f"no {title!r} pane on Advanced; have "
         f"{[inner.tabText(i) for i in range(inner.count())]}")
+
+
+def _advanced_field(plugin, wallet, label_fragment: str):
+    """The line edit of the Advanced row whose label contains ``label_fragment``,
+    found across all three content panes -- a test should not have to know which
+    pane a knob was filed on."""
+    from PyQt6.QtWidgets import QGridLayout, QLabel
+    for title in ADVANCED_CONTENT_PANES:
+        pane = _advanced_pane(plugin, wallet, title)
+        for grid in pane.findChildren(QGridLayout):
+            for i in range(grid.count()):
+                item = grid.itemAt(i)
+                widget = item.widget() if item is not None else None
+                if not isinstance(widget, QLabel):
+                    continue
+                if label_fragment not in widget.text():
+                    continue
+                row, col, _rs, _cs = grid.getItemPosition(i)
+                neighbour = grid.itemAtPosition(row, col + 1)
+                assert neighbour is not None, f"{label_fragment!r} has no input"
+                return neighbour.widget()
+    raise AssertionError(f"no Advanced row labelled {label_fragment!r}")
+
+
+def _advanced_apply(plugin, wallet):
+    """The Advanced form's single Apply button, pinned below the inner bar."""
+    from PyQt6.QtWidgets import QPushButton, QTabWidget
+    advanced = _advanced_tab(plugin, wallet)
+    inner = advanced.findChild(QTabWidget)
+    buttons = [b for b in advanced.findChildren(QPushButton)
+               if b.text() == "Apply" and not _is_inside(b, inner)]
+    assert len(buttons) == 1, [b.text() for b in advanced.findChildren(QPushButton)]
+    return buttons[0]
+
+
+def _is_inside(widget, ancestor) -> bool:
+    """Whether ``widget`` is somewhere under ``ancestor``."""
+    node = widget.parentWidget()
+    while node is not None:
+        if node is ancestor:
+            return True
+        node = node.parentWidget()
+    return False
 
 
 @pytest.fixture(scope="module")
@@ -761,36 +825,34 @@ def test_advanced_tab_present_after_partners(qapp):
 
 
 def test_advanced_tab_persists_daily_ceilings(qapp):
-    from PyQt6.QtWidgets import QLineEdit, QPushButton
+    from PyQt6.QtWidgets import QLineEdit
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = _advanced_pane(p, wallet)
+    # The ceilings are the first two edits on General; the Apply that saves them
+    # is pinned below the inner tab bar, shared with the other content panes.
+    general = _advanced_pane(p, wallet, "General")
 
-    opens_edit, closes_edit = advanced_tab.findChildren(QLineEdit)[:2]
+    opens_edit, closes_edit = general.findChildren(QLineEdit)[:2]
     opens_edit.setText("7")
     closes_edit.setText("0")   # 0 = unlimited
-    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
-                     if b.text() == "Apply")
-    apply_btn.click()
+    _advanced_apply(p, wallet).click()
 
     assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 7
     assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY == 0
 
 
 def test_advanced_tab_rejects_invalid_without_persisting(qapp):
-    from PyQt6.QtWidgets import QLineEdit, QPushButton
+    from PyQt6.QtWidgets import QLineEdit
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = _advanced_pane(p, wallet)
+    general = _advanced_pane(p, wallet, "General")
 
-    opens_edit, closes_edit = advanced_tab.findChildren(QLineEdit)[:2]
+    opens_edit, closes_edit = general.findChildren(QLineEdit)[:2]
     opens_edit.setText("-3")   # negative rejected
     closes_edit.setText("abc")  # non-int rejected
-    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
-                     if b.text() == "Apply")
-    apply_btn.click()
+    _advanced_apply(p, wallet).click()
 
     # Neither invalid value is written; defaults are untouched.
     assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 5
@@ -840,21 +902,20 @@ def _edit_for(tab, label_prefix: str):
 
 
 def test_advanced_tab_persists_toggles_reserve_and_clamps(qapp):
-    from PyQt6.QtWidgets import QCheckBox, QLineEdit, QPushButton
+    from PyQt6.QtWidgets import QCheckBox
     from electrum.plugins.inbound_liquidity import MAX_LOG_RETENTION_DAYS
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = _advanced_pane(p, wallet)
-    reserve = _edit_for(advanced_tab, "On-chain reserve")
-    retention = _edit_for(advanced_tab, "Keep decision log")
+    # Both amounts and all six toggles are on General; one Apply saves the lot.
+    general = _advanced_pane(p, wallet, "General")
+    reserve = _edit_for(general, "On-chain reserve")
+    retention = _edit_for(general, "Keep decision log")
     reserve.setText("7500")
     retention.setText("99999")               # -> clamped
-    for cb in advanced_tab.findChildren(QCheckBox):
+    for cb in general.findChildren(QCheckBox):
         cb.setChecked(False)                 # flip every feature toggle off
-    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
-                     if b.text() == "Apply")
-    apply_btn.click()
+    _advanced_apply(p, wallet).click()
 
     assert p.settings(wallet).INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT == 7500
     assert p.settings(wallet).INBOUND_LIQUIDITY_LOG_RETENTION_DAYS == MAX_LOG_RETENTION_DAYS
@@ -1276,7 +1337,12 @@ def _settings_layout_order(state) -> List[str]:
 
     Labels contribute their text, nested rows contribute their button labels, so
     a test can assert *where* a section sits rather than merely that it exists.
+
+    The isinstance order matters, twice over: a QLabel is a QFrame, and so is the
+    QScrollArea holding the form -- so both have to be named before the QFrame
+    branch, or the scroll area is reported as a separator.
     """
+    from PyQt6.QtWidgets import QScrollArea
     settings = state.container.findChild(QTabWidget).widget(0)
     layout = settings.layout()
     out: List[str] = []
@@ -1285,6 +1351,8 @@ def _settings_layout_order(state) -> List[str]:
         widget = item.widget()
         if isinstance(widget, QLabel):          # QLabel before QFrame: it IS one
             out.append(f"label:{widget.text()}")
+        elif isinstance(widget, QScrollArea):   # likewise a QFrame
+            out.append("widget:QScrollArea")
         elif isinstance(widget, QFrame):
             out.append("separator")
         elif widget is not None:
@@ -1300,19 +1368,35 @@ def _settings_layout_order(state) -> List[str]:
 
 
 def test_status_section_sits_at_the_bottom_of_the_settings_tab(qapp):
-    # It is a footer, below the Apply button and after the stretch that pins it
-    # to the bottom edge -- not a banner wedged between the automation switch
-    # and the settings fields.
+    # It is a footer, below the Apply button and on the bottom edge of the tab
+    # -- not a banner wedged between the automation switch and the settings
+    # fields.
+    #
+    # What pins it there changed: it used to be a stretch placed ahead of the
+    # footer inside one flat layout. The form now lives in a scroll area (so its
+    # text cannot be clipped on a short window), and THAT is what takes up the
+    # slack -- it is the only expanding item, so everything after it is held
+    # against the bottom edge. The stretch moved inside the scrolling form,
+    # where it keeps the fields top-aligned. Hence the assertion on the scroll
+    # area rather than on a top-level stretch.
+    from PyQt6.QtWidgets import QScrollArea, QSizePolicy
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
+    settings = p._tabs[wallet].container.findChild(QTabWidget).widget(0)
     order = _settings_layout_order(p._tabs[wallet])
 
     apply_row = next(i for i, m in enumerate(order) if m.startswith("row:") and "Apply" in m)
     header = order.index("label:Status")
-    stretch = next(i for i, m in enumerate(order) if m == "stretch")
 
-    assert apply_row < stretch < header, order
+    assert order[0] == "widget:QScrollArea", order
+    assert apply_row < header, order
+    # The pin itself: the form expands, the footer does not, so the footer is
+    # pushed down rather than floating under the Apply button on a tall window.
+    scroll = settings.layout().itemAt(0).widget()
+    assert isinstance(scroll, QScrollArea)
+    assert scroll.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Expanding
+    assert scroll.widgetResizable(), "the form would not follow the panel width"
     # Status header, the status itself, the "since" line, the version/update
     # line (empty and hidden unless the update check is switched on), and the
     # Unlock button that appears with a "wallet locked" status (hidden otherwise).
@@ -1616,16 +1700,13 @@ def test_advanced_tab_exposes_and_persists_the_minimum_swap_size(qapp):
     Clamping is asserted too: a negative floor is meaningless and must land as 0
     (off) rather than as a negative bound nothing can satisfy.
     """
-    from PyQt6.QtWidgets import QPushButton
     p = _make_plugin()
     window, wallet = _FakeWindow(), _FakeWallet()
     p._add_liquidity_tab(window, wallet)
-    advanced_tab = _advanced_pane(p, wallet)
-    edit = _edit_for(advanced_tab, "Minimum swap size")
+    edit = _advanced_field(p, wallet, "Minimum swap size")
     assert edit.text() == "25000", "the field does not show the shipped default"
 
-    apply_btn = next(b for b in advanced_tab.findChildren(QPushButton)
-                     if b.text() == "Apply")
+    apply_btn = _advanced_apply(p, wallet)
     edit.setText("60000")
     apply_btn.click()
     assert p.settings(wallet).INBOUND_LIQUIDITY_MIN_SWAP_SAT == 60_000
