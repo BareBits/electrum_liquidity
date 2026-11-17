@@ -326,10 +326,10 @@ class _AskingWindow(_FakeWindow):
 
 
 def _advanced_tab(p, wallet):
-    """Advanced's General pane. Scoped by title through the inner tab bar --
-    see test_qt_tab._advanced_pane for why position is not safe here."""
-    from test_qt_tab import _advanced_pane
-    return _advanced_pane(p, wallet)
+    """The whole Advanced tab. The reset button lives in the row pinned below
+    the inner tab bar (it resets every pane, so it belongs to none of them)."""
+    from test_qt_tab import _advanced_tab as advanced_tab
+    return advanced_tab(p, wallet)
 
 
 def _reset_button(p, wallet):

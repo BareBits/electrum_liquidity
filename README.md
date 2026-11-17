@@ -59,9 +59,17 @@ wallet, applies the rules below, and executes the resulting actions.
 
 ## Rules (configurable from the Liquidity tab)
 
-The everyday settings live on the **Settings** sub-tab; power-user knobs live on
-**Advanced → General**, the opt-in reporting controls on **Advanced → Usage
-statistics**, and the partner/provider lists on their own sub-tabs.
+The everyday settings live on the **Settings** sub-tab; power-user knobs live
+behind **Advanced**, which holds four panes of its own — **General** (the
+feature toggles, the daily action ceilings and the plain tuning amounts),
+**Reliability** (how provider and peer faults are scored), **Channel recovery**
+(the wedged-open, stuck-swap and offline auto-close timeouts) and **Usage
+statistics** (the opt-in reporting controls). The partner and provider lists
+have their own sub-tabs.
+
+The first three Advanced panes are one form in three views: a single **Apply**
+and **Reset**, pinned below the pane bar, save all of them together.
+
 This table lists the most-used settings and their tab — the tabs also carry more
 knobs not shown here (reliability tuning, offline auto-close, daily action
 ceilings, diagnostics, etc.).
@@ -531,21 +539,23 @@ first open is still confirming.
 
 A channel that is merely **still confirming** (its funding tx has not yet reached
 the depth the peer requires) is treated differently: it blocks only a further
-channel *open* — for up to the **confirming-open freeze** (Advanced tab, default
-3 days) — and never blocks reverse swaps on other, already-open channels. In a
-high-fee environment a funding tx can legitimately take days to confirm, and
-stalling unrelated channels for that long is pure lost value.
+channel *open* — for up to the **confirming-open freeze** (Advanced → Channel
+recovery, default 3 days) — and never blocks reverse swaps on other,
+already-open channels. In a high-fee environment a funding tx can legitimately
+take days to confirm, and stalling unrelated channels for that long is pure
+lost value.
 
 Two exceptions keep one genuinely wedged operation from freezing automation
 forever:
 
-- a channel stuck *opening* past the **stuck channel-open timeout** (Advanced
-  tab, default 60 min) is treated as wedged by an unresponsive peer — it no
-  longer counts toward the freeze, so automation can resume, and
+- a channel stuck *opening* past the **stuck channel-open timeout** (Advanced →
+  Channel recovery, default 60 min) is treated as wedged by an unresponsive
+  peer — it no longer counts toward the freeze, so automation can resume, and
 - a reverse swap whose funding is broadcast but still unswept past the **stuck
-  reverse-swap timeout** (Advanced tab, default 3 h) likewise stops counting
-  toward the freeze. The swap is still tracked and its provider still faulted
-  separately — this only releases the freeze so other opens/swaps can proceed.
+  reverse-swap timeout** (Advanced → Channel recovery, default 3 h) likewise
+  stops counting toward the freeze. The swap is still tracked and its provider
+  still faulted separately — this only releases the freeze so other opens/swaps
+  can proceed.
 
 ### Closing a wedged channel open
 
@@ -558,7 +568,7 @@ of which must pass:
    confirmations, nothing is wrong and the clock does not even start.
 2. **The wedge clock**, timed from the first moment the channel looked wedged —
    *not* from when it was created, so time spent waiting for confirmations never
-   counts against it. Default 6 h (Advanced tab).
+   counts against it. Default 6 h (Advanced → Channel recovery).
 3. **Repeated, spread-out evidence**: the channel must look wedged on several
    separate checks (default 5) spanning at least a minimum interval (default
    60 min). Evaluation ticks are event-driven and can fire in bursts, so a count
@@ -856,6 +866,24 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+### Small windows
+
+Every settings pane scrolls, and its **Apply** (with **Reset**, the status line
+and the **Status** footer) stays pinned below the scrolling part rather than
+travelling with it.
+
+Both halves of that matter, because a Qt tab given less height than its contents
+need does not scroll by default — it shrinks every widget instead, and a label
+shrunk below its text paints that text cut off. Electrum's own default window is
+840×400, which leaves roughly 290px of tab area against the Advanced form's
+~1030px, so at the shipped window size the panes used to shave a few pixels off
+every row (and squeeze the provider and partner tables down to a header strip
+with no rows visible) with no way to reach the rest of the form. Now the pane
+scrolls and the button that commits it cannot end up below the fold.
+
+On a tall window nothing changes: the tables still expand to fill the tab, and
+no scrollbar appears until it is needed.
+
 ### Unsaved changes
 
 Four sub-tabs hold their edits until you press **Apply**: **Settings**, **Swap
@@ -877,7 +905,8 @@ you:
 
 - **Apply changes** runs that tab's Apply, validation included. If a value is
   refused, you land back on the tab with the reason on screen, rather than
-  walking away believing it saved.
+  walking away believing it saved. On **Advanced**, whose one Apply covers three
+  panes, you land on the pane holding the value that was refused.
 - **Ignore** leaves them unsaved and leaves them **in the fields** — nothing is
   discarded. You are not asked about that same set of pending edits again; edit
   something further and you are.
@@ -1029,7 +1058,8 @@ installation and start moving its funds. (`plugins.inbound_liquidity.enabled`
 is still a config key; that is Electrum's own "is this plugin loaded", not a
 setting of the plugin.)
 
-**Resetting.** *Advanced → General → Reset this wallet to defaults* discards everything
+**Resetting.** *Advanced → Reset this wallet to defaults* (the button pinned
+below the pane bar, so it is in reach from any of them) discards everything
 stored for that wallet, putting it back on the shipped defaults. No other wallet
 is touched, and nothing about channels, swaps or funds changes.
 
@@ -1085,7 +1115,8 @@ inbound_liquidity/
   usage_stats.py        PURE opt-in usage-report builder (no Electrum imports) — the per-level field
                         allowlist, build_payload(), and the preview the consent screen shows
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
-                        Channel partners / Advanced [General | Usage statistics] /
+                        Channel partners / Advanced [General | Reliability |
+                        Channel recovery | Usage statistics] /
                         Actions / Declines / Faults / Log sub-tabs),
                         plus the grafts onto Electrum's own GUI: the Channels tab's "Managed by"
                         column, the balance pie chart's liquidity-goal-buffer slice, and the

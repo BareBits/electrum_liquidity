@@ -104,8 +104,15 @@ def _settings_edits(plugin, wallet):
 
 
 def _advanced_edits(plugin, wallet):
-    tabs = _sub_tabs(plugin, wallet)
-    return _plain_line_edits(tabs.widget(ADVANCED_TAB))
+    """The General pane's line edits -- index 0/1 are the daily ceilings.
+
+    Scoped to the pane, not to the whole Advanced tab: the tab now holds three
+    content panes behind an inner bar, and a findChildren() walk over it returns
+    their edits in QStackedWidget order rather than tab order (see
+    test_qt_tab._advanced_pane), so index 0 would silently be some other knob.
+    """
+    from test_qt_tab import _advanced_pane
+    return _plain_line_edits(_advanced_pane(plugin, wallet, "General"))
 
 
 def _goal_edit(plugin, wallet):
@@ -642,3 +649,114 @@ def test_closing_the_tab_disconnects_the_main_window_guard(qapp, dialog):
     p._remove_liquidity_tab(wallet)
     window.tabs.setCurrentIndex(window.tabs.indexOf(other))
     assert dialog.count == 0
+
+
+# --- the Advanced tab's INNER bar ----------------------------------------
+# Advanced holds four panes behind a bar of its own, and they are not four
+# equal things: General / Reliability / Channel recovery are ONE form sharing a
+# single tracker and a single Apply, while Usage statistics has its own.
+#
+# So the inner guard has to tell "moved within the Advanced form" (General ->
+# Reliability: nothing has been left, ask nothing) from "moved off it"
+# (General -> Usage statistics: the form is no longer on screen, ask).
+#
+# It used to do neither, which is the bug these pin. _install_sub_tab_guard
+# keyed panes by `host`, and looked them up by the page of the bar it was
+# watching; for the INNER bar those are different widgets (host is the outer
+# Advanced tab), so every lookup missed and the guard concluded there was
+# nothing to save. Nothing was lost for good -- leaving Advanced altogether
+# still asked, through the outer guard -- but an edit could be abandoned for
+# the usage pane in silence.
+def _inner_bar(plugin, wallet) -> QTabWidget:
+    return _sub_tabs(plugin, wallet).widget(ADVANCED_TAB).findChild(QTabWidget)
+
+
+def _inner_index(plugin, wallet, title: str) -> int:
+    inner = _inner_bar(plugin, wallet)
+    for i in range(inner.count()):
+        if inner.tabText(i) == title:
+            return i
+    raise AssertionError(
+        f"no {title!r} pane; have {[inner.tabText(i) for i in range(inner.count())]}")
+
+
+def _usage_radio(plugin, wallet):
+    """A usage-level radio that is NOT the current one, so ticking it dirties
+    that pane."""
+    from PyQt6.QtWidgets import QRadioButton
+    from test_qt_tab import _advanced_pane
+    pane = _advanced_pane(plugin, wallet, "Usage statistics")
+    return next(r for r in pane.findChildren(QRadioButton) if not r.isChecked())
+
+
+def test_moving_within_the_advanced_form_asks_nothing(qapp, dialog):
+    # The three content panes share one Apply, so moving between them leaves
+    # nothing behind -- being asked to save here would be a nag, and answering
+    # "Ignore" would make the plugin stop asking about edits still being typed.
+    p, window, wallet = _built()
+    _advanced_edits(p, wallet)[0].setText("9")      # a daily ceiling, on General
+    assert _pane(p, wallet, ADVANCED_TAB).tracker.is_dirty()
+    inner = _inner_bar(p, wallet)
+
+    for title in ("Reliability", "Channel recovery", "General"):
+        inner.setCurrentIndex(_inner_index(p, wallet, title))
+    assert dialog.count == 0, dialog.asked
+    # ...and the edit is still pending, in the widget, unsaved.
+    assert _advanced_edits(p, wallet)[0].text() == "9"
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 5
+
+
+def test_leaving_the_advanced_form_for_the_usage_pane_asks(qapp, dialog):
+    dialog.answer = True                            # Apply changes
+    p, window, wallet = _built()
+    _advanced_edits(p, wallet)[0].setText("9")
+    inner = _inner_bar(p, wallet)
+
+    inner.setCurrentIndex(_inner_index(p, wallet, "Usage statistics"))
+    assert dialog.count == 1, dialog.asked
+    assert "Advanced" in dialog.last_text()
+    assert p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY == 9
+
+
+def test_leaving_the_usage_pane_with_edits_asks(qapp, dialog, monkeypatch):
+    # The other direction, and the one pane of the four with its own Apply.
+    dialog.answer = True
+    p, window, wallet = _built()
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    inner = _inner_bar(p, wallet)
+    inner.setCurrentIndex(_inner_index(p, wallet, "Usage statistics"))
+    _usage_radio(p, wallet).setChecked(True)
+    dialog.asked.clear()
+
+    inner.setCurrentIndex(_inner_index(p, wallet, "General"))
+    assert dialog.count == 1, dialog.asked
+    assert "Usage statistics" in dialog.last_text()
+
+
+def test_a_clean_advanced_form_is_not_asked_about(qapp, dialog):
+    # No edits, no question -- in either direction across the inner bar.
+    p, window, wallet = _built()
+    inner = _inner_bar(p, wallet)
+    for title in ("Reliability", "Usage statistics", "Channel recovery",
+                  "General"):
+        inner.setCurrentIndex(_inner_index(p, wallet, title))
+    assert dialog.count == 0, dialog.asked
+
+
+def test_a_refused_value_keeps_the_user_on_the_advanced_form(qapp, dialog):
+    # Apply chosen, but the value cannot be saved: the inner bar must come back
+    # to the form rather than letting the user walk off to the usage pane
+    # believing it saved, and the pane it lands on is the one holding the bad
+    # value.
+    from test_qt_tab import _advanced_field
+    dialog.answer = True
+    p, window, wallet = _built()
+    _advanced_field(p, wallet, "Stuck channel-open timeout").setText("not-a-number")
+    inner = _inner_bar(p, wallet)
+    inner.setCurrentIndex(_inner_index(p, wallet, "General"))
+    dialog.asked.clear()
+
+    inner.setCurrentIndex(_inner_index(p, wallet, "Usage statistics"))
+    assert dialog.count == 1, dialog.asked
+    assert inner.tabText(inner.currentIndex()) == "Channel recovery"
+    assert "Invalid value" in _status_text(p, wallet, ADVANCED_TAB)

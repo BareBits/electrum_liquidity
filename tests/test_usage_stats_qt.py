@@ -127,13 +127,16 @@ def _preview_text(pane) -> str:
 
 # --- the nested tab, and what it must not have disturbed -----------------
 
-def test_advanced_hosts_general_and_usage_statistics(qapp):
+def test_advanced_hosts_its_content_panes_and_usage_statistics(qapp):
+    # Usage statistics comes LAST, after the three panes that make up the
+    # Advanced form -- it is the only one of the four with its own Apply.
     p, wallet = _built()
     advanced = p._tabs[wallet].container.findChild(QTabWidget).widget(3)
     inner = advanced.findChild(QTabWidget)
     assert inner is not None, "Advanced has no inner tab bar"
     titles = [inner.tabText(i) for i in range(inner.count())]
-    assert titles == ["General", "Usage statistics"]
+    assert titles == ["General", "Reliability", "Channel recovery",
+                      "Usage statistics"]
 
 
 def test_general_is_the_first_inner_tab(qapp):
@@ -402,8 +405,11 @@ def test_the_guard_can_apply_the_nested_pane(qapp, monkeypatch):
 
 
 def test_applying_elsewhere_does_not_disturb_the_usage_level(qapp, monkeypatch):
-    """The General pane's Apply writes two dozen settings in one batch; the
-    usage level must not be one of them."""
+    """The Advanced form's Apply writes two dozen settings in one batch; the
+    usage level must not be one of them. They sit behind the same inner tab bar
+    and the Advanced Apply is pinned right beside the usage pane, so nothing but
+    the separate tracker keeps them apart."""
+    from test_qt_tab import _advanced_apply
     p, wallet = _built()
     monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
     usage_pane = _usage_pane(p, wallet)
@@ -413,7 +419,7 @@ def test_applying_elsewhere_does_not_disturb_the_usage_level(qapp, monkeypatch):
     general = _advanced_pane(p, wallet, "General")
     for cb in general.findChildren(QCheckBox):
         cb.setChecked(False)
-    _apply(general).click()
+    _advanced_apply(p, wallet).click()
     assert p.usage_stats_level(wallet) == us.LEVEL_LIQUIDITY
 
 
