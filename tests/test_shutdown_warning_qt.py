@@ -175,8 +175,12 @@ def test_the_wait_ends_as_soon_as_the_attempt_finishes() -> None:
         time.sleep(0.3)
         p._note_attempt_finished(wallet)
 
-    threading.Thread(target=_finish_shortly, daemon=True).start()
+    # Clock started before the thread, so the 0.3s sleep is inside the measured
+    # window. Taken after the start instead, `elapsed` misses the slice between
+    # the sleep beginning and this line, so it lands just UNDER 0.3 and clears
+    # the lower bound only on whatever `sleep` happens to overshoot by.
     started = time.monotonic()
+    threading.Thread(target=_finish_shortly, daemon=True).start()
     p._await_shutdown(wallet)
     elapsed = time.monotonic() - started
     assert 0.3 <= elapsed < 5.0, f"the wait took {elapsed:.2f}s"
