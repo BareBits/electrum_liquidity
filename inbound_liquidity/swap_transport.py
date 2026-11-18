@@ -187,7 +187,18 @@ class TargetedNostrTransport(NostrTransport):
                 f"swap server {server_pubkey[:8]} did not reply within "
                 f"{self.RPC_REPLY_TIMEOUT_SEC:.0f}s (method={method})")
             raise
-        assert isinstance(response, dict)
+        # An explicit check, not an `assert`: asserts are stripped under
+        # `python -O`, and this one guards a value straight off a provider's DM.
+        # Without it, a reply that decodes to a list or a string reaches the
+        # `'error' in response` test below -- where a string would be searched
+        # for the SUBSTRING "error" and a list would raise an unhandled
+        # TypeError out of the swap path. A reply we cannot read is the
+        # provider failing to answer, so it surfaces as that.
+        if not isinstance(response, dict):
+            self.logger.warning(
+                f"swap server {server_pubkey[:8]} replied with "
+                f"{type(response).__name__}, not an object; discarding it")
+            raise SwapServerError()
         if 'error' in response:
             # The error text is an attacker-controlled string from the provider's
             # DM reply. Scrub control characters (CR/LF/ANSI) before logging so it

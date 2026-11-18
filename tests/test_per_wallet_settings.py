@@ -778,7 +778,7 @@ def test_the_sink_fee_ceiling_comes_from_the_wallet() -> None:
     # A wallet that lowered its fee ceiling was still paying sink routes up to
     # whatever the shared config said.
     p, w = _plugin_disagreeing(MAX_SWAP_FEE_PCT=0.5)
-    budget = p._sink_fee_budget(w, 1_000_000)
+    budget = p._ln_fee_budget(w, 1_000_000)
     assert budget.fee_msat == int(1_000_000 * 1000 * 0.5 / 100.0)
 
 

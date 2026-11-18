@@ -39,6 +39,20 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 DEFAULT_RETENTION_DAYS = 30
 
+# Most bytes one day-file may reach. Retention is otherwise purely by DAY, which
+# bounds how many files exist but says nothing about how big one gets -- and the
+# plugin writes a diagnostic line on every error path, including ones an outside
+# party can provoke (a swap provider advertising malformed offers, a peer failing
+# to connect). So a single day could grow without limit and fill the disk.
+#
+# Note what the module docstring's "footprint stays flat" claim does and does not
+# cover: writes stream a line at a time, so the LOGGER's memory is flat. That was
+# never a statement about the file. This is.
+#
+# 32 MiB is far more diagnostics than any real day produces, and the cap is per
+# file, so retention_days of them is the real ceiling.
+MAX_DAY_FILE_BYTES = 32 * 1024 * 1024
+
 
 def _sanitize_name(name: str) -> str:
     """Reduce an arbitrary wallet name to a safe single path component."""
@@ -61,9 +75,15 @@ class DiagLog:
     """Append-only, self-rotating, per-wallet JSON-lines diagnostic logger."""
 
     def __init__(self, base_dir: str,
-                 retention_days: int = DEFAULT_RETENTION_DAYS) -> None:
+                 retention_days: int = DEFAULT_RETENTION_DAYS,
+                 max_day_file_bytes: int = MAX_DAY_FILE_BYTES) -> None:
         self.base_dir = base_dir
         self.retention_days = max(1, int(retention_days))
+        self.max_day_file_bytes = max(1, int(max_day_file_bytes))
+        # Day-files we have already announced as full, so the "stopping" line is
+        # written once per file rather than on every subsequent write. Keyed by
+        # path; a handful of entries at most (one per wallet per retained day).
+        self._capped: set = set()
 
     # --- paths ------------------------------------------------------------
     def wallet_dir(self, wallet_name: str) -> str:
@@ -80,23 +100,65 @@ class DiagLog:
         ``today`` is derived from ``entry['ts']`` (epoch seconds) so the routing
         is deterministic and testable. Returns True on success; never raises —
         a logging fault must not break automation.
+
+        Returns False once the day-file has reached ``max_day_file_bytes``,
+        having written one final line saying so. Stopping is the right failure
+        here rather than rotating or truncating: a diagnostic log is only useful
+        if what it contains is the ORIGINAL sequence of events, and the entries
+        most worth keeping are the earliest ones — the beginning of whatever went
+        wrong. Dropping the tail of a runaway day loses repetition; dropping the
+        head would lose the diagnosis.
         """
         try:
             ts = float(entry.get("ts", 0.0))
             day = _day_from_ts(ts)
             folder = self.wallet_dir(wallet_name)
             os.makedirs(folder, exist_ok=True)
+            path = self._file_for_day(wallet_name, day)
             # Prepend a readable UTC time without mutating the caller's dict.
             record = {"time": _iso_from_ts(ts), **entry}
             line = json.dumps(record, ensure_ascii=False, sort_keys=True)
-            with open(self._file_for_day(wallet_name, day), "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            encoded = (line + "\n").encode("utf-8")
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0          # not created yet
+            if size + len(encoded) > self.max_day_file_bytes:
+                if path not in self._capped:
+                    self._capped.add(path)
+                    self._write_capped_notice(path, ts)
+                return False
+            with open(path, "ab") as fh:
+                fh.write(encoded)
             self._prune(wallet_name, day)
             return True
         except Exception:
             # Swallow every I/O / serialisation error: diagnostics are strictly
             # best-effort and must never propagate into the plugin.
             return False
+
+    def _write_capped_notice(self, path: str, ts: float) -> None:
+        """Record, once, that this day-file stopped accepting entries.
+
+        Written as a normal JSON line so a reader parsing the file does not have
+        to special-case it, and so the gap in the record is explicit — a log that
+        silently stops looks identical to a plugin that silently stopped.
+        """
+        notice = {
+            "time": _iso_from_ts(ts),
+            "ts": ts,
+            "category": "lifecycle",
+            "kind": "diag_log",
+            "reason": "diagnostic log reached its size limit for this day",
+            "detail": (f"this file reached {self.max_day_file_bytes} bytes; "
+                       f"further entries for this day are not recorded"),
+        }
+        try:
+            with open(path, "ab") as fh:
+                fh.write((json.dumps(notice, ensure_ascii=False,
+                                     sort_keys=True) + "\n").encode("utf-8"))
+        except OSError:
+            pass
 
     # --- retention --------------------------------------------------------
     def _prune(self, wallet_name: str, today: datetime.date) -> None:

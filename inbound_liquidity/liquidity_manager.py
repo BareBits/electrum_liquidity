@@ -340,6 +340,63 @@ def clamp_dev_fee_pct(pct: float, *, max_pct: float = 5.0) -> float:
     return pct
 
 
+# Bounds an economic figure must fall inside to be one we can reason about: sats
+# capped at the total bitcoin supply, a percentage at 100%. Shared by the
+# untrusted-offer validation (:func:`validate_offer`) and the settings clamps
+# just below -- a negative, NaN, infinite or absurd figure is equally unusable
+# whether a swap provider advertised it or a hand-edited wallet file holds it.
+_MAX_SATS: int = 21_000_000 * 100_000_000
+_MAX_PERCENTAGE_FEE: float = 100.0
+
+
+# --- settings coercion ----------------------------------------------------
+# Every threshold the engine decides on arrives from a per-wallet settings store
+# in the wallet file. ``set_setting`` type-checks a value against its ConfigVar,
+# but nothing bounds its RANGE -- and the wallet file is a place a user may edit
+# by hand (the plugin's own docs invite reading it). So a negative reserve, a NaN
+# percentage or an absurd sat figure can reach ``read_config`` today.
+#
+# None of those currently loses money: a negative ``onchain_reserve_sat`` makes
+# ``channel_funding_sat`` exceed the spendable balance and the open dies on
+# Electrum's ``NotEnoughFunds``; a NaN ceiling fails every comparison and
+# declines every swap. But that safety is downstream luck rather than an
+# invariant, and "the engine's arithmetic is only sane for sane inputs" is not a
+# property worth relying on. These two coerce at the boundary instead, so the
+# engine's fields mean what their docstrings say.
+def clamp_sat(value: object, *, default: int = 0,
+              max_sat: int = _MAX_SATS) -> int:
+    """A sat-denominated setting as an int in ``[0, max_sat]``.
+
+    ``default`` for anything that will not coerce (a string the type check let
+    through, None from an absent field), so a single unusable setting costs that
+    setting rather than the whole evaluation.
+    """
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, min(max_sat, number))
+
+
+def clamp_pct(value: object, *, default: float = 0.0,
+              max_pct: float = _MAX_PERCENTAGE_FEE) -> float:
+    """A percentage setting as a finite float in ``[0, max_pct]``.
+
+    NaN and the infinities are rejected to ``default`` rather than clamped:
+    every comparison with NaN is False, so a NaN ceiling does not read as "no
+    limit" or "no swaps" -- it reads as whichever the surrounding ``if`` happens
+    to be written as, which is exactly the kind of invisible behaviour this
+    exists to prevent.
+    """
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return max(0.0, min(max_pct, number))
+
+
 @dataclass(frozen=True)
 class DevFeePayoutDecision:
     """Whether to send a dev-fee payout right now, and how much.
@@ -1456,13 +1513,12 @@ class ProviderOffer:
     reliability_penalty_pct: float = 0.0
 
 
-# Bounds a sane provider offer must fall inside. All-sat fields are capped at the
-# total bitcoin supply; the percentage fee at 100%; the announcement PoW at a
-# 32-byte hash's worth of bits. These reject a hostile provider's negative /
-# NaN / infinite / absurd economics (which would otherwise game the cost gate and
-# the cheapest-provider ranking) before they reach the engine.
-_MAX_SATS: int = 21_000_000 * 100_000_000
-_MAX_PERCENTAGE_FEE: float = 100.0
+# The remaining bound a sane provider offer must fall inside: the announcement
+# PoW, at a 32-byte hash's worth of bits. The sat and percentage bounds it shares
+# with the settings clamps are declared up with those (``_MAX_SATS`` /
+# ``_MAX_PERCENTAGE_FEE``), because both uses want the same ceiling for the same
+# reason -- an economic figure outside it is not a figure we can reason about,
+# whether a provider advertised it or a hand-edited wallet file holds it.
 _MAX_POW_BITS: int = 256
 
 
@@ -3335,6 +3391,26 @@ def _decide_reverse_swaps(
 # we should nag the user about being "behind".
 _VERSION_RE = re.compile(r"^\s*v?(\d+(?:\.\d+)*)", re.IGNORECASE)
 
+# Bounds on a version read off a remote release payload. The glue already caps
+# the BODY it will read (UPDATE_CHECK_MAX_BYTES), but a capped body still holds
+# a quarter of a million version components: "1.1.1.1..." for 512 KB matches
+# this regex in full, and the parsed tuple -- then the normalised string rebuilt
+# from it in ``extract_release`` -- would be persisted to the config and
+# rendered in the status footer at that size.
+#
+# Four components is what a version has ("0.5.0", "0.5.0.1" at a stretch); more
+# than that is not a version we can be behind, so it is refused rather than
+# truncated. Truncating would invent a DIFFERENT version from the one published
+# and then compare against it, which is worse than declining to answer.
+MAX_VERSION_COMPONENTS: int = 4
+# Longest component we will parse, so a single absurd integer ("1" * 100_000,
+# which is one component and would pass the count check) cannot ride through
+# either. Four digits is room for a calendar-versioned year.
+MAX_VERSION_COMPONENT_CHARS: int = 4
+# Longest release URL we will keep. Generous next to a real GitHub release page
+# URL, and far short of a payload that is a link only in name.
+MAX_RELEASE_URL_CHARS: int = 500
+
 
 def parse_version(text: Optional[object]) -> Optional[Tuple[int, ...]]:
     """The numeric components of a version string: ``"v0.1.14"`` -> ``(0, 1, 14)``.
@@ -3342,13 +3418,23 @@ def parse_version(text: Optional[object]) -> Optional[Tuple[int, ...]]:
     Returns None for anything that does not start with a dotted number, so a
     surprise payload (an HTML error page, a renamed tag scheme) reads as "no
     usable answer" rather than as a version to compare against.
+
+    Also returns None for a number with absurdly many components, or one absurdly
+    long component -- see ``MAX_VERSION_COMPONENTS``. The text comes from a remote
+    party, and "no usable answer" is the right reading of something that is not
+    shaped like a version at all.
     """
     if text is None:
         return None
     match = _VERSION_RE.match(str(text))
     if not match:
         return None
-    return tuple(int(part) for part in match.group(1).split("."))
+    parts = match.group(1).split(".")
+    if len(parts) > MAX_VERSION_COMPONENTS:
+        return None
+    if any(len(part) > MAX_VERSION_COMPONENT_CHARS for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
 
 
 def is_newer_version(latest: Optional[object], current: Optional[object]) -> bool:
@@ -3390,8 +3476,10 @@ def extract_release(payload: Optional[Mapping]) -> Optional[ReleaseInfo]:
     exclude both, but this is a remote party's JSON -- the plugin should not
     start advertising an unreleased build because an endpoint changed its mind.
     The URL is taken from the payload rather than constructed, and dropped
-    unless it is an ``https://`` link, so a doctored payload cannot put an
-    arbitrary scheme in front of the user.
+    unless it is an ``https://`` link of sane length, so a doctored payload
+    cannot put an arbitrary scheme -- or half a megabyte of "URL" -- in front of
+    the user. Both fields end up persisted to the config and rendered in the
+    status footer, so each is bounded here, at the boundary.
     """
     if not isinstance(payload, Mapping):
         return None
@@ -3407,5 +3495,6 @@ def extract_release(payload: Optional[Mapping]) -> Optional[ReleaseInfo]:
     # dropped here, at the boundary, so nothing downstream has to wonder.
     version = ".".join(str(part) for part in parts)
     url = payload.get("html_url")
-    url = str(url) if isinstance(url, str) and url.startswith("https://") else ""
+    url = str(url) if (isinstance(url, str) and url.startswith("https://")
+                       and len(url) <= MAX_RELEASE_URL_CHARS) else ""
     return ReleaseInfo(version=version, url=url)

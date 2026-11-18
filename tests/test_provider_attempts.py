@@ -199,7 +199,7 @@ def test_every_provider_the_cascade_turns_to_is_counted() -> None:
     asyncio.run(p._reverse_swap(w, _action(chosen=A, alternates=(B, C)),
                                 state={}, transport=_transport([A, B, C])))
     assert _attempts(p, w) == {A: 1, B: 1, C: 1}
-    assert p.successes == [C]
+    assert p.committed == [C]
 
 
 def test_the_size_ladder_does_not_count_a_provider_twice() -> None:

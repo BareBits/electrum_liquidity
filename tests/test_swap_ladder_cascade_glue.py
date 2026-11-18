@@ -42,6 +42,7 @@ from test_swap_provider_failover_glue import (  # type: ignore  # noqa: E402
     A, B, C,
     _SM,
     _accept_without_funding,
+    _fund_successfully,
     _plugin,
     _transport,
     _wallet,
@@ -65,7 +66,7 @@ class _SizedSM(_SM):
         amount = kw["lightning_amount_sat"]
         npub = self._current
         self.attempts.append((npub, amount))
-        outcome = self._sized.get((npub, amount), "txid-" + npub)
+        outcome = self._sized.get((npub, amount), _fund_successfully)
         if isinstance(outcome, BaseException):
             raise outcome
         if callable(outcome):
@@ -135,7 +136,7 @@ def test_a_cheap_providers_small_rung_is_tried_before_a_dear_providers_full_size
     p = _plugin()
     _run(p, sm, _ladder_action(rungs))
     assert sm.attempts == [(A, 900_000), (A, 450_000), (B, 900_000)]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_a_smaller_rung_of_the_same_provider_can_be_the_one_that_works() -> None:
@@ -146,7 +147,7 @@ def test_a_smaller_rung_of_the_same_provider_can_be_the_one_that_works() -> None
     p = _plugin()
     _run(p, sm, _ladder_action(rungs))
     assert sm.attempts == [(A, 900_000), (A, 450_000)]
-    assert p.successes == [A]
+    assert p.committed == [A]
     assert B not in [n for n, _a in sm.attempts]
 
 
@@ -161,7 +162,7 @@ def test_the_walk_stops_at_the_first_commit_and_does_not_continue_the_ladder() -
     # Committed at 450k -- which is a PARTIAL drain of the 900k the engine
     # planned -- and the cascade still ends there.
     assert sm.attempts == [(A, 900_000), (A, 450_000)]
-    assert p.successes == [A]
+    assert p.committed == [A]
 
 
 # --- one fault per provider, however many rungs ---------------------------
@@ -192,7 +193,7 @@ def test_interleaved_providers_are_each_faulted_exactly_once() -> None:
     _run(p, sm, _ladder_action(rungs))
     assert sm.attempts == rungs
     assert sorted(_payment_faults(p)) == [A, B]
-    assert p.successes == [C]
+    assert p.committed == [C]
 
 
 def test_a_provider_faulted_on_an_early_rung_keeps_its_later_rungs() -> None:
@@ -204,7 +205,7 @@ def test_a_provider_faulted_on_an_early_rung_keeps_its_later_rungs() -> None:
     p = _plugin()
     _run(p, sm, _ladder_action(rungs))
     assert (A, 450_000) in sm.attempts
-    assert p.successes == [A]
+    assert p.committed == [A]
 
 
 def test_non_payment_failures_still_do_not_earn_a_payment_fault() -> None:
@@ -243,7 +244,7 @@ def test_a_vanished_provider_loses_every_one_of_its_rungs() -> None:
     p = _plugin()
     _run(p, sm, _ladder_action(rungs), transport=_transport([B]))
     assert sm.attempts == [(B, 900_000)]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_deadline_truncates_the_ladder_and_says_how_many_rungs_were_left() -> None:
@@ -291,7 +292,7 @@ def test_hand_built_attempts_with_a_reduced_rung_still_expand() -> None:
     # provider is still charged once for it. Pre-existing semantics, preserved:
     # the fault records what was observed, and the success is recorded too.
     assert _payment_faults(p) == [A]
-    assert p.successes == [A]
+    assert p.committed == [A]
 
 
 def test_engine_built_ladder_rungs_never_sprout_sub_rungs() -> None:

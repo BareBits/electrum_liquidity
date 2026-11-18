@@ -98,10 +98,33 @@ def _plugin(**config_over) -> LiquidityPlugin:
         new = set(sm._swaps) - before
         if new:
             p.tracked.append((npub, exp))
+        p._last_tracked_npub = npub
         return new
     p._track_new_swaps = _track
     p._diag_event = lambda wallet, **kw: p.diags.append(kw)
-    p._log_action = lambda wallet, **kw: p.logged.append(kw)
+
+    # Which provider's swap actually COMMITTED on-chain funding.
+    #
+    # This is what these tests used to read off `p.successes`, and it moved:
+    # committing funding and *completing* are no longer the same event. The
+    # executor sees only an unconfirmed funding txid, which Electrum can still
+    # replace under RBF, so it logs the action and ends the cascade but leaves
+    # the provider's success -- and the dev fee, and the lifetime totals -- to
+    # `_reconcile_pending_swaps` once the funding confirms. See
+    # `_swap_funding_confirmed`, and test_swap_completion_confirmation_glue.py
+    # for the deferral itself.
+    #
+    # So `successes`/`dev_fees` are expected EMPTY at this layer now, and the
+    # cascade-level question "which provider delivered" is this list. Read off
+    # the logged swap action, which the real code emits exactly once per
+    # committed swap, attributed to the provider whose swap was just tracked.
+    p.committed = []     # npub
+
+    def _log_action(wallet, **kw):
+        p.logged.append(kw)
+        if kw.get("kind") == "swap":
+            p.committed.append(getattr(p, "_last_tracked_npub", None))
+    p._log_action = _log_action
     # A swap that did not fund is a DECLINE, never an action -- see
     # _attempt_reverse_swap's unfunded arms. Captured separately so a test
     # can tell the two apart.
@@ -149,12 +172,30 @@ class _SM(SimpleNamespace):
     async def reverse_swap(self, **kw):
         npub = self._current
         self.attempts.append((npub, kw["lightning_amount_sat"]))
-        outcome = self.outcomes.get(npub, "txid-" + npub)
+        outcome = self.outcomes.get(npub, _fund_successfully)
         if isinstance(outcome, BaseException):
             raise outcome
         if callable(outcome):
             return await outcome(self, **kw)
         return outcome
+
+
+async def _fund_successfully(sm, **kw):
+    """The default outcome: the provider funded the swap.
+
+    Registers the swap object before returning the txid, which is not optional
+    realism -- Electrum's ``reverse_swap`` RETURNS ``swap.funding_txid``, so a
+    non-None txid always implies ``add_reverse_swap`` ran and the swap is in
+    ``sm._swaps``. The fake used to return a bare string instead, and once the
+    executor started tracking the funded swap (so reconciliation can grant the
+    success after a confirmation -- see ``_swap_funding_confirmed``) that
+    shortcut became visible as a swap nothing could reconcile.
+    """
+    key = f"{len(sm._swaps):02x}" + "ee" * 31
+    txid = "txid-" + sm._current
+    sm._swaps[key] = SimpleNamespace(prepay_hash=None, funding_txid=txid,
+                                     is_redeemed=False)
+    return txid
 
 
 def _wallet(sm, ln_payment: str = "failed") -> SimpleNamespace:
@@ -251,8 +292,10 @@ def test_pre_payment_failure_fails_over_to_next_provider(failure, expect_fault) 
     p = _plugin()
     _run(p, sm, _action())
     assert [n for n, _amt in sm.attempts] == [A, B]
-    assert p.successes == [B]                     # the failover completed it
-    assert p.dev_fees == [(399_500, "1x1x1")]
+    assert p.committed == [B]                     # the failover completed it
+    # The fee is not charged here any more: the executor records the basis
+    # reconciliation will price it on, once the funding confirms.
+    assert p.dev_fees == [] and p.tracked[-1] == (B, 399_500)
     assert (len(p.faults) == 1) == expect_fault
     if expect_fault:
         assert p.faults[0][0] == A                # charged to the one that failed
@@ -318,7 +361,7 @@ def test_unreachable_providers_are_faulted_when_one_responded() -> None:
         _run(p, sm, _action(chosen=A, alternates=(B, C)))
         # A timed out, B ran and succeeded, so the cascade stopped before C.
         assert [n for n, _amt in sm.attempts] == [B]
-        assert p.successes == [B]
+        assert p.committed == [B]
         assert [n for n, _r, _k in p.faults] == [A]
         assert "not reachable" in p.faults[0][1]
         assert p.faults[0][2].get("soft") in (None, False)   # escalating
@@ -375,7 +418,7 @@ def test_unswappable_amount_fails_over() -> None:
     p = _plugin()
     _run(p, sm, _action())
     assert [n for n, _amt in sm.attempts] == [B]   # A never issued an RPC
-    assert p.successes == [B]
+    assert p.committed == [B]
     assert p.faults == []                          # not a provider fault
     assert any("not swappable" in d.get("reason", "") for d in p.diags)
 
@@ -385,7 +428,7 @@ def test_cascade_walks_three_providers() -> None:
     p = _plugin()
     _run(p, sm, _action(chosen=A, alternates=(B, C)))
     assert [n for n, _amt in sm.attempts] == [A, B, C]
-    assert p.successes == [C]
+    assert p.committed == [C]
 
 
 # --- the safety line: never fail over once funds may be committed ---------
@@ -404,7 +447,7 @@ def test_no_failover_once_a_swap_object_exists() -> None:
     p._reverse_swap_timeout_sec = 0.05
     _run(p, sm, _action())
     assert [n for n, _amt in sm.attempts] == [A]      # B was NEVER tried
-    assert p.successes == [] and p.dev_fees == []
+    assert p.committed == [] and p.dev_fees == []
     assert p.tracked == [(A, 399_500)]                # handed to reconciliation
     assert len(p.faults) == 1 and p.faults[0][0] == A
 
@@ -421,8 +464,10 @@ def test_timeout_before_any_swap_exists_does_fail_over() -> None:
     p._reverse_swap_timeout_sec = 0.05
     _run(p, sm, _action())
     assert [n for n, _amt in sm.attempts] == [A, B]
-    assert p.successes == [B]
-    assert p.tracked == []                            # nothing was ever created
+    assert p.committed == [B]
+    # A hang before add_reverse_swap creates nothing for A, so the only
+    # record is B's funded swap -- the one reconciliation will complete.
+    assert p.tracked == [(B, 399_500)]
     assert len(p.faults) == 1 and p.faults[0][0] == A
 
 
@@ -452,10 +497,12 @@ def test_unfunded_swap_with_a_failed_payment_fails_over() -> None:
     p = _plugin()
     _run(p, sm, _action(alternates=(B,)), ln_payment="failed")
     assert [n for n, _amt in sm.attempts] == [A, B]    # B was actually tried
-    assert p.successes == [B]                          # and it delivered
-    assert p.dev_fees == [(399_500, "1x1x1")]
-    # The dead attempt is still tracked, so reconciliation keeps its own verdict.
-    assert p.tracked == [(A, 399_500)]
+    assert p.committed == [B]                          # and it delivered
+    assert p.dev_fees == []                            # charged on confirmation
+    # BOTH attempts are tracked, and reconciliation reaches opposite verdicts on
+    # them: A's swap never funded (its provider is charged once the stuck timeout
+    # passes) while B's funded and completes once it confirms.
+    assert p.tracked == [(A, 399_500), (B, 399_500)]
     # No swap action is logged for the attempt that moved nothing.
     assert len(p.logged) == 1
 
@@ -492,7 +539,7 @@ def test_unfunded_swap_with_an_inflight_payment_stops_the_cascade() -> None:
     _run(p, sm, _action(alternates=(B,)), ln_payment="inflight")
     assert [n for n, _amt in sm.attempts] == [A]       # B never tried
     assert p.tracked == [(A, 399_500)]
-    assert p.successes == [] and p.dev_fees == []
+    assert p.committed == [] and p.dev_fees == []
     assert p.faults == [] and p.peer_faults == []
     # Recorded, but as a decline -- nothing funded, so nothing is an action.
     assert p.logged == []
@@ -513,7 +560,7 @@ def test_unfunded_swap_with_no_route_to_the_provider_fails_over() -> None:
     p = _plugin()
     _run(p, sm, _action(alternates=(B,)), ln_payment="no_route")
     assert [n for n, _amt in sm.attempts] == [A, B]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
@@ -524,7 +571,7 @@ def test_unfunded_swap_whose_payment_settled_stops_the_cascade() -> None:
     p = _plugin()
     _run(p, sm, _action(alternates=(B,)), ln_payment="paid")
     assert [n for n, _amt in sm.attempts] == [A]
-    assert p.successes == [] and p.dev_fees == []
+    assert p.committed == [] and p.dev_fees == []
 
 
 def test_the_cascade_deadline_reaches_every_ranked_provider() -> None:
@@ -607,7 +654,7 @@ def test_a_resolving_prepay_htlc_no_longer_blocks_failover() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A, B]     # B WAS tried
-    assert p.successes == [B]
+    assert p.committed == [B]
     assert calls["n"] > 2, "the gate never re-asked after the first live reading"
 
 
@@ -621,7 +668,7 @@ def test_a_live_prepay_htlc_still_blocks_failover_while_it_stays_live() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]        # B never tried
-    assert p.successes == []
+    assert p.committed == []
     assert any("did not resolve in time" in (d.get("reason") or "")
                for d in p.diags)
 
@@ -663,7 +710,7 @@ def test_a_swap_that_funds_during_the_prepay_wait_stops_the_cascade() -> None:
                                 transport=_transport([A, B])))
     assert original is sm._swaps
     assert [n for n, _amt in sm.attempts] == [A]        # B never tried
-    assert p.successes == []
+    assert p.committed == []
 
 
 def test_a_settled_prepay_stops_the_cascade() -> None:
@@ -675,7 +722,7 @@ def test_a_settled_prepay_stops_the_cascade() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]
-    assert p.successes == []
+    assert p.committed == []
 
 
 # --- the MAIN payment's HTLCs, and the other half of the same bug ---------
@@ -730,7 +777,7 @@ def test_a_resolving_main_htlc_no_longer_blocks_failover() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A, B]     # B WAS tried
-    assert p.successes == [B]
+    assert p.committed == [B]
     assert calls["n"] > 2, "the gate never re-asked after the first live reading"
 
 
@@ -744,7 +791,7 @@ def test_a_live_main_htlc_still_blocks_failover_while_it_stays_live() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]        # B never tried
-    assert p.successes == []
+    assert p.committed == []
     assert any("did not resolve in time" in (d.get("reason") or "")
                for d in p.diags)
 
@@ -761,7 +808,7 @@ def test_a_main_payment_that_settles_during_the_wait_stops_the_cascade() -> None
                                 transport=_transport([A, B])))
     assert calls["settled"], "the test never reached the settled branch"
     assert [n for n, _amt in sm.attempts] == [A]        # B never tried
-    assert p.successes == []
+    assert p.committed == []
 
 
 def test_the_main_htlc_wait_is_bounded() -> None:
@@ -798,7 +845,7 @@ def test_a_swap_that_funds_while_the_main_htlc_is_live_stops_the_cascade() -> No
     asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
                                 transport=_transport([A, B])))
     assert [n for n, _amt in sm.attempts] == [A]
-    assert p.successes == []
+    assert p.committed == []
 
 
 # --- the gate says WHY ----------------------------------------------------
@@ -874,7 +921,7 @@ def test_first_success_stops_the_cascade() -> None:
     p = _plugin()
     _run(p, sm, _action(chosen=A, alternates=(B, C)))
     assert [n for n, _amt in sm.attempts] == [A]
-    assert p.successes == [A]
+    assert p.committed == [A]
     assert len(p.logged) == 1
 
 
@@ -889,7 +936,7 @@ def test_each_attempt_uses_its_own_amount_and_pairs() -> None:
                         alt_amounts={B: 250_000}))
     assert sm.attempts == [(A, 400_000), (B, 250_000)]
     assert sm.pairs_applied == [A, B]                 # re-applied per attempt
-    assert p.dev_fees == [(249_500, "1x1x1")]         # priced on B's amount
+    assert p.dev_fees == [] and p.tracked[-1] == (B, 249_500)   # B's amount
 
 
 def test_transport_is_retargeted_for_each_attempt() -> None:
@@ -951,7 +998,7 @@ def test_cascade_deadline_stops_before_starting_another_attempt() -> None:
         p, sm, _action(chosen=A, alternates=(B, C)),
         deadline=time.monotonic() + 0.01, npubs=[A, B, C])
     assert [n for n, _amt in sm.attempts] == [A]
-    assert p.successes == []
+    assert p.committed == []
     deadline_diags = [d for d in p.diags
                       if d.get("reason") == "swap provider cascade deadline reached"]
     assert len(deadline_diags) == 1
@@ -997,7 +1044,7 @@ def test_vanished_provider_is_skipped_and_the_next_one_runs() -> None:
     p = _plugin()
     _run(p, sm, _action(), transport=_transport([B]))  # A gone, B present
     assert [n for n, _amt in sm.attempts] == [B]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_cooldown_still_suppresses_a_reattempt() -> None:
@@ -1017,7 +1064,7 @@ def test_legacy_mode_still_single_shot() -> None:
     p = _plugin(SWAPSERVER_URL="https://swap.example")
     _run(p, sm, _action(chosen="", alternates=()), transport=_transport([]))
     assert [n for n, _amt in sm.attempts] == [""]
-    assert p.successes == []
+    assert p.committed == []
 
 
 def test_legacy_mode_with_nothing_configured_skips() -> None:
@@ -1061,7 +1108,7 @@ def test_a_failed_payment_retries_the_same_provider_smaller_first() -> None:
     p = _plugin()
     _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
     assert sm.attempts == [(A, 400_000), (A, 360_000), (B, 400_000)]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_the_reduced_rung_can_be_the_one_that_works() -> None:
@@ -1078,7 +1125,7 @@ def test_the_reduced_rung_can_be_the_one_that_works() -> None:
     p = _plugin()
     _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="failed")
     assert sm.attempts == [(A, 400_000), (A, 360_000)]
-    assert p.successes == [A]               # same provider, smaller swap
+    assert p.committed == [A]               # same provider, smaller swap
     assert [n for n, _amt in sm.attempts if n == B] == []   # B never needed
 
 
@@ -1091,7 +1138,7 @@ def test_no_reduced_rung_when_the_engine_priced_none() -> None:
     _run(p, sm, _reduced_action(alternates=(B,), reduced=None, alt_reduced=None),
          ln_payment="failed")
     assert sm.attempts == [(A, 400_000), (B, 400_000)]
-    assert p.successes == [B]
+    assert p.committed == [B]
 
 
 def test_every_provider_gets_its_own_reduced_rung() -> None:
@@ -1103,7 +1150,7 @@ def test_every_provider_gets_its_own_reduced_rung() -> None:
     assert sm.attempts == [(A, 400_000), (A, 360_000),
                            (B, 400_000), (B, 360_000),
                            (C, 400_000)]
-    assert p.successes == [C]
+    assert p.committed == [C]
 
 
 def test_a_failed_payment_faults_the_provider_once_not_once_per_rung() -> None:
@@ -1148,7 +1195,7 @@ def test_a_possibly_committed_swap_gets_no_reduced_rung() -> None:
     p = _plugin()
     _run(p, sm, _reduced_action(alternates=(B,)), ln_payment="inflight")
     assert sm.attempts == [(A, 400_000)]
-    assert p.successes == []
+    assert p.committed == []
 
 
 def test_a_reduced_rung_is_skipped_if_it_would_not_shrink() -> None:
@@ -1166,13 +1213,14 @@ def test_the_reduced_rung_uses_the_reduced_amount_for_costs_and_fees() -> None:
     async def _fail_big_succeed_small(sm, **kw):
         if kw["lightning_amount_sat"] > 380_000:
             return await _accept_without_funding(sm, **kw)
-        return "txid-small"
+        return await _fund_successfully(sm, **kw)
 
     sm = _SM({A: _fail_big_succeed_small})
     p = _plugin()
     _run(p, sm, _reduced_action(alternates=()), ln_payment="failed")
-    # get_recv_amount subtracts 500, so the fee accrues on 360_000 - 500.
-    assert p.dev_fees == [(359_500, "1x1x1")]
+    # get_recv_amount subtracts 500, so the basis recorded for the fee is
+    # 360_000 - 500 -- the rung that actually ran, not the size first planned.
+    assert p.dev_fees == [] and p.tracked[-1][1] == 359_500
     assert len(p.logged) == 1
     assert p.logged[0]["amount_sat"] == 360_000
     assert "reduced size" in p.logged[0]["detail"]
@@ -1246,7 +1294,7 @@ def test_a_failure_after_a_success_is_logged_afresh() -> None:
     sm = _SM({A: "txid-ok"})
     _run(p, sm, _action(alternates=()), ln_payment="failed")
     p._swap_cooldown_until.clear()
-    assert p.successes == [A]
+    assert p.committed == [A]
 
     _run_unfunded_cascade(p)
     assert len(p.declines) == 2, "the post-success failure was swallowed as a repeat"
