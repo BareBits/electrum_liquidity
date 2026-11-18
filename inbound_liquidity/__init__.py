@@ -11,10 +11,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import importlib
 import json
 import math
 import os
 import pkgutil
+import platform
+import re
 import sys
 import threading
 import time
@@ -58,6 +61,7 @@ from .liquidity_manager import (
     Action,
     BufferSplit,
     ChannelSnapshot,
+    channel_is_offline_discounted,
     clean_npub,
     CloseChannelAction,
     DAILY_WINDOW_SEC,
@@ -66,6 +70,8 @@ from .liquidity_manager import (
     LiquidityConfig,
     LiquiditySinkAction,
     LiquiditySnapshot,
+    MAX_NODE_ALIAS_CHARS,
+    MAX_PROVIDER_NAME_CHARS,
     MAX_SUGGESTED_PARTNERS,
     MIN_FUNDING_SAT,
     OpenChannelAction,
@@ -85,6 +91,9 @@ from .liquidity_manager import (
     classify_peer_observation,
     classify_pending_freeze,
     clamp_dev_fee_pct,
+    clamp_pct,
+    clamp_sat,
+    clean_display_name,
     compute_dev_fee,
     coop_before_force_ready,
     count_within_window,
@@ -92,6 +101,7 @@ from .liquidity_manager import (
     deadline_reached,
     decayed_penalty_pct,
     decide_dev_fee_payout,
+    effective_channel_count,
     eligible_providers,
     evaluate,
     extract_release,
@@ -100,7 +110,11 @@ from .liquidity_manager import (
     is_newer_version,
     liquidity_goal_met,
     normalize_node_id,
+    offline_discount_applies,
+    offline_streak_sec,
     order_channel_partners,
+    parse_provider_name,
+    record_offline_streak,
     record_uptime_sample,
     record_wedge_strike,
     reliability_penalty_pct,
@@ -117,6 +131,22 @@ from .liquidity_manager import (
     wallet_readiness_block,
 )
 from .diag_log import DiagLog
+# Bound as a MODULE rather than flattened into this namespace: every reference
+# below reads `usage_stats.build_payload` / `usage_stats.LEVEL_OFF`, which keeps
+# it obvious at the call site that a value is part of the reporting contract
+# rather than an ordinary local helper, and keeps generic names like `is_due`
+# and `parse_response` out of a namespace that already carries 70 imported ones.
+#
+# NOT `from . import usage_stats`, which looks equivalent and is not: that form
+# asks the import machinery for the fully-qualified
+# "electrum_external_plugins.inbound_liquidity.usage_stats", which walks the
+# dotted path from a top-level `electrum_external_plugins` that does not exist
+# on sys.path under a zip install -- ModuleNotFoundError, crashing Electrum on
+# install (exactly the hazard the compat shim above exists for, and caught by
+# tests/test_external_zip_load.py). `import_module` with a RELATIVE name
+# resolves against the parent already in sys.modules, like the
+# `from .liquidity_manager import ...` form above.
+usage_stats = importlib.import_module(".usage_stats", __package__)
 from .log_buffer import (
     DEFAULT_MAX_LINES as DEFAULT_LOG_BUFFER_LINES,
     LogCapture,
@@ -184,41 +214,42 @@ def _parse_banned_partners(raw: Optional[str]) -> frozenset:
 
 
 # A node alias is chosen by the remote node and arrives over the wire in its
-# gossip ``node_announcement``, so it is untrusted display input. BOLT 7 caps the
-# field at 32 bytes, but nothing stops a peer filling those bytes with control
-# characters, line breaks or zero-width padding -- which in a table cell means a
-# row that spills over its neighbours, or an alias that renders as a convincing
-# copy of another node's. Keep it to printable, single-line, bounded text.
-MAX_NODE_ALIAS_CHARS = 32
-
-
+# gossip ``node_announcement``, so it is untrusted display input. The sanitiser
+# and its 32-char bound now live in the pure engine as ``clean_display_name`` /
+# ``MAX_NODE_ALIAS_CHARS``, because a swap provider's nostr profile name needs
+# exactly the same treatment (see ``parse_provider_name``) and two copies of a
+# hostile-input filter is one copy too many. Both names are re-exported here:
+# they were part of this module's surface before the move, and the glue tests
+# import them from it.
 def _clean_node_alias(alias: Optional[str]) -> str:
-    """Make an untrusted node alias safe to put in a widget: drop control and
-    zero-width characters, collapse all whitespace to single spaces, and bound
-    the length. Returns '' for anything that cleans down to nothing."""
-    if not alias:
-        return ""
-    try:
-        text = str(alias)
-    except Exception:
-        return ""
-    # `isprintable` is False for every control character (newline, tab, NUL)
-    # AND for the invisible formatting ones an alias has no legitimate use for
-    # -- zero-width space, soft hyphen, and the bidi overrides that let an
-    # alias render as a reversed copy of another node's name. The ASCII space
-    # is printable, so ordinary multi-word names survive.
-    #
-    # Whitespace-like characters become a space rather than vanishing, so a
-    # line break between two words does not weld them together; the zero-width
-    # ones are deleted, since they sit INSIDE a word to disguise it. Then all
-    # runs of whitespace collapse to one.
-    text = "".join(
-        ch if ch.isprintable() else (" " if ch.isspace() else "")
-        for ch in text)
-    text = " ".join(text.split())
-    if len(text) > MAX_NODE_ALIAS_CHARS:
-        text = text[:MAX_NODE_ALIAS_CHARS - 1] + "…"
-    return text
+    """Make an untrusted node alias safe to put in a widget. Thin wrapper over
+    the engine's :func:`clean_display_name`, pinned to the node-alias bound."""
+    return clean_display_name(alias, max_chars=MAX_NODE_ALIAS_CHARS)
+
+
+# Longest fault reason we hand back for display. Reasons are our own templates,
+# but one of them interpolates a scrubbed exception from a swap provider, so the
+# length is not ours to assume.
+MAX_FAULT_REASON_CHARS = 300
+
+
+def _clean_reason(reason: Optional[object]) -> Optional[str]:
+    """A stored fault reason, made safe to display, or ``None`` if there is none.
+
+    ``scrub_text`` rather than ``clean_display_name``: a reason is diagnostic
+    text whose exact bytes matter when reading it back, so control characters
+    are ESCAPED to a visible form (``\\n``, ``\\x1b``) rather than removed. That
+    keeps a CR/LF or ANSI sequence from forging a line or driving a terminal
+    while still showing that it was there.
+
+    Note what this does not do: ``<`` and ``>`` survive, because they are
+    ordinary characters in an error message. Keeping them harmless is the
+    display sink's job -- see ``_literal_tooltip``, which is where these land.
+    """
+    if reason is None:
+        return None
+    cleaned = scrub_text(reason, max_len=MAX_FAULT_REASON_CHARS)
+    return cleaned or None
 
 
 _logger = get_logger(__name__)
@@ -738,8 +769,39 @@ UPDATE_CHECK_TIMEOUT_SEC = 15.0
 # make the wallet buffer an unbounded body.
 UPDATE_CHECK_MAX_BYTES = 512 * 1024
 
+# --- anonymous usage statistics -------------------------------------------
+# Where an opted-in wallet POSTs its report. A path of its own, distinct from
+# the sister software's `/analytics/` endpoint, so the two data sets stay
+# separate and neither can be polluted by the other's reports.
+USAGE_STATS_URL = "https://getbarebits.com/liqanalytics/report.php"
+# Env override, which is also the kill switch. Setting it to any of the
+# disabling words below stops every report at the source, whatever a wallet has
+# opted into -- the rig sets it, and it is the documented way for a packager or
+# a user to switch reporting off for a whole installation.
+USAGE_STATS_ENDPOINT_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT"
+USAGE_STATS_DISABLING_WORDS = frozenset({"", "disabled", "off", "0", "none", "no"})
+# Reporting is suppressed outright on regtest: a regtest wallet is a test
+# fixture, not a user, and counting rigs as installs would corrupt the very
+# numbers this feature exists to produce. The rig's own e2e test needs to
+# exercise a REAL send over the real daemon, so it sets this escape hatch --
+# which ships off, is read only from the environment, and is the exact
+# counterpart of the sister software's `SafeHttp::privateEndpointsAllowed()`
+# (test rigs point at 127.0.0.1 while production is https).
+USAGE_STATS_ALLOW_REGTEST_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ALLOW_REGTEST"
+# A report is ~1-2 KB; the reply is `{"ok":true}`. Both bounded, and the read
+# capped, for the same reason as the update check.
+USAGE_STATS_TIMEOUT_SEC = 15.0
+USAGE_STATS_MAX_BYTES = 16 * 1024
 
-def _plain_json_copy(value: Any) -> Any:
+
+# How deep `_plain_json_copy` will walk a wallet-db value. The stores it is used
+# on are at most three or four levels deep (a dict of per-key dicts, one of which
+# holds a list of pairs), so this is generous headroom rather than a constraint on
+# anything the plugin writes.
+MAX_JSON_COPY_DEPTH = 20
+
+
+def _plain_json_copy(value: Any, depth: int = 0) -> Any:
     """Rebuild ``value`` out of plain dicts/lists, recursively.
 
     Every ``_load_*`` helper below runs its wallet-db value through this, and
@@ -766,11 +828,25 @@ def _plain_json_copy(value: Any) -> Any:
     Values are JSON-plain by construction (these stores hold numbers, strings
     and nested dicts/lists of them), so a rebuild is faithful; tuples become
     lists, exactly as a save/load round-trip through the wallet file would.
+
+    Depth-limited, because the recursion is otherwise unbounded over a value this
+    plugin did not necessarily write. The stores it walks are at most three or
+    four levels deep by construction, but the wallet file is editable by hand and
+    a corrupted or deeply-nested value would raise ``RecursionError`` out of a
+    routine bookkeeping write -- the same class of failure as the ``cannot pickle
+    RLock`` one above, which aborted a channel-open loop mid-candidate. Past the
+    limit the branch is dropped rather than raising: a store we cannot read reads
+    as empty, which every caller already handles (they all default to ``{}``).
     """
+    if depth > MAX_JSON_COPY_DEPTH:
+        _logger.warning(
+            f"wallet-db value nested deeper than {MAX_JSON_COPY_DEPTH} levels; "
+            f"dropping the over-deep branch")
+        return None
     if isinstance(value, dict):
-        return {k: _plain_json_copy(v) for k, v in value.items()}
+        return {k: _plain_json_copy(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_plain_json_copy(v) for v in value]
+        return [_plain_json_copy(v, depth + 1) for v in value]
     return value
 
 
@@ -778,13 +854,36 @@ def _plain_json_copy(value: Any) -> Any:
 # JSON-plain list of entry dicts; see `_log_entry`).
 LOG_DB_KEY = "inbound_liquidity_decision_log"
 # Per-wallet provider reliability history: npub -> {consecutive_faults,
-# fault_count, success_count, last_fault_ts, last_success_ts, last_reason}.
+# fault_count, success_count, attempt_count, last_fault_ts, last_success_ts,
+# last_attempt_ts, last_reason}.
+#
+# ``attempt_count`` is display-only -- nothing in the ranking reads it. It
+# answers the one question the fault/success tallies cannot: how often did we
+# *try* this provider at all? A provider with 0 successes and 0 faults has
+# either never been reached for or been declined on price every time, and those
+# look identical without this. Counted once per provider per cascade (see
+# ``_walk_provider_cascade``), so the size ladder retrying one provider at three
+# amounts is one attempt, matching how a payment-failure fault is charged.
 RELIABILITY_DB_KEY = "inbound_liquidity_provider_reliability"
 # Per-wallet channel-peer reliability history: node_id(hex) -> {consecutive_faults,
 # fault_count, hard_fault_count, success_count, last_fault_ts, last_success_ts,
 # last_reason}. ``hard_fault_count`` (force-close / repeated open failure) is the
 # tally the auto-ban threshold reads; soft faults only feed the decaying penalty.
 PEER_RELIABILITY_DB_KEY = "inbound_liquidity_peer_reliability"
+# Field within a peer's reliability row: how many DAYS this peer has been
+# observed gone (one "peer offline" fault per 24h at most -- see the rate limit
+# in _scan_channel_health), cleared the moment the peer is next seen online.
+#
+# Diagnostic only. It decides nothing: the channel-ceiling discount reads the
+# per-channel offline STREAK instead (CHANNEL_OFFLINE_STREAK_DB_KEY), which
+# measures the same absence in hours rather than days. What this field is for is
+# reading a wallet file and seeing at a glance how long a peer has been down.
+# Kept separate from ``hard_fault_count``, which never clears because it answers
+# a different question (how many times has this peer wronged us, for the
+# auto-ban).
+PEER_OFFLINE_FAULTS_FIELD = "offline_fault_count"
+# ...and the rate-limit stamp that goes with it.
+PEER_OFFLINE_FAULT_TS_FIELD = "last_offline_fault_ts"
 # Reverse swaps we initiated and are still watching for on-chain funding, so a
 # swap that is accepted but never funds can be charged to the right party: the
 # *provider* if it accepted but never funded ("stuck"), or the channel *peer* if
@@ -812,6 +911,58 @@ RELIABILITY_ROW_MAX_IDLE_SEC = 90 * 86400.0
 # exactly 0.0: the decay is exponential and lands on denormal floats rather than
 # a clean zero, which would keep idle rows alive forever.
 RELIABILITY_PRUNE_MIN_PENALTY_PCT = 0.001
+# Per-wallet cache of swap providers' human-readable names:
+# npub -> {"name": str, "checked_ts": float}.
+#
+# A provider's offer carries no name at all (``SwapOffer`` is economics, relays,
+# PoW and a pubkey), so the only human-readable identity it can have is a NIP-01
+# kind-0 profile event published under the same pubkey it signs its offers with.
+# This caches what we found there, so a name survives a restart and is still
+# shown for a provider that has since gone offline -- the rows the Providers tab
+# builds from reliability history alone, which by definition advertise nothing.
+#
+# ``name`` is "" for a provider we looked up and that published no usable
+# profile. That is a real cache entry, not a miss: without it, every tick would
+# re-query the (common) no-profile case forever.
+#
+# Display only. Nothing keys off a name: ranking, the preferred/banned lists,
+# fault attribution and swap addressing all ride on the npub, because a kind-0
+# name is self-asserted and two providers may claim the same one.
+PROVIDER_PROFILES_DB_KEY = "inbound_liquidity_provider_profiles"
+# How long a cached name (or looked-and-found-nothing) stays fresh. Profiles
+# change very rarely, so this is long; it exists so that a provider which
+# publishes a profile *after* we first looked is picked up without the user
+# having to press Refresh, and so a renamed provider eventually re-reads.
+PROVIDER_PROFILE_TTL_SEC = 24 * 3600.0
+# Hard cap on rows in that cache, newest-checked kept. Bounds the wallet file
+# against a party that cycles nostr identities: discovery itself is bounded (
+# Electrum keeps at most 20 recent offers), but reliability history accumulates
+# npubs over time and this cache follows it.
+PROVIDER_PROFILE_MAX_ROWS = 200
+# Most swap offers one evaluation pass will consider, however many are on the
+# wire. Publishing a nostr offer is free and unpermissioned, so the discovered
+# set is sized by whoever cares to sign the most events -- and every per-offer
+# step downstream scaled with it. See `_bounded_offers` for which offers survive
+# the cap (already-known providers, then highest announcement proof-of-work) and
+# why those are the hard ones to game.
+#
+# Set far above any plausible real swap-provider population: the point is to have
+# a ceiling at all, not to ration honest providers. Matches
+# PROVIDER_PROFILE_MAX_ROWS so the discovery cap and the name cache agree.
+MAX_DISCOVERED_PROVIDERS = 200
+# Hard ceiling on rows in the per-wallet provider-reliability store, enforced on
+# every write. `_prune_reliability_store` already drops rows that are idle AND
+# unpenalised, but only after RELIABILITY_ROW_MAX_IDLE_SEC (90 days) -- so until
+# this, a flood of identities could keep 90 days' worth of rows in the wallet
+# file. Generous next to the discovery cap, so an honest wallet never reaches it.
+RELIABILITY_MAX_ROWS = 500
+# Ceiling on one profile lookup. Deliberately small: a name is cosmetic, and
+# this runs inside an evaluation that may be about to do a swap, so a slow or
+# silent relay must cost us a blank column and nothing else. (aionostr's own
+# ``EOSE_TIMEOUT_SEC`` is 60s, which is the wrong order of magnitude here.)
+PROFILE_FETCH_TIMEOUT_SEC = 5.0
+# NIP-01 kind 0: "user metadata", the event holding a profile's JSON.
+NOSTR_KIND_PROFILE = 0
 # First time (epoch sec) each still-pending reverse swap was observed freezing
 # automation: payment_hash hex -> first_seen_ts. A swap whose funding is broadcast
 # but not yet swept freezes the engine (see the in-flight freeze); this lets a
@@ -828,6 +979,23 @@ MAX_LOG_RETENTION_DAYS = 999
 # How many entries to keep regardless of age, as a hard backstop so a busy
 # wallet can't grow the log without bound between prunes.
 MAX_LOG_ENTRIES = 2000
+# How often one party (a provider npub, a peer node id) may append a fault row to
+# the decision log. Faults are the only log category an outside party can provoke
+# on demand -- publishing a malformed nostr offer costs nothing -- and the log is
+# a ring of MAX_LOG_ENTRIES, so without this a flood evicts every genuine entry
+# from the record an operator audits with. Five minutes is well inside the
+# evaluation cadence, so a real fault is never hidden for long.
+FAULT_LOG_MIN_INTERVAL_SEC = 300.0
+# The largest share of the decision log that fault rows may occupy. The rest is
+# reserved for the categories an outside party CANNOT provoke -- actions,
+# declines, lifecycle -- so a fault flood can never evict the record of what the
+# plugin actually did. Half leaves a thousand faults' worth of diagnosis at the
+# shipped cap, which is far more than a real wallet produces, while guaranteeing
+# an equal number of slots to everything else. See `_prune`.
+MAX_FAULT_LOG_SHARE = 0.5
+# Bound on the per-identity stamp dict behind that throttle, since the identities
+# are supplied by whoever is advertising at us.
+FAULT_LOG_MAX_TRACKED = 1000
 # --- tick status ----------------------------------------------------------
 # A single evaluation ("tick") can take a while: opening a nostr session waits up
 # to OFFER_CONNECT_TIMEOUT_SEC + OFFER_DISCOVERY_TIMEOUT_SEC, a channel open
@@ -917,6 +1085,25 @@ MAX_ACTION_TIMESTAMPS = 1000
 # closes (the watchdog's wedged-open force-close) are gated in the glue.
 DEFAULT_MAX_OPENS_PER_DAY = 5
 DEFAULT_MAX_CLOSES_PER_DAY = 5
+# Upper bounds the settings clamps hold these two counts to (see `read_config`).
+# Not limits on what a user may sensibly choose -- they are far above any sane
+# value -- but bounds that keep a hand-edited wallet file from putting a figure
+# in the engine that its arithmetic was never written for. A daily ceiling is
+# compared against a count of real actions, so anything past a few hundred is
+# already "unlimited" in every way that matters.
+MAX_ACTIONS_PER_DAY = 1_000
+# Likewise for the channel ceiling and the offline-discount allowance: both are
+# counts of channels, and no wallet has thousands.
+MAX_CHANNELS_CEILING = 1_000
+# Likewise for the offline-discount delay, in hours. A year is already far past
+# "never discount"; the point is only that the value be a finite number.
+MAX_OFFLINE_DISCOUNT_AFTER_HOURS = 24.0 * 365.0
+# Ceiling for the percentage settings that are THRESHOLDS rather than shares of
+# something, where a value above 100 is meaningful and must survive (see the note
+# in `read_config`). Deliberately far above any value with a distinct effect: the
+# point is only to reject NaN, the infinities and absurdity, not to second-guess
+# a number the user chose on purpose.
+MAX_THRESHOLD_PCT = 1_000_000.0
 # Shipped default for the liquidity goal (sat): the channel size the plugin aims
 # for. A plugin-opened channel smaller than this is replaced once it is blocking
 # a bigger one -- see `_decide_undersized_closes` in the engine for the full gate
@@ -999,6 +1186,43 @@ DEV_FEE_MAX_PCT = 5.0
 # persistently failing address (offline, no route) doesn't hammer the network on
 # every evaluation tick. The fee stays owed across the backoff.
 DEV_FEE_RETRY_BACKOFF_SEC = 300.0
+# The payout whose outcome we could not establish, remembered across ticks AND
+# across restarts: {"payment_hash": hex, "amount_sat": n, "started_ts": epoch}.
+#
+# This exists because ``lnworker.pay_invoice`` returning ``(False, log)`` does
+# NOT prove nothing was sent. ``pay_to_node`` gives up once it passes
+# ``LNWallet.PAYMENT_TIMEOUT`` (120s) and its ``finally`` deliberately keeps the
+# paysession alive while HTLCs are unresolved, so a payment can report failure
+# and settle afterwards. Electrum's own guard against paying twice keys on the
+# payment HASH (lnworker.pay_invoice: "A previous attempt to pay this invoice did
+# not clear"), and a retry here mints a FRESH invoice from the LNURL callback --
+# a different hash -- so that guard never fires for us.
+#
+# Without this record the owed ledger stayed untouched on a reported failure and
+# the next tick paid the same fee again; because the 24h payout cap is only
+# stamped on the success branch, it did not bound that either. So an unresolved
+# payout is persisted and re-checked instead, and nothing is paid until it
+# resolves. See `_resolve_dev_fee_inflight`.
+DEV_FEE_INFLIGHT_DB_KEY = "inbound_liquidity_dev_fee_inflight"
+# How long an unresolved payout is re-checked before we stop waiting. Past this,
+# it is treated as PAID: the fee is drawn down from the ledger and stamped
+# against the cap without our ever having seen it settle.
+#
+# That direction is deliberate. The two ways to be wrong are not symmetric --
+# assuming "failed" risks charging the user a second time for a fee they already
+# paid, while assuming "paid" risks the DEVELOPER not being paid a fee that was
+# owed. The user's funds are not ours to gamble with to collect our own fee, so
+# an outcome we cannot establish resolves in their favour. A week is far longer
+# than any HTLC can stay live (channel CLTV deltas are measured in hundreds of
+# blocks), so reaching this at all means the payment's fate is unknowable from
+# this wallet's state, not merely slow.
+DEV_FEE_INFLIGHT_MAX_AGE_SEC = 7 * 86_400.0
+# Upper bound on how long a single dev-fee payment may run before we stop
+# awaiting it. Above Electrum's own PAYMENT_TIMEOUT (120s) so a normal
+# give-up-and-retry happens inside pay_invoice, with headroom; this only catches
+# a wedge below it. Mirrors the liquidity sink's own backstop, which the payout
+# path was missing entirely.
+DEV_FEE_PAYMENT_TIMEOUT_SEC = 180.0
 
 # --- offline-channel auto-close persistence -------------------------------
 # Channel ids (hex) the plugin itself opened -- the ONLY channels eligible for
@@ -1012,6 +1236,13 @@ CHANNEL_UPTIME_DB_KEY = "inbound_liquidity_channel_uptime"
 # {"marked_ts": float, "reason": str}. The "trying to close since T" clock the
 # force-close deadline is measured from; survives restarts.
 CLOSE_INTENT_DB_KEY = "inbound_liquidity_close_intent"
+# Per-channel offline streaks (see liquidity_manager.record_offline_streak):
+# channel_id(hex) -> {"offline_sec": float, "last_ts": float}. How long each
+# peer has been contiguously observed offline, which is the prompt half of the
+# channel-ceiling discount. An entry exists only while its peer is offline: the
+# first online observation drops it. Persisted so the clock survives a restart
+# (the sample-gap cap keeps the restart gap itself from counting).
+CHANNEL_OFFLINE_STREAK_DB_KEY = "inbound_liquidity_offline_streak"
 # Per-channel wedged-open strike accumulators (see
 # liquidity_manager.record_wedge_strike): channel_id(hex) ->
 # {"strikes": int, "first_ts": float, "last_ts": float}. Persisted so the strike
@@ -1025,6 +1256,35 @@ WEDGE_STRIKES_DB_KEY = "inbound_liquidity_wedge_strikes"
 # cannot be bypassed by adding a new caller.
 CLOSE_ATTEMPT_DB_KEY = "inbound_liquidity_close_attempts"
 
+# --- lifetime usage totals -------------------------------------------------
+# Monotonic per-wallet counters of what this plugin has actually done: channels
+# opened and closed, sats funded into them, swaps completed and sats moved, sink
+# payments made, dev fee paid. Only ever incremented, never pruned.
+#
+# Why a dedicated store rather than deriving these from existing state: nothing
+# already kept can answer "how much liquidity has this plugin provisioned over
+# its life". The decision log is pruned by the retention setting, the action
+# timestamps are pruned to a rolling 24h (they exist to enforce the daily
+# ceilings), and the dev-fee ledger is a *balance owed* that is drawn down on
+# every payout. All three are the wrong shape for a lifetime total by design.
+#
+# These accrue from upgrade onward regardless of the usage-statistics opt-in:
+# they are ordinary local bookkeeping, shown in the GUI, and are only ever
+# TRANSMITTED if the user chooses level 3. Counting only while opted in would
+# make level 3 report zeros for its first week and would mean the consent
+# screen's preview could not show real numbers. Existing wallets start at zero
+# on upgrade -- there is no historical data to backfill from, and inventing one
+# from the pruned log would be a guess presented as a measurement.
+USAGE_TOTALS_DB_KEY = "inbound_liquidity_usage_totals"
+# The counter names, which are deliberately IDENTICAL to the matching
+# `usage_stats.UsageSnapshot` field names, so there is no translation table
+# between what is counted and what is reported.
+USAGE_TOTAL_FIELDS: Tuple[str, ...] = (
+    "channels_opened_total", "channels_closed_total", "force_closes_total",
+    "sats_funded_total", "swaps_completed_total", "sats_swapped_total",
+    "sink_payments_total", "sats_sunk_total", "dev_fee_paid_total_sat",
+)
+
 # Offline auto-close defaults (all editable from the Settings tab). Times are in
 # DAYS and stored as floats so tests can set sub-minute values.
 DEFAULT_OFFLINE_AUTOCLOSE_ENABLED = True
@@ -1037,6 +1297,28 @@ DEFAULT_OFFLINE_MIN_UPTIME_PCT = 10.0
 # The "trying to close for N days" horizon: force-close this long after we
 # committed, if the channel still hasn't closed (peer never agreed / stayed off).
 DEFAULT_OFFLINE_FORCE_CLOSE_DAYS = 7.0
+# How far an offline channel's discount may push the real channel count over
+# ``max_channels`` (see liquidity_manager.has_room_for_another_channel). 1 means
+# "one replacement may be opened alongside the dead channels, however many of
+# them there are"; 0 turns the discount off altogether.
+#
+# Ships at 1 rather than higher because the overshoot is only ever temporary --
+# the auto-close watchdog is already disposing of the discounted channels -- and
+# each replacement costs a funding fee. One at a time restores the wallet's
+# ability to receive without risking a burst of opens when several peers go dark
+# together (or when one flaky hub many channels point at has an outage).
+DEFAULT_OFFLINE_OPEN_ALLOWANCE = 1
+# How long a peer must be observed contiguously offline before its channel stops
+# counting toward max_channels. HOURS (float, so tests can use sub-minute values).
+#
+# Four hours clears every transient absence worth tolerating -- a peer restart, a
+# node upgrade, a home connection dropping for an hour -- while still restoring
+# the wallet's ability to receive the same day. Shorter is tempting and
+# asymmetrically risky: see the note on
+# ``LiquidityConfig.offline_discount_after_sec`` for why a premature discount
+# leaves behind a channel nothing will close. 0 disables this prong, leaving the
+# auto-close watchdog's close intent as the only evidence.
+DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS = 4.0
 # Don't re-launch a cooperative close on the same channel more often than this
 # (a cooperative close is async and can take minutes; each tick would otherwise
 # pile on another attempt).
@@ -1472,6 +1754,27 @@ SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_FORCE_CLOSE_DAYS = ConfigVar(
                         "days without success (the peer never agreed / stayed offline), it force-closes "
                         "the channel. This broadcasts a transaction, incurs a mining fee, and timelocks "
                         "your funds. Counts against the daily channel-close ceiling."))
+SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS = ConfigVar(
+    'plugins.inbound_liquidity.offline_discount_after_hours',
+    default=DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Treat a channel as offline after (hours)"),
+    long_desc=lambda: _("How long a channel's peer must be continuously unreachable before the "
+                        "channel stops counting toward the maximum number of channels, so a "
+                        "replacement can be opened without waiting for the dead one to close. Only "
+                        "time while this wallet was actually running and online counts. Keep this "
+                        "comfortably longer than a peer restart: if the peer comes back after a "
+                        "replacement was opened, the wallet is left holding an extra channel. 0 "
+                        "switches this off and leaves the auto-close watchdog as the only trigger."))
+SimpleConfig.INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE = ConfigVar(
+    'plugins.inbound_liquidity.offline_open_allowance',
+    default=DEFAULT_OFFLINE_OPEN_ALLOWANCE, type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Extra channels allowed while replacing offline ones"),
+    long_desc=lambda: _("A channel this plugin opened whose peer has gone offline stops counting "
+                        "toward the maximum number of channels, so a replacement can be opened "
+                        "without waiting out the close. This is how far over that maximum the "
+                        "wallet may go while the dead channels are still being closed: 1 allows one "
+                        "replacement at a time however many peers are down. Set to 0 to switch the "
+                        "behaviour off, so offline channels keep occupying their slot."))
 # --- update check ---------------------------------------------------------
 # Off until the user says otherwise. This is the plugin's only contact with a
 # server that is not part of running the wallet, and a periodic request to
@@ -1510,6 +1813,70 @@ SimpleConfig.INBOUND_LIQUIDITY_UPDATE_LATEST_URL = ConfigVar(
     'plugins.inbound_liquidity.update_latest_url',
     default='', type_=str, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Release page for the latest release seen"))
+
+# --- anonymous usage statistics -------------------------------------------
+# The opt-in report described in `usage_stats.py`. Off by default, and nothing
+# leaves the wallet until the user picks a level on the consent screen.
+#
+# Per-wallet like every other setting here. The consequence is deliberate and
+# worth stating: a user running three wallets is three consent decisions and
+# three install ids, so they appear in the data as three installs. The
+# alternative -- one installation-wide identity -- would count users more
+# accurately but would make this the one setting that is NOT a property of the
+# wallet it belongs to, and would let one wallet's choice start reporting on
+# another's behalf. Accurate consent beat accurate counting.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LEVEL = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_level',
+    default=usage_stats.LEVEL_OFF, type_=int, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Anonymous usage statistics level"),
+    long_desc=lambda: _("How much anonymous usage information this wallet sends: "
+                        "0 = nothing (the default), 1 = that the wallet exists and what "
+                        "it runs, 2 = plus the settings chosen, 3 = plus lifetime "
+                        "liquidity totals. Never includes addresses, transactions, "
+                        "balances or key material."))
+# Whether the question has been put to the user yet. Separate from the level so
+# "declined" (level 0, prompted) and "not asked" (level 0, not prompted) stay
+# distinguishable -- otherwise the consent screen would reappear forever for
+# anyone who said no. Same reasoning as UPDATE_CHECK_PROMPTED above.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_prompted',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Usage-statistics consent has been offered"))
+# The random UUIDv4 minted the moment this wallet opts in -- never derived from
+# anything (see usage_stats.new_install_id). Kept when the user opts back out,
+# so a later re-opt-in is the same install rather than a second one; a wallet
+# that never opts in never has one at all.
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_install_id',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Random identifier sent with usage statistics"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_sent_ts',
+    default=0.0, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Last usage report accepted (epoch seconds)"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_attempt_ts',
+    default=0.0, type_=float, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Last usage report attempted (epoch seconds)"))
+SimpleConfig.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = ConfigVar(
+    'plugins.inbound_liquidity.usage_stats_last_error',
+    default='', type_=str, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Why the last usage report did not land"))
+
+# --- trampoline warning ---------------------------------------------------
+# Whether this wallet has been told that trampoline routing undercuts the
+# plugin. Asked once and then never again, however the user answered -- hence a
+# flag of its own rather than inferring "already asked" from the routing mode
+# (which a user is entitled to leave exactly as it was).
+#
+# Per-wallet like every other setting here, even though the routing mode it
+# talks about is process-wide (Electrum's own LIGHTNING_USE_GOSSIP): the flag
+# records that a conversation was had with the person using THIS wallet, and
+# opening a second wallet is a second person to tell.
+SimpleConfig.INBOUND_LIQUIDITY_TRAMPOLINE_WARNED = ConfigVar(
+    'plugins.inbound_liquidity.trampoline_warned',
+    default=False, type_=bool, plugin=_PLUGIN_NAME,
+    short_desc=lambda: _("Trampoline-routing warning has been shown"))
 
 
 # --- per-wallet settings ---------------------------------------------------
@@ -1968,6 +2335,15 @@ class LiquidityPlugin(BasePlugin):
         # gates: whether a newer plugin exists has nothing to do with whether
         # this wallet is armed, synced, or funded. A no-op unless enabled.
         self._request_update_check(wallet)
+        # Opt-in usage report, on the same terms and for the same reason: it is
+        # about the installation, not about this wallet's readiness to act, and
+        # it self-throttles to one a week. A no-op unless the user opted in.
+        #
+        # This is the ONLY place a report is scheduled on its own -- the GUI's
+        # two call sites are both "the user just chose a level, send one now".
+        # So a headless install, or any wallet between restarts, reports from
+        # here or not at all.
+        self._request_usage_report(wallet)
 
     def _start_heartbeat(self, wallet: 'Abstract_Wallet') -> None:
         """Launch the per-wallet heartbeat loop on the network's asyncio loop, if
@@ -1997,6 +2373,15 @@ class LiquidityPlugin(BasePlugin):
                     return
                 except Exception as e:
                     self.logger.info(f"update check tick error: {e!r}")
+                # Self-throttled to once a WEEK; same reasoning as above -- this
+                # is only the clock that lets a wallet which is never restarted
+                # reach its next slot. A no-op unless the user opted in.
+                try:
+                    await self._maybe_send_usage_report(wallet)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    self.logger.info(f"usage report tick error: {e!r}")
                 try:
                     await self._evaluate(wallet)
                 except asyncio.CancelledError:
@@ -2095,6 +2480,7 @@ class LiquidityPlugin(BasePlugin):
         "_remediating_opens", "_tick_status",
         "_local_closes", "_wedged_faulted", "_close_capped_logged",
         "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
+        "_fault_log_stamps",
         "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
         "_heartbeat_tasks",
         "_last_eval_at", "_auto_eval_interval", "_last_state_sig",
@@ -2468,6 +2854,75 @@ class LiquidityPlugin(BasePlugin):
                     f"(running {running})")
         return f"version {running} (up to date)"
 
+    # --- routing mode (trampoline vs gossip) ------------------------------
+    # Electrum offers two ways to find a Lightning route: download the network
+    # gossip and path-find locally, or hand the payment to a trampoline node and
+    # let it route. Trampoline is Electrum's default, and it is the worse half of
+    # the bargain for this plugin specifically:
+    #
+    #   * it costs more -- the trampoline node's fee rides on top of the route's,
+    #     and every reverse swap and every sink payment the plugin makes pays it;
+    #   * it is centralised -- a handful of hard-coded nodes carry the payments,
+    #     and a channel can only be opened to one of them at all;
+    #   * it blinds the parts of this plugin that read the graph. Node aliases on
+    #     the Channel partners tab come from gossip, so most peers show no name;
+    #     and the peer suggestions a channel open walks come from the same place.
+    #
+    # Hence the one-time warning in qt.py. Note the inverted sense of Electrum's
+    # own ConfigVar: LIGHTNING_USE_GOSSIP False *is* trampoline mode, so the two
+    # halves of "trampoline is on and gossip is off" are a single condition.
+    def trampoline_routing_active(self) -> bool:
+        """Whether Lightning payments are routed through trampoline nodes rather
+        than over locally-synced gossip. Reads Electrum's process-wide config, not
+        a per-wallet setting -- the routing mode belongs to the installation."""
+        try:
+            return not bool(self.config.LIGHTNING_USE_GOSSIP)
+        except Exception:
+            # A config object without the var (a stub, an older Electrum) is not
+            # grounds for claiming the user is on trampoline and nagging them.
+            return False
+
+    def switch_to_gossip_routing(self, wallet: 'Abstract_Wallet') -> bool:
+        """Turn gossip routing on (i.e. turn trampoline off), and start syncing.
+
+        Does exactly what Electrum's own Preferences switch does
+        (``gui/qt/settings_dialog.py``): flip the ConfigVar, bring the gossip
+        machinery up on the running network, and fire the two callbacks whose
+        listeners render the result. Kept here rather than in qt.py so it is one
+        implementation for the GUI and the headless command alike, and so it can
+        be tested without a Qt event loop.
+
+        Returns True if the config now says gossip. Starting the sync is
+        best-effort: a wallet with no network (offline mode) still gets the
+        setting, and picks the gossip up on its next start -- which is better
+        than refusing to change a preference because the network is down.
+        """
+        try:
+            self.config.LIGHTNING_USE_GOSSIP = True
+        except Exception:
+            self.logger.exception("could not switch on gossip routing")
+            return False
+        network = getattr(wallet, "network", None)
+        if network is not None:
+            try:
+                network.start_gossip()
+            except Exception:
+                # The setting is saved either way; say so rather than reporting a
+                # failure the user would read as "nothing happened".
+                self.logger.exception(
+                    "gossip is enabled but could not be started now; "
+                    "it will start with the next Electrum run")
+        try:
+            from electrum import util as _util
+            _util.trigger_callback('ln_gossip_sync_progress')
+            _util.trigger_callback('channels_updated', wallet)
+        except Exception:
+            self.logger.debug("could not fire the post-gossip-switch callbacks")
+        self.logger.info("switched Lightning routing from trampoline to gossip")
+        self._diag_event(wallet, category="lifecycle", kind="config",
+                         reason="switched routing from trampoline to gossip")
+        return True
+
     def _request_update_check(self, wallet: 'Abstract_Wallet') -> None:
         """Fire the (self-throttling) update check on the network's asyncio loop.
 
@@ -2589,6 +3044,417 @@ class LiquidityPlugin(BasePlugin):
         if release is None:
             self.logger.info("update check: no usable release in the reply; skipping")
         return release
+
+    # --- anonymous usage statistics ---------------------------------------
+    #
+    # The glue half of `usage_stats.py`: it reads this wallet's settings and
+    # state, hands the pure module an already-coarsened snapshot, and makes the
+    # HTTP request. Every identifier is reduced to a boolean or a count HERE, on
+    # the way into the snapshot, so nothing identifying ever reaches the module
+    # that builds the payload (see UsageSnapshot's note).
+    #
+    # Three independent gates must all be open before anything is sent, and any
+    # one of them closed means silence:
+    #   1. the user picked a level (level 0 / never prompted -> nothing);
+    #   2. the endpoint is not switched off (the env kill switch);
+    #   3. the wallet is not on regtest (unless the rig's explicit override).
+
+    def usage_stats_endpoint(self) -> str:
+        """The endpoint a report would go to: the env override if set, else the
+        shipped default."""
+        override = os.environ.get(USAGE_STATS_ENDPOINT_ENV)
+        if override is not None:
+            return override.strip()
+        return USAGE_STATS_URL
+
+    def usage_stats_endpoint_disabled(self) -> bool:
+        """Whether reporting is switched off for this whole installation."""
+        return self.usage_stats_endpoint().lower() in USAGE_STATS_DISABLING_WORDS
+
+    @staticmethod
+    def _usage_stats_allow_regtest() -> bool:
+        """Whether the regtest suppression has been explicitly overridden.
+
+        Read from the environment only -- deliberately not a setting, so it
+        cannot be turned on from the GUI, cannot be persisted into a wallet
+        file, and leaves no way for a shipped build to start reporting regtest
+        wallets. The rig's e2e test is the only thing that sets it.
+        """
+        return (os.environ.get(USAGE_STATS_ALLOW_REGTEST_ENV, "").strip().lower()
+                in {"1", "true", "yes", "on"})
+
+    def usage_stats_network_name(self) -> str:
+        """This installation's network as the report names it, or "other"."""
+        try:
+            from electrum import constants
+            name = str(getattr(constants.net, "NET_NAME", "") or "")
+        except Exception:
+            return "other"
+        return name if name in usage_stats.NETWORKS else "other"
+
+    def usage_stats_network_suppressed(self) -> bool:
+        """True when this network must not report at all. See the constant."""
+        if self.usage_stats_network_name() != "regtest":
+            return False
+        return not self._usage_stats_allow_regtest()
+
+    def usage_stats_blocked_reason(self) -> Optional[str]:
+        """Why no report can leave this installation regardless of the opt-in,
+        or None when nothing is in the way. Phrased for a GUI label."""
+        if self.usage_stats_endpoint_disabled():
+            return _("Reporting is switched off for this installation "
+                     "({}).").format(USAGE_STATS_ENDPOINT_ENV)
+        if self.usage_stats_network_suppressed():
+            return _("This wallet is on regtest, so nothing is reported.")
+        return None
+
+    def usage_stats_level(self, wallet: 'Abstract_Wallet') -> int:
+        """This wallet's chosen level, validated. Anything unrecognised (a
+        hand-edited wallet file, a level from a future version) reads as OFF:
+        the safe answer for an unparseable consent record is "no consent"."""
+        try:
+            raw = self.settings(wallet).INBOUND_LIQUIDITY_USAGE_STATS_LEVEL
+        except Exception:
+            return usage_stats.LEVEL_OFF
+        try:
+            level = int(raw)
+        except (TypeError, ValueError):
+            return usage_stats.LEVEL_OFF
+        return level if level in usage_stats.LEVELS else usage_stats.LEVEL_OFF
+
+    def usage_stats_prompted(self, wallet: 'Abstract_Wallet') -> bool:
+        return bool(getattr(self.settings(wallet),
+                            'INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED', False))
+
+    def usage_stats_install_id(self, wallet: 'Abstract_Wallet') -> Optional[str]:
+        """This wallet's install id, or None if it has never opted in."""
+        raw = getattr(self.settings(wallet),
+                      'INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID', '')
+        return raw if usage_stats.is_install_id(raw) else None
+
+    def _ensure_usage_install_id(self, wallet: 'Abstract_Wallet') -> str:
+        """This wallet's install id, minting one if it has none.
+
+        Minted at opt-in rather than at install: a wallet that never opts in
+        never has an identifier at all, so there is nothing to leak, nothing to
+        correlate, and nothing to explain away. A re-opt-in reuses the existing
+        id so the receiver's one-row-per-install view does not grow a phantom
+        second install for the same wallet.
+        """
+        existing = self.usage_stats_install_id(wallet)
+        if existing is not None:
+            return existing
+        minted = usage_stats.new_install_id()
+        self.settings(wallet).INBOUND_LIQUIDITY_USAGE_STATS_INSTALL_ID = minted
+        return minted
+
+    def set_usage_stats_choice(self, wallet: 'Abstract_Wallet', level: int, *,
+                               mark_prompted: bool = True) -> int:
+        """Record the user's consent choice and return the level stored.
+
+        Opting in mints the install id. Opting out keeps the id and the
+        prompted flag: "they said no" has to be remembered, or the consent
+        screen would ask again at every start.
+        """
+        if not usage_stats.is_valid_choice(level):
+            raise ValueError(f"not a usage-statistics level: {level!r}")
+        c = self.settings(wallet)
+        if level != usage_stats.LEVEL_OFF:
+            self._ensure_usage_install_id(wallet)
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LEVEL = int(level)
+        if mark_prompted:
+            c.INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED = True
+        self.logger.info(
+            "usage statistics " + (f"enabled at level {level}" if level
+                                   else "declined / switched off"))
+        return int(level)
+
+    def build_usage_snapshot(self, wallet: 'Abstract_Wallet') -> 'usage_stats.UsageSnapshot':
+        """Everything a report may contain, gathered off this wallet.
+
+        Total and non-raising: a report is a courtesy, and a missing attribute
+        on an odd wallet (or a stub in a test) must degrade one field rather
+        than abort the report. Hence the `getattr(..., default)` style
+        throughout, and the broad guards around the counted collections.
+
+        Note what is NOT read here: no address, no channel id, no peer node id,
+        no npub, no balance. The configured sink address and channel peer are
+        reduced to booleans, and the partner/provider preference lists to their
+        lengths, before anything leaves this method.
+        """
+        c = self.settings(wallet)
+
+        def _flag(name: str, default: bool = False) -> bool:
+            return bool(getattr(c, name, default))
+
+        def _num(name: str, default: int = 0) -> int:
+            try:
+                return int(getattr(c, name, default) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _pct(name: str, default: float = 0.0) -> float:
+            try:
+                return float(getattr(c, name, default) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _listed(name: str) -> int:
+            """How many entries a comma/whitespace-separated preference list
+            holds. The COUNT only -- the members are node ids and npubs."""
+            try:
+                raw = str(getattr(c, name, '') or '')
+            except Exception:
+                return 0
+            return len([part for part in re.split(r"[,\s]+", raw) if part.strip()])
+
+        # Live channel counts (not amounts). Guarded because a wallet without
+        # Lightning, or one still starting up, has no channels mapping at all.
+        channels_open_now = 0
+        channels_managed_now = 0
+        try:
+            lnworker = getattr(wallet, "lnworker", None)
+            channels = dict(getattr(lnworker, "channels", {}) or {}) if lnworker else {}
+            managed = self._plugin_opened_channels(wallet)
+            for chan_id, chan in channels.items():
+                if getattr(chan, "is_closed", lambda: False)():
+                    continue
+                channels_open_now += 1
+                try:
+                    if chan_id.hex() in managed:
+                        channels_managed_now += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.info(f"could not count channels for the usage report: {e!r}")
+
+        totals = self._load_usage_totals(wallet)
+
+        return usage_stats.UsageSnapshot(
+            # --- level 1 -----------------------------------------------------
+            plugin_version=self.plugin_version() or "unknown",
+            electrum_version=self._electrum_version(),
+            python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+            os_family=self._os_family(),
+            gui_kind=self._gui_kind(),
+            network=self.usage_stats_network_name(),
+            # --- level 2: the settings chosen --------------------------------
+            automation_enabled=_flag('INBOUND_LIQUIDITY_AUTOMATION_ENABLED'),
+            manual_run_only=_flag('INBOUND_LIQUIDITY_MANUAL_RUN_ONLY'),
+            liquidity_goal_sat=_num('INBOUND_LIQUIDITY_GOAL_SAT'),
+            max_channels=_num('INBOUND_LIQUIDITY_MAX_CHANNELS'),
+            max_channel_size_sat=_num('INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT'),
+            min_onchain_to_open_sat=_num('INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT'),
+            onchain_reserve_sat=_num('INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT'),
+            max_swap_fee_pct=_pct('INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT'),
+            swap_trigger_pct=_pct('INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT'),
+            swap_trigger_sat=_num('INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT'),
+            min_swap_sat=_num('INBOUND_LIQUIDITY_MIN_SWAP_SAT'),
+            min_outbound_sat=_num('INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT'),
+            max_opens_per_day=_num('INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY'),
+            max_closes_per_day=_num('INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY'),
+            dev_fee_pct=_pct('INBOUND_LIQUIDITY_DEV_FEE_PCT'),
+            # Configured-or-not, never the value. These two are the only
+            # settings in the report that hold an identifier at all.
+            sink_configured=bool(str(
+                getattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', '') or '').strip()),
+            channel_peer_configured=bool(str(
+                getattr(c, 'INBOUND_LIQUIDITY_CHANNEL_PEER', '') or '').strip()),
+            defer_sink_until_goal=_flag('INBOUND_LIQUIDITY_DEFER_SINK_UNTIL_GOAL'),
+            disable_submarine_swaps=_flag('INBOUND_LIQUIDITY_DISABLE_SUBMARINE_SWAPS'),
+            manage_plugin_opened_only=_flag('INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY'),
+            one_channel_per_peer=_flag('INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER'),
+            partners_strict=_flag('INBOUND_LIQUIDITY_PARTNERS_STRICT'),
+            reliability_enabled=_flag('INBOUND_LIQUIDITY_RELIABILITY_ENABLED'),
+            peer_reliability_enabled=_flag('INBOUND_LIQUIDITY_PEER_RELIABILITY_ENABLED'),
+            auto_remediate_stuck_open=_flag('INBOUND_LIQUIDITY_AUTO_REMEDIATE_STUCK_OPEN'),
+            offline_autoclose_enabled=_flag('INBOUND_LIQUIDITY_OFFLINE_AUTOCLOSE_ENABLED'),
+            update_check_enabled=_flag('INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED'),
+            show_goal_in_piechart=_flag('INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART'),
+            diag_log_enabled=_flag('INBOUND_LIQUIDITY_DIAG_LOG_ENABLED'),
+            preferred_partners_count=_listed('INBOUND_LIQUIDITY_PREFERRED_PARTNERS'),
+            banned_partners_count=_listed('INBOUND_LIQUIDITY_BANNED_PARTNERS'),
+            preferred_npubs_count=_listed('INBOUND_LIQUIDITY_PREFERRED_NPUBS'),
+            banned_npubs_count=_listed('INBOUND_LIQUIDITY_BANNED_NPUBS'),
+            # --- level 3: what the plugin actually provisioned ---------------
+            channels_opened_total=totals["channels_opened_total"],
+            channels_closed_total=totals["channels_closed_total"],
+            force_closes_total=totals["force_closes_total"],
+            sats_funded_total=totals["sats_funded_total"],
+            swaps_completed_total=totals["swaps_completed_total"],
+            sats_swapped_total=totals["sats_swapped_total"],
+            sink_payments_total=totals["sink_payments_total"],
+            sats_sunk_total=totals["sats_sunk_total"],
+            dev_fee_paid_total_sat=totals["dev_fee_paid_total_sat"],
+            channels_open_now=channels_open_now,
+            channels_managed_now=channels_managed_now,
+        )
+
+    @staticmethod
+    def _electrum_version() -> str:
+        try:
+            from electrum.version import ELECTRUM_VERSION
+            return str(ELECTRUM_VERSION)
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _os_family() -> str:
+        """A coarse OS family from a fixed set. The family, not the release: the
+        full platform string carries kernel and distribution detail that is both
+        fingerprint-y and useless for counting."""
+        try:
+            system = platform.system()
+        except Exception:
+            return "other"
+        if system in usage_stats.OS_FAMILIES:
+            return system
+        return "BSD" if "bsd" in str(system).lower() else "other"
+
+    def _gui_kind(self) -> str:
+        """Which front end is running, read off this instance's own module.
+
+        Electrum instantiates the plugin as ``<gui_name>.Plugin``, so the
+        subclass's module IS the answer -- no extra plumbing, and it cannot go
+        stale the way a hand-set attribute could.
+        """
+        module = str(type(self).__module__ or "")
+        if module.endswith(".qt"):
+            return "qt"
+        if module.endswith(".cmdline"):
+            return "cmdline"
+        return "other"
+
+    def usage_stats_preview(self, wallet: 'Abstract_Wallet', level: int, *,
+                            now: Optional[float] = None) -> str:
+        """Pretty JSON of exactly what ``level`` would send for this wallet.
+
+        What the consent screen and the settings tab display. Routed through the
+        same builder the real report uses, with this wallet's real install id
+        when it has one, so the preview is the report rather than a mock-up.
+        """
+        return usage_stats.preview_json(
+            level, self.build_usage_snapshot(wallet),
+            now=now if now is not None else time.time(),
+            install_id=self.usage_stats_install_id(wallet))
+
+    def usage_stats_status(self, wallet: 'Abstract_Wallet') -> Dict[str, Any]:
+        """State for the settings tab and the headless status command."""
+        c = self.settings(wallet)
+        return {
+            "level": self.usage_stats_level(wallet),
+            "prompted": self.usage_stats_prompted(wallet),
+            "install_id": self.usage_stats_install_id(wallet),
+            "endpoint": None if self.usage_stats_endpoint_disabled()
+                        else self.usage_stats_endpoint(),
+            "blocked_reason": self.usage_stats_blocked_reason(),
+            "network": self.usage_stats_network_name(),
+            "last_sent_ts": float(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS', 0.0) or 0.0),
+            "last_attempt_ts": float(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS', 0.0) or 0.0),
+            "last_error": str(
+                getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR', '') or ''),
+            "interval_days": int(usage_stats.SEND_INTERVAL_SEC // 86_400),
+        }
+
+    def _request_usage_report(self, wallet: 'Abstract_Wallet', *,
+                              force: bool = False) -> None:
+        """Fire the (self-throttling) usage report on the network's asyncio loop.
+
+        Fire-and-forget for the same reason as the update check: this is a
+        courtesy report to a server that has nothing to do with running the
+        wallet, and neither wallet startup nor a heartbeat tick may wait on it
+        or fail because of it.
+        """
+        loop = getattr(getattr(wallet, "network", None), "asyncio_loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._maybe_send_usage_report(wallet, force=force), loop)
+        except Exception as e:
+            self.logger.info(f"could not schedule the usage report: {e!r}")
+
+    async def _maybe_send_usage_report(self, wallet: 'Abstract_Wallet', *,
+                                       force: bool = False) -> bool:
+        """Send this wallet's usage report if one is due. Returns whether the
+        receiver accepted it.
+
+        ``force`` skips the cadence check (used right after opting in, so the
+        user does not wait a week to see the feature work) but NOT any of the
+        three gates: a forced report still will not go out from a wallet that
+        has not opted in, on a disabled endpoint, or on regtest.
+
+        As with the update check, the attempt timestamp is stamped BEFORE the
+        request. An endpoint that is down therefore backs off for an hour rather
+        than being retried on every single heartbeat.
+        """
+        level = self.usage_stats_level(wallet)
+        if level == usage_stats.LEVEL_OFF:
+            return False
+        blocked = self.usage_stats_blocked_reason()
+        if blocked is not None:
+            self.logger.info(f"usage report not sent: {blocked}")
+            return False
+        c = self.settings(wallet)
+        now = time.time()
+        if not force and not usage_stats.is_due(
+                now=now,
+                last_sent_ts=float(
+                    getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS', 0.0) or 0.0),
+                last_attempt_ts=float(
+                    getattr(c, 'INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS', 0.0) or 0.0)):
+            return False
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ATTEMPT_TS = now
+
+        payload = usage_stats.build_payload(
+            level, self.build_usage_snapshot(wallet),
+            now=now, install_id=self._ensure_usage_install_id(wallet))
+        try:
+            await self._post_usage_report(wallet, payload)
+        except asyncio.CancelledError:
+            raise
+        except usage_stats.UsageReportRejected as e:
+            c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = str(e)
+            self.logger.info(f"usage report not accepted: {e}")
+            return False
+        except Exception as e:
+            # Scrubbed: the text can include a hostname or an error string from
+            # whatever answered, and it lands in a log line and a GUI label.
+            message = scrub_text(f"{type(e).__name__}: {e}")[:200]
+            c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = message
+            self.logger.info(f"usage report failed: {message}")
+            return False
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS = now
+        c.INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = ''
+        self.logger.info(
+            f"usage report accepted (level {level}, {len(payload['properties'])} fields)")
+        return True
+
+    async def _post_usage_report(self, wallet: 'Abstract_Wallet',
+                                 payload: Dict[str, Any]) -> None:
+        """POST one report, raising :class:`usage_stats.UsageReportRejected`
+        unless the receiver accepted it.
+
+        Routed through ``make_aiohttp_session`` so it honours the wallet's proxy
+        -- a Tor user's usage report must not be the one request that leaks
+        their IP -- with the same short timeout and read cap as the update
+        check.
+        """
+        proxy = getattr(getattr(wallet, "network", None), "proxy", None)
+        headers = {"User-Agent": "Electrum-inbound-liquidity-usage-stats",
+                   "Content-Type": "application/json",
+                   "Accept": "application/json"}
+        body = usage_stats.encode_payload(payload)
+        async with make_aiohttp_session(proxy, headers=headers,
+                                        timeout=USAGE_STATS_TIMEOUT_SEC) as session:
+            async with session.post(self.usage_stats_endpoint(), data=body) as response:
+                raw = await self._read_capped(response.content, USAGE_STATS_MAX_BYTES + 1)
+                status = response.status
+        if len(raw) > USAGE_STATS_MAX_BYTES:
+            raise usage_stats.UsageReportRejected("the endpoint replied with too much data")
+        usage_stats.parse_response(status, raw)
 
     # --- live log capture -------------------------------------------------
     #
@@ -2976,20 +3842,53 @@ class LiquidityPlugin(BasePlugin):
 
     # --- config -> engine -------------------------------------------------
     def read_config(self, wallet: 'Abstract_Wallet') -> LiquidityConfig:
+        """This wallet's settings as the engine's config.
+
+        Every numeric field is CLAMPED, not merely cast. ``set_setting`` checks a
+        value against its ConfigVar's declared type but not its range, and the
+        per-wallet store lives in the wallet file -- which this plugin's own docs
+        invite users to read, and which they can therefore edit. So a negative
+        reserve, a NaN ceiling or an absurd sat figure is reachable here.
+        None of them loses money today (a negative reserve oversizes the funding
+        amount and dies on Electrum's NotEnoughFunds; a NaN ceiling declines every
+        swap), but that is downstream luck rather than an invariant -- see the note
+        on ``clamp_sat`` / ``clamp_pct`` in the engine.
+        """
         c = self.settings(wallet)
         return LiquidityConfig(
             automation_enabled=bool(c.INBOUND_LIQUIDITY_AUTOMATION_ENABLED),
-            min_onchain_to_open_sat=int(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
-            onchain_reserve_sat=int(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
-            max_channels=int(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
+            min_onchain_to_open_sat=clamp_sat(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
+            onchain_reserve_sat=clamp_sat(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
+            max_channels=clamp_sat(c.INBOUND_LIQUIDITY_MAX_CHANNELS,
+                                   max_sat=MAX_CHANNELS_CEILING),
             max_channel_size_sat=self._max_channel_size_sat(wallet),
-            max_swap_fee_pct=float(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
-            swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
-            swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
-            min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
+            # NOT capped at 100. Both of these are thresholds whose whole
+            # meaning can lie above 100%, and clamping them there would silently
+            # change what the user asked for:
+            #
+            #   * swap_trigger_pct is "swap once local exceeds this % of
+            #     capacity", so a value over 100 is the natural way to say NEVER
+            #     (at exactly 100 a fresh channel, where local == capacity, is
+            #     still over the trigger -- so clamping "never" to 100 turns it
+            #     into "always", which is the opposite of the request);
+            #   * max_swap_fee_pct is an all-in cost ceiling, and an all-in cost
+            #     CAN exceed 100% on a small enough amount (the fixed mining and
+            #     claim fees do not shrink with it), so >100 is a meaningful way
+            #     to say "accept any cost".
+            #
+            # The bound that matters here is the one F7 was actually about:
+            # finite, non-negative, not absurd. Hence the generous ceiling.
+            max_swap_fee_pct=clamp_pct(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT,
+                                       max_pct=MAX_THRESHOLD_PCT),
+            swap_trigger_pct=clamp_pct(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT,
+                                       max_pct=MAX_THRESHOLD_PCT),
+            swap_trigger_sat=clamp_sat(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
+            min_outbound_sat=clamp_sat(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT),
             min_swap_sat=self._min_swap_sat(wallet),
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(wallet),
+            offline_open_allowance=self._offline_open_allowance(wallet),
+            offline_discount_after_sec=self._offline_discount_after_sec(wallet),
             liquidity_goal_sat=self._liquidity_goal_sat(wallet),
             preferred_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_PREFERRED_NPUBS),
             banned_npubs=_parse_npub_set(c.INBOUND_LIQUIDITY_BANNED_NPUBS),
@@ -3180,10 +4079,37 @@ class LiquidityPlugin(BasePlugin):
     # ceiling is enforced in the pure engine (it fed `opens_last_24h` into the
     # snapshot); the close ceiling is enforced here in the watchdog.
     def _max_opens_per_day(self, wallet: 'Abstract_Wallet') -> int:
-        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY))
+        return clamp_sat(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY,
+                         default=DEFAULT_MAX_OPENS_PER_DAY, max_sat=MAX_ACTIONS_PER_DAY)
+
+    def _offline_discount_after_sec(self, wallet: 'Abstract_Wallet') -> float:
+        """How long this wallet treats a peer as merely absent before its channel
+        stops occupying a slot. Hours in the setting, seconds to the engine;
+        floored at 0, which disables the streak prong.
+
+        Total, like its sibling readers: a hand-edited wallet file holding a
+        non-number here must cost this setting, not the whole tick."""
+        hours = clamp_pct(
+            getattr(self.settings(wallet),
+                    "INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS",
+                    DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS),
+            default=DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS,
+            max_pct=MAX_OFFLINE_DISCOUNT_AFTER_HOURS)
+        return hours * 3600.0
+
+    def _offline_open_allowance(self, wallet: 'Abstract_Wallet') -> int:
+        """How far over ``max_channels`` the offline discount may take this
+        wallet. Read off THIS wallet (it is a per-wallet setting) and floored at
+        0, where the discount is off entirely. A hand-edited negative value would
+        otherwise make the ceiling *stricter* than the user asked for."""
+        return clamp_sat(
+            getattr(self.settings(wallet), "INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE",
+                    DEFAULT_OFFLINE_OPEN_ALLOWANCE),
+            default=DEFAULT_OFFLINE_OPEN_ALLOWANCE, max_sat=MAX_CHANNELS_CEILING)
 
     def _max_closes_per_day(self, wallet: 'Abstract_Wallet') -> int:
-        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY))
+        return clamp_sat(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY,
+                         default=DEFAULT_MAX_CLOSES_PER_DAY, max_sat=MAX_ACTIONS_PER_DAY)
 
     def _load_action_timestamps(self, wallet: 'Abstract_Wallet') -> Dict[str, List[float]]:
         db = getattr(wallet, "db", None)
@@ -3228,6 +4154,69 @@ class LiquidityPlugin(BasePlugin):
         tss = [t for t in tss if t >= cutoff][-MAX_ACTION_TIMESTAMPS:]
         data[kind] = tss
         self._save_action_timestamps(wallet, data)
+
+    # --- lifetime usage totals -------------------------------------------
+    # See USAGE_TOTALS_DB_KEY. Plain monotonic counters; the only consumers are
+    # the GUI and (if the user opts in at level 3) the usage report.
+    def _load_usage_totals(self, wallet: 'Abstract_Wallet') -> Dict[str, int]:
+        """This wallet's lifetime totals, every field present and non-negative.
+
+        Total over USAGE_TOTAL_FIELDS so callers never have to handle a missing
+        key: the store did not exist before this feature, and every wallet
+        upgrading into it reads as all-zeros rather than as a dict of absences.
+        A hand-edited or corrupt value reads as 0 for that field alone rather
+        than discarding the rest.
+        """
+        db = getattr(wallet, "db", None)
+        raw = db.get(USAGE_TOTALS_DB_KEY, {}) if db is not None else {}
+        if not isinstance(raw, dict):
+            raw = {}
+        out: Dict[str, int] = {}
+        for field in USAGE_TOTAL_FIELDS:
+            try:
+                out[field] = max(0, int(raw.get(field, 0) or 0))
+            except (TypeError, ValueError):
+                out[field] = 0
+        return out
+
+    def _bump_usage_totals(self, wallet: 'Abstract_Wallet', **deltas: int) -> None:
+        """Add to this wallet's lifetime totals and persist.
+
+        Never raises. Every caller sits on a path that has ALREADY committed
+        funds -- a channel just opened, a swap just funded, a sink payment just
+        settled -- and on those paths an exception would lose the record of the
+        thing that just happened (see the comment at the channel-open site). A
+        counter is not worth that, so a failure here is logged and dropped.
+
+        An unknown counter name is a programming error and is rejected loudly in
+        the log rather than silently creating a field nothing reports.
+        """
+        try:
+            unknown = sorted(set(deltas) - set(USAGE_TOTAL_FIELDS))
+            if unknown:
+                self.logger.error(f"unknown usage-total counters ignored: {unknown}")
+            totals = self._load_usage_totals(wallet)
+            changed = False
+            for field, delta in deltas.items():
+                if field in unknown:
+                    continue
+                try:
+                    step = int(delta)
+                except (TypeError, ValueError):
+                    continue
+                if step <= 0:
+                    continue        # monotonic: these only ever go up
+                totals[field] = totals[field] + step
+                changed = True
+            if not changed:
+                return
+            db = getattr(wallet, "db", None)
+            if db is None:
+                return              # db-less wallet (unit-test mock)
+            db.put(USAGE_TOTALS_DB_KEY, totals)
+            wallet.save_db()
+        except Exception as e:
+            self.logger.info(f"could not record usage totals: {e!r}")
 
     def _within_close_cap(self, wallet: 'Abstract_Wallet',
                           now: Optional[float] = None) -> bool:
@@ -3346,13 +4335,165 @@ class LiquidityPlugin(BasePlugin):
             "daily_headroom_sat": max(0, DEV_FEE_DAILY_CAP_SAT - paid),
         }
 
+    # --- optional dev fee: the unresolved-payout record ------------------
+    def _load_dev_fee_inflight(self, wallet: 'Abstract_Wallet') -> Optional[Dict]:
+        """The payout whose outcome is still unknown, or None.
+
+        Shape-checked on the way out rather than trusted: this is a wallet-file
+        field, so it can be absent, hand-edited, or written by an older build.
+        Anything unusable reads as "no record", which lets payouts resume -- the
+        alternative, treating a corrupt record as a permanent hold, would silence
+        the fee forever with no way for a user to tell why.
+        """
+        db = getattr(wallet, "db", None)
+        raw = db.get(DEV_FEE_INFLIGHT_DB_KEY, None) if db is not None else None
+        if not isinstance(raw, dict):
+            return None
+        ph_hex = str(raw.get("payment_hash", "") or "")
+        # 32 bytes as hex: the shape of a payment hash. A value that is not one
+        # cannot be looked up in lnworker, so there is nothing to re-check.
+        if len(ph_hex) != 64:
+            return None
+        try:
+            bytes.fromhex(ph_hex)
+        except ValueError:
+            return None
+        return {
+            "payment_hash": ph_hex,
+            "amount_sat": _safe_int(raw.get("amount_sat", 0)),
+            "started_ts": float(raw.get("started_ts", 0.0) or 0.0),
+        }
+
+    def _save_dev_fee_inflight(self, wallet: 'Abstract_Wallet',
+                               record: Optional[Dict]) -> None:
+        """Persist (or clear, with ``None``) the unresolved-payout record.
+
+        The two directions fail differently, on purpose:
+
+        * RECORDING an attempt raises if it cannot reach disk. The record exists
+          to survive the process dying mid-payment, so a payment made without one
+          is exactly the unguarded case -- the caller catches this and declines to
+          pay at all.
+        * CLEARING one never raises. The clear always follows the ledger being
+          drawn down, and an exception there would escape mid-settlement; a stale
+          record is harmless by comparison, because re-resolving it finds the
+          payment already PR_PAID and the drawdown is floored at zero. So the
+          worst case is one extra stamp against the daily cap, which errs toward
+          paying less rather than more.
+        """
+        db = getattr(wallet, "db", None)
+        if db is None:
+            return  # db-less wallet (unit-test mock); nothing to persist
+        clearing = record is None
+        try:
+            if clearing:
+                db.put(DEV_FEE_INFLIGHT_DB_KEY, None)
+            else:
+                db.put(DEV_FEE_INFLIGHT_DB_KEY, {
+                    "payment_hash": str(record["payment_hash"]),
+                    "amount_sat": _safe_int(record["amount_sat"]),
+                    "started_ts": float(record["started_ts"]),
+                })
+            wallet.save_db()
+        except Exception as e:
+            self.logger.error(
+                f"could not persist the dev-fee in-flight record: {e!r}",
+                exc_info=True)
+            if not clearing:
+                raise
+
+    def _settle_dev_fee_inflight(self, wallet: 'Abstract_Wallet',
+                                 amount_sat: int, why: str) -> None:
+        """Account for an unresolved payout that we now treat as PAID: draw it
+        down from the owed ledger, stamp it against the rolling-24h cap, and
+        clear the record. Shared by the "we saw it settle" and the
+        "it outlived DEV_FEE_INFLIGHT_MAX_AGE_SEC" arms."""
+        remaining = max(0, self._load_dev_fee_owed(wallet) - int(amount_sat))
+        self._save_dev_fee_owed(wallet, remaining)
+        self._record_dev_fee_payment(wallet, int(amount_sat))
+        self._bump_usage_totals(wallet, dev_fee_paid_total_sat=int(amount_sat))
+        self._save_dev_fee_inflight(wallet, None)
+        self.logger.info(
+            f"dev-fee payout of {amount_sat} sat {why}; {remaining} sat still owed")
+
+    def _resolve_dev_fee_inflight(self, wallet: 'Abstract_Wallet') -> bool:
+        """Re-check the unresolved payout, if there is one. True means "still
+        unresolved -- do not start another payout".
+
+        The three resolutions, in the order they are tested:
+
+          * the payment settled -> account for it and clear the record;
+          * an HTLC may still be live -> keep holding (the whole point: minting a
+            fresh invoice now is what paid the fee twice);
+          * the payment is definitively dead (every route attempt exhausted, see
+            :meth:`_ln_payment_failed`) -> clear the record and let the fee, which
+            is still fully owed, be retried.
+
+        A record older than ``DEV_FEE_INFLIGHT_MAX_AGE_SEC`` is resolved as paid
+        regardless -- see the constant for why that direction.
+        """
+        record = self._load_dev_fee_inflight(wallet)
+        if record is None:
+            return False
+        ph_hex = record["payment_hash"]
+        amount_sat = record["amount_sat"]
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return True  # cannot check without one; keep holding
+        from electrum.lnutil import Direction
+        from electrum.invoices import PR_PAID
+        try:
+            payment_hash = bytes.fromhex(ph_hex)
+        except ValueError:
+            # Unreachable (the loader shape-checks), but a corrupt record must
+            # not be able to hold payouts shut forever.
+            self._save_dev_fee_inflight(wallet, None)
+            return False
+        try:
+            status = lnworker.get_payment_status(payment_hash, direction=Direction.SENT)
+        except Exception as e:
+            self.logger.info(
+                f"could not read the dev-fee payment's status ({e!r}); still holding")
+            return True
+        if status == PR_PAID:
+            self._settle_dev_fee_inflight(wallet, amount_sat, "settled after all")
+            return False
+        if self._payment_still_inflight(lnworker, payment_hash):
+            self.logger.info(
+                f"dev-fee payout of {amount_sat} sat is still unresolved "
+                f"({ph_hex[:10]}…); not paying again until it settles or fails")
+            return True
+        if self._ln_payment_failed(wallet, ph_hex):
+            self.logger.info(
+                f"dev-fee payout of {amount_sat} sat failed definitively "
+                f"({ph_hex[:10]}…); the fee stays owed and will be retried")
+            self._save_dev_fee_inflight(wallet, None)
+            return False
+        started_ts = record["started_ts"]
+        age = time.time() - started_ts
+        if started_ts <= 0.0 or age > DEV_FEE_INFLIGHT_MAX_AGE_SEC:
+            self._settle_dev_fee_inflight(
+                wallet, amount_sat,
+                f"outcome never established after {int(age // 86400)} day(s), so it "
+                f"is treated as paid rather than risk charging it twice")
+            return False
+        # Neither paid, nor in flight, nor provably failed -- Electrum has no
+        # route-attempt log for it yet. Keep holding; this resolves on a later
+        # tick, or ages out above.
+        return True
+
     # --- optional dev fee: payout ----------------------------------------
     # Accrued fees are paid out in batches to the configured Lightning address
     # via LNURL-pay: resolve the address -> fetch pay params -> request an invoice
     # for the payable amount -> pay it. The whole thing runs as a guarded
     # background task (an LN payment can take a while and must not block
-    # evaluation), and is resilient: on any failure the owed ledger is left
-    # untouched and a backoff is set, so the fee is simply retried on a later tick.
+    # evaluation).
+    #
+    # On a failure that we can show left nothing committed, the owed ledger is
+    # left untouched and a backoff is set, so the fee is retried on a later tick.
+    # A failure we CANNOT show that for is held instead -- see
+    # DEV_FEE_INFLIGHT_DB_KEY, which is the difference between retrying a fee and
+    # paying it twice.
     @staticmethod
     def _resolve_lnurl_pay_url(address: str) -> Optional[str]:
         """Turn a configured payout target into an LNURL-pay https URL: a
@@ -3440,6 +4581,12 @@ class LiquidityPlugin(BasePlugin):
         now_mono = time.monotonic()
         if now_mono < self._dev_fee_retry_until.get(wallet, 0.0):
             return  # backing off after a recent failure
+        # A previous payout whose outcome we never established holds everything:
+        # paying again now is exactly how the same fee got paid twice. Checked
+        # before the amount is even computed, and persisted, so a restart in the
+        # middle of a payment does not forget it.
+        if self._resolve_dev_fee_inflight(wallet):
+            return
         owed = self._load_dev_fee_owed(wallet)
         paid = self._dev_fee_paid_last_24h(wallet)
         decision = decide_dev_fee_payout(
@@ -3463,11 +4610,27 @@ class LiquidityPlugin(BasePlugin):
     async def _do_pay_dev_fee(self, wallet: 'Abstract_Wallet', address: str,
                               amount_sat: int) -> None:
         """Resolve the payout address, request an invoice for ``amount_sat`` and
-        pay it. On success, draw the amount down from the owed ledger and stamp it
-        against the rolling-24h cap. On any failure, leave the ledger untouched
-        and set a backoff so the same fee is retried later."""
+        pay it.
+
+        Three outcomes, and the third is the one that matters:
+
+          * settled -> draw the amount down from the owed ledger and stamp it
+            against the rolling-24h cap;
+          * failed, with nothing committed -> leave the ledger untouched and set a
+            backoff, so the same fee is retried later;
+          * failed, but an HTLC may still be live -> leave the ledger untouched AND
+            keep the persisted in-flight record, so no further payout is made
+            until that payment's fate is known. ``pay_invoice`` reporting failure
+            does not prove nothing was sent (see DEV_FEE_INFLIGHT_DB_KEY), and a
+            retry mints a fresh invoice that Electrum's own
+            same-payment-hash guard cannot catch.
+
+        The record is written BEFORE the payment, so a crash mid-payment is held
+        the same way a reported failure is.
+        """
         lnworker = getattr(wallet, "lnworker", None)
         ok = False
+        held = False
         try:
             if lnworker is None:
                 self.logger.info("dev-fee payout skipped: wallet has no lnworker")
@@ -3490,33 +4653,90 @@ class LiquidityPlugin(BasePlugin):
                                                 purpose="dev-fee payout")
             if invoice is None:
                 return
-            success, log = await lnworker.pay_invoice(invoice)
+            try:
+                payment_hash = bytes.fromhex(invoice.rhash)
+            except Exception:  # noqa: BLE001
+                payment_hash = b""
+            if not payment_hash:
+                # With no payment hash we could neither record this attempt nor
+                # ever ask what became of it, so it must not be made: an
+                # unrecordable payment is the one we cannot avoid repeating.
+                self.logger.warning(
+                    "dev-fee payout skipped: the invoice has no readable payment "
+                    "hash, so the attempt could not be tracked")
+                return
+            # Persist the attempt first. If this cannot be written, do not pay --
+            # an untracked payment is exactly what the double-pay guard needs.
+            try:
+                self._save_dev_fee_inflight(wallet, {
+                    "payment_hash": payment_hash.hex(),
+                    "amount_sat": int(pay_sat),
+                    "started_ts": time.time(),
+                })
+            except Exception:
+                self.logger.warning(
+                    "dev-fee payout skipped: could not record the attempt, and an "
+                    "unrecorded payment risks being made twice")
+                return
+            held = True
+            # Bounded and fee-budgeted, matching the liquidity sink: the payout
+            # path had neither, so a wedge below pay_invoice held the paying flag
+            # indefinitely and routing fees fell back to Electrum's default
+            # instead of the ceiling this wallet configured.
+            success, _log = await asyncio.wait_for(
+                lnworker.pay_invoice(
+                    invoice, budget=self._ln_fee_budget(wallet, pay_sat)),
+                timeout=DEV_FEE_PAYMENT_TIMEOUT_SEC)
             if not success:
-                self.logger.warning(f"dev-fee payout of {pay_sat} sat did not settle")
+                # Does this leave the channel committed? The in-flight check is
+                # the whole difference between a safe retry and a double payment.
+                if self._payment_still_inflight(lnworker, payment_hash):
+                    self.logger.warning(
+                        f"dev-fee payout of {pay_sat} sat did not settle, but an "
+                        f"HTLC may still be live; holding the fee until it resolves "
+                        f"rather than paying again")
+                    return
+                self.logger.warning(
+                    f"dev-fee payout of {pay_sat} sat did not settle "
+                    f"(nothing in flight); the fee stays owed")
+                held = False     # provably nothing committed: safe to retry
                 return
             ok = True
-            # Draw the paid amount down from the ledger (never below 0) and stamp
-            # it against the daily cap. Re-read owed so a concurrent accrual isn't
-            # clobbered.
-            remaining = max(0, self._load_dev_fee_owed(wallet) - pay_sat)
-            self._save_dev_fee_owed(wallet, remaining)
-            self._record_dev_fee_payment(wallet, pay_sat)
-            self.logger.info(
-                f"dev-fee payout of {pay_sat} sat settled to {address}; "
-                f"{remaining} sat still owed")
+            held = False
+            # Draw the paid amount down from the ledger (never below 0), stamp it
+            # against the daily cap and clear the in-flight record. Re-reads owed
+            # so a concurrent accrual isn't clobbered.
+            self._settle_dev_fee_inflight(wallet, pay_sat, f"settled to {address}")
+            remaining = self._load_dev_fee_owed(wallet)
             self._log_action(
                 wallet, kind="dev_fee", amount_sat=pay_sat,
                 source=None, dest=address,
                 reason="dev fee payout",
                 detail=f"paid {pay_sat} sat to {address}; {remaining} sat still owed",
                 state=None)
+        except asyncio.TimeoutError:
+            # Past our backstop with the payment still running. Treated exactly
+            # like a reported failure whose HTLC may be live: hold, never retry
+            # blind. `held` is already True, so the record stays.
+            self.logger.warning(
+                f"dev-fee payout of {amount_sat} sat timed out after "
+                f"{DEV_FEE_PAYMENT_TIMEOUT_SEC:.0f}s; holding the fee until the "
+                f"payment resolves")
         except Exception as e:
             self.logger.warning(f"dev-fee payout failed: {e!r}")
         finally:
             self._dev_fee_paying[wallet] = False
+            if not ok and not held:
+                # Nothing was committed, so clear any record we wrote and let the
+                # fee be retried after a backoff -- so a persistently failing
+                # address doesn't hammer the network every tick. The fee stays owed.
+                try:
+                    if self._load_dev_fee_inflight(wallet) is not None:
+                        self._save_dev_fee_inflight(wallet, None)
+                except Exception as e:  # noqa: BLE001
+                    self.logger.info(
+                        f"could not clear the dev-fee in-flight record: {e!r}")
             if not ok:
-                # Back off before the next attempt so a persistently failing
-                # address doesn't retry every tick. The fee stays owed.
                 self._dev_fee_retry_until[wallet] = time.monotonic() + DEV_FEE_RETRY_BACKOFF_SEC
 
     # --- provider reliability --------------------------------------------
@@ -3538,15 +4758,73 @@ class LiquidityPlugin(BasePlugin):
         raw = db.get(RELIABILITY_DB_KEY, {}) if db is not None else {}
         return _plain_json_copy(raw) if isinstance(raw, dict) else {}
 
-    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict]) -> None:
+    def _save_reliability(self, wallet: 'Abstract_Wallet', data: Dict[str, Dict],
+                          *, write_to_disk: bool = True) -> None:
+        """Persist the provider reliability store.
+
+        ``write_to_disk=False`` puts the value in the wallet db without forcing a
+        write of the whole wallet file. The value is visible to every reader
+        immediately (and ``put`` marks the db modified, so the next save of any
+        kind flushes it); what is given up is only that an abrupt kill could lose
+        the last few updates.
+
+        That is the right trade for the Attempts tally and the wrong one for a
+        fault or a success: those change how providers are RANKED, so losing one
+        changes what the plugin does next, while losing a display counter changes
+        a number on a tab. The cascade walks several providers per swap and this
+        is on that path -- a full wallet-file write per provider, to bump
+        something that decides nothing, is not worth it.
+        """
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
+        data = self._cap_reliability_rows(data)
         try:
             db.put(RELIABILITY_DB_KEY, data)
-            wallet.save_db()
+            if write_to_disk:
+                wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist provider reliability: {e!r}", exc_info=True)
+
+    def _cap_reliability_rows(self, data: Dict[str, Dict]) -> Dict[str, Dict]:
+        """Hold the reliability store to ``RELIABILITY_MAX_ROWS``, dropping the
+        least informative rows first.
+
+        The age-based prune (:meth:`_prune_reliability_store`) is the normal way
+        rows leave, but it waits 90 days -- which is a long time to carry a flood
+        of identities in the wallet file, and nostr offers cost nothing to
+        publish. This is the backstop, applied on every write.
+
+        Rows are kept by how much they would cost to lose, most valuable first:
+        a provider we have SUCCEEDED with, then one with a real fault history, then
+        the merely-seen. Within that, the most recently active wins. Dropping a
+        row forgets a penalty, so the ordering deliberately makes a penalised
+        provider the last thing evicted -- a flooder cannot wash out its own bad
+        record by publishing more identities.
+        """
+        if len(data) <= RELIABILITY_MAX_ROWS:
+            return data
+
+        def _value(item) -> tuple:
+            _npub, stats = item
+            stats = stats if isinstance(stats, dict) else {}
+
+            def _num(key: str) -> float:
+                try:
+                    return float(stats.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            last_active = max(_num("last_fault_ts"), _num("last_success_ts"),
+                              _num("last_attempt_ts"))
+            # Negated for an ascending sort: keep-first comes out first.
+            return (-_num("success_count"), -_num("fault_count"), -last_active)
+
+        kept = dict(sorted(data.items(), key=_value)[:RELIABILITY_MAX_ROWS])
+        self.logger.warning(
+            f"provider reliability store held {len(data)} rows, above the "
+            f"{RELIABILITY_MAX_ROWS}-row ceiling; dropped "
+            f"{len(data) - len(kept)} of the least active, unpenalised ones")
+        return kept
 
     def _provider_penalty(self, wallet: 'Abstract_Wallet', npub: str,
                           stats: Optional[Dict], params: Dict[str, float],
@@ -3664,6 +4942,30 @@ class LiquidityPlugin(BasePlugin):
                         hard=False, soft=soft)
         self.on_log_changed(wallet)
 
+    def _record_provider_attempt(self, wallet: 'Abstract_Wallet', npub: str) -> None:
+        """Note that we tried to swap with this provider.
+
+        Display only -- see RELIABILITY_DB_KEY. It deliberately records nothing
+        the ranking can read: no ``consecutive_faults``, no penalty, no verdict
+        about the provider at all. Trying somebody is not evidence against them.
+
+        Called once per provider per cascade, at the moment we first turn to it,
+        so it counts a provider that then turned out to be unreachable as well as
+        one that produced a swap. Both are attempts; which kind it was is what the
+        Successes and Faults columns beside it are for.
+        """
+        if not npub:
+            return  # single-provider / URL mode has no per-provider identity
+        data = self._load_reliability(wallet)
+        s = data.get(npub, {})
+        s["attempt_count"] = int(s.get("attempt_count", 0) or 0) + 1
+        s["last_attempt_ts"] = time.time()
+        data[npub] = s
+        # Deliberately not flushed to disk -- see _save_reliability. This runs
+        # once per provider inside the swap cascade, and a cosmetic tally does
+        # not justify a wallet-file write there.
+        self._save_reliability(wallet, data, write_to_disk=False)
+
     def _record_provider_success(self, wallet: 'Abstract_Wallet', npub: str) -> None:
         if not npub:
             return
@@ -3701,22 +5003,43 @@ class LiquidityPlugin(BasePlugin):
 
         Runs on the tick, next to pending-swap reconciliation. Writes only when
         something was actually removed.
+
+        Also prunes the cached display names that hang off these rows, so the two
+        stores shrink together rather than the name cache outliving every row
+        that could have shown it.
         """
         data = self._load_reliability(wallet)
         if not data:
+            # No reliability rows, but a name cache can still hold entries for
+            # providers that are merely discovered -- keep exactly those.
+            self._prune_provider_profiles(
+                wallet, {o.npub for o in self.discovered_providers(wallet)})
             return
         params = dict(self._reliability_params(wallet))
         params["enabled"] = True
         now = time.time()
         keep: Dict[str, Dict] = {}
         for npub, stats in data.items():
+            # An attempt counts as activity even though it is display-only: a
+            # provider we keep turning to but that never completes a swap and
+            # never cleanly faults (declined on price, say) would otherwise have
+            # its row pruned and its Attempts tally silently reset to 0 under a
+            # user who is watching that number to decide whether to ban it.
             last_active = max(float(stats.get("last_fault_ts", 0.0) or 0.0),
-                              float(stats.get("last_success_ts", 0.0) or 0.0))
+                              float(stats.get("last_success_ts", 0.0) or 0.0),
+                              float(stats.get("last_attempt_ts", 0.0) or 0.0))
             idle = now - last_active > RELIABILITY_ROW_MAX_IDLE_SEC
             penalty = self._provider_penalty(wallet, npub, stats, params, now)
             if idle and penalty < RELIABILITY_PRUNE_MIN_PENALTY_PCT:
                 continue
             keep[npub] = stats
+        # The name cache follows the rows that can display a name: the surviving
+        # reliability rows, plus whoever is advertising right now. Done whether
+        # or not any reliability row was dropped -- a discovered provider can
+        # stop advertising without its reliability row changing at all.
+        self._prune_provider_profiles(
+            wallet,
+            set(keep) | {o.npub for o in self.discovered_providers(wallet)})
         if len(keep) == len(data):
             return
         dropped = len(data) - len(keep)
@@ -3750,12 +5073,271 @@ class LiquidityPlugin(BasePlugin):
                 "consecutive_faults": int(stats.get("consecutive_faults", 0)),
                 "fault_count": int(stats.get("fault_count", 0)),
                 "success_count": int(stats.get("success_count", 0)),
+                # Absent from every row written before this field existed, so it
+                # reads 0 there rather than breaking the tab.
+                "attempt_count": int(stats.get("attempt_count", 0) or 0),
                 "last_fault_ts": float(stats.get("last_fault_ts", 0.0) or 0.0),
                 "last_success_ts": float(stats.get("last_success_ts", 0.0) or 0.0),
-                "last_reason": stats.get("last_reason"),
+                "last_attempt_ts": float(stats.get("last_attempt_ts", 0.0) or 0.0),
+                # Scrubbed on the way OUT as well as in: this is a
+                # wallet-file field, so it can predate today's rules or
+                # have been hand-edited, and one of the reasons it holds
+                # is built from a provider-influenced exception.
+                "last_reason": _clean_reason(stats.get("last_reason")),
                 "penalty_pct": self._provider_penalty(wallet, npub, stats, params, now),
             }
         return rows
+
+    # --- provider display names -------------------------------------------
+    # A swap provider's offer has no name in it, so the only human-readable
+    # identity it can have is a nostr kind-0 profile published under the pubkey
+    # it signs its offers with. These read/cache/serve that name. All of it is
+    # cosmetic: see PROVIDER_PROFILES_DB_KEY for why nothing may key off it.
+    def _load_provider_profiles(self, wallet: 'Abstract_Wallet') -> Dict[str, Dict]:
+        db = getattr(wallet, "db", None)
+        raw = db.get(PROVIDER_PROFILES_DB_KEY, {}) if db is not None else {}
+        return _plain_json_copy(raw) if isinstance(raw, dict) else {}
+
+    def _save_provider_profiles(self, wallet: 'Abstract_Wallet',
+                                data: Dict[str, Dict]) -> None:
+        """Persist the provider-name cache, newest-checked rows first if it has
+        to be trimmed.
+
+        Written WITHOUT forcing a wallet-file write (see ``_save_reliability``
+        for that trade): a display name decides nothing, so an abrupt kill
+        losing the last lookup costs one re-query of a cosmetic field.
+        """
+        db = getattr(wallet, "db", None)
+        if db is None:
+            return  # db-less wallet (unit-test mock); nothing to persist
+        if len(data) > PROVIDER_PROFILE_MAX_ROWS:
+            newest = sorted(
+                data.items(),
+                key=lambda kv: float((kv[1] or {}).get("checked_ts", 0.0) or 0.0),
+                reverse=True)[:PROVIDER_PROFILE_MAX_ROWS]
+            data = dict(newest)
+        try:
+            db.put(PROVIDER_PROFILES_DB_KEY, data)
+        except Exception as e:  # noqa: BLE001  (a name must never break a tick)
+            self.logger.info(f"could not store provider profiles: {e!r}")
+
+    def provider_name(self, wallet: 'Abstract_Wallet', npub: str) -> str:
+        """This provider's self-published display name, or ``""`` if it has none
+        (or none has been looked up yet). Never raises."""
+        if not npub:
+            return ""
+        row = self._load_provider_profiles(wallet).get(npub)
+        if not isinstance(row, dict):
+            return ""
+        return clean_display_name(row.get("name"),
+                                  max_chars=MAX_PROVIDER_NAME_CHARS)
+
+    def provider_names(self, wallet: 'Abstract_Wallet') -> Dict[str, str]:
+        """Every cached provider name, keyed by npub, for the Providers tab.
+        Providers with no name are omitted rather than mapped to ``""``.
+
+        Re-sanitised on the way out, not trusted as stored: the cache is a
+        wallet-file field, and an older plugin build (or a hand-edited wallet)
+        could hold a value that today's bound would reject.
+        """
+        out: Dict[str, str] = {}
+        for npub, row in self._load_provider_profiles(wallet).items():
+            if not isinstance(row, dict):
+                continue
+            name = clean_display_name(row.get("name"),
+                                      max_chars=MAX_PROVIDER_NAME_CHARS)
+            if name:
+                out[npub] = name
+        return out
+
+    @staticmethod
+    def _npub_to_hex(npub: str) -> str:
+        """A provider's npub as its raw 32-byte pubkey hex, or ``""``.
+
+        ``clean_npub`` has already gated the shape, but it does no bech32
+        checksum check (that is aionostr's job, here) -- so a syntactically fine
+        npub can still fail to decode, and must cost a name rather than the
+        whole lookup.
+        """
+        try:
+            import electrum_aionostr as aionostr
+            import electrum_aionostr.util  # noqa: F401  (binds aionostr.util)
+            return aionostr.util.from_nip19(npub)['object'].hex()
+        except Exception:
+            return ""
+
+    async def _refresh_provider_profiles(
+            self, wallet: 'Abstract_Wallet',
+            transport: Optional['SwapServerTransport'],
+            *, force: bool = False) -> None:
+        """Look up the discovered providers' kind-0 display names and cache them.
+
+        ``force`` re-reads every discovered provider (the Providers tab's
+        Refresh button, an explicit user action). Otherwise only providers whose
+        cached entry is missing or older than ``PROVIDER_PROFILE_TTL_SEC`` are
+        queried, so the steady state -- every provider already looked up -- costs
+        no relay traffic and returns before doing any I/O at all.
+
+        Runs on the swap-evaluation path, so it is bounded by
+        ``PROFILE_FETCH_TIMEOUT_SEC`` and swallows everything: a name is
+        cosmetic, and no failure here may delay or break a swap. A partial
+        result is kept (the providers that did answer are cached).
+        """
+        manager = getattr(transport, "relay_manager", None)
+        get_events = getattr(manager, "get_events", None)
+        if get_events is None:
+            return  # URL/HTTP transport, or a session whose relays never came up
+        # Identities only, straight off the transport -- deliberately NOT via
+        # `_offers_from_transport`. That one validates the advertised terms and
+        # records a soft reliability fault for a provider whose terms are
+        # malformed, and it is already called once per tick by `build_snapshot`:
+        # running it again here would charge such a provider two faults per tick
+        # instead of one. A name lookup must not touch the ranking at all.
+        get_recent = getattr(transport, "get_recent_offers", None)
+        if get_recent is None:
+            return
+        try:
+            raw_offers = list(get_recent())
+        except Exception as e:  # noqa: BLE001  (cosmetic; never break the tick)
+            self.logger.info(f"could not read offers for profile lookup: {e!r}")
+            return
+        # A provider whose terms are rejected still has a usable identity, and
+        # still gets a row on the Providers tab -- so it is still worth a name.
+        # Bounded the same way discovery is, and for the same reason: this list
+        # becomes a nostr filter's `authors` array, so an unbounded offer set
+        # became an unbounded subscription. `_bounded_offers` is reused rather
+        # than re-deriving a cap, so the names looked up are exactly the
+        # providers the ranking actually considered. Passing wallet=None keeps
+        # this a pure read -- a name lookup must not record a fault or an event.
+        raw_offers = self._bounded_offers(None, raw_offers, quiet=True)
+        npubs = {clean_npub(getattr(o, "server_npub", None)) for o in raw_offers}
+        npubs.discard("")
+        if not npubs:
+            return
+        cache = self._load_provider_profiles(wallet)
+        now = time.time()
+
+        def is_stale(npub: str) -> bool:
+            row = cache.get(npub)
+            if not isinstance(row, dict):
+                return True
+            try:
+                checked = float(row.get("checked_ts", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return True     # hand-edited wallet file; look it up again
+            # Anything outside "stamped at some point up to now" is stale: a
+            # NaN (which fails every comparison), and a future stamp from a
+            # clock that moved backwards, would otherwise pin a row as fresh
+            # forever.
+            if not 0.0 < checked <= now:
+                return True
+            return now - checked > PROVIDER_PROFILE_TTL_SEC
+
+        want = npubs if force else {n for n in npubs if is_stale(n)}
+        if not want:
+            return
+        # Query by raw pubkey (what a nostr filter's "authors" holds), keeping a
+        # map back to the npub the cache is keyed by.
+        by_pubkey: Dict[str, str] = {}
+        for npub in sorted(want):
+            pubkey = self._npub_to_hex(npub)
+            if pubkey:
+                by_pubkey[pubkey] = npub
+        if not by_pubkey:
+            return
+        found: Dict[str, Tuple[int, str]] = {}  # pubkey -> (created_at, name)
+        try:
+            await asyncio.wait_for(
+                self._collect_provider_profiles(get_events, by_pubkey, found),
+                timeout=PROFILE_FETCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            # Expected whenever a relay sends no end-of-stored-events marker.
+            # Whatever arrived before the deadline is in `found` and is kept --
+            # UNLESS nothing arrived at all, which is indistinguishable from the
+            # relay never having answered us. Caching that as "none of these
+            # providers has a name" would hide every name for a whole TTL on the
+            # strength of one slow lookup, so treat it as the failure it
+            # probably is and try again next tick.
+            if not found:
+                self.logger.info(
+                    f"provider profile lookup timed out after "
+                    f"{PROFILE_FETCH_TIMEOUT_SEC:.0f}s with no reply; "
+                    f"leaving {len(by_pubkey)} provider(s) to retry")
+                return
+            self.logger.debug(
+                f"provider profile lookup timed out after "
+                f"{PROFILE_FETCH_TIMEOUT_SEC:.0f}s ({len(found)} of "
+                f"{len(by_pubkey)} answered)")
+        except Exception as e:  # noqa: BLE001  (cosmetic; never break the tick)
+            self.logger.info(f"provider profile lookup failed: {e!r}")
+            return
+        # Stamp EVERY provider we asked about, answered or not, so a provider
+        # with no profile is not re-queried on every single tick.
+        checked_ts = time.time()
+        named = 0
+        for pubkey, npub in by_pubkey.items():
+            name = found.get(pubkey, (0, ""))[1]
+            if name:
+                named += 1
+            cache[npub] = {"name": name, "checked_ts": checked_ts}
+        self._save_provider_profiles(wallet, cache)
+        self.logger.debug(
+            f"looked up {len(by_pubkey)} provider profile(s); {named} named")
+
+    @staticmethod
+    async def _collect_provider_profiles(
+            get_events, by_pubkey: Dict[str, str],
+            found: Dict[str, Tuple[int, str]]) -> None:
+        """Drain one kind-0 query into ``found`` (pubkey -> (created_at, name)).
+
+        Split out from its caller so the whole drain can be wrapped in a single
+        ``wait_for``, and so ``found`` keeps the partial result when that
+        deadline fires mid-stream.
+
+        Two guards on each event, both about a hostile or buggy relay:
+
+        * the event's author must be one we asked about. aionostr verifies the
+          Schnorr signature when it builds the ``Event`` (see its
+          ``Event.__init__``), so a relay cannot forge a profile for someone
+          else's pubkey -- but it can volunteer an unrelated author's real
+          profile, and that must not land in another provider's row;
+        * kind 0 is a *replaceable* event, so several relays may each answer with
+          a different vintage of the same profile. Newest ``created_at`` wins.
+        """
+        async for event in get_events(
+                {"kinds": [NOSTR_KIND_PROFILE], "authors": sorted(by_pubkey)},
+                only_stored=True):
+            pubkey = str(getattr(event, "pubkey", "") or "")
+            if pubkey not in by_pubkey:
+                continue
+            try:
+                created_at = int(getattr(event, "created_at", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            previous = found.get(pubkey)
+            if previous is not None and previous[0] >= created_at:
+                continue
+            found[pubkey] = (created_at,
+                             parse_provider_name(getattr(event, "content", "")))
+
+    def _prune_provider_profiles(self, wallet: 'Abstract_Wallet',
+                                 keep: Set[str]) -> None:
+        """Drop cached names for providers nothing refers to any more.
+
+        ``keep`` is the set of npubs still worth a row -- the surviving
+        reliability rows plus the currently-discovered providers, i.e. exactly
+        the npubs the Providers tab can put on screen. Writes only when
+        something was actually removed.
+        """
+        cache = self._load_provider_profiles(wallet)
+        if not cache:
+            return
+        kept = {npub: row for npub, row in cache.items() if npub in keep}
+        if len(kept) == len(cache):
+            return
+        self.logger.debug(
+            f"pruned {len(cache) - len(kept)} unreferenced provider name(s)")
+        self._save_provider_profiles(wallet, kept)
 
     # --- channel-peer reliability ----------------------------------------
     # Mirrors the provider reliability store above, but keyed by Lightning node id
@@ -3826,10 +5408,16 @@ class LiquidityPlugin(BasePlugin):
 
     def _record_peer_fault(self, wallet: 'Abstract_Wallet', node_id: str, reason: str,
                            *, hard: bool = False, rate_key: Optional[str] = None,
-                           rate_limit_sec: float = 0.0) -> bool:
+                           rate_limit_sec: float = 0.0,
+                           tally_key: Optional[str] = None) -> bool:
         """Record a channel-peer fault. ``hard`` faults (force-close / channel
         closed by peer / open failure / peer offline) bump the auto-ban tally;
         soft faults only feed the decaying penalty.
+
+        ``tally_key`` additionally increments a named per-peer counter for THIS
+        kind of fault (used by the offline tally the channel-ceiling discount
+        reads). Bumped only when a fault is actually recorded, so it inherits the
+        rate limit rather than counting every tick of the same outage.
 
         The ranking counter escalates from its *aged* value
         (:meth:`_aged_consecutive_faults`); the auto-ban tally does not age. The
@@ -3860,6 +5448,11 @@ class LiquidityPlugin(BasePlugin):
         # that helper reads is the rate ``_peer_penalty`` decays at.
         s["consecutive_faults"] = self._aged_consecutive_faults(wallet, s) + 1
         s["fault_count"] = int(s.get("fault_count", 0)) + 1
+        if tally_key:
+            try:
+                s[tally_key] = int(s.get(tally_key, 0) or 0) + 1
+            except (TypeError, ValueError):
+                s[tally_key] = 1  # hand-edited garbage in the wallet file
         if hard:
             # NOT aged, deliberately. This is the auto-ban tally, not a ranking
             # input: a force-close is a serious, deliberate act, it is remembered
@@ -3879,6 +5472,48 @@ class LiquidityPlugin(BasePlugin):
         self._log_fault(wallet, kind="peer", ident=node_id, reason=reason, hard=hard)
         self._maybe_auto_ban_peer(wallet, node_id, s)
         self.on_log_changed(wallet)
+        return True
+
+    def _clear_peer_offline_faults(self, wallet: 'Abstract_Wallet',
+                                   node_id: str) -> bool:
+        """Forget a peer's offline tally because it has just been seen online.
+        Returns True if anything was cleared (so the caller can log it once).
+
+        The tally counts days this peer has been gone, so a peer answering us
+        again refutes it: left standing, the count would read as an outage still
+        in progress for the rest of the wallet's life.
+
+        Clearing the rate-limit STAMP along with it is the part that affects
+        behaviour. Without that, a peer that recovers and drops out again hours
+        later would be silenced by the previous outage's stamp and not faulted at
+        all until a full 24h had passed since the earlier fault.
+
+        Note what this deliberately does NOT clear: ``hard_fault_count`` (the
+        auto-ban tally, which is meant to accumulate for the life of the wallet)
+        and the decaying ``consecutive_faults`` penalty, which heals on its own
+        schedule and only affects try-ORDER.
+        """
+        node_id = normalize_node_id(node_id)
+        if not node_id:
+            return False
+        data = self._load_peer_reliability(wallet)
+        s = data.get(node_id)
+        if not s:
+            return False
+        if not (s.get(PEER_OFFLINE_FAULTS_FIELD) or s.get(PEER_OFFLINE_FAULT_TS_FIELD)):
+            return False
+        had = int(s.get(PEER_OFFLINE_FAULTS_FIELD, 0) or 0)
+        s.pop(PEER_OFFLINE_FAULTS_FIELD, None)
+        # The rate-limit stamp goes with it: a peer that drops out again after
+        # recovering should fault immediately rather than being silenced by a
+        # stamp from the previous outage.
+        s.pop(PEER_OFFLINE_FAULT_TS_FIELD, None)
+        data[node_id] = s
+        self._save_peer_reliability(wallet, data)
+        if had:
+            self.logger.info(
+                f"peer {node_id[:12]}… is back online; clearing its "
+                f"{had} offline fault(s) (channel counts toward the ceiling again)")
         return True
 
     def _record_peer_success(self, wallet: 'Abstract_Wallet', node_id: str) -> None:
@@ -4001,7 +5636,11 @@ class LiquidityPlugin(BasePlugin):
                 "success_count": int(stats.get("success_count", 0)),
                 "last_fault_ts": float(stats.get("last_fault_ts", 0.0) or 0.0),
                 "last_success_ts": float(stats.get("last_success_ts", 0.0) or 0.0),
-                "last_reason": stats.get("last_reason"),
+                # Scrubbed on the way OUT as well as in: this is a
+                # wallet-file field, so it can predate today's rules or
+                # have been hand-edited, and one of the reasons it holds
+                # is built from a provider-influenced exception.
+                "last_reason": _clean_reason(stats.get("last_reason")),
                 "penalty_pct": self._peer_penalty(nid, stats, params, now),
             }
         return rows
@@ -4032,6 +5671,52 @@ class LiquidityPlugin(BasePlugin):
         except Exception as e:
             self.logger.error(f"could not persist pending-swap tracking: {e!r}",
                               exc_info=True)
+
+    def _swap_funding_confirmed(self, wallet: 'Abstract_Wallet', swap) -> bool:
+        """Whether this reverse swap's on-chain funding has actually CONFIRMED.
+
+        The distinction this draws is the whole point. ``swap.funding_txid`` being
+        set does not mean the sats arrived: the swap manager's watcher sets it the
+        moment it sees a matching output in an *unconfirmed* transaction, and
+        Electrum says outright that it can change afterwards --
+        ``submarine_swaps.py``: "note: swap.funding_txid can change due to RBF, it
+        will get updated here". So a provider can have a funding tx seen, and
+        then replace it.
+
+        The plugin used to count a swap complete on that first sighting, which
+        meant a provider could clear its accumulated reliability penalty, and
+        make the user accrue a dev fee, on sats that never arrived. One
+        confirmation is cheap to wait for -- reconciliation runs every tick -- and
+        it is the same test Electrum's own claim path uses
+        (``_claim_to_output``: ``get_tx_height(...).height() > TX_HEIGHT_UNCONFIRMED``).
+
+        Best-effort and conservative: anything unreadable answers False, i.e.
+        "not yet", which defers the accrual rather than granting it. The swap's
+        record is kept either way, so a False here costs a tick, not a fee.
+        """
+        from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
+        txid = getattr(swap, "funding_txid", None)
+        if not txid:
+            return False
+        try:
+            return wallet.adb.get_tx_height(txid).height() > TX_HEIGHT_UNCONFIRMED
+        except Exception as e:  # noqa: BLE001
+            self.logger.info(
+                f"could not read the funding tx's confirmation state ({e!r}); "
+                f"treating the swap as not yet confirmed")
+            return False
+
+    def _swap_delivered(self, wallet: 'Abstract_Wallet', swap) -> bool:
+        """Whether the provider has demonstrably delivered: we already swept the
+        funding output (``is_redeemed``), or it has at least one confirmation.
+
+        The single definition of "this swap completed", shared by the executor and
+        by reconciliation so the two cannot drift -- the dev fee, the provider's
+        success and the lifetime totals all hang off it.
+        """
+        if getattr(swap, "is_redeemed", False):
+            return True
+        return self._swap_funding_confirmed(wallet, swap)
 
     def _track_pending_swap(self, wallet: 'Abstract_Wallet', payment_hash_hex: str,
                             npub: str, node_id: str = "", channel_id: str = "",
@@ -4181,16 +5866,17 @@ class LiquidityPlugin(BasePlugin):
                 swap = sm.get_swap(bytes.fromhex(ph_hex))
             except Exception:
                 swap = None
-            if swap is not None and (getattr(swap, "is_redeemed", False)
-                                     or getattr(swap, "funding_txid", None)):
-                # Provider created the on-chain output (and we may already have
-                # claimed it) -- it honoured the swap. This is the swap's confirmed
-                # completion, so accrue its dev fee now (once -- the record is then
-                # dropped).
+            if swap is not None and self._swap_delivered(wallet, swap):
+                # Provider's on-chain output is confirmed (or we have already
+                # claimed it) -- it honoured the swap. This is the swap's
+                # confirmed completion, so accrue its dev fee now (once -- the
+                # record is then dropped).
                 self._record_provider_success(wallet, npub)
+                basis_sat = int(info.get("fee_basis_sat", 0) or 0)
                 self._accrue_dev_fee(
-                    wallet, int(info.get("fee_basis_sat", 0) or 0),
-                    source=f"swap {ph_hex[:10]}…")
+                    wallet, basis_sat, source=f"swap {ph_hex[:10]}…")
+                self._bump_usage_totals(wallet, swaps_completed_total=1,
+                                        sats_swapped_total=basis_sat)
                 del data[ph_hex]
                 changed = True
             elif now - started_ts > PENDING_SWAP_MAX_AGE_SEC:
@@ -4202,6 +5888,11 @@ class LiquidityPlugin(BasePlugin):
                 # delivery is still a delivery however late we notice it (and the
                 # dev fee for it is still owed).
                 #
+                # It is also what bounds the awaiting-confirmation arm just below:
+                # a funding tx that is seen and never confirms (because it was
+                # replaced) holds its record until it ages out here, rather than
+                # forever.
+                #
                 # A record with no usable started_ts (0.0, only reachable through
                 # a corrupted store) lands here too, which is the right home for
                 # it: previously it aged past every timeout instantly and faulted
@@ -4212,6 +5903,25 @@ class LiquidityPlugin(BasePlugin):
                     f"attribute to a provider or a peer")
                 del data[ph_hex]
                 changed = True
+            elif swap is not None and getattr(swap, "funding_txid", None):
+                # Funding is SEEN but not yet confirmed. Its own arm, ahead of
+                # every verdict below, because none of them is right here:
+                #
+                #  * it is not a completion yet -- the tx can still be replaced
+                #    (see _swap_funding_confirmed), so the fee must not accrue;
+                #  * it is emphatically not "stuck with no on-chain funding", which
+                #    is what the timeout arm further down would otherwise charge
+                #    this provider for. Faulting a provider that funded correctly,
+                #    for the crime of us waiting out a confirmation, would be a
+                #    worse bug than the one the confirmation gate fixes.
+                #
+                # So: leave the record exactly as it is and look again next tick.
+                # Placed BELOW the staleness arm on purpose, so this cannot hold a
+                # record indefinitely -- a funding tx that never confirms ages out
+                # up there like any other unresolved swap.
+                self.logger.debug(
+                    f"swap {ph_hex[:10]}… : funding tx seen but unconfirmed; "
+                    f"awaiting a confirmation before counting it complete")
             elif attribution.is_resolved:
                 # Our Lightning payment failed before any funding, and the onion
                 # error says WHO failed it. The provider never got the chance to
@@ -4413,6 +6123,8 @@ class LiquidityPlugin(BasePlugin):
         close_capped_logged = self._close_capped_logged.setdefault(wallet, set())
         strikes = self._load_json_dict(wallet, WEDGE_STRIKES_DB_KEY)
         strikes_changed = False
+        streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
+        streaks_changed = False
         first_scan = wallet not in self._known_chan_states
         known = self._known_chan_states.setdefault(wallet, {})
         try:
@@ -4420,6 +6132,9 @@ class LiquidityPlugin(BasePlugin):
         except Exception:
             return
         live_ids = set()
+        # Channels currently OPEN -- the only ones an offline streak is kept for
+        # (a pre-OPEN or closing channel has no slot to discount).
+        open_ids = set()
         for chan in channels:
             cid = chan.channel_id.hex()
             live_ids.add(cid)
@@ -4428,6 +6143,8 @@ class LiquidityPlugin(BasePlugin):
             except Exception:
                 node_id = ""
             state = chan.get_state()
+            if state == ChannelState.OPEN:
+                open_ids.add(cid)
             # Closing/closed? A remote force-close leaves us <= OPEN but with an
             # unconfirmed closing txid (mirrors get_state_for_GUI).
             remote_fc = (state <= ChannelState.OPEN
@@ -4452,11 +6169,36 @@ class LiquidityPlugin(BasePlugin):
             # may simply not have been dialed yet (startup grace) or the network
             # is down (shutdown), so a healthy peer is never faulted for our own
             # transitional state; only a genuine offline (False) faults.
+            # This is the ONE place a peer-reachability observation is folded
+            # into the offline streak the channel-ceiling discount reads -- the
+            # autoclose watchdog observes the same peers a moment later in the
+            # same tick, and sampling the streak there as well would stamp
+            # ``last_ts`` twice per tick.
+            #
+            # An observed-ONLINE reading both ends the streak and clears the
+            # offline fault tally, which is what lets a recovered peer's channel
+            # occupy its slot again. Only a definite reading moves anything: None
+            # (not observed -- network down, or inside the startup grace) leaves
+            # both exactly as they were, so our own downtime neither accrues
+            # against the peer nor forgives it.
             if state == ChannelState.OPEN:
-                if self._observe_peer(wallet, chan, now) is False:
+                observed = self._observe_peer(wallet, chan, now)
+                if observed is not None:
+                    updated = record_offline_streak(
+                        streaks.get(cid), now, observed)
+                    if updated is None:
+                        if streaks.pop(cid, None) is not None:
+                            streaks_changed = True
+                    elif updated != streaks.get(cid):
+                        streaks[cid] = updated
+                        streaks_changed = True
+                if observed is False:
                     self._record_peer_fault(
                         wallet, node_id, "peer offline", hard=True,
-                        rate_key="last_offline_fault_ts", rate_limit_sec=86400.0)
+                        rate_key=PEER_OFFLINE_FAULT_TS_FIELD, rate_limit_sec=86400.0,
+                        tally_key=PEER_OFFLINE_FAULTS_FIELD)
+                elif observed is True:
+                    self._clear_peer_offline_faults(wallet, node_id)
             # Stuck-open watchdog. Three independent gates before we will close
             # anything (see liquidity_manager's "wedged channel-open
             # remediation" notes): eligibility (is it actually wedged, or just
@@ -4511,6 +6253,14 @@ class LiquidityPlugin(BasePlugin):
             strikes_changed = True
         if strikes_changed:
             self._save_json(wallet, WEDGE_STRIKES_DB_KEY, strikes)
+        # Same for the offline streaks, plus any channel that has left OPEN: once
+        # it is closing there is no slot left to discount, and keeping the clock
+        # running would let a reused channel id inherit a stale streak.
+        for gone in [c for c in streaks if c not in open_ids]:
+            del streaks[gone]
+            streaks_changed = True
+        if streaks_changed:
+            self._save_json(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY, streaks)
 
     # --- offline-channel auto-close --------------------------------------
     # Applies ONLY to channels the plugin opened (see PLUGIN_OPENED_CHANNELS_DB_KEY).
@@ -4894,6 +6644,7 @@ class LiquidityPlugin(BasePlugin):
         if on_force_closed is not None:
             on_force_closed()
         self._record_action_event(wallet, "close")
+        self._bump_usage_totals(wallet, channels_closed_total=1, force_closes_total=1)
         attempted = int(rec.get("coop_attempts", 0) or 0)
         why = (f"after {attempted} cooperative close attempt(s)" if attempted
                else "peer was never reachable to close cooperatively")
@@ -4944,6 +6695,7 @@ class LiquidityPlugin(BasePlugin):
                 f"{node_id[:12]}… ({reason}; peer is currently reachable)")
             await lnworker.close_channel(chan_id)
             self._record_action_event(wallet, "close")
+            self._bump_usage_totals(wallet, channels_closed_total=1)
             self.logger.info(f"cooperatively closed channel {cid[:12]}…")
             self._log_action(
                 wallet, kind="close", amount_sat=None,
@@ -5036,7 +6788,16 @@ class LiquidityPlugin(BasePlugin):
         except Exception as e:
             self.logger.warning(f"could not read discovered offers: {e!r}")
             return []
+        raw_offers = self._bounded_offers(wallet, raw_offers)
         offers: List[ProviderOffer] = []
+        # Faults for malformed offers are collected and written ONCE at the end of
+        # the pass, not per provider. Each `_record_provider_fault` is a full
+        # wallet-file write, and anyone may publish a nostr offer: a flood of
+        # distinct identities advertising out-of-range terms therefore used to cost
+        # one whole-wallet write per identity, over a dict that grew with each --
+        # quadratic disk I/O, performed while this wallet's evaluation lock is
+        # held. See `_record_provider_faults_bulk`.
+        malformed: List[str] = []
         faulted_this_pass: set = set()  # fault each bad provider at most once/pass
         for o in raw_offers:
             # ``max_forward`` (not ``max_reverse``) is the provider's cap on a
@@ -5068,11 +6829,130 @@ class LiquidityPlugin(BasePlugin):
                 # At most once per pass, so a provider spamming many bad offers
                 # under one identity can't amplify into a burst of db writes.
                 faulted_this_pass.add(npub)
-                self._record_provider_fault(
-                    wallet, npub, "advertised malformed/out-of-range offer", soft=True)
+                malformed.append(npub)
             elif not npub:
                 self.logger.info("dropping offer with unusable provider identity")
+        if malformed and wallet is not None:
+            self._record_provider_faults_bulk(
+                wallet, malformed, "advertised malformed/out-of-range offer")
         return offers
+
+    def _bounded_offers(self, wallet: Optional['Abstract_Wallet'],
+                        raw_offers: List[Any], *, quiet: bool = False) -> List[Any]:
+        """At most ``MAX_DISCOVERED_PROVIDERS`` of the offers on the wire.
+
+        There is no cost to publishing a nostr offer and no gatekeeper on who may,
+        so the discovered set is attacker-sized: every per-offer step downstream
+        (validation, the reliability-penalty join, the ranking, the profile
+        lookup, and -- before the batching above -- a wallet-file write each)
+        scaled with however many events a flooder cared to sign.
+
+        Which ones to keep, when there are too many, is chosen to be the opposite
+        of cheap-to-game:
+
+          * providers this wallet already has reliability history for come first.
+            A flooder's fresh identities have none, and cannot acquire any without
+            actually being selected and transacted with;
+          * then by announcement proof-of-work, which costs real work per
+            identity -- the one signal in an offer an attacker cannot fake for
+            free. (Electrum already verifies the announcement's signature and the
+            client's own PoW target before an offer reaches us at all.)
+
+        Ties and non-numeric PoW values keep their arrival order, so in the
+        ordinary case -- a handful of honest providers, far below the cap -- this
+        returns the list untouched and changes nothing.
+
+        ``quiet`` suppresses the "ignored N offers" report. Set by the
+        name-lookup caller, which re-derives the same bound over the same offers
+        purely to size a nostr filter: reporting it there would say the same
+        thing twice per tick about one capped discovery pass.
+        """
+        if len(raw_offers) <= MAX_DISCOVERED_PROVIDERS:
+            return raw_offers
+        known: frozenset = frozenset()
+        if wallet is not None:
+            try:
+                known = frozenset(self._load_reliability(wallet))
+            except Exception:  # noqa: BLE001  (ranking hygiene must not break a tick)
+                known = frozenset()
+
+        def _rank(indexed) -> tuple:
+            index, offer = indexed
+            npub = clean_npub(getattr(offer, "server_npub", None))
+            try:
+                pow_bits = int(getattr(offer, "pow_bits", 0) or 0)
+            except (TypeError, ValueError):
+                pow_bits = 0
+            # Negated so that "known" and "more PoW" sort FIRST under an
+            # ascending sort, with `index` breaking ties by arrival order.
+            return (0 if npub and npub in known else 1, -pow_bits, index)
+
+        kept = sorted(enumerate(raw_offers), key=_rank)[:MAX_DISCOVERED_PROVIDERS]
+        dropped = len(raw_offers) - len(kept)
+        if not quiet:
+            # Never silent: a capped discovery pass means the plugin may not have
+            # considered the cheapest provider on the network, and that has to be
+            # visible rather than inferred from a swap that was dearer than
+            # expected.
+            self.logger.warning(
+                f"{len(raw_offers)} swap offers were advertised, which is more "
+                f"than this plugin will consider; kept {len(kept)} (providers "
+                f"already known to this wallet, then highest announcement "
+                f"proof-of-work) and ignored {dropped}")
+            if wallet is not None:
+                self._diag_event(
+                    wallet, category="error", kind="providers",
+                    reason="more swap offers advertised than will be considered",
+                    detail=(f"{len(raw_offers)} advertised; kept "
+                            f"{MAX_DISCOVERED_PROVIDERS}, ignored {dropped}"))
+        # Back into arrival order, so this is purely a filter and the downstream
+        # ordering stays the engine's business.
+        return [offer for _index, offer in sorted(kept, key=lambda iv: iv[0])]
+
+    def _record_provider_faults_bulk(self, wallet: 'Abstract_Wallet',
+                                     npubs: Sequence[str], reason: str) -> None:
+        """Record one soft fault for each of ``npubs`` in a SINGLE wallet-file
+        write.
+
+        Same effect as calling :meth:`_record_provider_fault` per npub, and the
+        escalation arithmetic is deliberately identical (soft faults floor the
+        counter at one decaying level and never compound) -- but the store is
+        loaded once, mutated in memory, and saved once. That is the difference
+        between a flood of malformed offers costing one write and costing one
+        write per identity over a growing dict.
+
+        The per-npub log line and Faults-log entry are kept: those are bounded by
+        the discovery cap and are how an operator sees what is being advertised at
+        them. The decision-log append is rate-limited separately (see
+        ``_log_fault``), so this cannot flush the log either.
+        """
+        if not npubs:
+            return
+        data = self._load_reliability(wallet)
+        now = time.time()
+        for npub in npubs:
+            if not npub:
+                continue
+            s = data.get(npub, {})
+            prev = self._aged_consecutive_faults(wallet, s)
+            s["consecutive_faults"] = max(prev, 1)   # soft: floor, never escalate
+            s["fault_count"] = int(s.get("fault_count", 0)) + 1
+            s["last_fault_ts"] = now
+            s["last_reason"] = reason
+            data[npub] = s
+        self._save_reliability(wallet, data)
+        self.logger.info(
+            f"{len(npubs)} provider(s) soft-faulted: {reason} "
+            f"({', '.join(n[:12] + '…' for n in npubs[:5])}"
+            f"{', …' if len(npubs) > 5 else ''})")
+        # One log write for the batch too. Appending per npub would have moved the
+        # quadratic cost from the reliability store straight onto the decision
+        # log, which is a whole-wallet write per entry.
+        rows = [self._fault_log_entry(kind="provider", ident=npub, reason=reason,
+                                      hard=False, soft=True)
+                for npub in npubs
+                if npub and self._fault_log_allowed(wallet, "provider", npub)]
+        self._append_log_many(wallet, rows)
 
     @staticmethod
     def _chan_unsettled_is_swap(chan, sm) -> bool:
@@ -5372,6 +7252,11 @@ class LiquidityPlugin(BasePlugin):
         # Set of channel ids (hex) the plugin opened itself, for the
         # manage-plugin-opened-only scope switch. Read once per snapshot.
         plugin_opened = self._plugin_opened_channels(wallet)
+        # The two persisted inputs to the channel-ceiling discount (see
+        # liquidity_manager.offline_discount_applies), read ONCE per snapshot
+        # rather than per channel: both are whole-wallet JSON blobs.
+        close_intents = self._load_json_dict(wallet, CLOSE_INTENT_DB_KEY)
+        offline_streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
         for chan in lnworker.channels.values():
             # Skip dead channels. Electrum keeps CLOSED/REDEEMED channel records
             # in ``lnworker.channels`` indefinitely (they are only dropped when the
@@ -5393,7 +7278,8 @@ class LiquidityPlugin(BasePlugin):
             # the next line.
             if chan.get_state() in closing_states:
                 closing_channel_count += 1
-            if chan.get_state() in pending_states:
+            is_pending = chan.get_state() in pending_states
+            if is_pending:
                 # Age is from channel creation for BOTH horizons: this is the
                 # freeze-escape clock, and it must always run so a pre-OPEN
                 # channel un-freezes the plugin eventually no matter what.
@@ -5423,6 +7309,10 @@ class LiquidityPlugin(BasePlugin):
             # stops the engine from mislabelling our just-issued swap as a "possible
             # stuck payment" while its on-chain funding confirms.
             unsettled_is_swap = has_unsettled and self._chan_unsettled_is_swap(chan, sm)
+            # Offline-discount inputs. A channel with no streak record simply
+            # carries 0, which leaves it counting toward the ceiling in full --
+            # the safe direction, since it cannot manufacture a channel open.
+            cid_hex = chan.channel_id.hex()
             channels.append(ChannelSnapshot(
                 channel_id=chan.channel_id.hex(),
                 short_id=str(chan.short_channel_id) if chan.short_channel_id else chan.channel_id.hex()[:8],
@@ -5433,9 +7323,12 @@ class LiquidityPlugin(BasePlugin):
                 is_active=chan.is_active(),
                 has_unsettled_htlcs=has_unsettled,
                 unsettled_is_swap=unsettled_is_swap,
-                is_plugin_opened=chan.channel_id.hex() in plugin_opened,
+                is_plugin_opened=cid_hex in plugin_opened,
                 is_frozen_for_sending=self._chan_frozen_for_sending(chan),
                 frozen_by_user=self._chan_frozen_by_user(chan),
+                is_pending=is_pending,
+                close_intent=cid_hex in close_intents,
+                offline_streak_sec=offline_streak_sec(offline_streaks.get(cid_hex)),
             ))
         # Reverse swaps with a broadcast-but-not-yet-swept funding tx; Electrum's
         # own "must stay online for these" set. Self-clears on settle/refund, so
@@ -5695,9 +7588,16 @@ class LiquidityPlugin(BasePlugin):
         """
         return (
             snapshot.onchain_spendable_sat,
+            # The moment a channel stops occupying a slot is included, because
+            # the open it frees must not wait out a backoff that thinks nothing
+            # has changed. Deliberately the DERIVED verdict and not the raw
+            # ``offline_streak_sec``: the streak grows on every tick while a peer
+            # is down, so including it would make this signature differ on every
+            # tick of an outage and the backoff would never engage.
             tuple((ch.channel_id, ch.capacity_sat, ch.local_sat, ch.remote_sat,
                    ch.spendable_local_sat, ch.is_active, ch.has_unsettled_htlcs,
-                   ch.unsettled_is_swap, ch.is_plugin_opened)
+                   ch.unsettled_is_swap, ch.is_plugin_opened, ch.is_pending,
+                   ch.close_intent, channel_is_offline_discounted(ch, config))
                   for ch in snapshot.channels),
             snapshot.pending_channel_count,
             snapshot.pending_open_freeze_count,
@@ -5910,6 +7810,12 @@ class LiquidityPlugin(BasePlugin):
                     self._set_status(wallet, "discovering swap providers")
                     async with self._swap_session(wallet) as transport:
                         snapshot = self.build_snapshot(wallet, transport)
+                        # Fill in any provider display name we have never looked
+                        # up, while a relay session is open anyway. A no-op once
+                        # every discovered provider is cached, which is the
+                        # steady state -- so this costs nothing on the swap path
+                        # except when a provider is new to us.
+                        await self._refresh_provider_profiles(wallet, transport)
                         acted = await self._run_decision(wallet, snapshot, config, transport)
                 else:
                     acted = await self._run_decision(wallet, base, config, None)
@@ -6088,15 +7994,37 @@ class LiquidityPlugin(BasePlugin):
 
     async def refresh_providers(self, wallet: 'Abstract_Wallet') -> List[ProviderOffer]:
         """Open a session, discover providers, cache and return them. Used by the
-        Providers settings tab's refresh button."""
+        Providers settings tab's refresh button.
+
+        Also re-reads every discovered provider's display name. Forced, unlike
+        the evaluation tick's gap-fill: this is the user explicitly asking for
+        the provider list to be brought up to date, which includes a provider
+        that has published or changed a profile since we last looked.
+        """
         async with self._swap_session(wallet) as transport:
             offers = self._offers_from_transport(wallet, transport)
             self._last_offers[wallet] = offers
+            await self._refresh_provider_profiles(wallet, transport, force=True)
             return offers
 
     def discovered_providers(self, wallet: 'Abstract_Wallet') -> List[ProviderOffer]:
-        """Last set of providers discovered on nostr (may be empty)."""
-        return list(self._last_offers.get(wallet, []))
+        """Last set of providers discovered on nostr (may be empty).
+
+        Hardened because this is no longer a GUI-only read: the provider-name
+        cache prune consults it from the tick, where neither failure below may
+        escape into the middle of an evaluation.
+
+        * read through ``_per_wallet_store``, since the glue harnesses build a
+          plugin via ``object.__new__`` without ``BasePlugin.__init__`` and the
+          attribute may not exist at all;
+        * tolerate a wallet that cannot be a dict key. This store is keyed by
+          wallet object, which every real ``Abstract_Wallet`` supports; an
+          unhashable stand-in simply has no discovered offers.
+        """
+        try:
+            return list(self._per_wallet_store("_last_offers").get(wallet, []))
+        except TypeError:
+            return []
 
     @log_exceptions
     async def _execute(self, wallet: 'Abstract_Wallet', action: Action,
@@ -6215,6 +8143,11 @@ class LiquidityPlugin(BasePlugin):
             # Count this open toward the rolling-24h open ceiling.
             self._bookkeep("open against the daily ceiling",
                            self._record_action_event, wallet, "open")
+            # ...and toward the lifetime totals (the "how much liquidity did
+            # this plugin provision" figures).
+            self._bookkeep("open against the lifetime totals",
+                           self._bump_usage_totals, wallet,
+                           channels_opened_total=1, sats_funded_total=int(funding_sat))
             self._bookkeep(
                 "open in the decision log", self._log_action,
                 wallet, kind="open", amount_sat=funding_sat,
@@ -6414,6 +8347,10 @@ class LiquidityPlugin(BasePlugin):
         # THIS cascade. The ladder means one provider can appear at several sizes;
         # the fault belongs to the provider, so it is charged at most once here.
         charged_npubs: Set[str] = set()
+        # Providers whose Attempts tally has already been bumped for this cascade,
+        # for the same reason: the ladder lists one provider at several sizes, and
+        # turning to it once is one attempt however many amounts we then try.
+        attempted_npubs: Set[str] = set()
         async with session as tr:
             for index, (attempt, offer) in enumerate(attempts, start=1):
                 if self._stop_cascade_for_shutdown(wallet, action, total - index + 1):
@@ -6430,6 +8367,13 @@ class LiquidityPlugin(BasePlugin):
                         source=attempt.npub,
                         detail=f"{remaining} rung(s) untried after {index - 1} attempt(s)")
                     break
+                # Bumped here, before the first rung runs, rather than after the
+                # walk: the cascade can leave by half a dozen paths (commit,
+                # abort, shutdown, deadline) and "we turned to this provider" is
+                # already true by the time any of them is taken.
+                if attempt.npub and attempt.npub not in attempted_npubs:
+                    attempted_npubs.add(attempt.npub)
+                    self._record_provider_attempt(wallet, attempt.npub)
                 rungs = self._attempt_rungs(attempt)
                 stop = False
                 # Whether any rung for THIS entry died with a failed Lightning
@@ -6924,16 +8868,23 @@ class LiquidityPlugin(BasePlugin):
                              detail=f"{type(e).__name__}: {e}")
             return _SwapAttempt.NEXT if retryable else _SwapAttempt.ABORT
         if funding_txid:
-            # The provider created the on-chain funding output: it honoured the
-            # swap. Count it as a success straight away (the claim is Electrum's
-            # job from here). This is a confirmed completion, so accrue the dev fee
-            # now, on the net on-chain amount received.
+            # The provider created the on-chain funding output: it committed to
+            # the swap, and the claim is Electrum's job from here. So this logs
+            # the action and ends the cascade -- a real funding txid is the ONLY
+            # thing that logs an action. See the unfunded arms below for why that
+            # boundary is drawn here and not after them.
             #
-            # A real funding txid is the ONLY thing that logs an action. See the
-            # unfunded arms below for why that boundary is drawn here and not after
-            # them.
-            self._record_provider_success(wallet, npub)
-            self._accrue_dev_fee(wallet, expected_onchain_sat, source=action.short_id)
+            # What it does NOT do is count the swap COMPLETE. That needs the
+            # funding tx to confirm: the txid here comes from an unconfirmed
+            # sighting and Electrum notes it can change under RBF, so crediting
+            # the provider with a success and charging the user a dev fee at this
+            # moment would both be done on sats that may never arrive (see
+            # _swap_funding_confirmed). Instead the swap is TRACKED, exactly as the
+            # unfunded paths track theirs, and reconciliation grants the success,
+            # the fee and the lifetime totals once the funding confirms -- or ages
+            # the record out if it never does.
+            self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                  expected_onchain_sat)
             # This channel just worked, so forget whatever failure we last recorded
             # for it: a recurrence after a success is news, not a repeat.
             self._last_exec_decline_sig.pop(action.channel_id, None)
@@ -7500,16 +9451,20 @@ class LiquidityPlugin(BasePlugin):
             out.append(capped)
         return out
 
-    def _sink_fee_budget(self, wallet: 'Abstract_Wallet', amount_sat: int):
-        """The routing-fee budget for a sink payment: the user's existing
-        ``max_swap_fee_pct`` ceiling, applied to the amount being sent.
+    def _ln_fee_budget(self, wallet: 'Abstract_Wallet', amount_sat: int):
+        """The routing-fee budget for a Lightning payment the plugin makes: the
+        user's existing ``max_swap_fee_pct`` ceiling, applied to the amount sent.
 
-        The same knob governs both drain routes on purpose -- it is the answer to
+        The same knob governs every drain route on purpose -- it is the answer to
         "how much am I willing to pay to convert outbound into inbound", and a
         sink payment converts exactly what a reverse swap does. Note the ceiling
         is strict: a route costing more is not taken, which surfaces as a payment
         failure and drops the ladder to its next rung. A ceiling of 0 therefore
         permits only zero-fee routes (a direct channel to the sink's node).
+
+        Also used for the dev-fee payout, which had no budget at all and so paid
+        routes up to Electrum's own default rather than the ceiling this wallet
+        configured -- a fee on top of the fee, out of the user's channel.
 
         Takes the wallet because the ceiling is ITS ceiling: this read was left
         on the installation-wide config, so a wallet that lowered its fee
@@ -7681,7 +9636,7 @@ class LiquidityPlugin(BasePlugin):
             payment_hash = bytes.fromhex(invoice.rhash)
         except Exception:  # noqa: BLE001
             payment_hash = b""
-        kwargs: Dict[str, Any] = {"budget": self._sink_fee_budget(wallet, amount_sat)}
+        kwargs: Dict[str, Any] = {"budget": self._ln_fee_budget(wallet, amount_sat)}
         if chan is not None:
             kwargs["channels"] = [chan]
         try:
@@ -7719,6 +9674,8 @@ class LiquidityPlugin(BasePlugin):
             # which is what the dev fee is charged on -- here on the amount sent,
             # the sink's equivalent of a swap's net on-chain receipt.
             self._accrue_dev_fee(wallet, amount_sat, source=action.short_id)
+            self._bump_usage_totals(wallet, sink_payments_total=1,
+                                    sats_sunk_total=int(amount_sat))
             self._log_action(
                 wallet, kind="sink", amount_sat=amount_sat,
                 source=action.short_id, dest=action.address,
@@ -7860,9 +9817,17 @@ class LiquidityPlugin(BasePlugin):
         preferred = _parse_partner_list(c.INBOUND_LIQUIDITY_PREFERRED_PARTNERS)
         banned = _parse_banned_partners(c.INBOUND_LIQUIDITY_BANNED_PARTNERS)
         strict = bool(c.INBOUND_LIQUIDITY_PARTNERS_STRICT)
-        exclude: frozenset = frozenset()
+        # Peers that have gone dark are never a candidate, switch or no switch,
+        # and `ignore_peers` does not relax this one -- see
+        # :meth:`_offline_discounted_peer_ids`. (The two sets cannot actually
+        # overlap today: `ignore_peers` only ever names the peer of a channel the
+        # replacement rule is about to close COOPERATIVELY, which requires that
+        # peer to be reachable, and a reachable peer is not discounted unless the
+        # watchdog already holds a close intent on it -- in which case excluding
+        # it is right anyway.)
+        exclude: frozenset = self._offline_discounted_peer_ids(wallet)
         if apply_peer_guard and bool(c.INBOUND_LIQUIDITY_ONE_CHANNEL_PER_PEER):
-            exclude = self._current_peer_node_ids(wallet) - frozenset(ignore_peers)
+            exclude |= self._current_peer_node_ids(wallet) - frozenset(ignore_peers)
         suggested: List[str] = []
         if not strict:
             suggested = [node_id.hex() for node_id in await self._suggest_peers(wallet)]
@@ -7982,6 +9947,64 @@ class LiquidityPlugin(BasePlugin):
                 continue
             if nid:
                 out.add(nid)
+        return frozenset(out)
+
+    def _offline_discounted_peer_ids(self, wallet: 'Abstract_Wallet') -> frozenset:
+        """Normalized pubkeys of the peers whose channel has stopped counting
+        toward the channel ceiling because they have gone dark (see
+        ``liquidity_manager.offline_discount_applies``).
+
+        Excluded from channel-partner selection UNCONDITIONALLY -- unlike the
+        one-channel-per-peer exclusion, this one is not behind a switch. The
+        discount is the very thing that authorised the extra open, so opening it
+        back to the node that went dark would be self-defeating: a second channel
+        to an unreachable peer receives nothing, cannot be cooperatively closed,
+        and costs a funding fee to find that out. With the one-channel-per-peer
+        guard ON this is already covered (the dead peer still holds a non-closed
+        channel); this is what covers it with the guard off.
+
+        Asks the ENGINE predicate rather than re-deriving the rule, so the set of
+        peers excluded here cannot drift from the set of channels discounted in
+        the snapshot.
+        """
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return frozenset()
+        try:
+            from electrum.lnchannel import ChannelState
+        except Exception:
+            return frozenset()
+        try:
+            channels = list(lnworker.channels.values())
+        except Exception:
+            return frozenset()
+        plugin_opened = self._plugin_opened_channels(wallet)
+        close_intents = self._load_json_dict(wallet, CLOSE_INTENT_DB_KEY)
+        streaks = self._load_json_dict(wallet, CHANNEL_OFFLINE_STREAK_DB_KEY)
+        discount_after_sec = self._offline_discount_after_sec(wallet)
+        pending_states = (ChannelState.PREOPENING, ChannelState.OPENING,
+                          ChannelState.FUNDED)
+        out: set = set()
+        for chan in channels:
+            try:
+                state = chan.get_state()
+                if state >= ChannelState.CLOSED:
+                    continue
+                cid_hex = chan.channel_id.hex()
+                node_id = normalize_node_id(chan.node_id.hex())
+                is_active = bool(chan.is_active())
+            except Exception:
+                continue
+            if not node_id:
+                continue
+            if offline_discount_applies(
+                    is_plugin_opened=cid_hex in plugin_opened,
+                    is_pending=state in pending_states,
+                    is_active=is_active,
+                    close_intent=cid_hex in close_intents,
+                    offline_streak_sec=offline_streak_sec(streaks.get(cid_hex)),
+                    discount_after_sec=discount_after_sec):
+                out.add(node_id)
         return frozenset(out)
 
     def node_alias(self, wallet: 'Abstract_Wallet', node_id_hex: str) -> str:
@@ -8144,6 +10167,44 @@ class LiquidityPlugin(BasePlugin):
             days = DEFAULT_LOG_RETENTION_DAYS
         return max(1, min(days, MAX_LOG_RETENTION_DAYS))
 
+    def _fault_log_allowed(self, wallet: 'Abstract_Wallet', kind: str,
+                           ident: str) -> bool:
+        """Whether this party may append another fault row to the decision log
+        yet. One per identity per ``FAULT_LOG_MIN_INTERVAL_SEC``.
+
+        Keyed per identity rather than globally on purpose: a single misbehaving
+        provider must not be able to mute the log for everyone else, which a
+        global throttle would let it do. In-memory (not persisted) -- the window
+        is minutes and the only cost of forgetting it on restart is one extra row
+        per identity.
+
+        The bookkeeping dict is itself bounded, since the identities are
+        attacker-supplied: past ``FAULT_LOG_MAX_TRACKED`` the oldest stamps are
+        dropped, which at worst lets an identity log one row sooner than the
+        window would have allowed.
+
+        Fails OPEN. This is a flood guard, not a correctness gate, so a wallet
+        object that cannot key the store (an unhashable stand-in) gets its entry
+        logged rather than losing it to the throttle's own bookkeeping.
+        """
+        try:
+            stamps = self._per_wallet_store("_fault_log_stamps").setdefault(wallet, {})
+        except TypeError:
+            return True
+        now = time.monotonic()
+        key = f"{kind}:{ident}"
+        last = stamps.get(key)
+        if last is not None and (now - last) < FAULT_LOG_MIN_INTERVAL_SEC:
+            return False
+        if len(stamps) >= FAULT_LOG_MAX_TRACKED and key not in stamps:
+            # Drop the least recently stamped half, so this is amortised rather
+            # than a sort on every fault once the dict is full.
+            for stale, _ts in sorted(stamps.items(), key=lambda kv: kv[1])[
+                    :max(1, FAULT_LOG_MAX_TRACKED // 2)]:
+                stamps.pop(stale, None)
+        stamps[key] = now
+        return True
+
     def _log_fault(self, wallet: 'Abstract_Wallet', *, kind: str, ident: str,
                    reason: str, hard: bool, soft: bool = False) -> None:
         """Append a reliability fault to the decision log (category "fault") so its
@@ -8151,11 +10212,31 @@ class LiquidityPlugin(BasePlugin):
         "provider"; ``ident`` is the node id / npub. ``soft`` marks an ambiguous,
         non-escalating fault (see :meth:`_record_provider_fault`) so the Faults
         view can show it is a low-severity/transient signal, not a real fault. A
-        no-op for db-less wallets (unit-test mocks)."""
+        no-op for db-less wallets (unit-test mocks).
+
+        Rate-limited per (kind, identity), because the decision log is a ring
+        pruned to ``MAX_LOG_ENTRIES`` and faults are the one category an outside
+        party can provoke at will: anyone may publish a malformed nostr offer, and
+        each used to append an entry. Enough of them and every genuine row -- the
+        opens, swaps and closes the operator audits their money with -- is evicted
+        from the only record of it. A fault that is suppressed is still recorded
+        where it decides anything (the reliability store and its counters, written
+        by the caller); what is dropped is a duplicate log line.
+        """
         if getattr(wallet, "db", None) is None:
             return
+        if not self._fault_log_allowed(wallet, kind, ident):
+            return
+        self._append_log(wallet, self._fault_log_entry(
+            kind=kind, ident=ident, reason=reason, hard=hard, soft=soft))
+
+    def _fault_log_entry(self, *, kind: str, ident: str, reason: str,
+                         hard: bool, soft: bool) -> Dict:
+        """One fault row, built but not written. Split out so the batch path
+        (:meth:`_record_provider_faults_bulk`) produces rows identical to the
+        single-fault path's rather than a second transcription of them."""
         prefix = "soft fault: " if soft else ("hard fault: " if hard else "fault: ")
-        entry = {
+        return {
             "ts": time.time(),
             "category": "fault",
             "kind": kind,
@@ -8166,7 +10247,6 @@ class LiquidityPlugin(BasePlugin):
             "detail": None,
             "state": {},
         }
-        self._append_log(wallet, entry)
 
     def _state_dict(self, wallet: 'Abstract_Wallet', snapshot: LiquiditySnapshot,
                     config: LiquidityConfig) -> Dict:
@@ -8176,6 +10256,11 @@ class LiquidityPlugin(BasePlugin):
             "onchain_spendable_sat": snapshot.onchain_spendable_sat,
             "num_channels": len(snapshot.channels),
             "active_channels": sum(1 for c in snapshot.channels if c.is_active),
+            # What the channel ceiling is actually measured against: the channel
+            # count minus the offline-discounted ones. Dumped next to the raw
+            # count because the pair is the whole answer to "I am at max
+            # channels, why did it open another one?" (and its inverse).
+            "effective_channels": effective_channel_count(snapshot, config),
             "pending_channel_count": snapshot.pending_channel_count,
             "pending_open_freeze_count": snapshot.pending_open_freeze_count,
             "inflight_swap_count": snapshot.inflight_swap_count,
@@ -8211,6 +10296,7 @@ class LiquidityPlugin(BasePlugin):
                 "disable_submarine_swaps": config.disable_submarine_swaps,
                 "manage_plugin_opened_only": config.manage_plugin_opened_only,
                 "max_opens_per_day": config.max_opens_per_day,
+                "offline_open_allowance": config.offline_open_allowance,
                 "max_closes_per_day": self._max_closes_per_day(wallet),
                 "stuck_swap_timeout_min": int(self._stuck_swap_timeout_sec(wallet) // 60),
                 "preferred_npubs": sorted(config.preferred_npubs),
@@ -8225,6 +10311,12 @@ class LiquidityPlugin(BasePlugin):
                     "spendable_local_sat": c.spendable_local_sat,
                     "is_active": c.is_active,
                     "is_plugin_opened": c.is_plugin_opened,
+                    # Why this channel does (or does not) hold a slot, and the
+                    # evidence behind it: how long its peer has been observed
+                    # gone, and whether the auto-close watchdog has committed.
+                    "offline_discounted": channel_is_offline_discounted(c, config),
+                    "offline_streak_sec": int(c.offline_streak_sec),
+                    "close_intent": c.close_intent,
                 }
                 for c in snapshot.channels
             ],
@@ -8317,13 +10409,58 @@ class LiquidityPlugin(BasePlugin):
 
     def _prune(self, wallet: 'Abstract_Wallet',
                entries: List[Dict]) -> List[Dict]:
+        """Apply retention, then the size cap -- with a reserve that faults may
+        not eat into.
+
+        The size cap alone was a plain "keep the newest N", which made the log
+        evictable by whoever could generate the most entries. Faults are the one
+        category an outside party can provoke on demand (publishing a malformed
+        nostr offer costs nothing, and every distinct identity earns its own row),
+        so a flood pushed out every action, decline and lifecycle row -- emptying
+        the only record an operator has of what the plugin did with their money,
+        which is precisely what somebody doing that would want.
+
+        Note why a per-identity throttle is not sufficient on its own and is not
+        what this relies on: a flooder uses a FRESH identity per offer, so every
+        row looks like a different party's first fault. The bound has to be on the
+        share of the log faults may occupy, not on the rate any one party reports
+        at. ``_fault_log_allowed`` still throttles a single repeat offender, which
+        is a different (and cheaper) problem.
+
+        So: faults are held to ``MAX_FAULT_LOG_SHARE`` of the cap, keeping the
+        newest of them, and everything else keeps the rest. Within each group the
+        newest survive, and the result is restored to chronological order so
+        readers and the retention pass see an unchanged shape.
+        """
         cutoff = time.time() - self._retention_days(wallet) * 86400
         kept = [e for e in entries if float(e.get("ts", 0)) >= cutoff]
-        if len(kept) > MAX_LOG_ENTRIES:
-            kept = kept[-MAX_LOG_ENTRIES:]
-        return kept
+        if len(kept) <= MAX_LOG_ENTRIES:
+            return kept
+        fault_budget = int(MAX_LOG_ENTRIES * MAX_FAULT_LOG_SHARE)
+        faults = [e for e in kept if e.get("category") == "fault"]
+        others = [e for e in kept if e.get("category") != "fault"]
+        faults = faults[-fault_budget:]
+        # Faults that did not use their whole budget leave room for the rest, so
+        # a quiet wallet still fills the log with its own history.
+        others = others[-(MAX_LOG_ENTRIES - len(faults)):]
+        merged = others + faults
+        merged.sort(key=lambda e: float(e.get("ts", 0)))
+        return merged
 
     def _append_log(self, wallet: 'Abstract_Wallet', entry: Dict) -> None:
+        self._append_log_many(wallet, [entry])
+
+    def _append_log_many(self, wallet: 'Abstract_Wallet',
+                         new_entries: Sequence[Dict]) -> None:
+        """Append entries to the decision log in ONE wallet-file write.
+
+        Batched because the single-entry path is a whole-wallet write each time,
+        and one discovery pass can legitimately produce an entry per provider.
+        Writing per entry made a flood of malformed offers cost a write per
+        identity over a growing list -- the same quadratic shape
+        ``_record_provider_faults_bulk`` exists to avoid on the reliability
+        store, which is where that cost simply moved to until this.
+        """
         if getattr(wallet, "db", None) is None:
             # No store to append to. Matches _log_fault's own guard: a wallet with
             # no db is a unit-test mock, and the decision log is a record of what
@@ -8331,17 +10468,20 @@ class LiquidityPlugin(BasePlugin):
             # it can change no behaviour. Guarded here rather than in each
             # _log_* caller so every category is covered by one rule.
             return
+        if not new_entries:
+            return
         entries = self._load_log(wallet)
-        entries.append(entry)
+        entries.extend(new_entries)
         entries = self._prune(wallet, entries)
         try:
             wallet.db.put(LOG_DB_KEY, entries)
             wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist decision log: {e!r}", exc_info=True)
-        # Mirror the same already-scrubbed entry to the on-disk diagnostic log
+        # Mirror the same already-scrubbed entries to the on-disk diagnostic log
         # (a no-op unless the operator has enabled it).
-        self._diag_write(wallet, entry)
+        for entry in new_entries:
+            self._diag_write(wallet, entry)
         self.on_log_changed(wallet)
 
     # --- diagnostic log file (opt-in) -------------------------------------
@@ -8449,6 +10589,33 @@ def _register_commands() -> None:
         arg:str:value:The new value, parsed against the setting's declared type. Booleans accept true/false/yes/no/on/off/1/0
         """
         return plugin.set_setting(wallet, str(name).strip().upper(), value)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def usage_stats_status(self, plugin=None, wallet=None) -> Dict[str, Any]:
+        """
+        Show this wallet's anonymous-usage-statistics state: the chosen level,
+        the random identifier (if it has ever opted in), when a report was last
+        sent or last failed, and whether anything can be sent at all.
+
+        Read-only -- it never opts a wallet in. The level is an ordinary
+        setting, so `inbound_liquidity_set_setting usage_stats_level 2` is how
+        a headless install opts in (the GUI's consent screen is the same
+        choice, with previews).
+        """
+        return plugin.usage_stats_status(wallet)
+
+    @plugin_command('w', _PLUGIN_NAME)
+    async def usage_stats_preview(self, level, plugin=None, wallet=None) -> str:
+        """
+        Show exactly what this wallet WOULD send at a given level, without
+        sending anything or changing any setting.
+
+        Rendered by the same code that builds the real report, so this is the
+        report rather than a description of one.
+
+        arg:str:level:1 (count me), 2 (plus settings) or 3 (plus liquidity totals)
+        """
+        return plugin.usage_stats_preview(wallet, int(level))
 
     @plugin_command('w', _PLUGIN_NAME)
     async def reset_settings(self, plugin=None, wallet=None) -> Dict[str, Any]:

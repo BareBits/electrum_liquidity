@@ -10,3 +10,10 @@ e2e/electrum
 e2e/.venv-electrum
 e2e/bin
 e2e/.run
+
+# The usage-statistics receiver writes its database next to itself, which is
+# what happens if you serve scripts/analytics-endpoint/ in place to try it out
+# locally (see its README). Real reports, even test ones, are never committed.
+scripts/analytics-endpoint/*.sqlite
+scripts/analytics-endpoint/*.sqlite-wal
+scripts/analytics-endpoint/*.sqlite-shm

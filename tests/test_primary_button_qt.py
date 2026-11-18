@@ -28,8 +28,8 @@ from electrum.plugins.inbound_liquidity.qt_widgets import (  # type: ignore  # n
 )
 
 from test_qt_tab import (  # noqa: E402,F401
-    _FakeWallet, _FakeWindow, _make_plugin, _plain_line_edits,
-    _silence_log_tab_timer, qapp,
+    _FakeWallet, _FakeWindow, _advanced_apply, _advanced_pane, _make_plugin,
+    _plain_line_edits, _silence_log_tab_timer, qapp,
 )
 
 # The sub-tabs that carry an Apply, by index in the Liquidity tab.
@@ -37,14 +37,44 @@ APPLY_TABS = {0: "Settings", 1: "Swap providers", 2: "Channel partners",
               3: "Advanced"}
 
 
-def _apply_buttons(plugin, wallet):
-    """Every sub-tab's Apply, keyed by the sub-tab's title."""
+def _apply_panes(plugin, wallet):
+    """Every Apply-gated pane, keyed by the title the user sees.
+
+    Advanced contributes TWO entries, but not two symmetrical ones. Its three
+    content panes (General / Reliability / Channel recovery) are one form with
+    one shared Apply pinned below the inner tab bar, so "Advanced" here is the
+    whole Advanced tab -- the only widget that holds both those fields and the
+    button that saves them. Usage statistics is a genuinely separate pane with
+    its own Apply inside it, and is resolved on its own.
+
+    Note the two overlap: the Usage statistics pane is a descendant of the
+    Advanced tab. Harmless for both callers, which either look up one Apply per
+    title or skip every button named "Apply".
+    """
     sub = plugin._tabs[wallet].container.findChild(QTabWidget)
-    found = {}
+    panes = {}
     for index, title in APPLY_TABS.items():
         assert sub.tabText(index) == title, \
             f"sub-tab {index} is {sub.tabText(index)!r}, not {title!r}"
-        buttons = [b for b in sub.widget(index).findChildren(QPushButton)
+        if title == "Advanced":
+            panes["Advanced"] = sub.widget(index)
+            panes["Usage statistics"] = _advanced_pane(
+                plugin, wallet, "Usage statistics")
+        else:
+            panes[title] = sub.widget(index)
+    return panes
+
+
+def _apply_buttons(plugin, wallet):
+    """Every Apply-gated pane's Apply, keyed by the pane's title."""
+    found = {}
+    for title, pane in _apply_panes(plugin, wallet).items():
+        if title == "Advanced":
+            # Its own Apply is pinned outside the inner bar; searching the whole
+            # tab would also turn up the usage pane's.
+            found[title] = _advanced_apply(plugin, wallet)
+            continue
+        buttons = [b for b in pane.findChildren(QPushButton)
                    if b.text() == "Apply"]
         assert len(buttons) == 1, f"{title}: expected one Apply, got {len(buttons)}"
         found[title] = buttons[0]
@@ -112,9 +142,8 @@ def test_no_other_button_was_painted_green(qapp) -> None:
     # Reset / Refresh / Run now share those rows; the green is what marks the
     # one that commits the form.
     p, wallet = _built()
-    sub = p._tabs[wallet].container.findChild(QTabWidget)
-    for index, title in APPLY_TABS.items():
-        for btn in sub.widget(index).findChildren(QPushButton):
+    for title, pane in _apply_panes(p, wallet).items():
+        for btn in pane.findChildren(QPushButton):
             if btn.text() == "Apply":
                 continue
             assert ACCENT_GREEN not in btn.styleSheet(), \
@@ -150,8 +179,7 @@ def test_the_partners_apply_still_persists_its_form(qapp) -> None:
 
 def test_the_advanced_apply_still_persists_its_form(qapp) -> None:
     p, wallet = _built()
-    sub = p._tabs[wallet].container.findChild(QTabWidget)
-    edits = _plain_line_edits(sub.widget(3))
+    edits = _plain_line_edits(_advanced_pane(p, wallet, "General"))
     assert edits, "the Advanced tab has no plain text fields"
     before = p.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY
     _apply_buttons(p, wallet)["Advanced"].click()

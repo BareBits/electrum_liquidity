@@ -296,3 +296,190 @@ def test_env_for_prepends_pythonpath_and_keeps_existing():
     assert env["HOME"] == "/h"
     assert env[trampoline_stub.TRAMPOLINE_JSON_ENV] == str(trampoline_stub.TRAMPOLINE_JSON)
     assert (trampoline_stub.INJECT_DIR / "sitecustomize.py").exists()
+
+
+# --- the rig never reports usage statistics -------------------------------
+#
+# A rig wallet is a test fixture, not a user. The plugin already refuses to
+# report from regtest, so these assert the SECOND, independent guard: the
+# endpoint kill switch, applied to everything a rig spawns.
+
+def test_preflight_switches_usage_reporting_off(monkeypatch):
+    """Applied in `preflight`, not only in `main`, because every e2e module
+    builds its rig by constructing Rig directly -- so a kill switch that only
+    ran in `main` would be missing from exactly the rigs that run unattended."""
+    import run as run_mod
+
+    monkeypatch.delenv(run_mod.USAGE_STATS_ENDPOINT_ENV, raising=False)
+    run_mod._disable_usage_stats_by_default()
+    assert os.environ[run_mod.USAGE_STATS_ENDPOINT_ENV] == "disabled"
+
+
+def test_an_explicit_endpoint_is_left_alone(monkeypatch):
+    """`setdefault`, not an assignment: the usage-statistics e2e test points the
+    rig at its own local receiver, and that is the one case where a rig is
+    supposed to send a report."""
+    import run as run_mod
+
+    monkeypatch.setenv(run_mod.USAGE_STATS_ENDPOINT_ENV,
+                       "http://127.0.0.1:9/report.php")
+    run_mod._disable_usage_stats_by_default()
+    assert os.environ[run_mod.USAGE_STATS_ENDPOINT_ENV] == \
+        "http://127.0.0.1:9/report.php"
+
+
+# --- orchestrator self-discovery (no re-exec) -----------------------------
+#
+# A process cannot stamp the rig marker into its own /proc/environ (the environ
+# block is fixed at exec time), so the orchestrator used to re-execv itself at
+# startup to get one. Under a test runner that "process" is pytest, so the
+# re-exec restarted the whole session -- and did it while pytest had fd 1/2
+# redirected to capture tempfiles that are unlinked when the session dies, so the
+# output went to an orphaned inode.
+#
+# It now records its pid plus its start time instead. These cover the guard that
+# makes acting on a recorded pid safe at all.
+
+def test_proc_starttime_reads_our_own(tmp_path) -> None:
+    from rig.procman import _proc_starttime
+    mine = _proc_starttime(os.getpid())
+    assert isinstance(mine, int) and mine > 0
+    # Stable across calls -- it is a property of the process, not the moment.
+    assert _proc_starttime(os.getpid()) == mine
+
+
+def test_proc_starttime_survives_a_comm_with_spaces_and_parens(tmp_path, monkeypatch) -> None:
+    """Field 2 of /proc/<pid>/stat is the executable name in parentheses and may
+    contain spaces and parens. Splitting the whole line on whitespace is the
+    classic way to misread this file, so the parse starts after the LAST ')'."""
+    import io
+
+    from rig import procman
+
+    # A real stat line's shape: pid, "(comm)", state, then 49 more fields.
+    # Field 22 overall -- the 20th after the comm -- is starttime.
+    fields = ["4242", "(ev il) proc)", "S"]
+    fields += [str(i) for i in range(4, 22)]      # fields 4..21
+    fields.append("987654")                        # field 22: starttime
+    fields += [str(i) for i in range(23, 53)]      # fields 23..52
+    stat_file = tmp_path / "stat"
+    stat_file.write_text(" ".join(fields))
+
+    # Redirect only this pid's stat read; everything else opens normally.
+    real_open = io.open
+
+    def _fake_open(path, *args, **kwargs):
+        if str(path) == "/proc/4242/stat":
+            return real_open(stat_file, *args, **kwargs)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(procman, "open", _fake_open, raising=False)
+    assert procman._proc_starttime(4242) == 987654, (
+        "the comm field's spaces/parens were not skipped correctly")
+
+
+def test_proc_starttime_is_none_for_a_dead_pid() -> None:
+    from rig.procman import _proc_starttime
+    # PID 2^22 is above the default pid_max, so it cannot exist.
+    assert _proc_starttime(4194304 + 1) is None
+
+
+def _write_state(path, **over) -> None:
+    import json
+    state = {
+        "orchestrator_pid": os.getpid(),
+        "orchestrator_starttime": None,
+        "marker": paths.MARKER_VALUE,
+        "children": [],
+    }
+    from rig.procman import _proc_starttime
+    state["orchestrator_starttime"] = _proc_starttime(os.getpid())
+    state.update(over)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+
+
+def test_previous_orchestrator_is_found_when_pid_and_starttime_agree(monkeypatch, tmp_path) -> None:
+    from rig import paths as rig_paths, procman
+    state = tmp_path / "state.json"
+    _write_state(state)
+    monkeypatch.setattr(rig_paths, "STATE_FILE", state)
+    monkeypatch.setattr(procman.paths, "STATE_FILE", state, raising=False)
+    assert procman._previous_orchestrator_pid() == os.getpid()
+
+
+def test_a_recycled_pid_is_refused(monkeypatch, tmp_path) -> None:
+    """The guard that earns this mechanism its keep. A pid in a file is a
+    liability on its own: by the time the next run reads it, the kernel may have
+    handed that number to something unrelated -- and the outcome here is a
+    SIGKILL. A mismatched start time must be refused."""
+    from rig import procman
+    state = tmp_path / "state.json"
+    _write_state(state, orchestrator_starttime=1)   # our pid, somebody else's start
+    monkeypatch.setattr(procman.paths, "STATE_FILE", state, raising=False)
+    assert procman._previous_orchestrator_pid() is None
+
+
+def test_a_state_file_from_another_checkout_is_ignored(monkeypatch, tmp_path) -> None:
+    from rig import procman
+    state = tmp_path / "state.json"
+    _write_state(state, marker="/somewhere/else/.run")
+    monkeypatch.setattr(procman.paths, "STATE_FILE", state, raising=False)
+    assert procman._previous_orchestrator_pid() is None
+
+
+def test_a_state_file_predating_the_starttime_field_is_declined(monkeypatch, tmp_path) -> None:
+    """An older build's state file has a pid and no start time. Declining is
+    deliberate -- a pid alone cannot be acted on safely."""
+    import json
+    from rig import procman
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "orchestrator_pid": os.getpid(),
+        "marker": paths.MARKER_VALUE,
+        "children": [],
+    }))
+    monkeypatch.setattr(procman.paths, "STATE_FILE", state, raising=False)
+    assert procman._previous_orchestrator_pid() is None
+
+
+@pytest.mark.parametrize("body", ["not json", "[]", '"a string"', "null"])
+def test_a_malformed_state_file_is_ignored(monkeypatch, tmp_path, body) -> None:
+    from rig import procman
+    state = tmp_path / "state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(body)
+    monkeypatch.setattr(procman.paths, "STATE_FILE", state, raising=False)
+    assert procman._previous_orchestrator_pid() is None
+
+
+def test_a_missing_state_file_is_ignored(monkeypatch, tmp_path) -> None:
+    from rig import procman
+    monkeypatch.setattr(procman.paths, "STATE_FILE", tmp_path / "nope.json",
+                        raising=False)
+    assert procman._previous_orchestrator_pid() is None
+
+
+def test_ensure_marked_does_not_reexec_and_marks_only_this_process(monkeypatch) -> None:
+    """The regression this change is about.
+
+    `_ensure_marked` must set the marker in THIS process's environment and
+    return -- never hand control to `os.execv`, which under pytest restarts the
+    entire test session. Marking the environment is also what keeps the marker
+    off the orchestrator's ANCESTORS: exporting it in the shell instead would
+    mark the parent shell and any `timeout` wrapper, and `find_rig_pids`
+    excludes only `os.getpid()`, so the first sweep would SIGTERM whatever is
+    holding the test run open.
+    """
+    import run as run_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("_ensure_marked re-exec'd the interpreter")
+    monkeypatch.setattr(os, "execv", _boom)
+    monkeypatch.delenv(paths.MARKER_ENV, raising=False)
+
+    run_mod._ensure_marked()
+    assert os.environ[paths.MARKER_ENV] == paths.MARKER_VALUE
+    # Idempotent: calling it again (every rig fixture does) is a no-op.
+    run_mod._ensure_marked()
+    assert os.environ[paths.MARKER_ENV] == paths.MARKER_VALUE

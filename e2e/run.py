@@ -195,6 +195,7 @@ class Rig:
 
     # -- lifecycle ----------------------------------------------------------
     def preflight(self) -> None:
+        _disable_usage_stats_by_default()
         killed = self.pm.kill_previous()
         if killed:
             log(f"killed {len(killed)} leftover process(es) from a previous run: {killed}")
@@ -883,16 +884,71 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _ensure_marked() -> None:
-    """Re-exec once so this process's /proc/environ carries the rig marker, so a
-    future launch can discover and kill it. execv preserves the PID."""
-    if os.environ.get(paths.MARKER_ENV) == paths.MARKER_VALUE:
-        return
+    """Mark this run so a future launch can discover and clean up after it.
+
+    Two things need to be discoverable, and they are found differently:
+
+    * CHILDREN carry the marker in their environment, which ``procman.spawn``
+      stamps on each one explicitly. Setting it here as well means anything the
+      rig starts outside ``spawn`` (an ``electrum`` CLI call, say) inherits it
+      too;
+    * the ORCHESTRATOR records its pid and start time in ``state.json``
+      (``procman._write_state`` / ``_previous_orchestrator_pid``).
+
+    It does NOT re-exec, and that is the point of this function's existence.
+    A process cannot stamp its own ``/proc/environ`` -- the environ block is
+    captured at ``exec`` time -- so making the orchestrator self-discoverable
+    that way required re-``execv``-ing the interpreter at startup. That is
+    harmless for ``python run.py`` and destructive for everything else: every
+    e2e test calls this from a fixture, where the "process" is PYTEST, so the
+    re-exec restarted the entire test session mid-run. Worse, it did so while
+    pytest had fd 1 and 2 redirected to its capture tempfiles, which are
+    unlinked when the original session dies -- so a suite's entire output
+    vanished into an orphaned inode, and the run could only be observed at all
+    with ``-s``.
+
+    Setting an env var in the shell is NOT a substitute, and is actively unsafe:
+    it marks the orchestrator's ANCESTORS too (the shell, a ``timeout`` wrapper),
+    and ``find_rig_pids`` excludes only ``os.getpid()`` -- so the first sweep
+    SIGTERMs the parent that is holding the test run open. The marker must land
+    on this process and nothing above it; recording the pid achieves that without
+    touching the environment at all.
+    """
     os.environ[paths.MARKER_ENV] = paths.MARKER_VALUE
-    os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+
+
+# The plugin's usage-reporting kill switch (inbound_liquidity/__init__.py's
+# USAGE_STATS_ENDPOINT_ENV). Spelled out rather than imported: run.py is the
+# rig launcher and must work without importing the plugin package, which needs
+# Electrum on the path.
+USAGE_STATS_ENDPOINT_ENV = "ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT"
+
+
+def _disable_usage_stats_by_default() -> None:
+    """Switch the plugin's usage reporting off for everything this rig spawns,
+    unless the caller has deliberately set the endpoint themselves.
+
+    Belt and braces over a guarantee the plugin already makes: a rig wallet is
+    on regtest, and the plugin refuses to report from regtest at all. This adds
+    the endpoint kill switch on top, so a rig can never contact the real
+    endpoint even if someone sets the regtest override by hand, or if a future
+    change moves the network check.
+
+    `setdefault`, not an assignment, so the usage-statistics e2e test can point
+    the rig at its own local receiver instead -- which is the one case where a
+    rig is supposed to send a report, and it sends it to php -S on loopback.
+
+    Called from ``Rig.preflight`` rather than only from ``main``: every e2e
+    module builds its rig by constructing ``Rig`` directly, so a kill switch
+    that only ran in ``main`` would be absent from exactly the 25 rigs that run
+    unattended. Idempotent, so calling it from both is harmless.
+    """
+    os.environ.setdefault(USAGE_STATS_ENDPOINT_ENV, "disabled")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     _ensure_marked()
+    _disable_usage_stats_by_default()
     args = parse_args(argv)
     if args.blocks < 101:
         log("warning: --blocks < 101 means coinbase coins will not be spendable yet")

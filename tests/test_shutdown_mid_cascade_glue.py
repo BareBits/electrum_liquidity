@@ -165,10 +165,22 @@ def _plugin() -> LiquidityPlugin:
         new = set(sm._swaps) - before
         if new:
             p.tracked.append((npub, exp))
+        p._last_tracked_npub = npub
         return new
     p._track_new_swaps = _track
     p._diag_event = lambda wallet, **kw: p.diags.append(kw)
-    p._log_action = lambda wallet, **kw: p.logged.append(kw)
+
+    # Which provider's swap committed funding. Not `successes`: the executor logs
+    # the action and stops the cascade, but leaves the provider's success (and the
+    # dev fee) to reconciliation once the funding tx confirms -- an unconfirmed
+    # funding txid can still be replaced under RBF. See `_swap_funding_confirmed`.
+    p.committed = []
+
+    def _log_action(wallet, **kw):
+        p.logged.append(kw)
+        if kw.get("kind") == "swap":
+            p.committed.append(getattr(p, "_last_tracked_npub", None))
+    p._log_action = _log_action
     p._log_decline = lambda wallet, decline, state: p.declines.append((decline, state))
     p._last_exec_decline_sig = {}
     p.on_action_done = lambda wallet, msg: None
@@ -238,7 +250,9 @@ def test_shutdown_stops_the_cascade_before_a_reduced_rung() -> None:
 def test_shutdown_does_not_interrupt_the_attempt_already_running() -> None:
     """The safety line. An attempt whose Lightning payment may already be in
     flight runs to completion even though the wallet is closing -- and if it
-    funds, it is recorded as the success it is."""
+    funds, the action is logged and the swap tracked, so the completion is not
+    lost to the shutdown. (The fee and the provider's success follow from
+    reconciliation once the funding confirms, on this or a later run.)"""
     sm = _SM({})
     p = _plugin()
     wallet = _Wallet(sm)
@@ -246,13 +260,19 @@ def test_shutdown_does_not_interrupt_the_attempt_already_running() -> None:
     async def _begin_closing_then_fund(sm_, **kw):
         p.begin_shutdown(wallet)
         await asyncio.sleep(0)            # a real await, mid-attempt
+        # Registers the swap before returning the txid, as Electrum does.
+        key = f"{len(sm_._swaps):02x}" + "ee" * 31
+        sm_._swaps[key] = SimpleNamespace(prepay_hash=None,
+                                          funding_txid="txid-A",
+                                          is_redeemed=False)
         return "txid-A"
 
     sm.outcomes[A] = _begin_closing_then_fund
     asyncio.run(p._reverse_swap(wallet, _action(), state={},
                                 transport=_transport([A, B, C])))
-    assert p.successes == [A]
-    assert p.dev_fees == [(399_500, "1x1x1")]
+    assert p.committed == [A]
+    assert p.dev_fees == []                        # charged on confirmation
+    assert p.tracked == [(A, 399_500)]             # ... on this basis
     assert len(p.logged) == 1
 
 
@@ -313,7 +333,7 @@ def test_a_cascade_on_a_wallet_that_is_not_closing_is_untouched() -> None:
     asyncio.run(p._reverse_swap(wallet, _action(), state={},
                                 transport=_transport([A, B, C])))
     assert [n for n, _amt in sm.attempts] == [A, B, C]
-    assert p.successes == [C]
+    assert p.committed == [C]
 
 
 # --- the in-flight record, and what teardown waits on ---------------------

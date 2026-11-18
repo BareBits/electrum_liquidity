@@ -97,11 +97,25 @@ def test_an_unknown_name_reads_as_a_dash(qapp) -> None:
     assert tree.topLevelItem(0).text(p._PARTNER_NAME_COL) == "—"
 
 
+def _tooltip_text(item, col: int) -> str:
+    """What a tooltip actually DISPLAYS.
+
+    Tooltips are built by `_literal_tooltip`, which escapes the text and wraps
+    it so QToolTip renders it verbatim instead of interpreting any tag inside
+    it. These tests care about the rendered characters, not that markup, so
+    they read it back through the same renderer Qt uses.
+    """
+    from PyQt6.QtGui import QTextDocument
+    doc = QTextDocument()
+    doc.setHtml(item.toolTip(col))
+    return doc.toPlainText()
+
+
 def test_the_name_cell_shows_the_full_name_and_id_on_hover(qapp) -> None:
     # Both values are shortened in the table: the name is elided at the column
     # width, the id is abbreviated outright.
     p, _w, tree = _build({NODE_A: "ACINQ"})
-    assert tree.topLevelItem(0).toolTip(p._PARTNER_NAME_COL) == f"ACINQ\n{NODE_A}"
+    assert _tooltip_text(tree.topLevelItem(0), p._PARTNER_NAME_COL) == f"ACINQ\n{NODE_A}"
 
 
 def test_an_untrusted_name_is_sanitised_before_it_reaches_the_cell(qapp) -> None:
@@ -167,7 +181,7 @@ def test_the_fault_reason_tooltip_is_on_the_faults_column(qapp) -> None:
     p._record_peer_fault(wallet, NODE_A, "could not connect", hard=False)
     p._tabs[wallet].refresh()
     row = _partners_tree(p, wallet).topLevelItem(0)
-    assert row.toolTip(p._PARTNER_FAULTS_COL) == "could not connect"
+    assert _tooltip_text(row, p._PARTNER_FAULTS_COL) == "could not connect"
     assert _headers(_partners_tree(p, wallet))[p._PARTNER_FAULTS_COL] == "Faults"
 
 

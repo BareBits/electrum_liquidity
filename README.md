@@ -61,8 +61,17 @@ wallet, applies the rules below, and executes the resulting actions.
 
 ## Rules (configurable from the Liquidity tab)
 
-The everyday settings live on the **Settings** sub-tab; power-user knobs live on
-the **Advanced** sub-tab, and the partner/provider lists on their own sub-tabs.
+The everyday settings live on the **Settings** sub-tab; power-user knobs live
+behind **Advanced**, which holds four panes of its own — **General** (the
+feature toggles, the daily action ceilings and the plain tuning amounts),
+**Reliability** (how provider and peer faults are scored), **Channel recovery**
+(the wedged-open, stuck-swap and offline auto-close timeouts) and **Usage
+statistics** (the opt-in reporting controls). The partner and provider lists
+have their own sub-tabs.
+
+The first three Advanced panes are one form in three views: a single **Apply**
+and **Reset**, pinned below the pane bar, save all of them together.
+
 This table lists the most-used settings and their tab — the tabs also carry more
 knobs not shown here (reliability tuning, offline auto-close, daily action
 ceilings, diagnostics, etc.).
@@ -101,6 +110,7 @@ and the shipped default for everything else. See
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
 | `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once, by dialog, the first time the plugin loads. Nothing is ever downloaded or installed | `false` |
+| `trampoline_warned` | — | Bookkeeping, not a preference: whether this wallet has been told that trampoline routing undercuts the plugin. Set once the dialog has been answered, either way, so the question is asked once per wallet and never again. See [Trampoline routing](#trampoline-routing) | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
 (bounded by what Electrum can actually *send* over the channel, minus any
@@ -531,21 +541,23 @@ first open is still confirming.
 
 A channel that is merely **still confirming** (its funding tx has not yet reached
 the depth the peer requires) is treated differently: it blocks only a further
-channel *open* — for up to the **confirming-open freeze** (Advanced tab, default
-3 days) — and never blocks reverse swaps on other, already-open channels. In a
-high-fee environment a funding tx can legitimately take days to confirm, and
-stalling unrelated channels for that long is pure lost value.
+channel *open* — for up to the **confirming-open freeze** (Advanced → Channel
+recovery, default 3 days) — and never blocks reverse swaps on other,
+already-open channels. In a high-fee environment a funding tx can legitimately
+take days to confirm, and stalling unrelated channels for that long is pure
+lost value.
 
 Two exceptions keep one genuinely wedged operation from freezing automation
 forever:
 
-- a channel stuck *opening* past the **stuck channel-open timeout** (Advanced
-  tab, default 60 min) is treated as wedged by an unresponsive peer — it no
-  longer counts toward the freeze, so automation can resume, and
+- a channel stuck *opening* past the **stuck channel-open timeout** (Advanced →
+  Channel recovery, default 60 min) is treated as wedged by an unresponsive
+  peer — it no longer counts toward the freeze, so automation can resume, and
 - a reverse swap whose funding is broadcast but still unswept past the **stuck
-  reverse-swap timeout** (Advanced tab, default 3 h) likewise stops counting
-  toward the freeze. The swap is still tracked and its provider still faulted
-  separately — this only releases the freeze so other opens/swaps can proceed.
+  reverse-swap timeout** (Advanced → Channel recovery, default 3 h) likewise
+  stops counting toward the freeze. The swap is still tracked and its provider
+  still faulted separately — this only releases the freeze so other opens/swaps
+  can proceed.
 
 ### Closing a wedged channel open
 
@@ -558,7 +570,7 @@ of which must pass:
    confirmations, nothing is wrong and the clock does not even start.
 2. **The wedge clock**, timed from the first moment the channel looked wedged —
    *not* from when it was created, so time spent waiting for confirmations never
-   counts against it. Default 6 h (Advanced tab).
+   counts against it. Default 6 h (Advanced → Channel recovery).
 3. **Repeated, spread-out evidence**: the channel must look wedged on several
    separate checks (default 5) spanning at least a minimum interval (default
    60 min). Evaluation ticks are event-driven and can fire in bursts, so a count
@@ -653,7 +665,8 @@ next to a link to the release notes.
 
 It is **off until you say otherwise**. The first time the plugin loads it asks,
 once, with a dialog; whichever way you answer is remembered, and you can change
-it later from **Advanced → Check GitHub for plugin updates**. Declining is
+it later from **Advanced → General → Check GitHub for plugin updates**.
+Declining is
 final — you are not asked again — and a headless (`cmdline`) install, where
 there is no dialog, never checks unless the setting is turned on explicitly.
 
@@ -668,6 +681,101 @@ What it never does is download or install anything. A plugin that can rewrite
 its own code turns a compromised GitHub account — or one intercepted response —
 into code execution against a wallet holding funds. You get a version number and
 a link; updating stays a step you take deliberately.
+
+### Anonymous usage statistics (opt-in)
+
+The plugin can send us a small report so we know how many people run it, which
+settings matter, and how much liquidity it actually provisions. It is **off
+until you choose a level**, and the plugin behaves identically either way.
+
+You are asked once, on a consent screen that shows **the exact report** each
+level would send. That is not a description of the report — the preview is
+rendered by the same function that builds the real one, so what you are shown is
+what would be sent. Pick a level and press *Save my choice*; *Ask me later*
+records nothing at all, and so do Escape and the close button. Change or revoke
+the choice at any time under **Advanced → Usage statistics**, which shows the
+same live preview.
+
+**Never sent, at any level:** any personally identifiable information,
+including your addresses, transactions, invoices, channel ids, balances,
+channel capacities, sink Lightning address, channel peers' node ids,
+providers' npubs, wallet name, file paths, seed or any key material. Where
+a setting *is* an identifier, the report carries only whether it is set, or how
+long a list is — `sink_configured: true`, never the address;
+`preferred_npubs_count: 2`, never the npubs.
+
+The levels are cumulative:
+
+| Level | Name | Adds |
+|---|---|---|
+| 0 | Off | Nothing is sent. The default. |
+| 1 | Count me | A random identifier, the plugin/Electrum/Python versions, OS family, desktop-or-headless, and which network you are on. |
+| 2 | Settings | The settings you chose, as numbers and booleans: goal, channel limits, fee ceiling, swap triggers, daily ceilings, dev-fee percentage, feature toggles. |
+| 3 | Liquidity | Lifetime totals — channels opened and closed, sats funded, swaps completed, sats swapped, sink payments, sats sunk, dev fee paid — plus how many channels are open now and how many the plugin manages. |
+
+Level 3 is **running totals and counts only**. A lifetime total says what the
+plugin did; a balance would say what your wallet holds, and that is never
+reported. Those lifetime counters are new in this version, so they start at zero
+on upgrade — there is no pruned history to backfill from, and inventing one
+would be a guess presented as a measurement. They accrue locally from then on
+whether or not you ever opt in, and are only ever *transmitted* at level 3.
+
+**The identifier** is a random UUIDv4 minted the moment you opt in. It is not
+derived from your wallet, its keys, its seed or its path, so nobody — us
+included — can work backwards from it, and a wallet that never opts in never has
+one. Opting out keeps it locally so a later re-opt-in is the same install rather
+than a second one.
+
+**Scope is per wallet**, like every other setting here: you are asked for each
+wallet and each reports separately. A three-wallet user therefore appears as
+three installs. That was a deliberate trade — accurate consent over an accurate
+user count — because the alternative would have made this the one setting that
+is not a property of the wallet it belongs to, and would have let one wallet's
+choice start reporting on another's behalf.
+
+**Cadence and transport:** one report on opting in, then one a week, through
+Electrum's configured proxy like every other HTTP call the wallet makes. A
+failed attempt backs off an hour rather than a week. The endpoint is
+`getbarebits.com/liqanalytics/report.php` — a path of its own, so these reports
+never mingle with the sister software's.
+
+Our side sees the IP the request came from, as any HTTPS server does. It is used
+for a per-address rate limit (held two hours at most) and to resolve a country
+in memory; only the two-letter country is stored with the report, never the
+address.
+
+**Two independent ways nothing is sent**, each sufficient on its own:
+
+- `ELECTRUM_INBOUND_LIQUIDITY_USAGE_ENDPOINT=disabled` switches reporting off
+  for the whole installation, whatever any wallet has chosen. For packagers and
+  managed deployments.
+- **Regtest is suppressed outright.** A regtest wallet is a test fixture, not a
+  user, and counting rigs as installs would corrupt the very numbers this
+  exists to produce. The rig's own e2e test overrides this with an env-only
+  escape hatch that ships off, so it can exercise a real send against a local
+  copy of the receiver.
+
+**How the promise is enforced rather than just made.** The complete per-level
+field list is one allowlist in `inbound_liquidity/usage_stats.py`; the builder
+intersects its output with it, so a field added by mistake is not sent. The
+receiver in `scripts/analytics-endpoint/` enforces its own copy of the same list
+and *refuses* a report carrying anything else, so even a client bug could not
+widen what is collected. The tests assert the two lists agree field for field,
+and separately build a level-3 report from a wallet deliberately stuffed with
+addresses, txids, channel ids, node ids, npubs and balances, failing if any of
+them turns up anywhere in the result.
+
+Full detail, including what the dev fee and update check disclose, is in
+[PRIVACY.md](PRIVACY.md).
+
+Headless installs have no consent screen, so they never report unless opted in
+explicitly:
+
+```bash
+electrum inbound_liquidity_set_setting usage_stats_level 2 -w <wallet>
+electrum inbound_liquidity_usage_stats_status -w <wallet>
+electrum inbound_liquidity_usage_stats_preview 3 -w <wallet>   # shows, sends nothing
+```
 
 ### Decision log
 
@@ -760,6 +868,87 @@ partner). If asking Electrum for a suggestion failed outright, that is named too
 rather than reported as "the network has nobody for you". The same line is
 written to the log, so it shows up in the **Log** sub-tab as well.
 
+### Small windows
+
+Every settings pane scrolls, and its **Apply** (with **Reset**, the status line
+and the **Status** footer) stays pinned below the scrolling part rather than
+travelling with it.
+
+Both halves of that matter, because a Qt tab given less height than its contents
+need does not scroll by default — it shrinks every widget instead, and a label
+shrunk below its text paints that text cut off. Electrum's own default window is
+840×400, which leaves roughly 290px of tab area against the Advanced form's
+~1030px, so at the shipped window size the panes used to shave a few pixels off
+every row (and squeeze the provider and partner tables down to a header strip
+with no rows visible) with no way to reach the rest of the form. Now the pane
+scrolls and the button that commits it cannot end up below the fold.
+
+On a tall window nothing changes: the tables still expand to fill the tab, and
+no scrollbar appears until it is needed.
+
+### Unsaved changes
+
+Four sub-tabs hold their edits until you press **Apply**: **Settings**, **Swap
+providers**, **Channel partners** and **Advanced**. That is deliberate — several
+of those fields are cross-validated against each other, and half of them move
+money — but it means a typed value and a saved value look identical on screen.
+
+So the tab says which it is. While anything on it differs from what the wallet
+has stored, **Click APPLY to save changes** appears under the status line, and
+goes away when you apply it (or when you type the old value back — undoing your
+own edit leaves nothing to save). A configuration warning already on that line
+keeps its place *above* the hint rather than being hidden by it; a stale
+*"Settings saved."* does not, because it stopped being true.
+
+Navigating away with edits outstanding asks what to do about them — both between
+these sub-tabs and when you leave the **Liquidity** tab for one of Electrum's
+own, in which case every dirty sub-tab is named, not just the one in front of
+you:
+
+- **Apply changes** runs that tab's Apply, validation included. If a value is
+  refused, you land back on the tab with the reason on screen, rather than
+  walking away believing it saved. On **Advanced**, whose one Apply covers three
+  panes, you land on the pane holding the value that was refused.
+- **Ignore** leaves them unsaved and leaves them **in the fields** — nothing is
+  discarded. You are not asked about that same set of pending edits again; edit
+  something further and you are.
+
+The three tabs that rebuild themselves from the wallet on ordinary events
+(channel updates, provider refreshes) no longer overwrite edits in flight: the
+live columns keep refreshing, the fields and tick-boxes you are working in do
+not move.
+
+### Trampoline routing
+
+Electrum finds Lightning routes one of two ways: download the network gossip and
+path-find locally, or hand the payment to a **trampoline** node. Trampoline is
+Electrum's default, and it is the worse half of the bargain for this plugin:
+
+- **it costs more** — the trampoline node's fee rides on top of the route's, and
+  every reverse swap and every sink payment the plugin makes pays it;
+- **it is centralised** — a handful of nodes carry the payments, and a channel
+  can only be opened to one of them at all;
+- **it blinds the plugin** — the node aliases on the **Channel partners** tab
+  come from gossip, so most peers show no name, and the peer suggestions a
+  channel open walks come from the same place.
+
+So the first time a managed wallet loads while trampoline is on, the plugin says
+so once and offers to switch: *"Yes, switch to full gossip mode (suggested)"* or
+*"No"*. Answering it either way is remembered per wallet (`trampoline_warned`),
+so you are not asked again — opening a second wallet is a second person to tell,
+and is asked separately.
+
+Saying yes does exactly what Electrum's own **Preferences** switch does: turns
+off trampoline, turns on gossip and starts the sync. The routing mode itself is
+Electrum's process-wide setting, not a per-wallet one, so it applies to every
+wallet; only the record of having asked is per wallet.
+
+Because that dialog is shown only once, a **standing banner** at the top of the
+**Settings** tab says the same thing for as long as the condition holds, with a
+**Switch to full gossip mode** button beside it. It appears if you decline, if
+you dismiss the dialog, and if you switch back to trampoline later from
+Electrum's Preferences.
+
 ### Reading the provider and partner tables
 
 Both list tabs — **Swap providers** and **Channel partners** — sort on any
@@ -783,8 +972,65 @@ peer announces over Lightning gossip, which is the same name Electrum's own
 (`lnworker.lnpeermgr.get_node_alias`). It reads `—` whenever this wallet has not
 been told a name, and with gossip off — Electrum's default — that is most peers,
 because trampoline routing downloads no node announcements. Turn gossip on and
-the names fill in. The node id is still there in the next column, and hovering
+the names fill in — see [Trampoline routing](#trampoline-routing), which offers
+to do exactly that. The node id is still there in the next column, and hovering
 the name shows both in full.
+
+The **Swap providers** tab likewise leads with a **Provider name** column — but
+a provider's name is a very different kind of thing from a peer's, and worth a
+paragraph before you rely on it.
+
+A swap offer carries **no name at all**. Electrum's provider announcement (a
+nostr `kind 30315` event) holds fees, limits, relays and a proof-of-work nonce,
+and nothing else — which is why this tab showed a bare npub for so long. What a
+provider *can* do is publish an ordinary **nostr profile** (`kind 0`) under the
+same key it signs its offers with, and that profile may carry a name. So the
+plugin looks one up for every provider it discovers, and shows it here.
+
+Three things follow, all of them worth knowing:
+
+- **Most providers have no name.** Publishing a profile is optional and separate
+  from running a swapserver, so `—` in this column is the normal case, not a
+  failure. The lookup is also strictly cosmetic: it is bounded to a few seconds,
+  it runs on a relay session the plugin already has open, and if it fails or
+  times out you lose a name and nothing else — never a swap.
+- **A name is not an identity.** Nothing verifies it. Any key can publish any
+  name, including one already used by a provider you trust. The **npub** in the
+  next column is the real identity, and it is what the preferred and banned
+  lists, the reliability history and the swap addressing all match on — a name
+  decides nothing anywhere in the plugin.
+- **Clashes are flagged.** If two providers on the list publish the same name,
+  both rows are marked **⚠** and hovering either says so. That is the
+  impersonation case made visible rather than left for you to notice.
+
+Hovering a name shows where it came from, along with the full npub. Sorting by
+this column orders by the name itself (so the ⚠ marker does not shuffle
+anything, and two rows claiming one name stay adjacent); providers with no name
+sort to the bottom either way. A name is cached per wallet, so it survives a
+restart and still shows for a provider that has since gone offline — the rows
+built from reliability history alone, which by definition advertise nothing.
+**Refresh** re-reads every discovered provider's profile.
+
+The tab also carries two tallies side by side, which answer different questions
+and are easy to conflate:
+
+- **Attempts** — how many times the plugin *turned to* this provider for a swap.
+  Counted once per provider per cascade, so a provider retried at a smaller size
+  after a failed payment counts once, not twice; a provider that then turned out
+  to be unreachable still counts, because we did try it.
+- **Successes** — how many of those it actually delivered, i.e. produced an
+  on-chain funding output for.
+
+Both are display only — neither feeds the ranking, which reads the **Faults**
+and **Penalty %** columns instead. Together they distinguish the two states that
+used to look identical: a provider nobody has ever tried (`0 / 0`), and one
+tried repeatedly that never delivers (`0 / 7`). **Reset stats** clears them along
+with the rest of the row.
+
+The **Channel partners** table lists **peers we have seen or tried** — not a
+list of candidates to pick from. That is peers you hold a channel with *and*
+peers you only have a fault history for, which is where to look after a failed
+open. A node that is not listed at all goes in the **Preferred partners** box.
 
 An alias is chosen by the remote node, so it is treated as untrusted text:
 control characters and line breaks (which would spill a row over its neighbours)
@@ -814,7 +1060,8 @@ installation and start moving its funds. (`plugins.inbound_liquidity.enabled`
 is still a config key; that is Electrum's own "is this plugin loaded", not a
 setting of the plugin.)
 
-**Resetting.** *Advanced → Reset this wallet to defaults* discards everything
+**Resetting.** *Advanced → Reset this wallet to defaults* (the button pinned
+below the pane bar, so it is in reach from any of them) discards everything
 stored for that wallet, putting it back on the shipped defaults. No other wallet
 is touched, and nothing about channels, swaps or funds changes.
 
@@ -864,10 +1111,15 @@ inbound_liquidity/
   manifest.json         plugin metadata (available_for: qt, cmdline)
   __init__.py           ConfigVars + base plugin: per-wallet settings store, event wiring, snapshot,
                         executor, decision-log store, dev fee, daily ceilings, offline auto-close,
+                        the provider display-name (nostr kind-0) lookup and its cache,
                         MIN_FUNDING_SAT floor override, and the inbound_liquidity_* CLI commands
   liquidity_manager.py  PURE rules engine (no Electrum imports) — evaluate(snapshot, config) -> DecisionResult
+  usage_stats.py        PURE opt-in usage-report builder (no Electrum imports) — the per-level field
+                        allowlist, build_payload(), and the preview the consent screen shows
   qt.py                 top-level "Liquidity" main-window tab (Settings / Swap providers /
-                        Channel partners / Advanced / Actions / Declines / Faults / Log sub-tabs),
+                        Channel partners / Advanced [General | Reliability |
+                        Channel recovery | Usage statistics] /
+                        Actions / Declines / Faults / Log sub-tabs),
                         plus the grafts onto Electrum's own GUI: the Channels tab's "Managed by"
                         column, the balance pie chart's liquidity-goal-buffer slice, and the
                         Send tab's inline buffer warning
@@ -879,7 +1131,15 @@ inbound_liquidity/
 tests/                  pure-engine unit tests + Electrum-glue tests covering the rules engine,
                         per-wallet settings, decision log, provider/peer reliability, dev fee, daily
                         caps, offline auto-close, startup readiness, diagnostics, the Qt tab (incl.
-                        one tab per open wallet), and the funding floor
+                        one tab per open wallet), the funding floor, and the opt-in usage
+                        statistics (engine, glue, consent screen, and that the shipped PHP
+                        receiver enforces the same allowlist)
+scripts/
+  analytics-endpoint/   the receiving end of the opt-in usage statistics: report.php (validates
+                        against its own copy of the per-level allowlist and stores one row per
+                        install), common.php, summary.php, import-geo.php (the DB-IP
+                        IP-to-country table). Deployed to getbarebits.com/liqanalytics/
+PRIVACY.md              what is and is not sent, for all three network flows
 ```
 
 The decision logic lives in `liquidity_manager.py` as a pure function
@@ -913,6 +1173,63 @@ dominate at small amounts. With the default `max_swap_fee_pct = 0.9` the plugin
 will correctly **decline** those as uneconomical; raise **"Max fee to move LN →
 on-chain"** on the **Liquidity → Settings** tab (e.g. to 10, then **Apply**) to
 watch swaps actually execute against the rig provider.
+
+## Handling untrusted input
+
+Most of what this plugin acts on comes from somebody else: a swap provider's
+nostr announcement, a Lightning peer's gossip, GitHub's release feed. None of it
+is trustworthy, so each kind is gated at the boundary and, separately, rendered
+safely wherever it is shown.
+
+| Source | What arrives | Gate |
+|---|---|---|
+| nostr offer | fees, limits, PoW | `validate_offer` — typed, finite, bounded, non-negative |
+| nostr offer | provider identity | `clean_npub` / `looks_like_hex_pubkey` — bech32 / 64-hex shape |
+| nostr offer | announced relays | `clean_relay_urls` — hygiene only; see the note below |
+| nostr kind 0 | provider display name | `parse_provider_name` → `clean_display_name` |
+| nostr DM | provider error replies | `scrub_text` before logging; never stored or shown |
+| Lightning gossip | peer node alias | `clean_display_name` |
+| Lightning / swap | fault reasons | `scrub_text`, bounded, on write **and** on read |
+| GitHub | release tag, URL | `extract_release` — version rebuilt from digits, `https://` only |
+
+Two rules run through all of it.
+
+**The gate makes the value inert; the sink makes it inert *on screen*.** These
+are different jobs. A name may legitimately contain `<` or `&`, so the sanitiser
+keeps them — which means every widget that displays outside text has to not
+interpret them. Qt makes that easy to get wrong: `QLabel` defaults to
+`Qt.AutoText` and silently switches to HTML for anything that looks like markup,
+and `QToolTip` always interprets rich text with no per-item opt-out. So the
+status line is pinned to `PlainText`, and every tooltip built from outside data
+goes through `_literal_tooltip`, which escapes it and wraps it in markup we
+wrote. The table cells were already safe — the item delegate draws plain text.
+
+**An identity is never a name.** Ranking, the preferred/banned lists, fault
+attribution and swap addressing all key on the npub or node id. A display name
+decides nothing, anywhere, because anyone can publish any name — including one
+already used by a provider you trust. Where two providers do claim one name, the
+Swap providers tab marks both ⚠ rather than leaving you to spot it.
+
+**A provider's announced relays are not a threat.** The table lists
+`clean_relay_urls` for completeness, but it is the odd one out: following those
+relays is the *mechanism*. A provider has to be able to say where it can be
+reached, and subscribing there is how we hear it — it learns nothing by that
+which sending it a swap request does not already tell it. That function exists
+only because those strings are also logged and written to disk (Electrum
+persists them to `recent_swapserver_relays` and reloads them at startup), and
+because a malformed offer should not put a non-string or an embedded newline
+into a connect list. It drops what cannot be dialled and bounds what is kept;
+the provider's choice of host, port, path, query or userinfo is passed through
+untouched.
+
+Two things deliberately *not* done:
+
+- a nostr `nip05` address is not shown, because showing an unverified one as if
+  it were authenticated would be worse than showing nothing, and verifying it
+  means an HTTPS request to a provider-chosen domain — which would tell that
+  domain you are shopping for swaps;
+- a provider is not judged on its relay list. Where it publishes is its own
+  business.
 
 ## Tests
 

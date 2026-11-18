@@ -18,7 +18,7 @@ import electrum_aionostr.util  # noqa: F401  (ensures aionostr.util is bound)
 
 from electrum.submarine_swaps import NostrTransport, SwapServerError
 
-from .liquidity_manager import looks_like_hex_pubkey, scrub_text
+from .liquidity_manager import clean_relay_urls, looks_like_hex_pubkey, scrub_text
 
 
 class TargetedNostrTransport(NostrTransport):
@@ -109,7 +109,27 @@ class TargetedNostrTransport(NostrTransport):
                 # otherwise starve the asyncio thread the whole wallet runs on.
                 await asyncio.sleep(self.NO_PROVIDER_BACKOFF_SEC)
                 continue
-            latest_known_relays = offer.relays
+            # Following the provider's announced relays is the mechanism -- it
+            # is how we hear a provider that publishes somewhere we are not
+            # subscribed. `clean_relay_urls` is hygiene on the way in, not a
+            # gate on who we are willing to talk to: it drops entries that are
+            # not strings, carry whitespace or control characters, exceed a
+            # sane length, or are not ws://|wss:// (which cannot be dialled at
+            # all). These strings get logged and persisted to disk by
+            # `_store_last_swapserver_relays`, and outside text is scrubbed
+            # before it reaches either. The provider's choice of host, port,
+            # path or query is passed through untouched.
+            latest_known_relays = list(clean_relay_urls(offer.relays))
+            dropped = len(list(offer.relays or ())) - len(latest_known_relays)
+            if dropped > 0:
+                self.logger.info(
+                    f"ignored {dropped} unusable relay URL(s) announced by "
+                    f"{(self.target_npub or '')[:12] or 'the swap provider'}…")
+            if not latest_known_relays:
+                # Nothing followable. Keep whatever we already had rather than
+                # clearing our relay set on a provider's bad announcement.
+                await asyncio.sleep(self.NO_PROVIDER_BACKOFF_SEC)
+                continue
             if latest_known_relays != previous_relays:
                 self.logger.debug(
                     "swap provider relays changed, updating relay list.")
@@ -167,7 +187,18 @@ class TargetedNostrTransport(NostrTransport):
                 f"swap server {server_pubkey[:8]} did not reply within "
                 f"{self.RPC_REPLY_TIMEOUT_SEC:.0f}s (method={method})")
             raise
-        assert isinstance(response, dict)
+        # An explicit check, not an `assert`: asserts are stripped under
+        # `python -O`, and this one guards a value straight off a provider's DM.
+        # Without it, a reply that decodes to a list or a string reaches the
+        # `'error' in response` test below -- where a string would be searched
+        # for the SUBSTRING "error" and a list would raise an unhandled
+        # TypeError out of the swap path. A reply we cannot read is the
+        # provider failing to answer, so it surfaces as that.
+        if not isinstance(response, dict):
+            self.logger.warning(
+                f"swap server {server_pubkey[:8]} replied with "
+                f"{type(response).__name__}, not an object; discarding it")
+            raise SwapServerError()
         if 'error' in response:
             # The error text is an attacker-controlled string from the provider's
             # DM reply. Scrub control characters (CR/LF/ANSI) before logging so it

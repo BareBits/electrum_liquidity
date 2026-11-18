@@ -144,3 +144,56 @@ def test_unchanged_relays_do_not_churn_the_relay_manager() -> None:
     asyncio.run(_run_one_tick(t, ticks=3))
     assert len(t.stored) == 1        # stored once, then recognised as unchanged
     assert len(t.updated) == 1
+
+
+# --- malformed announcements ----------------------------------------------
+# Following a provider's relays is the mechanism, not a risk -- see
+# test_relay_url_hardening for why `clean_relay_urls` exists (log/disk hygiene
+# and junk rejection, not a trust boundary). These pin that the loop applies it
+# at all, and that an unusable announcement costs the provider its relays
+# rather than costing us our own relay set.
+def test_a_non_websocket_relay_is_not_dialled() -> None:
+    t = _transport(offers={CHOSEN: _offer(
+        ["http://evil.example", "file:///etc/passwd", "wss://good"])})
+    t.target_npub = CHOSEN
+    asyncio.run(_run_one_tick(t))
+    assert t.stored == [["wss://good"]]
+    assert t.updated and set(t.updated[0]) == {"wss://ours", "wss://good"}
+
+
+def test_a_relay_with_credentials_is_followed_like_any_other() -> None:
+    # Deliberate: the userinfo is the provider's own, for its own relay.
+    t = _transport(offers={CHOSEN: _offer(["wss://user:pass@relay.one"])})
+    t.target_npub = CHOSEN
+    asyncio.run(_run_one_tick(t))
+    assert t.stored == [["wss://user:pass@relay.one"]]
+
+
+def test_an_all_bad_announcement_leaves_our_relays_alone() -> None:
+    # "Nothing usable announced" must not be read as "drop everything", or a
+    # provider with a broken announcement would take our relay set with it.
+    t = _transport(offers={CHOSEN: _offer(["http://a", "ftp://b", ""])})
+    t.target_npub = CHOSEN
+    asyncio.run(_run_one_tick(t))
+    assert t.stored == []
+    assert t.updated == []
+    assert t._last_swapserver_relays is None
+
+
+def test_the_announced_list_is_capped() -> None:
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        MAX_RELAY_URLS,
+    )
+    t = _transport(offers={CHOSEN: _offer(
+        [f"wss://relay{i}" for i in range(MAX_RELAY_URLS + 40)])})
+    t.target_npub = CHOSEN
+    asyncio.run(_run_one_tick(t))
+    assert t.stored and len(t.stored[0]) == MAX_RELAY_URLS
+
+
+def test_a_junk_relay_entry_does_not_break_the_loop() -> None:
+    t = _transport(offers={CHOSEN: _offer(["wss://good"])})
+    t._offers[CHOSEN].relays = [None, 42, "wss://good", {"u": "x"}]
+    t.target_npub = CHOSEN
+    asyncio.run(_run_one_tick(t))
+    assert t.stored == [["wss://good"]]

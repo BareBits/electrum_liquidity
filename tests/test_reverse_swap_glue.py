@@ -230,16 +230,27 @@ def test_our_side_swap_condition_does_not_fault_provider(msg) -> None:
 
 
 # --- funded swap -> success recorded AND dev fee accrued ------------------
-def test_funded_swap_records_success_and_dev_fee() -> None:
+def test_funded_swap_logs_the_action_but_defers_success_and_dev_fee() -> None:
+    """A funding txid ends the cascade and logs the action -- but does NOT credit
+    the provider or charge the fee.
+
+    The txid comes from an UNCONFIRMED sighting, and Electrum notes it can still
+    change under RBF (``submarine_swaps.py``: "swap.funding_txid can change due
+    to RBF"). Crediting a success here would clear the provider's accumulated
+    reliability penalty, and accruing the fee would charge the user, both on sats
+    that may never arrive. So the swap is tracked instead, carrying the basis, and
+    ``_reconcile_pending_swaps`` grants all three once the funding confirms.
+    """
     async def _rs(**kw):
         return "funding-txid-abc"        # provider created the funding output
     p = _plugin()
     _run(p, _wallet(_sm(_rs)), _action(), _transport())
-    assert p.successes == [NPUB]
-    # dev fee accrues on the net on-chain amount (get_recv_amount: 400_000-500).
-    assert p.dev_fees == [(399_500, "1x1x1")]
-    assert p.tracked == []               # funded now, nothing to reconcile
-    assert len(p.logged) == 1
+    assert p.successes == []             # deferred to confirmation
+    assert p.dev_fees == []              # likewise
+    # Tracked with the net on-chain amount (get_recv_amount: 400_000-500), which
+    # is the basis reconciliation will price the fee on.
+    assert p.tracked == [(NPUB, 399_500)]
+    assert len(p.logged) == 1            # the action IS reported straight away
 
 
 # --- unfunded, cause undeterminable -> tracked, no success/fee yet --------
@@ -346,4 +357,4 @@ def test_reverse_swap_unresolvable_channel_routes_unpinned() -> None:
     p = _plugin()
     asyncio.run(p._reverse_swap(wallet, _action(), state={}, transport=_transport()))
     assert "channels" not in captured           # unpinned
-    assert p.successes == [NPUB]                 # but the swap still completed
+    assert len(p.logged) == 1                    # but the swap still committed

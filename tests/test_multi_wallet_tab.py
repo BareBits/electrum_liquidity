@@ -326,7 +326,10 @@ class _AskingWindow(_FakeWindow):
 
 
 def _advanced_tab(p, wallet):
-    return p._tabs[wallet].container.findChild(QTabWidget).widget(3)
+    """The whole Advanced tab. The reset button lives in the row pinned below
+    the inner tab bar (it resets every pane, so it belongs to none of them)."""
+    from test_qt_tab import _advanced_tab as advanced_tab
+    return advanced_tab(p, wallet)
 
 
 def _reset_button(p, wallet):

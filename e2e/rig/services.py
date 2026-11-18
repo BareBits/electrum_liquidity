@@ -1068,3 +1068,85 @@ def discover_swap_provider(
                       key=lambda kv: float(kv[1].get("percentage_fee") or 0.0))
     electrum_cli("setconfig", "swapserver_npub", npub, inst=client)
     return npub, offer
+
+
+# ==========================================================================
+# Provider nostr profiles (kind 0)
+# ==========================================================================
+# A swap offer carries no human-readable name, so the plugin reads a provider's
+# display name from a NIP-01 kind-0 profile event published under the SAME
+# pubkey the provider signs its offers with. The rig's swapservers are plain
+# Electrum daemons and publish no such profile, so a test that wants a named
+# provider has to publish one for it -- as that provider, or the plugin would
+# (correctly) ignore it.
+#
+# The key is reachable because an Electrum wallet derives its nostr identity
+# deterministically: `LNWallet.__init__` does
+# `generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NOSTR_KEY)` over the
+# wallet's lightning xprv. The rig's wallets are unencrypted, so the xprv is
+# readable straight out of the wallet file and the derivation can be repeated
+# here exactly.
+
+
+def provider_nostr_keys(inst: ElectrumInstance) -> tuple[str, str]:
+    """``(pubkey_hex, nsec)`` for ``inst``'s swap-provider nostr identity.
+
+    Mirrors Electrum's own derivation (see the note above) rather than guessing:
+    a key derived any other way would sign events the client attributes to
+    nobody. ``pubkey_hex`` is the x-only 32-byte form that appears in an event's
+    ``pubkey`` field and in ``SwapOffer.server_pubkey``.
+    """
+    from electrum import constants
+    from electrum.bip32 import BIP32Node
+    from electrum.lnutil import LnKeyFamily, generate_keypair
+    from electrum_aionostr.util import to_nip19
+
+    # The rig is regtest, and a wallet's lightning xprv carries the regtest
+    # version bytes -- which `BIP32Node.from_xkey` rejects while the process-wide
+    # network is still the default mainnet (the rig otherwise drives Electrum
+    # through the CLI, so nothing has set it). This is the rig's only in-process
+    # use of Electrum's key machinery, so it sets the network itself; idempotent,
+    # and the whole process is regtest-only anyway.
+    if constants.net is not constants.BitcoinRegtest:
+        constants.BitcoinRegtest.set_as_network()
+
+    with open(wallet_path(inst)) as fh:
+        db = json.load(fh)
+    xprv = db.get("lightning_xprv") or db.get("lightning_privkey2")
+    if not xprv:
+        raise RuntimeError(
+            f"{inst.name} wallet has no lightning xprv; it cannot be a provider")
+    keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NOSTR_KEY)
+    # `NostrTransport` drops the 1-byte compressed-pubkey prefix for the nostr
+    # pubkey and keeps the full 32-byte privkey for the nsec.
+    return keypair.pubkey.hex()[2:], to_nip19('nsec', keypair.privkey.hex())
+
+
+def publish_provider_profile(ep: Endpoints, inst: ElectrumInstance,
+                             profile: dict, *, log,
+                             timeout: float = 30.0) -> str:
+    """Publish ``profile`` as ``inst``'s nostr kind-0 metadata event.
+
+    Returns the published event id. Synchronous (it runs its own asyncio loop),
+    so a test can call it like any other rig helper.
+    """
+    import asyncio
+
+    import electrum_aionostr as aionostr
+
+    pubkey_hex, nsec = provider_nostr_keys(inst)
+    content = json.dumps(profile)
+
+    async def _publish() -> str:
+        manager = aionostr.Manager([ep.nostr_relay_url], private_key=nsec)
+        await manager.connect()
+        try:
+            return await aionostr._add_event(
+                manager, kind=0, tags=[], content=content, private_key=nsec)
+        finally:
+            await manager.close()
+
+    event_id = asyncio.run(asyncio.wait_for(_publish(), timeout=timeout))
+    log(f"  published kind-0 profile for {inst.name} "
+        f"({pubkey_hex[:12]}…): {profile}")
+    return event_id
