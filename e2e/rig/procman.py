@@ -4,15 +4,28 @@ Safety contract
 ---------------
 The machine may be running unrelated ``bitcoind`` / ``electrum`` / ``Fulcrum``
 processes (e.g. another rig or the user's real wallet). This module must
-**never** kill those. The only signal used to decide ownership is the marker
-environment variable (``paths.MARKER_ENV`` == ``paths.MARKER_VALUE``) stamped
-onto every child we start and onto the orchestrator itself.
+**never** kill those. Ownership is therefore never inferred from a process
+*name*; it has to be proven, and there are three independent proofs:
 
-Discovery walks ``/proc/<pid>/environ`` (readable for our own uid) and matches
-that exact marker. Because the marker value is the absolute run directory of
-*this* rig checkout, a match unambiguously means "ours" -- covering
-grandchildren and re-parented daemons that a PID list would miss, while
-excluding every unrelated instance.
+* the marker environment variable (``paths.MARKER_ENV`` == ``paths.MARKER_VALUE``)
+  stamped onto every child we start (see ``spawn``). Discovery walks
+  ``/proc/<pid>/environ``, readable for our own uid. Because the marker value is
+  the absolute run directory of this rig checkout, a match unambiguously means
+  "ours" -- covering grandchildren and re-parented daemons a PID list would miss;
+* the run-dir path in ``/proc/<pid>/cmdline``, which stays readable even for a
+  non-dumpable process. This is what reaches the Electrum daemon, which marks
+  itself non-dumpable because it holds wallet keys, so its ``environ`` is
+  unreadable to us;
+* for the ORCHESTRATOR itself, the pid recorded in ``state.json`` together with
+  that process's start time, which makes the record immune to PID reuse (see
+  ``_previous_orchestrator_pid``).
+
+That third proof exists because the orchestrator cannot stamp its own
+``/proc/environ``: a process's environ block is captured at ``exec`` time and
+cannot be rewritten afterwards. The rig used to work around that by re-``execv``
+-ing itself at startup, which is destructive when the orchestrator is a test
+runner -- it restarts the whole pytest session, and discards any output pytest
+had captured. Recording the pid instead costs one file write and is exact.
 
 The nostr relay runs as a Docker container rather than a plain child; it is
 tracked separately by its fixed, rig-scoped container name (see ``paths``).
@@ -91,18 +104,29 @@ class ProcessManager:
     def find_rig_pids() -> list[int]:
         """All PIDs (excluding ourselves) belonging to this rig.
 
-        Ownership is proven two complementary ways, both keyed on this rig's
-        unique run dir (``MARKER_VALUE``):
+        Ownership is proven three complementary ways -- see the module docstring
+        for why each is needed:
 
         * the ``ELECTRUM_LIQTEST_RIG`` env marker in ``/proc/<pid>/environ`` --
-          catches the orchestrator and any dumpable child, and
+          catches any dumpable child;
         * the run-dir path appearing in ``/proc/<pid>/cmdline`` -- catches the
           services whose argv references ``.run/`` (bitcoind ``-datadir``,
           Fulcrum's conf, each Electrum ``--dir``, the docker ``-v`` mount).
+          Essential because Electrum's daemon marks itself non-dumpable (it holds
+          wallet keys), so its ``environ`` is unreadable to us;
+        * a still-running orchestrator recorded in ``state.json`` -- which a scan
+          of ``/proc`` cannot find, because a process cannot stamp the marker into
+          its own already-exec'd environ.
 
-        The cmdline path is essential because Electrum's daemon marks itself
-        non-dumpable (it holds wallet keys), so its ``environ`` is unreadable to
-        us and the env-marker scan alone would miss it.
+        ``me`` is excluded, so the orchestrator never finds ITSELF through the
+        state file it just wrote. That matters most under a test runner, where one
+        pytest process is the orchestrator for every rig in the session: without
+        the exclusion the first teardown would kill the test run.
+
+        Note what is deliberately NOT a proof: a process merely having the run
+        dir open, or being named like a rig service. A developer tailing
+        ``.run/logs/bitcoind.log`` must not be swept up, and nor must their real
+        wallet.
         """
         me = os.getpid()
         found: list[int] = []
@@ -114,6 +138,9 @@ class ProcessManager:
                 continue
             if _proc_marker(pid) == paths.MARKER_VALUE or _proc_cmdline_is_ours(pid):
                 found.append(pid)
+        previous = _previous_orchestrator_pid()
+        if previous is not None and previous != me and previous not in found:
+            found.append(previous)
         return found
 
     # -- teardown -----------------------------------------------------------
@@ -155,9 +182,18 @@ class ProcessManager:
 
     # -- persistence --------------------------------------------------------
     def _write_state(self) -> None:
+        """Persist who we are and what we started.
+
+        ``orchestrator_starttime`` is what makes ``orchestrator_pid`` safe to act
+        on later: a bare pid in a file is a liability, because by the time the
+        next run reads it the kernel may have recycled it onto something
+        unrelated. Pairing it with the process's start time identifies the
+        process rather than the slot -- see ``_previous_orchestrator_pid``.
+        """
         paths.RUN_DIR.mkdir(parents=True, exist_ok=True)
         state = {
             "orchestrator_pid": os.getpid(),
+            "orchestrator_starttime": _proc_starttime(os.getpid()),
             "marker": paths.MARKER_VALUE,
             "children": [{"name": c.name, "pid": c.pid, "log": str(c.log_path)} for c in self.children],
         }
@@ -218,6 +254,70 @@ def _proc_cmdline_is_ours(pid: int) -> bool:
     service_tokens = (b"bitcoind", b"Fulcrum", b"/electrum", b"electrum ",
                       b"docker", paths.NOSTR_CONTAINER.encode())
     return any(tok in cmdline for tok in service_tokens)
+
+
+def _proc_starttime(pid: int) -> Optional[int]:
+    """The process's start time in clock ticks since boot, or None.
+
+    Field 22 of ``/proc/<pid>/stat``. Parsed from after the last ``)`` because
+    field 2 is the executable name in parentheses and may itself contain spaces
+    and parentheses -- splitting the whole line on whitespace is the classic way
+    to misread this file.
+
+    Paired with a pid, this identifies a PROCESS rather than a pid slot: the
+    kernel can hand the same pid to something else, but not with the same start
+    time.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    try:
+        tail = raw[raw.rindex(b")") + 1:].split()
+        return int(tail[19])        # field 22 overall, 20th after the comm field
+    except (ValueError, IndexError):
+        return None
+
+
+def _previous_orchestrator_pid() -> Optional[int]:
+    """The pid of an orchestrator from an earlier run that is STILL RUNNING, or
+    None.
+
+    Read out of ``state.json``, which the previous run wrote and which is still
+    on disk at this point -- ``preflight`` sweeps before it wipes the run dir.
+
+    Every condition here is a safety gate, because the outcome is a SIGKILL:
+
+    * the file has to name this rig (``marker``), so a state file copied from
+      another checkout is ignored;
+    * the pid has to still be alive;
+    * its start time has to match what was recorded. Without this the record
+      would be a pid-reuse hazard -- the next run could read a months-old file
+      and kill whatever innocent process now holds that number.
+
+    Anything missing, malformed or mismatched yields None. Failing to find a
+    previous orchestrator is cheap (its children are still discoverable by
+    marker and cmdline); killing the wrong process is not.
+    """
+    try:
+        state = json.loads(paths.STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    if state.get("marker") != paths.MARKER_VALUE:
+        return None
+    pid, recorded = state.get("orchestrator_pid"), state.get("orchestrator_starttime")
+    if not isinstance(pid, int) or not isinstance(recorded, int):
+        # A state file from a build before the start time was recorded. Declining
+        # is deliberate: a pid alone cannot be acted on safely.
+        return None
+    if pid <= 0 or not _pid_alive(pid):
+        return None
+    if _proc_starttime(pid) != recorded:
+        return None      # the pid was recycled onto a different process
+    return pid
 
 
 def _pid_alive(pid: int) -> bool:
