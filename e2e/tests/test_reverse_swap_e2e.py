@@ -84,8 +84,56 @@ def _swap_actions() -> List[Dict]:
             if e.get("category") == "action" and e.get("kind") == "swap"]
 
 
+# Wallet-db keys, as literal strings -- matching the convention the rest of this
+# module already uses (see `_dev_fee_owed`).
+#
+# Deliberately NOT read off the plugin by importing it here. The plugin registers
+# its ConfigVars on SimpleConfig at import time, into a process-global key
+# registry, and this pytest process already holds it as
+# `electrum.plugins.inbound_liquidity`; importing it a second time under another
+# module name re-runs the module body and dies with
+# "duplicate config key str: plugins.inbound_liquidity.automation_enabled".
+# (The plugin's own comments flag that double-import hazard.)
+#
+# The risk a literal carries is that a renamed key silently reads `{}` and the
+# assertion passes for the wrong reason. That is closed in the unit suite, where
+# importing the plugin IS safe: test_swap_completion_confirmation_glue.py pins
+# both of these strings against the real constants.
+PENDING_SWAPS_DB_KEY = "inbound_liquidity_pending_swap_providers"
+USAGE_TOTALS_DB_KEY = "inbound_liquidity_usage_totals"
+
+
+def _pending_swaps() -> Dict:
+    return _wallet_db().get(PENDING_SWAPS_DB_KEY, {}) or {}
+
+
+def _usage_totals() -> Dict:
+    return _wallet_db().get(USAGE_TOTALS_DB_KEY, {}) or {}
+
+
 def _dev_fee_owed() -> int:
     return int(_wallet_db().get("inbound_liquidity_dev_fee_owed_sat", 0) or 0)
+
+
+def _dev_fee_charged() -> int:
+    """Total dev fee this wallet has been charged: still owed, plus already paid.
+
+    The durable observable, and the only correct one. ``owed`` alone is transient
+    and racy: the rig configures a working local LNURL payout stub, and
+    ``_evaluate`` runs `_reconcile_pending_swaps` (which ACCRUES the fee) and
+    `_maybe_pay_dev_fee` (which pays it out, zeroing the ledger) in the SAME tick.
+    Once the accrued amount clears the 1000-sat payout threshold -- which 0.5% of
+    a ~700k-sat swap does -- ``owed`` returns to 0 before any outside poll can see
+    it.
+
+    That race is new. The fee used to accrue synchronously in the executor, a
+    different path at a different moment from the payout tick, so a window
+    existed; now both happen in one tick. Summing the two makes the assertion
+    independent of whether the payout has fired yet, which is what the tests
+    actually mean by "a fee was charged".
+    """
+    totals = _usage_totals()
+    return _dev_fee_owed() + int(totals.get("dev_fee_paid_total_sat", 0) or 0)
 
 
 def _max_inbound() -> int:
@@ -161,5 +209,68 @@ def test_reverse_swap_increases_inbound_and_accrues_dev_fee(rig):
         f"no channel was drained by the swap (min local_balance={_min_local()})"
 
     # 3) A dev fee accrued on the completed swap.
-    assert _wait_until(lambda: _dev_fee_owed() > 0, rig=rig, timeout=120), \
-        "no dev fee accrued after the reverse swap completed"
+    assert _wait_until(lambda: _dev_fee_charged() > 0, rig=rig, timeout=600), \
+        "no dev fee was charged after the reverse swap completed"
+
+
+def test_the_dev_fee_waits_for_the_funding_tx_to_confirm(rig):
+    """A real swap's fee is granted by RECONCILIATION after a confirmation, not
+    by the executor on first sight of a funding txid.
+
+    Why this needs the rig. The executor sees ``swap.funding_txid`` as soon as the
+    swap manager's watcher spots a matching output in an UNCONFIRMED transaction,
+    and Electrum notes it can still change under RBF
+    (``submarine_swaps.py``: "swap.funding_txid can change due to RBF"). So the
+    plugin logs the action immediately but defers the provider's success, the dev
+    fee and the lifetime totals until the funding confirms. Only a real swap
+    against a real provider on a real chain exercises that ordering; the glue
+    tests (test_swap_completion_confirmation_glue.py) pin the arms in isolation.
+
+    Asserted here, in order:
+      * the swap action is logged while its pending record still exists -- i.e.
+        the executor committed but did not complete it;
+      * once blocks are mined, the fee accrues and the record is consumed.
+    """
+    _arm_swap_config()
+    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
+
+    assert _dev_fee_charged() == 0, "a dev fee was already charged before the swap"
+
+    # The action appears as soon as funding is SEEN.
+    assert _wait_until(lambda: len(_swap_actions()) >= 1, rig=rig, timeout=240), \
+        "plugin never executed a reverse swap"
+
+    # The swap is tracked for reconciliation rather than being completed inline.
+    # (Checked as "it was tracked at some point", because reconciliation runs on
+    # the very next tick and may legitimately have consumed it already once the
+    # rig's 30s block interval has produced a confirmation.)
+    tracked_or_settled = (
+        bool(_pending_swaps())
+        or _dev_fee_charged() > 0)
+    assert tracked_or_settled, (
+        "the swap was neither tracked for reconciliation nor already settled; "
+        "the executor appears to have completed it without tracking")
+
+    # With blocks mined, it reconciles: the fee accrues and the record clears.
+    #
+    # The timeout has to clear the HEARTBEAT, not just a confirmation. The fee is
+    # granted by `_reconcile_pending_swaps`, which runs on an evaluation TICK, and
+    # a funding tx merely confirming need not change any wallet balance -- so it
+    # need not produce the material-state change that bypasses the auto-eval
+    # backoff. In the worst case the next tick is the heartbeat
+    # (HEARTBEAT_INTERVAL_SEC = 600s). In practice it resolves far sooner, once
+    # the claim lands and moves the on-chain balance.
+    #
+    # An earlier version of this test allowed 180s and failed here for that
+    # reason alone, while the swap itself had completed perfectly well.
+    assert _wait_until(lambda: _dev_fee_charged() > 0, rig=rig, timeout=750), \
+        "the dev fee was never charged after the funding tx confirmed"
+    assert _wait_until(
+        lambda: not _pending_swaps(),
+        rig=rig, timeout=180), \
+        "the pending-swap record was never consumed by reconciliation"
+
+    # And the lifetime totals were granted exactly once alongside it.
+    totals = _usage_totals()
+    assert int(totals.get("swaps_completed_total", 0)) >= 1, \
+        f"the completed swap was not counted in the lifetime totals: {totals}"

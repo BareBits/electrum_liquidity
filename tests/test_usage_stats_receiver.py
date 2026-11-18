@@ -536,3 +536,154 @@ def test_a_real_wire_body_fits_the_receivers_size_cap():
     body = us.encode_payload(
         us.build_payload(3, _snapshot(), now=NOW, install_id=AN_ID))
     assert len(body) < cap / 2, f"a level-3 report is {len(body)} of {cap} bytes"
+
+
+# --- report-table bounds --------------------------------------------------
+#
+# `reports` had no retention at all: only `recent_requests` was ever purged, so
+# rows accumulated forever. That matters more than disk, because nothing
+# authenticates a report and `install_id` is chosen by the CLIENT -- so anyone
+# can mint install ids and insert rows at the rate limit, growing the table
+# without bound and skewing every published figure.
+#
+# These drive the real `analytics_purge_reports()` against a real sqlite file.
+# The row ceiling is shrunk to 5 for the test (via a patched copy of the
+# constant) so a ceiling hit can be provoked without inserting 250,000 rows.
+
+def _insert_report(workdir, install_id: str, received_at: int,
+                   first_seen_at: int = None) -> str:
+    """PHP to insert one report row, filling the denormalised columns."""
+    first = received_at if first_seen_at is None else first_seen_at
+    return (
+        '$pdo->prepare("INSERT INTO reports (install_id, first_seen_at,'
+        ' received_at, schema_version, level, country, plugin_version,'
+        ' electrum_version, network, gui_kind, os_family, payload)'
+        ' VALUES (?, ?, ?, 1, 1, NULL, \'0.5.0\', \'4.7.2\', \'mainnet\','
+        " 'qt', 'Linux', '{}')\")->execute(["
+        f'{json.dumps(install_id)}, {first}, {received_at}]);')
+
+
+@pytest.fixture()
+def capped_endpoint(endpoint_copy):
+    """``endpoint_copy`` with the row ceiling shrunk to 5, so the backstop can
+    be exercised without inserting a quarter of a million rows."""
+    common = endpoint_copy / "common.php"
+    text = common.read_text()
+    patched = text.replace(
+        "const ANALYTICS_MAX_REPORT_ROWS      = 250000;",
+        "const ANALYTICS_MAX_REPORT_ROWS      = 5;")
+    assert patched != text, "the row-ceiling constant was not found to patch"
+    common.write_text(patched)
+    return endpoint_copy
+
+
+def test_reports_past_the_retention_window_are_dropped(endpoint_copy):
+    now = 1_762_819_200
+    out = _php_in(endpoint_copy, f'''
+        $pdo = analytics_db();
+        $now = {now};
+        {_insert_report(endpoint_copy, "stale", now - 200 * 86400)}
+        {_insert_report(endpoint_copy, "fresh", now - 10)}
+        $r = analytics_purge_reports($pdo, $now);
+        echo json_encode([$r,
+            $pdo->query("SELECT install_id FROM reports")->fetchAll(PDO::FETCH_COLUMN)]);
+    ''')
+    purged, remaining = json.loads(out)
+    assert purged["retention"] == 1
+    assert remaining == ["fresh"], "only the stale row should age out"
+
+
+def test_an_install_that_keeps_reporting_never_ages_out(endpoint_copy):
+    """Retention keys on ``received_at``, not ``first_seen_at``.
+
+    An install that has been running for years is refreshed by its own weekly
+    report, so it must survive however long ago it first appeared -- otherwise
+    the endpoint would forget exactly the installs it most wants to count.
+    """
+    now = 1_762_819_200
+    out = _php_in(endpoint_copy, f'''
+        $pdo = analytics_db();
+        $now = {now};
+        {_insert_report(endpoint_copy, "longlived", now - 5, now - 900 * 86400)}
+        analytics_purge_reports($pdo, $now);
+        echo json_encode(
+            $pdo->query("SELECT install_id FROM reports")->fetchAll(PDO::FETCH_COLUMN));
+    ''')
+    assert json.loads(out) == ["longlived"]
+
+
+def test_the_row_ceiling_drops_the_oldest_received_first(capped_endpoint):
+    """Past the ceiling, the least recently active rows go.
+
+    Deliberately NOT the oldest *first seen*: if rows are being manufactured,
+    evicting long-standing installs in favour of freshly-minted ids is exactly
+    backwards.
+    """
+    now = 1_762_819_200
+    inserts = "\n".join(
+        _insert_report(capped_endpoint, f"id{i}", now - (100 - i))
+        for i in range(9))          # id0 oldest ... id8 newest
+    out = _php_in(capped_endpoint, f'''
+        $pdo = analytics_db();
+        $now = {now};
+        {inserts}
+        $r = analytics_purge_reports($pdo, $now);
+        echo json_encode([$r, $pdo->query(
+            "SELECT install_id FROM reports ORDER BY received_at")->fetchAll(PDO::FETCH_COLUMN)]);
+    ''')
+    purged, remaining = json.loads(out)
+    assert purged["ceiling"] == 4                       # 9 inserted, 5 kept
+    assert remaining == ["id4", "id5", "id6", "id7", "id8"]
+
+
+def test_a_purge_within_bounds_changes_nothing(endpoint_copy):
+    """The common path: nothing stale, nothing over the ceiling, no deletions.
+    Runs on every single report, so it must be a no-op when it has no work."""
+    now = 1_762_819_200
+    out = _php_in(endpoint_copy, f'''
+        $pdo = analytics_db();
+        $now = {now};
+        {_insert_report(endpoint_copy, "a", now - 10)}
+        {_insert_report(endpoint_copy, "b", now - 20)}
+        $r = analytics_purge_reports($pdo, $now);
+        echo json_encode([$r,
+            (int)$pdo->query("SELECT COUNT(*) FROM reports")->fetchColumn()]);
+    ''')
+    purged, count = json.loads(out)
+    assert purged == {"retention": 0, "ceiling": 0}
+    assert count == 2
+
+
+def test_storing_a_report_enforces_the_bounds(capped_endpoint):
+    """The bounds are applied by the real store path, not only by calling the
+    purge directly -- report.php runs it inside the insert's transaction."""
+    now = 1_762_819_200
+    inserts = "\n".join(
+        _insert_report(capped_endpoint, f"old{i}", now - (500 - i))
+        for i in range(9))
+    out = _php_in(capped_endpoint, f'''
+        $pdo = analytics_db();
+        $now = {now};
+        {inserts}
+        // Reach report.php's analytics_store() without running its request
+        // handling: define the request as a POST-less include and call it.
+        $src = file_get_contents("report.php");
+        $start = strpos($src, "function analytics_store");
+        $end = strpos($src, "\\ntry {{");
+        eval(substr($src, $start, $end - $start));
+        $report = ["schema_version" => 1, "event" => "usage_report",
+                   "client" => ANALYTICS_CLIENT_MARKER,
+                   "install_id" => {json.dumps(AN_ID)},
+                   "sent_at" => "2025-11-11T00:00:00Z", "level" => 1,
+                   "properties" => ["plugin_version" => "0.5.0",
+                       "electrum_version" => "4.7.2", "python_version" => "3.12",
+                       "os_family" => "Linux", "gui_kind" => "qt",
+                       "network" => "mainnet"]];
+        $res = analytics_store($pdo, $report, null, "192.0.2.7", $now);
+        echo json_encode([$res,
+            (int)$pdo->query("SELECT COUNT(*) FROM reports")->fetchColumn()]);
+    ''')
+    result, count = json.loads(out)
+    assert result == {"stored": True}
+    # 9 pre-existing + the one just stored, held down to the 5-row ceiling.
+    assert count == 5, f"the store path did not bound the table (got {count})"

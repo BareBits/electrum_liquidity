@@ -116,7 +116,21 @@ $now = time();
 
 $pdo = analytics_db();
 $geoLoadedAt = analytics_meta_get($pdo, 'geo_loaded_at');
-$rows = $pdo->query('SELECT * FROM reports ORDER BY received_at DESC')->fetchAll();
+// Bounded fetch. The aggregations below are computed in PHP (they read
+// per-report JSON properties, which is awkward to do in SQL portably), so the
+// whole result set is held in memory -- and the table is fed by an
+// unauthenticated endpoint. report.php now caps the table itself, and this LIMIT
+// is the second, independent bound: a dashboard that cannot be made to exhaust
+// memory even if the writer's ceiling were ever raised or bypassed.
+//
+// Newest-received first, so if the limit ever does bite it is the freshest
+// reports that are summarised -- which is what the active-window figures are
+// about anyway.
+$rowLimit = ANALYTICS_MAX_REPORT_ROWS;
+$stmt = $pdo->prepare('SELECT * FROM reports ORDER BY received_at DESC LIMIT ?');
+$stmt->execute([$rowLimit]);
+$rows = $stmt->fetchAll();
+$rowsTruncated = count($rows) >= $rowLimit;
 foreach ($rows as &$r) {
     $decoded = json_decode((string)$r['payload'], true);
     $r['_props'] = (is_array($decoded) && is_array($decoded['properties'] ?? null))
@@ -157,6 +171,8 @@ $aggregates = [
     'geo_loaded_at'      => $geoLoadedAt,
     'active_days'        => $activeDays,
     'installs_total'     => count($rows),
+    // So a truncated page is never mistaken for the whole population.
+    'rows_truncated'     => $rowsTruncated,
     'installs_active'    => count($active),
     'reporting_settings' => count($withSettings),
     'reporting_liquidity' => count($withLiquidity),
@@ -232,6 +248,11 @@ header('Content-Type: text/html; charset=utf-8');
   <a href="?format=json&amp;active_days=<?= (int)$activeDays ?>">JSON</a> ·
   <a href="?format=csv&amp;active_days=<?= (int)$activeDays ?>">CSV</a>
 </p>
+<?php if ($rowsTruncated): ?>
+<p class="muted"><strong>Note:</strong> this page summarises the newest
+  <?= (int)$rowLimit ?> reports only — the stored set reached that limit, so the
+  figures below are not the whole population.</p>
+<?php endif; ?>
 
 <div class="grid">
 <?php foreach ([

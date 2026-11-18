@@ -65,10 +65,16 @@ class _FakeDB:
 
 
 class _FakeWallet:
-    def __init__(self, sm=None) -> None:
+    def __init__(self, sm=None, *, funding_height: int = 0) -> None:
         self.db = _FakeDB()
         self.saved = 0
         self.lnworker = SimpleNamespace(swap_manager=sm) if sm is not None else None
+        # What `get_tx_height(...).height()` says about a swap's funding tx.
+        # 0 is Electrum's TX_HEIGHT_UNCONFIRMED; above it means confirmed, which
+        # is what a swap now needs before it counts as the provider's success.
+        self.adb = SimpleNamespace(
+            get_tx_height=lambda txid: SimpleNamespace(
+                height=lambda: funding_height))
 
     def save_db(self) -> None:
         self.saved += 1
@@ -204,12 +210,38 @@ def _action() -> ReverseSwapAction:
                              provider_npub=NPUB)
 
 
-def test_reverse_swap_success_records_success() -> None:
-    p, sm = _plugin(), _swap_manager(lambda **kw: _coro("funding-txid"))
-    w = _FakeWallet(sm)
+def test_reverse_swap_success_is_recorded_once_the_funding_confirms() -> None:
+    """The executor commits the swap; the SUCCESS is granted by reconciliation
+    after the funding tx confirms.
+
+    Both halves are asserted here, in order, because the split is the point: a
+    funding txid alone is an unconfirmed sighting Electrum can still replace, so
+    crediting the provider on it would let a provider clear its reliability
+    penalty without ever delivering.
+    """
+    swap = SimpleNamespace(is_redeemed=False, funding_txid="funding-txid")
+
+    def _rs(**kw):
+        # Register the swap before returning its txid, as Electrum's
+        # reverse_swap does -- it RETURNS swap.funding_txid, so a non-None txid
+        # always means add_reverse_swap already stored the swap. That is what
+        # gives reconciliation something to find.
+        sm._swaps["ab" * 32] = swap
+        return _coro("funding-txid")
+
+    p, sm = _plugin(), _swap_manager(None)
+    sm.reverse_swap = _rs
+    sm.get_swap = lambda ph: swap
+    w = _FakeWallet(sm, funding_height=101)        # confirmed
     p._log_action = lambda *a, **k: None
     p.on_action_done = lambda *a, **k: None
     asyncio.run(p._reverse_swap(w, _action(), state={}, transport=_transport()))
+    # Nothing credited yet -- the swap is merely tracked for reconciliation.
+    # The row does exist, holding the display-only attempt tally, but carries no
+    # verdict about the provider: that is exactly the distinction being drawn.
+    assert "success_count" not in p._load_reliability(w).get(NPUB, {})
+    assert p._load_pending_swaps(w)                # ... and it IS tracked
+    p._reconcile_pending_swaps(w)
     assert p._load_reliability(w)[NPUB]["success_count"] == 1
     assert p._load_reliability(w)[NPUB]["consecutive_faults"] == 0
 
@@ -305,9 +337,16 @@ def test_reverse_swap_no_funding_tracks_pending() -> None:
 
 
 # --- stuck-swap reconciliation --------------------------------------------
-def _reconcile_wallet(swap_obj) -> "_FakeWallet":
+def _reconcile_wallet(swap_obj, *, funding_height: int = 101) -> "_FakeWallet":
+    """A wallet whose swap manager returns ``swap_obj``.
+
+    ``funding_height`` defaults to a CONFIRMED funding tx, because that is what
+    the completion arm needs: an unconfirmed funding txid can still be replaced
+    under RBF, so reconciliation deliberately waits for a confirmation before
+    crediting the provider or charging the dev fee.
+    """
     sm = SimpleNamespace(_swaps={}, get_swap=lambda ph: swap_obj)
-    return _FakeWallet(sm)
+    return _FakeWallet(sm, funding_height=funding_height)
 
 
 def test_reconcile_funded_swap_is_success() -> None:

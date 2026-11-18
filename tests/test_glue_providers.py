@@ -157,21 +157,28 @@ def test_offers_from_transport_drops_and_faults_bad_offers() -> None:
         get_recent_offers=lambda: [good, negative_fee, non_numeric, dup_bad, no_identity])
 
     p = _plugin()
-    faults = []
-    p._record_provider_fault = lambda wallet, npub, reason, **kw: faults.append((npub, kw))
+    # The faults for a pass are written in ONE batch, not one per provider --
+    # each individual write is a whole-wallet-file write, and offers come from
+    # anyone (see `_record_provider_faults_bulk`). So the batch writer is what
+    # this observes, and that it is called exactly once is part of the point.
+    batches = []
+    p._record_provider_faults_bulk = \
+        lambda wallet, npubs, reason: batches.append((list(npubs), reason))
     wallet = object()
 
     out = p._offers_from_transport(wallet, transport)
 
     # Only the sane offer survives; a single bad offer never takes out the rest.
     assert [o.npub for o in out] == [good_npub]
-    # Each identifiable-but-bad provider is faulted exactly once per pass (the
-    # duplicate bad offer under bad_npub_1 does not amplify into a second fault);
-    # the good provider is not faulted, and the unidentifiable offer records none.
-    faulted_npubs = [npub for npub, _ in faults]
+    # One batch for the whole pass...
+    assert len(batches) == 1
+    faulted_npubs, reason = batches[0]
+    # ...carrying each identifiable-but-bad provider exactly once (the duplicate
+    # bad offer under bad_npub_1 does not amplify into a second entry); the good
+    # provider is absent, and the unidentifiable offer records nothing.
     assert sorted(faulted_npubs) == sorted([bad_npub_1, bad_npub_2])
     assert good_npub not in faulted_npubs
-    assert all(kw.get("soft") for _, kw in faults)
+    assert "malformed" in reason
 
 
 def test_offers_from_transport_survives_raising_feed() -> None:

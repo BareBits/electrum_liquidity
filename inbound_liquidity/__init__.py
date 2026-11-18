@@ -91,6 +91,8 @@ from .liquidity_manager import (
     classify_peer_observation,
     classify_pending_freeze,
     clamp_dev_fee_pct,
+    clamp_pct,
+    clamp_sat,
     clean_display_name,
     compute_dev_fee,
     coop_before_force_ready,
@@ -792,7 +794,14 @@ USAGE_STATS_TIMEOUT_SEC = 15.0
 USAGE_STATS_MAX_BYTES = 16 * 1024
 
 
-def _plain_json_copy(value: Any) -> Any:
+# How deep `_plain_json_copy` will walk a wallet-db value. The stores it is used
+# on are at most three or four levels deep (a dict of per-key dicts, one of which
+# holds a list of pairs), so this is generous headroom rather than a constraint on
+# anything the plugin writes.
+MAX_JSON_COPY_DEPTH = 20
+
+
+def _plain_json_copy(value: Any, depth: int = 0) -> Any:
     """Rebuild ``value`` out of plain dicts/lists, recursively.
 
     Every ``_load_*`` helper below runs its wallet-db value through this, and
@@ -819,11 +828,25 @@ def _plain_json_copy(value: Any) -> Any:
     Values are JSON-plain by construction (these stores hold numbers, strings
     and nested dicts/lists of them), so a rebuild is faithful; tuples become
     lists, exactly as a save/load round-trip through the wallet file would.
+
+    Depth-limited, because the recursion is otherwise unbounded over a value this
+    plugin did not necessarily write. The stores it walks are at most three or
+    four levels deep by construction, but the wallet file is editable by hand and
+    a corrupted or deeply-nested value would raise ``RecursionError`` out of a
+    routine bookkeeping write -- the same class of failure as the ``cannot pickle
+    RLock`` one above, which aborted a channel-open loop mid-candidate. Past the
+    limit the branch is dropped rather than raising: a store we cannot read reads
+    as empty, which every caller already handles (they all default to ``{}``).
     """
+    if depth > MAX_JSON_COPY_DEPTH:
+        _logger.warning(
+            f"wallet-db value nested deeper than {MAX_JSON_COPY_DEPTH} levels; "
+            f"dropping the over-deep branch")
+        return None
     if isinstance(value, dict):
-        return {k: _plain_json_copy(v) for k, v in value.items()}
+        return {k: _plain_json_copy(v, depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_plain_json_copy(v) for v in value]
+        return [_plain_json_copy(v, depth + 1) for v in value]
     return value
 
 
@@ -916,6 +939,23 @@ PROVIDER_PROFILE_TTL_SEC = 24 * 3600.0
 # Electrum keeps at most 20 recent offers), but reliability history accumulates
 # npubs over time and this cache follows it.
 PROVIDER_PROFILE_MAX_ROWS = 200
+# Most swap offers one evaluation pass will consider, however many are on the
+# wire. Publishing a nostr offer is free and unpermissioned, so the discovered
+# set is sized by whoever cares to sign the most events -- and every per-offer
+# step downstream scaled with it. See `_bounded_offers` for which offers survive
+# the cap (already-known providers, then highest announcement proof-of-work) and
+# why those are the hard ones to game.
+#
+# Set far above any plausible real swap-provider population: the point is to have
+# a ceiling at all, not to ration honest providers. Matches
+# PROVIDER_PROFILE_MAX_ROWS so the discovery cap and the name cache agree.
+MAX_DISCOVERED_PROVIDERS = 200
+# Hard ceiling on rows in the per-wallet provider-reliability store, enforced on
+# every write. `_prune_reliability_store` already drops rows that are idle AND
+# unpenalised, but only after RELIABILITY_ROW_MAX_IDLE_SEC (90 days) -- so until
+# this, a flood of identities could keep 90 days' worth of rows in the wallet
+# file. Generous next to the discovery cap, so an honest wallet never reaches it.
+RELIABILITY_MAX_ROWS = 500
 # Ceiling on one profile lookup. Deliberately small: a name is cosmetic, and
 # this runs inside an evaluation that may be about to do a swap, so a slow or
 # silent relay must cost us a blank column and nothing else. (aionostr's own
@@ -939,6 +979,23 @@ MAX_LOG_RETENTION_DAYS = 999
 # How many entries to keep regardless of age, as a hard backstop so a busy
 # wallet can't grow the log without bound between prunes.
 MAX_LOG_ENTRIES = 2000
+# How often one party (a provider npub, a peer node id) may append a fault row to
+# the decision log. Faults are the only log category an outside party can provoke
+# on demand -- publishing a malformed nostr offer costs nothing -- and the log is
+# a ring of MAX_LOG_ENTRIES, so without this a flood evicts every genuine entry
+# from the record an operator audits with. Five minutes is well inside the
+# evaluation cadence, so a real fault is never hidden for long.
+FAULT_LOG_MIN_INTERVAL_SEC = 300.0
+# The largest share of the decision log that fault rows may occupy. The rest is
+# reserved for the categories an outside party CANNOT provoke -- actions,
+# declines, lifecycle -- so a fault flood can never evict the record of what the
+# plugin actually did. Half leaves a thousand faults' worth of diagnosis at the
+# shipped cap, which is far more than a real wallet produces, while guaranteeing
+# an equal number of slots to everything else. See `_prune`.
+MAX_FAULT_LOG_SHARE = 0.5
+# Bound on the per-identity stamp dict behind that throttle, since the identities
+# are supplied by whoever is advertising at us.
+FAULT_LOG_MAX_TRACKED = 1000
 # --- tick status ----------------------------------------------------------
 # A single evaluation ("tick") can take a while: opening a nostr session waits up
 # to OFFER_CONNECT_TIMEOUT_SEC + OFFER_DISCOVERY_TIMEOUT_SEC, a channel open
@@ -1028,6 +1085,25 @@ MAX_ACTION_TIMESTAMPS = 1000
 # closes (the watchdog's wedged-open force-close) are gated in the glue.
 DEFAULT_MAX_OPENS_PER_DAY = 5
 DEFAULT_MAX_CLOSES_PER_DAY = 5
+# Upper bounds the settings clamps hold these two counts to (see `read_config`).
+# Not limits on what a user may sensibly choose -- they are far above any sane
+# value -- but bounds that keep a hand-edited wallet file from putting a figure
+# in the engine that its arithmetic was never written for. A daily ceiling is
+# compared against a count of real actions, so anything past a few hundred is
+# already "unlimited" in every way that matters.
+MAX_ACTIONS_PER_DAY = 1_000
+# Likewise for the channel ceiling and the offline-discount allowance: both are
+# counts of channels, and no wallet has thousands.
+MAX_CHANNELS_CEILING = 1_000
+# Likewise for the offline-discount delay, in hours. A year is already far past
+# "never discount"; the point is only that the value be a finite number.
+MAX_OFFLINE_DISCOUNT_AFTER_HOURS = 24.0 * 365.0
+# Ceiling for the percentage settings that are THRESHOLDS rather than shares of
+# something, where a value above 100 is meaningful and must survive (see the note
+# in `read_config`). Deliberately far above any value with a distinct effect: the
+# point is only to reject NaN, the infinities and absurdity, not to second-guess
+# a number the user chose on purpose.
+MAX_THRESHOLD_PCT = 1_000_000.0
 # Shipped default for the liquidity goal (sat): the channel size the plugin aims
 # for. A plugin-opened channel smaller than this is replaced once it is blocking
 # a bigger one -- see `_decide_undersized_closes` in the engine for the full gate
@@ -1110,6 +1186,43 @@ DEV_FEE_MAX_PCT = 5.0
 # persistently failing address (offline, no route) doesn't hammer the network on
 # every evaluation tick. The fee stays owed across the backoff.
 DEV_FEE_RETRY_BACKOFF_SEC = 300.0
+# The payout whose outcome we could not establish, remembered across ticks AND
+# across restarts: {"payment_hash": hex, "amount_sat": n, "started_ts": epoch}.
+#
+# This exists because ``lnworker.pay_invoice`` returning ``(False, log)`` does
+# NOT prove nothing was sent. ``pay_to_node`` gives up once it passes
+# ``LNWallet.PAYMENT_TIMEOUT`` (120s) and its ``finally`` deliberately keeps the
+# paysession alive while HTLCs are unresolved, so a payment can report failure
+# and settle afterwards. Electrum's own guard against paying twice keys on the
+# payment HASH (lnworker.pay_invoice: "A previous attempt to pay this invoice did
+# not clear"), and a retry here mints a FRESH invoice from the LNURL callback --
+# a different hash -- so that guard never fires for us.
+#
+# Without this record the owed ledger stayed untouched on a reported failure and
+# the next tick paid the same fee again; because the 24h payout cap is only
+# stamped on the success branch, it did not bound that either. So an unresolved
+# payout is persisted and re-checked instead, and nothing is paid until it
+# resolves. See `_resolve_dev_fee_inflight`.
+DEV_FEE_INFLIGHT_DB_KEY = "inbound_liquidity_dev_fee_inflight"
+# How long an unresolved payout is re-checked before we stop waiting. Past this,
+# it is treated as PAID: the fee is drawn down from the ledger and stamped
+# against the cap without our ever having seen it settle.
+#
+# That direction is deliberate. The two ways to be wrong are not symmetric --
+# assuming "failed" risks charging the user a second time for a fee they already
+# paid, while assuming "paid" risks the DEVELOPER not being paid a fee that was
+# owed. The user's funds are not ours to gamble with to collect our own fee, so
+# an outcome we cannot establish resolves in their favour. A week is far longer
+# than any HTLC can stay live (channel CLTV deltas are measured in hundreds of
+# blocks), so reaching this at all means the payment's fate is unknowable from
+# this wallet's state, not merely slow.
+DEV_FEE_INFLIGHT_MAX_AGE_SEC = 7 * 86_400.0
+# Upper bound on how long a single dev-fee payment may run before we stop
+# awaiting it. Above Electrum's own PAYMENT_TIMEOUT (120s) so a normal
+# give-up-and-retry happens inside pay_invoice, with headroom; this only catches
+# a wedge below it. Mirrors the liquidity sink's own backstop, which the payout
+# path was missing entirely.
+DEV_FEE_PAYMENT_TIMEOUT_SEC = 180.0
 
 # --- offline-channel auto-close persistence -------------------------------
 # Channel ids (hex) the plugin itself opened -- the ONLY channels eligible for
@@ -2367,6 +2480,7 @@ class LiquidityPlugin(BasePlugin):
         "_remediating_opens", "_tick_status",
         "_local_closes", "_wedged_faulted", "_close_capped_logged",
         "_known_chan_states", "_coop_closing", "_dev_fee_paying", "_dev_fee_retry_until",
+        "_fault_log_stamps",
         "_started_at", "_peer_seen_online", "_swap_freeze_escaped_logged",
         "_heartbeat_tasks",
         "_last_eval_at", "_auto_eval_interval", "_last_state_sig",
@@ -3728,17 +3842,48 @@ class LiquidityPlugin(BasePlugin):
 
     # --- config -> engine -------------------------------------------------
     def read_config(self, wallet: 'Abstract_Wallet') -> LiquidityConfig:
+        """This wallet's settings as the engine's config.
+
+        Every numeric field is CLAMPED, not merely cast. ``set_setting`` checks a
+        value against its ConfigVar's declared type but not its range, and the
+        per-wallet store lives in the wallet file -- which this plugin's own docs
+        invite users to read, and which they can therefore edit. So a negative
+        reserve, a NaN ceiling or an absurd sat figure is reachable here.
+        None of them loses money today (a negative reserve oversizes the funding
+        amount and dies on Electrum's NotEnoughFunds; a NaN ceiling declines every
+        swap), but that is downstream luck rather than an invariant -- see the note
+        on ``clamp_sat`` / ``clamp_pct`` in the engine.
+        """
         c = self.settings(wallet)
         return LiquidityConfig(
             automation_enabled=bool(c.INBOUND_LIQUIDITY_AUTOMATION_ENABLED),
-            min_onchain_to_open_sat=int(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
-            onchain_reserve_sat=int(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
-            max_channels=int(c.INBOUND_LIQUIDITY_MAX_CHANNELS),
+            min_onchain_to_open_sat=clamp_sat(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT),
+            onchain_reserve_sat=clamp_sat(c.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT),
+            max_channels=clamp_sat(c.INBOUND_LIQUIDITY_MAX_CHANNELS,
+                                   max_sat=MAX_CHANNELS_CEILING),
             max_channel_size_sat=self._max_channel_size_sat(wallet),
-            max_swap_fee_pct=float(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT),
-            swap_trigger_pct=float(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT),
-            swap_trigger_sat=int(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
-            min_outbound_sat=max(0, int(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT)),
+            # NOT capped at 100. Both of these are thresholds whose whole
+            # meaning can lie above 100%, and clamping them there would silently
+            # change what the user asked for:
+            #
+            #   * swap_trigger_pct is "swap once local exceeds this % of
+            #     capacity", so a value over 100 is the natural way to say NEVER
+            #     (at exactly 100 a fresh channel, where local == capacity, is
+            #     still over the trigger -- so clamping "never" to 100 turns it
+            #     into "always", which is the opposite of the request);
+            #   * max_swap_fee_pct is an all-in cost ceiling, and an all-in cost
+            #     CAN exceed 100% on a small enough amount (the fixed mining and
+            #     claim fees do not shrink with it), so >100 is a meaningful way
+            #     to say "accept any cost".
+            #
+            # The bound that matters here is the one F7 was actually about:
+            # finite, non-negative, not absurd. Hence the generous ceiling.
+            max_swap_fee_pct=clamp_pct(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT,
+                                       max_pct=MAX_THRESHOLD_PCT),
+            swap_trigger_pct=clamp_pct(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT,
+                                       max_pct=MAX_THRESHOLD_PCT),
+            swap_trigger_sat=clamp_sat(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT),
+            min_outbound_sat=clamp_sat(c.INBOUND_LIQUIDITY_MIN_OUTBOUND_SAT),
             min_swap_sat=self._min_swap_sat(wallet),
             manage_plugin_opened_only=bool(c.INBOUND_LIQUIDITY_MANAGE_PLUGIN_OPENED_ONLY),
             max_opens_per_day=self._max_opens_per_day(wallet),
@@ -3934,27 +4079,37 @@ class LiquidityPlugin(BasePlugin):
     # ceiling is enforced in the pure engine (it fed `opens_last_24h` into the
     # snapshot); the close ceiling is enforced here in the watchdog.
     def _max_opens_per_day(self, wallet: 'Abstract_Wallet') -> int:
-        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY))
+        return clamp_sat(self.settings(wallet).INBOUND_LIQUIDITY_MAX_OPENS_PER_DAY,
+                         default=DEFAULT_MAX_OPENS_PER_DAY, max_sat=MAX_ACTIONS_PER_DAY)
 
     def _offline_discount_after_sec(self, wallet: 'Abstract_Wallet') -> float:
         """How long this wallet treats a peer as merely absent before its channel
         stops occupying a slot. Hours in the setting, seconds to the engine;
-        floored at 0, which disables the streak prong."""
-        return max(0.0, float(getattr(
-            self.settings(wallet), "INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS",
-            DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS)) * 3600.0)
+        floored at 0, which disables the streak prong.
+
+        Total, like its sibling readers: a hand-edited wallet file holding a
+        non-number here must cost this setting, not the whole tick."""
+        hours = clamp_pct(
+            getattr(self.settings(wallet),
+                    "INBOUND_LIQUIDITY_OFFLINE_DISCOUNT_AFTER_HOURS",
+                    DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS),
+            default=DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS,
+            max_pct=MAX_OFFLINE_DISCOUNT_AFTER_HOURS)
+        return hours * 3600.0
 
     def _offline_open_allowance(self, wallet: 'Abstract_Wallet') -> int:
         """How far over ``max_channels`` the offline discount may take this
         wallet. Read off THIS wallet (it is a per-wallet setting) and floored at
         0, where the discount is off entirely. A hand-edited negative value would
         otherwise make the ceiling *stricter* than the user asked for."""
-        return max(0, int(getattr(
-            self.settings(wallet), "INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE",
-            DEFAULT_OFFLINE_OPEN_ALLOWANCE)))
+        return clamp_sat(
+            getattr(self.settings(wallet), "INBOUND_LIQUIDITY_OFFLINE_OPEN_ALLOWANCE",
+                    DEFAULT_OFFLINE_OPEN_ALLOWANCE),
+            default=DEFAULT_OFFLINE_OPEN_ALLOWANCE, max_sat=MAX_CHANNELS_CEILING)
 
     def _max_closes_per_day(self, wallet: 'Abstract_Wallet') -> int:
-        return max(0, int(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY))
+        return clamp_sat(self.settings(wallet).INBOUND_LIQUIDITY_MAX_CLOSES_PER_DAY,
+                         default=DEFAULT_MAX_CLOSES_PER_DAY, max_sat=MAX_ACTIONS_PER_DAY)
 
     def _load_action_timestamps(self, wallet: 'Abstract_Wallet') -> Dict[str, List[float]]:
         db = getattr(wallet, "db", None)
@@ -4180,13 +4335,165 @@ class LiquidityPlugin(BasePlugin):
             "daily_headroom_sat": max(0, DEV_FEE_DAILY_CAP_SAT - paid),
         }
 
+    # --- optional dev fee: the unresolved-payout record ------------------
+    def _load_dev_fee_inflight(self, wallet: 'Abstract_Wallet') -> Optional[Dict]:
+        """The payout whose outcome is still unknown, or None.
+
+        Shape-checked on the way out rather than trusted: this is a wallet-file
+        field, so it can be absent, hand-edited, or written by an older build.
+        Anything unusable reads as "no record", which lets payouts resume -- the
+        alternative, treating a corrupt record as a permanent hold, would silence
+        the fee forever with no way for a user to tell why.
+        """
+        db = getattr(wallet, "db", None)
+        raw = db.get(DEV_FEE_INFLIGHT_DB_KEY, None) if db is not None else None
+        if not isinstance(raw, dict):
+            return None
+        ph_hex = str(raw.get("payment_hash", "") or "")
+        # 32 bytes as hex: the shape of a payment hash. A value that is not one
+        # cannot be looked up in lnworker, so there is nothing to re-check.
+        if len(ph_hex) != 64:
+            return None
+        try:
+            bytes.fromhex(ph_hex)
+        except ValueError:
+            return None
+        return {
+            "payment_hash": ph_hex,
+            "amount_sat": _safe_int(raw.get("amount_sat", 0)),
+            "started_ts": float(raw.get("started_ts", 0.0) or 0.0),
+        }
+
+    def _save_dev_fee_inflight(self, wallet: 'Abstract_Wallet',
+                               record: Optional[Dict]) -> None:
+        """Persist (or clear, with ``None``) the unresolved-payout record.
+
+        The two directions fail differently, on purpose:
+
+        * RECORDING an attempt raises if it cannot reach disk. The record exists
+          to survive the process dying mid-payment, so a payment made without one
+          is exactly the unguarded case -- the caller catches this and declines to
+          pay at all.
+        * CLEARING one never raises. The clear always follows the ledger being
+          drawn down, and an exception there would escape mid-settlement; a stale
+          record is harmless by comparison, because re-resolving it finds the
+          payment already PR_PAID and the drawdown is floored at zero. So the
+          worst case is one extra stamp against the daily cap, which errs toward
+          paying less rather than more.
+        """
+        db = getattr(wallet, "db", None)
+        if db is None:
+            return  # db-less wallet (unit-test mock); nothing to persist
+        clearing = record is None
+        try:
+            if clearing:
+                db.put(DEV_FEE_INFLIGHT_DB_KEY, None)
+            else:
+                db.put(DEV_FEE_INFLIGHT_DB_KEY, {
+                    "payment_hash": str(record["payment_hash"]),
+                    "amount_sat": _safe_int(record["amount_sat"]),
+                    "started_ts": float(record["started_ts"]),
+                })
+            wallet.save_db()
+        except Exception as e:
+            self.logger.error(
+                f"could not persist the dev-fee in-flight record: {e!r}",
+                exc_info=True)
+            if not clearing:
+                raise
+
+    def _settle_dev_fee_inflight(self, wallet: 'Abstract_Wallet',
+                                 amount_sat: int, why: str) -> None:
+        """Account for an unresolved payout that we now treat as PAID: draw it
+        down from the owed ledger, stamp it against the rolling-24h cap, and
+        clear the record. Shared by the "we saw it settle" and the
+        "it outlived DEV_FEE_INFLIGHT_MAX_AGE_SEC" arms."""
+        remaining = max(0, self._load_dev_fee_owed(wallet) - int(amount_sat))
+        self._save_dev_fee_owed(wallet, remaining)
+        self._record_dev_fee_payment(wallet, int(amount_sat))
+        self._bump_usage_totals(wallet, dev_fee_paid_total_sat=int(amount_sat))
+        self._save_dev_fee_inflight(wallet, None)
+        self.logger.info(
+            f"dev-fee payout of {amount_sat} sat {why}; {remaining} sat still owed")
+
+    def _resolve_dev_fee_inflight(self, wallet: 'Abstract_Wallet') -> bool:
+        """Re-check the unresolved payout, if there is one. True means "still
+        unresolved -- do not start another payout".
+
+        The three resolutions, in the order they are tested:
+
+          * the payment settled -> account for it and clear the record;
+          * an HTLC may still be live -> keep holding (the whole point: minting a
+            fresh invoice now is what paid the fee twice);
+          * the payment is definitively dead (every route attempt exhausted, see
+            :meth:`_ln_payment_failed`) -> clear the record and let the fee, which
+            is still fully owed, be retried.
+
+        A record older than ``DEV_FEE_INFLIGHT_MAX_AGE_SEC`` is resolved as paid
+        regardless -- see the constant for why that direction.
+        """
+        record = self._load_dev_fee_inflight(wallet)
+        if record is None:
+            return False
+        ph_hex = record["payment_hash"]
+        amount_sat = record["amount_sat"]
+        lnworker = getattr(wallet, "lnworker", None)
+        if lnworker is None:
+            return True  # cannot check without one; keep holding
+        from electrum.lnutil import Direction
+        from electrum.invoices import PR_PAID
+        try:
+            payment_hash = bytes.fromhex(ph_hex)
+        except ValueError:
+            # Unreachable (the loader shape-checks), but a corrupt record must
+            # not be able to hold payouts shut forever.
+            self._save_dev_fee_inflight(wallet, None)
+            return False
+        try:
+            status = lnworker.get_payment_status(payment_hash, direction=Direction.SENT)
+        except Exception as e:
+            self.logger.info(
+                f"could not read the dev-fee payment's status ({e!r}); still holding")
+            return True
+        if status == PR_PAID:
+            self._settle_dev_fee_inflight(wallet, amount_sat, "settled after all")
+            return False
+        if self._payment_still_inflight(lnworker, payment_hash):
+            self.logger.info(
+                f"dev-fee payout of {amount_sat} sat is still unresolved "
+                f"({ph_hex[:10]}…); not paying again until it settles or fails")
+            return True
+        if self._ln_payment_failed(wallet, ph_hex):
+            self.logger.info(
+                f"dev-fee payout of {amount_sat} sat failed definitively "
+                f"({ph_hex[:10]}…); the fee stays owed and will be retried")
+            self._save_dev_fee_inflight(wallet, None)
+            return False
+        started_ts = record["started_ts"]
+        age = time.time() - started_ts
+        if started_ts <= 0.0 or age > DEV_FEE_INFLIGHT_MAX_AGE_SEC:
+            self._settle_dev_fee_inflight(
+                wallet, amount_sat,
+                f"outcome never established after {int(age // 86400)} day(s), so it "
+                f"is treated as paid rather than risk charging it twice")
+            return False
+        # Neither paid, nor in flight, nor provably failed -- Electrum has no
+        # route-attempt log for it yet. Keep holding; this resolves on a later
+        # tick, or ages out above.
+        return True
+
     # --- optional dev fee: payout ----------------------------------------
     # Accrued fees are paid out in batches to the configured Lightning address
     # via LNURL-pay: resolve the address -> fetch pay params -> request an invoice
     # for the payable amount -> pay it. The whole thing runs as a guarded
     # background task (an LN payment can take a while and must not block
-    # evaluation), and is resilient: on any failure the owed ledger is left
-    # untouched and a backoff is set, so the fee is simply retried on a later tick.
+    # evaluation).
+    #
+    # On a failure that we can show left nothing committed, the owed ledger is
+    # left untouched and a backoff is set, so the fee is retried on a later tick.
+    # A failure we CANNOT show that for is held instead -- see
+    # DEV_FEE_INFLIGHT_DB_KEY, which is the difference between retrying a fee and
+    # paying it twice.
     @staticmethod
     def _resolve_lnurl_pay_url(address: str) -> Optional[str]:
         """Turn a configured payout target into an LNURL-pay https URL: a
@@ -4274,6 +4581,12 @@ class LiquidityPlugin(BasePlugin):
         now_mono = time.monotonic()
         if now_mono < self._dev_fee_retry_until.get(wallet, 0.0):
             return  # backing off after a recent failure
+        # A previous payout whose outcome we never established holds everything:
+        # paying again now is exactly how the same fee got paid twice. Checked
+        # before the amount is even computed, and persisted, so a restart in the
+        # middle of a payment does not forget it.
+        if self._resolve_dev_fee_inflight(wallet):
+            return
         owed = self._load_dev_fee_owed(wallet)
         paid = self._dev_fee_paid_last_24h(wallet)
         decision = decide_dev_fee_payout(
@@ -4297,11 +4610,27 @@ class LiquidityPlugin(BasePlugin):
     async def _do_pay_dev_fee(self, wallet: 'Abstract_Wallet', address: str,
                               amount_sat: int) -> None:
         """Resolve the payout address, request an invoice for ``amount_sat`` and
-        pay it. On success, draw the amount down from the owed ledger and stamp it
-        against the rolling-24h cap. On any failure, leave the ledger untouched
-        and set a backoff so the same fee is retried later."""
+        pay it.
+
+        Three outcomes, and the third is the one that matters:
+
+          * settled -> draw the amount down from the owed ledger and stamp it
+            against the rolling-24h cap;
+          * failed, with nothing committed -> leave the ledger untouched and set a
+            backoff, so the same fee is retried later;
+          * failed, but an HTLC may still be live -> leave the ledger untouched AND
+            keep the persisted in-flight record, so no further payout is made
+            until that payment's fate is known. ``pay_invoice`` reporting failure
+            does not prove nothing was sent (see DEV_FEE_INFLIGHT_DB_KEY), and a
+            retry mints a fresh invoice that Electrum's own
+            same-payment-hash guard cannot catch.
+
+        The record is written BEFORE the payment, so a crash mid-payment is held
+        the same way a reported failure is.
+        """
         lnworker = getattr(wallet, "lnworker", None)
         ok = False
+        held = False
         try:
             if lnworker is None:
                 self.logger.info("dev-fee payout skipped: wallet has no lnworker")
@@ -4324,34 +4653,90 @@ class LiquidityPlugin(BasePlugin):
                                                 purpose="dev-fee payout")
             if invoice is None:
                 return
-            success, log = await lnworker.pay_invoice(invoice)
+            try:
+                payment_hash = bytes.fromhex(invoice.rhash)
+            except Exception:  # noqa: BLE001
+                payment_hash = b""
+            if not payment_hash:
+                # With no payment hash we could neither record this attempt nor
+                # ever ask what became of it, so it must not be made: an
+                # unrecordable payment is the one we cannot avoid repeating.
+                self.logger.warning(
+                    "dev-fee payout skipped: the invoice has no readable payment "
+                    "hash, so the attempt could not be tracked")
+                return
+            # Persist the attempt first. If this cannot be written, do not pay --
+            # an untracked payment is exactly what the double-pay guard needs.
+            try:
+                self._save_dev_fee_inflight(wallet, {
+                    "payment_hash": payment_hash.hex(),
+                    "amount_sat": int(pay_sat),
+                    "started_ts": time.time(),
+                })
+            except Exception:
+                self.logger.warning(
+                    "dev-fee payout skipped: could not record the attempt, and an "
+                    "unrecorded payment risks being made twice")
+                return
+            held = True
+            # Bounded and fee-budgeted, matching the liquidity sink: the payout
+            # path had neither, so a wedge below pay_invoice held the paying flag
+            # indefinitely and routing fees fell back to Electrum's default
+            # instead of the ceiling this wallet configured.
+            success, _log = await asyncio.wait_for(
+                lnworker.pay_invoice(
+                    invoice, budget=self._ln_fee_budget(wallet, pay_sat)),
+                timeout=DEV_FEE_PAYMENT_TIMEOUT_SEC)
             if not success:
-                self.logger.warning(f"dev-fee payout of {pay_sat} sat did not settle")
+                # Does this leave the channel committed? The in-flight check is
+                # the whole difference between a safe retry and a double payment.
+                if self._payment_still_inflight(lnworker, payment_hash):
+                    self.logger.warning(
+                        f"dev-fee payout of {pay_sat} sat did not settle, but an "
+                        f"HTLC may still be live; holding the fee until it resolves "
+                        f"rather than paying again")
+                    return
+                self.logger.warning(
+                    f"dev-fee payout of {pay_sat} sat did not settle "
+                    f"(nothing in flight); the fee stays owed")
+                held = False     # provably nothing committed: safe to retry
                 return
             ok = True
-            # Draw the paid amount down from the ledger (never below 0) and stamp
-            # it against the daily cap. Re-read owed so a concurrent accrual isn't
-            # clobbered.
-            remaining = max(0, self._load_dev_fee_owed(wallet) - pay_sat)
-            self._save_dev_fee_owed(wallet, remaining)
-            self._record_dev_fee_payment(wallet, pay_sat)
-            self._bump_usage_totals(wallet, dev_fee_paid_total_sat=int(pay_sat))
-            self.logger.info(
-                f"dev-fee payout of {pay_sat} sat settled to {address}; "
-                f"{remaining} sat still owed")
+            held = False
+            # Draw the paid amount down from the ledger (never below 0), stamp it
+            # against the daily cap and clear the in-flight record. Re-reads owed
+            # so a concurrent accrual isn't clobbered.
+            self._settle_dev_fee_inflight(wallet, pay_sat, f"settled to {address}")
+            remaining = self._load_dev_fee_owed(wallet)
             self._log_action(
                 wallet, kind="dev_fee", amount_sat=pay_sat,
                 source=None, dest=address,
                 reason="dev fee payout",
                 detail=f"paid {pay_sat} sat to {address}; {remaining} sat still owed",
                 state=None)
+        except asyncio.TimeoutError:
+            # Past our backstop with the payment still running. Treated exactly
+            # like a reported failure whose HTLC may be live: hold, never retry
+            # blind. `held` is already True, so the record stays.
+            self.logger.warning(
+                f"dev-fee payout of {amount_sat} sat timed out after "
+                f"{DEV_FEE_PAYMENT_TIMEOUT_SEC:.0f}s; holding the fee until the "
+                f"payment resolves")
         except Exception as e:
             self.logger.warning(f"dev-fee payout failed: {e!r}")
         finally:
             self._dev_fee_paying[wallet] = False
+            if not ok and not held:
+                # Nothing was committed, so clear any record we wrote and let the
+                # fee be retried after a backoff -- so a persistently failing
+                # address doesn't hammer the network every tick. The fee stays owed.
+                try:
+                    if self._load_dev_fee_inflight(wallet) is not None:
+                        self._save_dev_fee_inflight(wallet, None)
+                except Exception as e:  # noqa: BLE001
+                    self.logger.info(
+                        f"could not clear the dev-fee in-flight record: {e!r}")
             if not ok:
-                # Back off before the next attempt so a persistently failing
-                # address doesn't retry every tick. The fee stays owed.
                 self._dev_fee_retry_until[wallet] = time.monotonic() + DEV_FEE_RETRY_BACKOFF_SEC
 
     # --- provider reliability --------------------------------------------
@@ -4393,12 +4778,53 @@ class LiquidityPlugin(BasePlugin):
         db = getattr(wallet, "db", None)
         if db is None:
             return  # db-less wallet (unit-test mock); nothing to persist
+        data = self._cap_reliability_rows(data)
         try:
             db.put(RELIABILITY_DB_KEY, data)
             if write_to_disk:
                 wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist provider reliability: {e!r}", exc_info=True)
+
+    def _cap_reliability_rows(self, data: Dict[str, Dict]) -> Dict[str, Dict]:
+        """Hold the reliability store to ``RELIABILITY_MAX_ROWS``, dropping the
+        least informative rows first.
+
+        The age-based prune (:meth:`_prune_reliability_store`) is the normal way
+        rows leave, but it waits 90 days -- which is a long time to carry a flood
+        of identities in the wallet file, and nostr offers cost nothing to
+        publish. This is the backstop, applied on every write.
+
+        Rows are kept by how much they would cost to lose, most valuable first:
+        a provider we have SUCCEEDED with, then one with a real fault history, then
+        the merely-seen. Within that, the most recently active wins. Dropping a
+        row forgets a penalty, so the ordering deliberately makes a penalised
+        provider the last thing evicted -- a flooder cannot wash out its own bad
+        record by publishing more identities.
+        """
+        if len(data) <= RELIABILITY_MAX_ROWS:
+            return data
+
+        def _value(item) -> tuple:
+            _npub, stats = item
+            stats = stats if isinstance(stats, dict) else {}
+
+            def _num(key: str) -> float:
+                try:
+                    return float(stats.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            last_active = max(_num("last_fault_ts"), _num("last_success_ts"),
+                              _num("last_attempt_ts"))
+            # Negated for an ascending sort: keep-first comes out first.
+            return (-_num("success_count"), -_num("fault_count"), -last_active)
+
+        kept = dict(sorted(data.items(), key=_value)[:RELIABILITY_MAX_ROWS])
+        self.logger.warning(
+            f"provider reliability store held {len(data)} rows, above the "
+            f"{RELIABILITY_MAX_ROWS}-row ceiling; dropped "
+            f"{len(data) - len(kept)} of the least active, unpenalised ones")
+        return kept
 
     def _provider_penalty(self, wallet: 'Abstract_Wallet', npub: str,
                           stats: Optional[Dict], params: Dict[str, float],
@@ -4777,6 +5203,13 @@ class LiquidityPlugin(BasePlugin):
             return
         # A provider whose terms are rejected still has a usable identity, and
         # still gets a row on the Providers tab -- so it is still worth a name.
+        # Bounded the same way discovery is, and for the same reason: this list
+        # becomes a nostr filter's `authors` array, so an unbounded offer set
+        # became an unbounded subscription. `_bounded_offers` is reused rather
+        # than re-deriving a cap, so the names looked up are exactly the
+        # providers the ranking actually considered. Passing wallet=None keeps
+        # this a pure read -- a name lookup must not record a fault or an event.
+        raw_offers = self._bounded_offers(None, raw_offers, quiet=True)
         npubs = {clean_npub(getattr(o, "server_npub", None)) for o in raw_offers}
         npubs.discard("")
         if not npubs:
@@ -5239,6 +5672,52 @@ class LiquidityPlugin(BasePlugin):
             self.logger.error(f"could not persist pending-swap tracking: {e!r}",
                               exc_info=True)
 
+    def _swap_funding_confirmed(self, wallet: 'Abstract_Wallet', swap) -> bool:
+        """Whether this reverse swap's on-chain funding has actually CONFIRMED.
+
+        The distinction this draws is the whole point. ``swap.funding_txid`` being
+        set does not mean the sats arrived: the swap manager's watcher sets it the
+        moment it sees a matching output in an *unconfirmed* transaction, and
+        Electrum says outright that it can change afterwards --
+        ``submarine_swaps.py``: "note: swap.funding_txid can change due to RBF, it
+        will get updated here". So a provider can have a funding tx seen, and
+        then replace it.
+
+        The plugin used to count a swap complete on that first sighting, which
+        meant a provider could clear its accumulated reliability penalty, and
+        make the user accrue a dev fee, on sats that never arrived. One
+        confirmation is cheap to wait for -- reconciliation runs every tick -- and
+        it is the same test Electrum's own claim path uses
+        (``_claim_to_output``: ``get_tx_height(...).height() > TX_HEIGHT_UNCONFIRMED``).
+
+        Best-effort and conservative: anything unreadable answers False, i.e.
+        "not yet", which defers the accrual rather than granting it. The swap's
+        record is kept either way, so a False here costs a tick, not a fee.
+        """
+        from electrum.address_synchronizer import TX_HEIGHT_UNCONFIRMED
+        txid = getattr(swap, "funding_txid", None)
+        if not txid:
+            return False
+        try:
+            return wallet.adb.get_tx_height(txid).height() > TX_HEIGHT_UNCONFIRMED
+        except Exception as e:  # noqa: BLE001
+            self.logger.info(
+                f"could not read the funding tx's confirmation state ({e!r}); "
+                f"treating the swap as not yet confirmed")
+            return False
+
+    def _swap_delivered(self, wallet: 'Abstract_Wallet', swap) -> bool:
+        """Whether the provider has demonstrably delivered: we already swept the
+        funding output (``is_redeemed``), or it has at least one confirmation.
+
+        The single definition of "this swap completed", shared by the executor and
+        by reconciliation so the two cannot drift -- the dev fee, the provider's
+        success and the lifetime totals all hang off it.
+        """
+        if getattr(swap, "is_redeemed", False):
+            return True
+        return self._swap_funding_confirmed(wallet, swap)
+
     def _track_pending_swap(self, wallet: 'Abstract_Wallet', payment_hash_hex: str,
                             npub: str, node_id: str = "", channel_id: str = "",
                             fee_basis_sat: int = 0) -> None:
@@ -5387,12 +5866,11 @@ class LiquidityPlugin(BasePlugin):
                 swap = sm.get_swap(bytes.fromhex(ph_hex))
             except Exception:
                 swap = None
-            if swap is not None and (getattr(swap, "is_redeemed", False)
-                                     or getattr(swap, "funding_txid", None)):
-                # Provider created the on-chain output (and we may already have
-                # claimed it) -- it honoured the swap. This is the swap's confirmed
-                # completion, so accrue its dev fee now (once -- the record is then
-                # dropped).
+            if swap is not None and self._swap_delivered(wallet, swap):
+                # Provider's on-chain output is confirmed (or we have already
+                # claimed it) -- it honoured the swap. This is the swap's
+                # confirmed completion, so accrue its dev fee now (once -- the
+                # record is then dropped).
                 self._record_provider_success(wallet, npub)
                 basis_sat = int(info.get("fee_basis_sat", 0) or 0)
                 self._accrue_dev_fee(
@@ -5410,6 +5888,11 @@ class LiquidityPlugin(BasePlugin):
                 # delivery is still a delivery however late we notice it (and the
                 # dev fee for it is still owed).
                 #
+                # It is also what bounds the awaiting-confirmation arm just below:
+                # a funding tx that is seen and never confirms (because it was
+                # replaced) holds its record until it ages out here, rather than
+                # forever.
+                #
                 # A record with no usable started_ts (0.0, only reachable through
                 # a corrupted store) lands here too, which is the right home for
                 # it: previously it aged past every timeout instantly and faulted
@@ -5420,6 +5903,25 @@ class LiquidityPlugin(BasePlugin):
                     f"attribute to a provider or a peer")
                 del data[ph_hex]
                 changed = True
+            elif swap is not None and getattr(swap, "funding_txid", None):
+                # Funding is SEEN but not yet confirmed. Its own arm, ahead of
+                # every verdict below, because none of them is right here:
+                #
+                #  * it is not a completion yet -- the tx can still be replaced
+                #    (see _swap_funding_confirmed), so the fee must not accrue;
+                #  * it is emphatically not "stuck with no on-chain funding", which
+                #    is what the timeout arm further down would otherwise charge
+                #    this provider for. Faulting a provider that funded correctly,
+                #    for the crime of us waiting out a confirmation, would be a
+                #    worse bug than the one the confirmation gate fixes.
+                #
+                # So: leave the record exactly as it is and look again next tick.
+                # Placed BELOW the staleness arm on purpose, so this cannot hold a
+                # record indefinitely -- a funding tx that never confirms ages out
+                # up there like any other unresolved swap.
+                self.logger.debug(
+                    f"swap {ph_hex[:10]}… : funding tx seen but unconfirmed; "
+                    f"awaiting a confirmation before counting it complete")
             elif attribution.is_resolved:
                 # Our Lightning payment failed before any funding, and the onion
                 # error says WHO failed it. The provider never got the chance to
@@ -6286,7 +6788,16 @@ class LiquidityPlugin(BasePlugin):
         except Exception as e:
             self.logger.warning(f"could not read discovered offers: {e!r}")
             return []
+        raw_offers = self._bounded_offers(wallet, raw_offers)
         offers: List[ProviderOffer] = []
+        # Faults for malformed offers are collected and written ONCE at the end of
+        # the pass, not per provider. Each `_record_provider_fault` is a full
+        # wallet-file write, and anyone may publish a nostr offer: a flood of
+        # distinct identities advertising out-of-range terms therefore used to cost
+        # one whole-wallet write per identity, over a dict that grew with each --
+        # quadratic disk I/O, performed while this wallet's evaluation lock is
+        # held. See `_record_provider_faults_bulk`.
+        malformed: List[str] = []
         faulted_this_pass: set = set()  # fault each bad provider at most once/pass
         for o in raw_offers:
             # ``max_forward`` (not ``max_reverse``) is the provider's cap on a
@@ -6318,11 +6829,130 @@ class LiquidityPlugin(BasePlugin):
                 # At most once per pass, so a provider spamming many bad offers
                 # under one identity can't amplify into a burst of db writes.
                 faulted_this_pass.add(npub)
-                self._record_provider_fault(
-                    wallet, npub, "advertised malformed/out-of-range offer", soft=True)
+                malformed.append(npub)
             elif not npub:
                 self.logger.info("dropping offer with unusable provider identity")
+        if malformed and wallet is not None:
+            self._record_provider_faults_bulk(
+                wallet, malformed, "advertised malformed/out-of-range offer")
         return offers
+
+    def _bounded_offers(self, wallet: Optional['Abstract_Wallet'],
+                        raw_offers: List[Any], *, quiet: bool = False) -> List[Any]:
+        """At most ``MAX_DISCOVERED_PROVIDERS`` of the offers on the wire.
+
+        There is no cost to publishing a nostr offer and no gatekeeper on who may,
+        so the discovered set is attacker-sized: every per-offer step downstream
+        (validation, the reliability-penalty join, the ranking, the profile
+        lookup, and -- before the batching above -- a wallet-file write each)
+        scaled with however many events a flooder cared to sign.
+
+        Which ones to keep, when there are too many, is chosen to be the opposite
+        of cheap-to-game:
+
+          * providers this wallet already has reliability history for come first.
+            A flooder's fresh identities have none, and cannot acquire any without
+            actually being selected and transacted with;
+          * then by announcement proof-of-work, which costs real work per
+            identity -- the one signal in an offer an attacker cannot fake for
+            free. (Electrum already verifies the announcement's signature and the
+            client's own PoW target before an offer reaches us at all.)
+
+        Ties and non-numeric PoW values keep their arrival order, so in the
+        ordinary case -- a handful of honest providers, far below the cap -- this
+        returns the list untouched and changes nothing.
+
+        ``quiet`` suppresses the "ignored N offers" report. Set by the
+        name-lookup caller, which re-derives the same bound over the same offers
+        purely to size a nostr filter: reporting it there would say the same
+        thing twice per tick about one capped discovery pass.
+        """
+        if len(raw_offers) <= MAX_DISCOVERED_PROVIDERS:
+            return raw_offers
+        known: frozenset = frozenset()
+        if wallet is not None:
+            try:
+                known = frozenset(self._load_reliability(wallet))
+            except Exception:  # noqa: BLE001  (ranking hygiene must not break a tick)
+                known = frozenset()
+
+        def _rank(indexed) -> tuple:
+            index, offer = indexed
+            npub = clean_npub(getattr(offer, "server_npub", None))
+            try:
+                pow_bits = int(getattr(offer, "pow_bits", 0) or 0)
+            except (TypeError, ValueError):
+                pow_bits = 0
+            # Negated so that "known" and "more PoW" sort FIRST under an
+            # ascending sort, with `index` breaking ties by arrival order.
+            return (0 if npub and npub in known else 1, -pow_bits, index)
+
+        kept = sorted(enumerate(raw_offers), key=_rank)[:MAX_DISCOVERED_PROVIDERS]
+        dropped = len(raw_offers) - len(kept)
+        if not quiet:
+            # Never silent: a capped discovery pass means the plugin may not have
+            # considered the cheapest provider on the network, and that has to be
+            # visible rather than inferred from a swap that was dearer than
+            # expected.
+            self.logger.warning(
+                f"{len(raw_offers)} swap offers were advertised, which is more "
+                f"than this plugin will consider; kept {len(kept)} (providers "
+                f"already known to this wallet, then highest announcement "
+                f"proof-of-work) and ignored {dropped}")
+            if wallet is not None:
+                self._diag_event(
+                    wallet, category="error", kind="providers",
+                    reason="more swap offers advertised than will be considered",
+                    detail=(f"{len(raw_offers)} advertised; kept "
+                            f"{MAX_DISCOVERED_PROVIDERS}, ignored {dropped}"))
+        # Back into arrival order, so this is purely a filter and the downstream
+        # ordering stays the engine's business.
+        return [offer for _index, offer in sorted(kept, key=lambda iv: iv[0])]
+
+    def _record_provider_faults_bulk(self, wallet: 'Abstract_Wallet',
+                                     npubs: Sequence[str], reason: str) -> None:
+        """Record one soft fault for each of ``npubs`` in a SINGLE wallet-file
+        write.
+
+        Same effect as calling :meth:`_record_provider_fault` per npub, and the
+        escalation arithmetic is deliberately identical (soft faults floor the
+        counter at one decaying level and never compound) -- but the store is
+        loaded once, mutated in memory, and saved once. That is the difference
+        between a flood of malformed offers costing one write and costing one
+        write per identity over a growing dict.
+
+        The per-npub log line and Faults-log entry are kept: those are bounded by
+        the discovery cap and are how an operator sees what is being advertised at
+        them. The decision-log append is rate-limited separately (see
+        ``_log_fault``), so this cannot flush the log either.
+        """
+        if not npubs:
+            return
+        data = self._load_reliability(wallet)
+        now = time.time()
+        for npub in npubs:
+            if not npub:
+                continue
+            s = data.get(npub, {})
+            prev = self._aged_consecutive_faults(wallet, s)
+            s["consecutive_faults"] = max(prev, 1)   # soft: floor, never escalate
+            s["fault_count"] = int(s.get("fault_count", 0)) + 1
+            s["last_fault_ts"] = now
+            s["last_reason"] = reason
+            data[npub] = s
+        self._save_reliability(wallet, data)
+        self.logger.info(
+            f"{len(npubs)} provider(s) soft-faulted: {reason} "
+            f"({', '.join(n[:12] + '…' for n in npubs[:5])}"
+            f"{', …' if len(npubs) > 5 else ''})")
+        # One log write for the batch too. Appending per npub would have moved the
+        # quadratic cost from the reliability store straight onto the decision
+        # log, which is a whole-wallet write per entry.
+        rows = [self._fault_log_entry(kind="provider", ident=npub, reason=reason,
+                                      hard=False, soft=True)
+                for npub in npubs
+                if npub and self._fault_log_allowed(wallet, "provider", npub)]
+        self._append_log_many(wallet, rows)
 
     @staticmethod
     def _chan_unsettled_is_swap(chan, sm) -> bool:
@@ -8238,22 +8868,23 @@ class LiquidityPlugin(BasePlugin):
                              detail=f"{type(e).__name__}: {e}")
             return _SwapAttempt.NEXT if retryable else _SwapAttempt.ABORT
         if funding_txid:
-            # The provider created the on-chain funding output: it honoured the
-            # swap. Count it as a success straight away (the claim is Electrum's
-            # job from here). This is a confirmed completion, so accrue the dev fee
-            # now, on the net on-chain amount received.
+            # The provider created the on-chain funding output: it committed to
+            # the swap, and the claim is Electrum's job from here. So this logs
+            # the action and ends the cascade -- a real funding txid is the ONLY
+            # thing that logs an action. See the unfunded arms below for why that
+            # boundary is drawn here and not after them.
             #
-            # A real funding txid is the ONLY thing that logs an action. See the
-            # unfunded arms below for why that boundary is drawn here and not after
-            # them.
-            self._record_provider_success(wallet, npub)
-            self._accrue_dev_fee(wallet, expected_onchain_sat, source=action.short_id)
-            # Lifetime totals. Measured on the NET ON-CHAIN amount received --
-            # the same basis the dev fee is charged on, and the one figure the
-            # late-reconciliation path (_reconcile_pending_swaps) also has, so
-            # both swap-completion sites count the same quantity.
-            self._bump_usage_totals(wallet, swaps_completed_total=1,
-                                    sats_swapped_total=int(expected_onchain_sat))
+            # What it does NOT do is count the swap COMPLETE. That needs the
+            # funding tx to confirm: the txid here comes from an unconfirmed
+            # sighting and Electrum notes it can change under RBF, so crediting
+            # the provider with a success and charging the user a dev fee at this
+            # moment would both be done on sats that may never arrive (see
+            # _swap_funding_confirmed). Instead the swap is TRACKED, exactly as the
+            # unfunded paths track theirs, and reconciliation grants the success,
+            # the fee and the lifetime totals once the funding confirms -- or ages
+            # the record out if it never does.
+            self._track_new_swaps(wallet, sm, swaps_before, npub, action,
+                                  expected_onchain_sat)
             # This channel just worked, so forget whatever failure we last recorded
             # for it: a recurrence after a success is news, not a repeat.
             self._last_exec_decline_sig.pop(action.channel_id, None)
@@ -8820,16 +9451,20 @@ class LiquidityPlugin(BasePlugin):
             out.append(capped)
         return out
 
-    def _sink_fee_budget(self, wallet: 'Abstract_Wallet', amount_sat: int):
-        """The routing-fee budget for a sink payment: the user's existing
-        ``max_swap_fee_pct`` ceiling, applied to the amount being sent.
+    def _ln_fee_budget(self, wallet: 'Abstract_Wallet', amount_sat: int):
+        """The routing-fee budget for a Lightning payment the plugin makes: the
+        user's existing ``max_swap_fee_pct`` ceiling, applied to the amount sent.
 
-        The same knob governs both drain routes on purpose -- it is the answer to
+        The same knob governs every drain route on purpose -- it is the answer to
         "how much am I willing to pay to convert outbound into inbound", and a
         sink payment converts exactly what a reverse swap does. Note the ceiling
         is strict: a route costing more is not taken, which surfaces as a payment
         failure and drops the ladder to its next rung. A ceiling of 0 therefore
         permits only zero-fee routes (a direct channel to the sink's node).
+
+        Also used for the dev-fee payout, which had no budget at all and so paid
+        routes up to Electrum's own default rather than the ceiling this wallet
+        configured -- a fee on top of the fee, out of the user's channel.
 
         Takes the wallet because the ceiling is ITS ceiling: this read was left
         on the installation-wide config, so a wallet that lowered its fee
@@ -9001,7 +9636,7 @@ class LiquidityPlugin(BasePlugin):
             payment_hash = bytes.fromhex(invoice.rhash)
         except Exception:  # noqa: BLE001
             payment_hash = b""
-        kwargs: Dict[str, Any] = {"budget": self._sink_fee_budget(wallet, amount_sat)}
+        kwargs: Dict[str, Any] = {"budget": self._ln_fee_budget(wallet, amount_sat)}
         if chan is not None:
             kwargs["channels"] = [chan]
         try:
@@ -9532,6 +10167,44 @@ class LiquidityPlugin(BasePlugin):
             days = DEFAULT_LOG_RETENTION_DAYS
         return max(1, min(days, MAX_LOG_RETENTION_DAYS))
 
+    def _fault_log_allowed(self, wallet: 'Abstract_Wallet', kind: str,
+                           ident: str) -> bool:
+        """Whether this party may append another fault row to the decision log
+        yet. One per identity per ``FAULT_LOG_MIN_INTERVAL_SEC``.
+
+        Keyed per identity rather than globally on purpose: a single misbehaving
+        provider must not be able to mute the log for everyone else, which a
+        global throttle would let it do. In-memory (not persisted) -- the window
+        is minutes and the only cost of forgetting it on restart is one extra row
+        per identity.
+
+        The bookkeeping dict is itself bounded, since the identities are
+        attacker-supplied: past ``FAULT_LOG_MAX_TRACKED`` the oldest stamps are
+        dropped, which at worst lets an identity log one row sooner than the
+        window would have allowed.
+
+        Fails OPEN. This is a flood guard, not a correctness gate, so a wallet
+        object that cannot key the store (an unhashable stand-in) gets its entry
+        logged rather than losing it to the throttle's own bookkeeping.
+        """
+        try:
+            stamps = self._per_wallet_store("_fault_log_stamps").setdefault(wallet, {})
+        except TypeError:
+            return True
+        now = time.monotonic()
+        key = f"{kind}:{ident}"
+        last = stamps.get(key)
+        if last is not None and (now - last) < FAULT_LOG_MIN_INTERVAL_SEC:
+            return False
+        if len(stamps) >= FAULT_LOG_MAX_TRACKED and key not in stamps:
+            # Drop the least recently stamped half, so this is amortised rather
+            # than a sort on every fault once the dict is full.
+            for stale, _ts in sorted(stamps.items(), key=lambda kv: kv[1])[
+                    :max(1, FAULT_LOG_MAX_TRACKED // 2)]:
+                stamps.pop(stale, None)
+        stamps[key] = now
+        return True
+
     def _log_fault(self, wallet: 'Abstract_Wallet', *, kind: str, ident: str,
                    reason: str, hard: bool, soft: bool = False) -> None:
         """Append a reliability fault to the decision log (category "fault") so its
@@ -9539,11 +10212,31 @@ class LiquidityPlugin(BasePlugin):
         "provider"; ``ident`` is the node id / npub. ``soft`` marks an ambiguous,
         non-escalating fault (see :meth:`_record_provider_fault`) so the Faults
         view can show it is a low-severity/transient signal, not a real fault. A
-        no-op for db-less wallets (unit-test mocks)."""
+        no-op for db-less wallets (unit-test mocks).
+
+        Rate-limited per (kind, identity), because the decision log is a ring
+        pruned to ``MAX_LOG_ENTRIES`` and faults are the one category an outside
+        party can provoke at will: anyone may publish a malformed nostr offer, and
+        each used to append an entry. Enough of them and every genuine row -- the
+        opens, swaps and closes the operator audits their money with -- is evicted
+        from the only record of it. A fault that is suppressed is still recorded
+        where it decides anything (the reliability store and its counters, written
+        by the caller); what is dropped is a duplicate log line.
+        """
         if getattr(wallet, "db", None) is None:
             return
+        if not self._fault_log_allowed(wallet, kind, ident):
+            return
+        self._append_log(wallet, self._fault_log_entry(
+            kind=kind, ident=ident, reason=reason, hard=hard, soft=soft))
+
+    def _fault_log_entry(self, *, kind: str, ident: str, reason: str,
+                         hard: bool, soft: bool) -> Dict:
+        """One fault row, built but not written. Split out so the batch path
+        (:meth:`_record_provider_faults_bulk`) produces rows identical to the
+        single-fault path's rather than a second transcription of them."""
         prefix = "soft fault: " if soft else ("hard fault: " if hard else "fault: ")
-        entry = {
+        return {
             "ts": time.time(),
             "category": "fault",
             "kind": kind,
@@ -9554,7 +10247,6 @@ class LiquidityPlugin(BasePlugin):
             "detail": None,
             "state": {},
         }
-        self._append_log(wallet, entry)
 
     def _state_dict(self, wallet: 'Abstract_Wallet', snapshot: LiquiditySnapshot,
                     config: LiquidityConfig) -> Dict:
@@ -9717,13 +10409,58 @@ class LiquidityPlugin(BasePlugin):
 
     def _prune(self, wallet: 'Abstract_Wallet',
                entries: List[Dict]) -> List[Dict]:
+        """Apply retention, then the size cap -- with a reserve that faults may
+        not eat into.
+
+        The size cap alone was a plain "keep the newest N", which made the log
+        evictable by whoever could generate the most entries. Faults are the one
+        category an outside party can provoke on demand (publishing a malformed
+        nostr offer costs nothing, and every distinct identity earns its own row),
+        so a flood pushed out every action, decline and lifecycle row -- emptying
+        the only record an operator has of what the plugin did with their money,
+        which is precisely what somebody doing that would want.
+
+        Note why a per-identity throttle is not sufficient on its own and is not
+        what this relies on: a flooder uses a FRESH identity per offer, so every
+        row looks like a different party's first fault. The bound has to be on the
+        share of the log faults may occupy, not on the rate any one party reports
+        at. ``_fault_log_allowed`` still throttles a single repeat offender, which
+        is a different (and cheaper) problem.
+
+        So: faults are held to ``MAX_FAULT_LOG_SHARE`` of the cap, keeping the
+        newest of them, and everything else keeps the rest. Within each group the
+        newest survive, and the result is restored to chronological order so
+        readers and the retention pass see an unchanged shape.
+        """
         cutoff = time.time() - self._retention_days(wallet) * 86400
         kept = [e for e in entries if float(e.get("ts", 0)) >= cutoff]
-        if len(kept) > MAX_LOG_ENTRIES:
-            kept = kept[-MAX_LOG_ENTRIES:]
-        return kept
+        if len(kept) <= MAX_LOG_ENTRIES:
+            return kept
+        fault_budget = int(MAX_LOG_ENTRIES * MAX_FAULT_LOG_SHARE)
+        faults = [e for e in kept if e.get("category") == "fault"]
+        others = [e for e in kept if e.get("category") != "fault"]
+        faults = faults[-fault_budget:]
+        # Faults that did not use their whole budget leave room for the rest, so
+        # a quiet wallet still fills the log with its own history.
+        others = others[-(MAX_LOG_ENTRIES - len(faults)):]
+        merged = others + faults
+        merged.sort(key=lambda e: float(e.get("ts", 0)))
+        return merged
 
     def _append_log(self, wallet: 'Abstract_Wallet', entry: Dict) -> None:
+        self._append_log_many(wallet, [entry])
+
+    def _append_log_many(self, wallet: 'Abstract_Wallet',
+                         new_entries: Sequence[Dict]) -> None:
+        """Append entries to the decision log in ONE wallet-file write.
+
+        Batched because the single-entry path is a whole-wallet write each time,
+        and one discovery pass can legitimately produce an entry per provider.
+        Writing per entry made a flood of malformed offers cost a write per
+        identity over a growing list -- the same quadratic shape
+        ``_record_provider_faults_bulk`` exists to avoid on the reliability
+        store, which is where that cost simply moved to until this.
+        """
         if getattr(wallet, "db", None) is None:
             # No store to append to. Matches _log_fault's own guard: a wallet with
             # no db is a unit-test mock, and the decision log is a record of what
@@ -9731,17 +10468,20 @@ class LiquidityPlugin(BasePlugin):
             # it can change no behaviour. Guarded here rather than in each
             # _log_* caller so every category is covered by one rule.
             return
+        if not new_entries:
+            return
         entries = self._load_log(wallet)
-        entries.append(entry)
+        entries.extend(new_entries)
         entries = self._prune(wallet, entries)
         try:
             wallet.db.put(LOG_DB_KEY, entries)
             wallet.save_db()
         except Exception as e:
             self.logger.error(f"could not persist decision log: {e!r}", exc_info=True)
-        # Mirror the same already-scrubbed entry to the on-disk diagnostic log
+        # Mirror the same already-scrubbed entries to the on-disk diagnostic log
         # (a no-op unless the operator has enabled it).
-        self._diag_write(wallet, entry)
+        for entry in new_entries:
+            self._diag_write(wallet, entry)
         self.on_log_changed(wallet)
 
     # --- diagnostic log file (opt-in) -------------------------------------

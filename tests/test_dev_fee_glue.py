@@ -7,6 +7,7 @@ off). Heavy Electrum objects are faked/monkeypatched; skipped outside the venv.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from types import SimpleNamespace
@@ -41,12 +42,30 @@ class _FakeDB:
         self._d[key] = value
 
 
+class _FakeAdb:
+    """Just enough address-synchroniser to answer "has this tx confirmed?".
+
+    ``height`` is the value ``get_tx_height(...).height()`` reports: 0 is
+    Electrum's TX_HEIGHT_UNCONFIRMED, anything above it is a confirmed block.
+    That distinction is load-bearing -- a swap is only counted complete (and its
+    dev fee only charged) once its funding tx confirms, because the txid the
+    executor sees comes from an unconfirmed sighting that RBF can still replace.
+    """
+
+    def __init__(self, height: int = 0) -> None:
+        self.height = height
+
+    def get_tx_height(self, txid):
+        return SimpleNamespace(height=lambda: self.height)
+
+
 class _FakeWallet:
-    def __init__(self, lnworker=None) -> None:
+    def __init__(self, lnworker=None, *, funding_height: int = 0) -> None:
         self.db = _FakeDB()
         self.saved = 0
         self.lnworker = lnworker
         self.network = SimpleNamespace(is_connected=lambda: True)
+        self.adb = _FakeAdb(funding_height)
 
     def save_db(self) -> None:
         self.saved += 1
@@ -129,7 +148,8 @@ def test_reconcile_accrues_on_completion() -> None:
     swap = SimpleNamespace(is_redeemed=False, funding_txid="ff" * 32)
     sm = SimpleNamespace(get_swap=lambda h: swap)
     ln = SimpleNamespace(swap_manager=sm)
-    p, w = _plugin(), _FakeWallet(ln)
+    # Funding CONFIRMED (block 101), which is what makes this a completion.
+    p, w = _plugin(), _FakeWallet(ln, funding_height=101)
     # A pending swap we were watching, carrying its expected on-chain basis.
     w.db.put(PENDING_SWAPS_DB_KEY, {
         ph: {"npub": "", "started_ts": time.time(), "node_id": "",
@@ -143,11 +163,26 @@ def test_reconcile_accrues_on_completion() -> None:
 
 # --- payout executor ------------------------------------------------------
 class _FakeInvoice:
+    """A stand-in for ``electrum.invoices.Invoice``.
+
+    ``rhash`` matters as much as the amount: the payout tracks its attempt by
+    payment hash so a reported failure can be re-checked instead of blindly
+    retried (see DEV_FEE_INFLIGHT_DB_KEY), and it refuses to pay an invoice it
+    cannot identify. Derived from the amount so each rung has its own hash,
+    which is what lets a test say "this amount's payment is still in flight".
+    """
+
     def __init__(self, sat: int) -> None:
         self._sat = sat
+        self.rhash = _hash_for(sat).hex()
 
     def get_amount_sat(self) -> int:
         return self._sat
+
+
+def _hash_for(sat: int) -> bytes:
+    """The deterministic 32-byte payment hash _FakeInvoice gives amount ``sat``."""
+    return hashlib.sha256(f"devfee:{sat}".encode()).digest()
 
 
 def _patch_lnurl(monkeypatch, *, min_sat=1, max_sat=100_000, pay_result=(True, []),
