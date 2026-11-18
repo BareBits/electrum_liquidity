@@ -65,8 +65,23 @@ function-scoped rig, wipes `.run`, and kills any prior rig — so do **not** run
 them while a manual `run.py` rig is up):
 
 ```bash
-RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q -s
+RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest tests -q
 ```
+
+`-s` is optional and only decides whether the `[rig]` progress lines reach your
+terminal; add it to watch a rig come up, leave it off for a quieter run. It used
+to be effectively mandatory: the orchestrator re-`execv`-ed itself at startup to
+get the ownership marker into its own `/proc/environ`, which under pytest
+restarted the whole session — and did so while pytest held fd 1/2 redirected to
+capture tempfiles that are unlinked when the session dies, so without `-s` the
+entire suite's output disappeared into an orphaned inode. The orchestrator now
+records its pid and start time in `.run/state.json` instead, so there is no
+re-exec and no lost output.
+
+Do **not** export `ELECTRUM_LIQTEST_RIG` yourself to try to influence this. The
+marker has to be on the orchestrator and nothing above it; setting it in the
+shell marks the parent shell and any `timeout` wrapper too, and the rig's
+first cleanup sweep will then terminate whatever is holding your test run open.
 
 | Test | Asserts (against the live daemon + real `wallet.db`) |
 |---|---|
