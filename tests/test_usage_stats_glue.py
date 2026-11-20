@@ -161,6 +161,64 @@ def test_declining_is_remembered_so_the_screen_does_not_come_back():
         "a declined choice must be recorded, or the consent screen reappears"
 
 
+# --- the consent record belongs to the wallet, not the installation -------
+#
+# The consent screen is offered once per wallet and says so, so the record
+# behind it has to be per wallet too, in both directions: one wallet's answer
+# may not be read as another's, and none of it may arrive from the
+# installation-wide config -- which is exactly how a wallet that was never
+# asked could start reporting on another wallet's consent.
+
+def test_one_wallets_consent_is_not_another_wallets_consent():
+    p = _plugin()
+    a, b = _FakeWallet(), _FakeWallet()
+    p.set_usage_stats_choice(a, us.LEVEL_LIQUIDITY)
+    assert p.usage_stats_level(b) == us.LEVEL_OFF, \
+        "a wallet that was never asked inherited another wallet's opt-in"
+    assert not p.usage_stats_prompted(b)
+    assert p.usage_stats_install_id(b) is None
+    # ...and answering for b leaves a exactly as it was.
+    p.set_usage_stats_choice(b, us.LEVEL_COUNT)
+    assert p.usage_stats_level(a) == us.LEVEL_LIQUIDITY
+    assert p.usage_stats_level(b) == us.LEVEL_COUNT
+
+
+def test_each_opted_in_wallet_gets_its_own_identifier():
+    """Three wallets are three installs at the receiver. Deliberate: a shared
+    identity would count users more accurately but would let one wallet's
+    choice report on another's behalf (see the note on the ConfigVar)."""
+    p = _plugin()
+    wallets = [_FakeWallet() for _ in range(3)]
+    for w in wallets:
+        p.set_usage_stats_choice(w, us.LEVEL_COUNT)
+    ids = [p.usage_stats_install_id(w) for w in wallets]
+    assert all(us.is_install_id(i) for i in ids), ids
+    assert len(set(ids)) == 3, f"wallets are sharing an install id: {ids}"
+
+
+def test_an_installation_wide_opt_in_does_not_opt_any_wallet_in():
+    """The config value is not a fallback for a wallet that has no value of its
+    own -- a setting this wallet was never given must not arrive from the
+    installation and start sending reports."""
+    p = _plugin(INBOUND_LIQUIDITY_USAGE_STATS_LEVEL=us.LEVEL_LIQUIDITY,
+                INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED=True)
+    w = _FakeWallet()
+    p.settings_store(w).clear()         # as if this wallet had never been asked
+    assert p.usage_stats_level(w) == us.LEVEL_OFF
+    assert not p.usage_stats_prompted(w)
+
+
+def test_the_cadence_stamps_are_per_wallet_too():
+    """Otherwise one wallet's weekly report would hold another's back."""
+    p = _plugin()
+    a, b = _FakeWallet(), _FakeWallet()
+    p.settings(a).INBOUND_LIQUIDITY_USAGE_STATS_LAST_SENT_TS = 1_700_000_000.0
+    p.settings(a).INBOUND_LIQUIDITY_USAGE_STATS_LAST_ERROR = "nope"
+    assert p.usage_stats_status(b)["last_sent_ts"] == 0.0
+    assert p.usage_stats_status(b)["last_error"] == ""
+    assert p.usage_stats_status(a)["last_sent_ts"] == 1_700_000_000.0
+
+
 @pytest.mark.parametrize("bad", [4, -1, "two", None, 1.5])
 def test_an_invalid_choice_is_refused(bad):
     p, w = _plugin(), _FakeWallet()
