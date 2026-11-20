@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple,
+)
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -1261,6 +1263,30 @@ def _wallet_name(wallet: 'Abstract_Wallet') -> str:
         return "?"
 
 
+def _wallet_session_key(wallet: 'Abstract_Wallet') -> str:
+    """A stable identity for ``wallet`` for the duration of this process.
+
+    Used to remember which wallets have already been offered a one-time prompt
+    (the update-check opt-in, the usage-statistics consent screen) in this
+    session. Keyed on the wallet FILE rather than the wallet object, so closing
+    and reopening a wallet is still "already asked": a long consent dialog that
+    came back because the user toggled between two wallets would be read as the
+    plugin nagging, not as the plugin honouring "ask me later".
+
+    Always a string, so it can never fail to go into a set -- a wallet with no
+    storage path (an in-memory wallet, or a harness double) falls back to its
+    object identity, which is good enough: such a wallet has no file for the
+    answer to be remembered in either.
+    """
+    try:
+        path = wallet.storage.path
+    except Exception:
+        path = None
+    if isinstance(path, str) and path:
+        return path
+    return f"id:{id(wallet)}"
+
+
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -1343,14 +1369,29 @@ class Plugin(LiquidityPlugin):
         self._unlock_prompting: set = set()
         # Instance attribute so tests can shrink it.
         self._unlock_prompt_cooldown_sec: float = UNLOCK_PROMPT_COOLDOWN_SEC
-        # Whether the update-check opt-in has been put on screen in this session.
-        # The persisted flag records the *answer*; this guards against opening a
-        # second wallet stacking a second dialog before the first is answered.
-        self._update_opt_in_asked: bool = False
-        # Same guard for the usage-statistics consent screen, for the same
-        # reason -- and more so here, since that dialog is a long one to find
-        # stacked twice.
-        self._usage_consent_asked: bool = False
+        # Wallets whose one-time prompts have been put on screen in this
+        # session, keyed by _wallet_session_key. The persisted flag records the
+        # *answer*; these record that the question was asked, so a wallet that
+        # deferred is not asked again until the next start.
+        #
+        # Per WALLET and not a single flag per process, which is what these
+        # were: every one of these prompts is about a per-wallet setting, so a
+        # user running three wallets has three of each decision to make. A
+        # process-wide flag meant the first wallet opened was asked and the
+        # second and third were silently skipped for the rest of the session --
+        # which, for the usage-statistics screen, is consent never offered at
+        # all for those wallets rather than consent offered and declined.
+        self._update_opt_in_asked: Set[str] = set()
+        self._usage_consent_asked: Set[str] = set()
+        # Whether a usage-statistics consent dialog is on screen right now, and
+        # the wallets waiting their turn behind it. That dialog runs a blocking
+        # `exec()` inside the load_wallet hook, so a second wallet opening while
+        # it is up would stack a second copy of a long modal on top of the
+        # first; instead the second wallet is queued and offered the screen as
+        # soon as the first one closes. The short prompts are not queued -- see
+        # _maybe_prompt_update_opt_in.
+        self._usage_consent_on_screen: bool = False
+        self._usage_consent_queue: List['Abstract_Wallet'] = []
         # One Send-tab buffer-warning refresher per open wallet. Keyed by wallet
         # rather than window because that is the key the buffer itself is looked
         # up by, and Electrum opens one window per wallet.
@@ -1549,17 +1590,24 @@ class Plugin(LiquidityPlugin):
         remembered -- "prompted" is stored separately from "enabled" so that
         declining is final rather than being re-asked at every startup.
 
+        Asked once PER WALLET, not once per installation: the opt-in is a
+        per-wallet setting, so a second wallet is a second decision to make.
+        Not queued behind the consent screen the way that dialog queues behind
+        itself -- this is a one-line question box, so two of them on screen is
+        a smaller harm than a wallet that is never asked at all.
+
         Never blocks or breaks wallet load: a failure to show the dialog leaves
         the flag unset (it will be offered again next time) and nothing else.
         """
+        key = _wallet_session_key(wallet)
         c = self.settings(wallet)
         if bool(c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED):
             return
         if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED', False)):
             return          # already switched on from Advanced; nothing to ask
-        if self._update_opt_in_asked:
-            return          # a second wallet opening in the same session
-        self._update_opt_in_asked = True
+        if key in self._update_opt_in_asked:
+            return          # this wallet already had its turn this session
+        self._update_opt_in_asked.add(key)
         try:
             enable = bool(window.question(
                 ' '.join([
@@ -1575,7 +1623,7 @@ class Plugin(LiquidityPlugin):
         except Exception:
             # A prompt is a convenience; never let it break loading a wallet.
             self.logger.exception("could not show the update-check opt-in prompt")
-            self._update_opt_in_asked = False
+            self._update_opt_in_asked.discard(key)
             return
         c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = True
         c.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = enable
@@ -1586,11 +1634,19 @@ class Plugin(LiquidityPlugin):
             self._request_update_check(wallet)
 
     def _maybe_prompt_usage_consent(self, window: 'ElectrumWindow',
-                                    wallet: 'Abstract_Wallet') -> None:
-        """Offer the anonymous-usage-statistics choice ONCE, with previews.
+                                    wallet: 'Abstract_Wallet') -> bool:
+        """Offer the anonymous-usage-statistics choice ONCE PER WALLET, with
+        previews. Returns whether the dialog was put on screen for ``wallet``.
 
         Everything about this is built around not manufacturing consent:
 
+          * Offered **once per wallet**, because the choice IS per wallet: the
+            level, the consent flag and the install id all live in the wallet's
+            own file. A single process-wide "already asked" flag -- which is
+            what this used to be -- meant that only the first wallet opened in
+            a session was ever asked, and every other wallet reported nothing
+            while never having been given the choice. The question is now put
+            to each wallet, and the answers stay independent.
           * The dialog opens on **Off**. The only way to end up sharing anything
             is to deliberately select a level and press Save, so an impatient
             Return or a reflexive click leaves reporting off.
@@ -1610,25 +1666,55 @@ class Plugin(LiquidityPlugin):
         """
         from . import usage_stats
 
+        key = _wallet_session_key(wallet)
         if self.usage_stats_prompted(wallet):
-            return
+            return False
         if self.usage_stats_level(wallet) != usage_stats.LEVEL_OFF:
-            return      # already switched on from Advanced; nothing to ask
+            return False    # already switched on from Advanced; nothing to ask
         if self.usage_stats_blocked_reason() is not None:
-            return      # nothing could be sent regardless; see the docstring
-        if self._usage_consent_asked:
-            return      # a second wallet opening in the same session
-        self._usage_consent_asked = True
+            return False    # nothing could be sent regardless; see the docstring
+        if key in self._usage_consent_asked:
+            return False    # this wallet already had its turn this session
+        if self._usage_consent_on_screen:
+            # Another wallet's consent screen is up. Wait for it rather than
+            # stacking a second long modal on top; _drain_usage_consent_queue
+            # comes back for this wallet as soon as that one is answered.
+            self._queue_usage_consent(wallet)
+            return False
+        self._usage_consent_asked.add(key)
+        self._usage_consent_on_screen = True
+        # Whether Electrum had this wallet open when the screen went up, so the
+        # check after it closes can tell "the user closed the wallet while the
+        # dialog was on screen" from "this caller never registered a tab at
+        # all" (every harness in the test suite, and any future non-tab path).
+        was_open = self._wallet_is_open(wallet)
         try:
             chosen = self._ask_usage_consent(window, wallet)
         except Exception:
             # A prompt is a convenience; never let it break loading a wallet.
             self.logger.exception("could not show the usage-statistics consent screen")
-            self._usage_consent_asked = False
-            return
+            self._usage_consent_asked.discard(key)
+            return False
+        finally:
+            # Before anything below can return, and before the queue is
+            # drained: a dialog left recorded as on screen would silence the
+            # screen for every other wallet for the rest of the session, which
+            # is the bug this whole path exists to not have.
+            self._usage_consent_on_screen = False
+            self._schedule_usage_consent_drain()
         if chosen is None:
-            self.logger.info("usage-statistics consent deferred ('ask me later')")
-            return
+            self.logger.info(
+                f"usage-statistics consent deferred ('ask me later') "
+                f"for {_wallet_name(wallet)}")
+            return True
+        # Only now that the dialog has closed: a wallet closed while its screen
+        # was up must not have a choice written into a file nobody is holding
+        # open any more, and must not start reporting on its way out.
+        if was_open and not self._wallet_is_open(wallet):
+            self.logger.info(
+                f"usage-statistics consent discarded: {_wallet_name(wallet)} "
+                f"was closed before the choice was saved")
+            return True
         self.set_usage_stats_choice(wallet, chosen)
         if chosen != usage_stats.LEVEL_OFF:
             # Don't make the user wait a week to see that it works.
@@ -1641,6 +1727,93 @@ class Plugin(LiquidityPlugin):
                 state.refresh()
             except Exception:
                 self.logger.debug("could not refresh the tab after the consent choice")
+        return True
+
+    def _wallet_is_open(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether a window still holds this wallet's Liquidity tab.
+
+        Read off the tab handles rather than ``self.wallets``, because that set
+        holds only the wallets the plugin MANAGES -- a wallet without Lightning
+        has a Liquidity tab and a settings store but is not managed, and its
+        consent choice is still worth saving. ``_tabs`` is keyed by wallet and
+        dropped in ``close_wallet``/``on_close_window``, so it is exactly the
+        "a window still has this wallet" question.
+        """
+        try:
+            return wallet in self._tabs
+        except TypeError:
+            return False    # unhashable double; it has no tab either way
+
+    def _consent_queue(self) -> List['Abstract_Wallet']:
+        """The wallets waiting for the consent screen, created on first use.
+
+        Tolerant of its own absence for the same reason as
+        ``_per_wallet_store``: the test harnesses build a plugin via
+        ``object.__new__`` without the constructor, and failing to track a
+        queued dialog must never become an AttributeError out of the middle of
+        closing a wallet.
+        """
+        queue = getattr(self, "_usage_consent_queue", None)
+        if not isinstance(queue, list):
+            queue = []
+            self._usage_consent_queue = queue
+        return queue
+
+    def _queue_usage_consent(self, wallet: 'Abstract_Wallet') -> None:
+        """Remember that ``wallet`` is still owed the consent screen."""
+        key = _wallet_session_key(wallet)
+        queue = self._consent_queue()
+        if any(_wallet_session_key(queued) == key for queued in queue):
+            return          # already waiting; one turn each
+        queue.append(wallet)
+        self.logger.debug(
+            f"usage-statistics consent screen queued for {_wallet_name(wallet)} "
+            f"behind another wallet's")
+
+    def _schedule_usage_consent_drain(self) -> None:
+        """Ask Qt to offer the screen to the next waiting wallet.
+
+        Through a zero-delay timer rather than a direct call: this runs as the
+        consent dialog's blocking ``exec()`` unwinds, inside the ``load_wallet``
+        hook of the wallet that was just asked. Showing the next dialog from
+        here would nest a second ``exec()`` inside the first one's unwind and
+        hold up that hook; posting it to the event loop lets the current load
+        finish first, which is also the order the user sees.
+        """
+        if not self._consent_queue():
+            return
+        try:
+            QTimer.singleShot(0, self._drain_usage_consent_queue)
+        except Exception:
+            # No event loop to post to (a harness, or a Qt that is shutting
+            # down). The queued wallets keep their turn for the next start.
+            self.logger.debug("could not schedule the consent-screen queue drain")
+
+    def _drain_usage_consent_queue(self) -> None:
+        """Offer the consent screen to the first waiting wallet still open.
+
+        One wallet per run: the call below blocks on its dialog and schedules
+        the next drain on the way out, so the queue empties one screen at a
+        time. Wallets that were closed while waiting, or that answered from the
+        Advanced pane in the meantime, are dropped and asked again next session
+        rather than being chased.
+        """
+        queue = self._consent_queue()
+        while queue:
+            if self._usage_consent_on_screen:
+                return      # someone else got in first; their drain continues
+            wallet = queue.pop(0)
+            state = self._tabs.get(wallet)
+            if state is None:
+                self.logger.debug(
+                    f"dropping the queued consent screen for "
+                    f"{_wallet_name(wallet)}: no longer open")
+                continue
+            window = getattr(state, "window", None)
+            if window is None:
+                continue
+            if self._maybe_prompt_usage_consent(window, wallet):
+                return      # its own drain picks up whatever is still queued
 
     def _ask_usage_consent(self, window: 'ElectrumWindow',
                            wallet: 'Abstract_Wallet') -> Optional[int]:
@@ -1650,7 +1823,15 @@ class Plugin(LiquidityPlugin):
         from . import usage_stats
 
         descriptions = usage_stats.level_descriptions()
-        dialog = WindowModalDialog(window, _("Help improve this plugin?"))
+        # The wallet is named in the title AND in the opening paragraph, because
+        # this screen is now offered once per wallet: a user with three wallets
+        # sees three of these, and a consent screen that does not say what it is
+        # consenting FOR is not one. A window title is painted as plain text, so
+        # a wallet name full of markup is safe here; the label below is pinned to
+        # plain text for the same reason.
+        name = _wallet_name(wallet)
+        dialog = WindowModalDialog(
+            window, _("Help improve this plugin? — {wallet}").format(wallet=name))
         # Wide enough that a 50-field JSON preview is readable without the user
         # having to resize the dialog to find out what they are agreeing to.
         dialog.setMinimumWidth(620)
@@ -1669,7 +1850,7 @@ class Plugin(LiquidityPlugin):
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
-        layout.addWidget(_wrapped_label(_(
+        intro = _wrapped_label(_(
             "Would you help us understand how many people run the Inbound "
             "Liquidity plugin, which settings matter, and how much liquidity it "
             "actually provisions?\n\n"
@@ -1677,8 +1858,14 @@ class Plugin(LiquidityPlugin):
             "not to participate, no data will be sent to us. The plugin "
             "behaves exactly the same either way. If you say yes, this wallet "
             "sends one small report weekly. You can opt in or out on a "
-            "per-wallet basis, this consent screen is only for this specific "
-            "wallet.")))
+            "per-wallet basis: this consent screen is only for the wallet "
+            "\"{wallet}\", and every other wallet is asked separately."
+        ).format(wallet=name))
+        # A wallet name is a file name the user chose, so it is not markup --
+        # and must not be able to become markup. QLabel's default AutoText would
+        # interpret a name like "<b>x" as rich text.
+        intro.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(intro)
 
         layout.addWidget(_wrapped_label(_("We never send, at any level:")))
         for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
@@ -1878,6 +2065,18 @@ class Plugin(LiquidityPlugin):
         # should not silence the prompt for a wallet the user just opened.
         self._unlock_declined_at.pop(wallet, None)
         self._unlock_prompting.discard(wallet)
+        # A wallet waiting its turn for the consent screen has stopped waiting.
+        # In place rather than rebound: a drain already running holds a
+        # reference to this list, and leaving it a stale copy would let it offer
+        # the screen to a wallet that has since closed.
+        #
+        # The "already asked this session" record is deliberately NOT dropped
+        # here, unlike the unlock prompt above. It is keyed by wallet file so
+        # that "ask me later" survives a close and reopen -- otherwise the
+        # longest dialog in the plugin would come back every time the user
+        # switches between two wallets.
+        queue = self._consent_queue()
+        queue[:] = [queued for queued in queue if queued is not wallet]
         # Drop the Send tab's refresher with its window; the class patches stay
         # installed (they are global and idempotent) but go inert once the last
         # wallet closes and the provider is cleared.

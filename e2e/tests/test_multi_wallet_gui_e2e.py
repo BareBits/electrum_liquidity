@@ -14,6 +14,13 @@ Plugins dialog's ``reload_windows()``, which closes and rebuilds every open
 window -- and the one that produced it in a unit test: a window replaced without
 ``close_wallet`` firing.
 
+It also covers the analytics consent screen, which is per wallet for the same
+reason the settings are: every wallet must be asked in its own right, and its
+answer must land in its own file. That lives here rather than in a module of
+its own because ``ElectrumGui.__init__`` constructs a ``QApplication``
+unconditionally, and a second one in the same process is undefined behaviour in
+Qt -- so there is exactly one real-Qt-GUI module, and this is it.
+
 The last section covers the settings tabs' own surface in the same real
 windows: the Channel partners tab's node-name column (resolved through
 Electrum's REAL ``LNPeerManager.get_node_alias``, against a real ``LNWallet``),
@@ -33,7 +40,7 @@ import asyncio
 import os
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pytest
 
@@ -84,16 +91,96 @@ if _ELECTRUM_IMPORT_ERROR is not None:
 
 WALLET_NAMES = ("liq_gui_a", "liq_gui_b", "liq_gui_c")
 
+# What the user picks on each wallet's analytics consent screen -- one wallet
+# per answer, so every branch of the choice is exercised against a real wallet
+# file: a mid level, an explicit "no thanks", and the full level.
+CONSENT_ANSWERS: Dict[str, int] = {
+    "liq_gui_a": 2,     # LEVEL_SETTINGS
+    "liq_gui_b": 0,     # LEVEL_OFF -- a deliberate, recorded "no"
+    "liq_gui_c": 3,     # LEVEL_LIQUIDITY
+}
+# Reachable-looking and certainly dead: port 1 is privileged and nothing is
+# listening, so an opt-in here can attempt a POST and get nowhere. NOT one of
+# the disabling words, or the consent screen would be skipped entirely.
+DEAD_USAGE_ENDPOINT = "http://127.0.0.1:1/report.php"
+
+
+class _ConsentDriver:
+    """Stands in for the user in front of the analytics consent screen.
+
+    Installed over ``WindowModalDialog.exec`` for the whole module, because the
+    screen comes up as each wallet's window opens and a modal with nobody to
+    click it would hang this module for its whole timeout. It recognises the
+    consent screen by its title and its radio buttons, picks the level that
+    wallet is meant to pick, and presses Save. Any OTHER modal that tries to
+    open is rejected rather than driven: silently answering a dialog we did not
+    recognise would be worse than failing.
+    """
+
+    def __init__(self) -> None:
+        self.titles: List[str] = []
+        self.bodies: List[str] = []
+        self.unexpected: List[str] = []
+        self.hook: Callable[[str], None] = lambda name: None
+
+    def install(self, monkeypatch) -> None:
+        from electrum.gui.qt.util import WindowModalDialog
+        # A plain function, not the driver itself: a callable instance set as a
+        # class attribute is not a descriptor, so `dialog.exec()` would be
+        # called with no arguments at all.
+        monkeypatch.setattr(WindowModalDialog, "exec",
+                            lambda dialog: self(dialog), raising=False)
+
+    def __call__(self, dialog) -> int:
+        from PyQt6.QtWidgets import QLabel, QRadioButton
+
+        title = dialog.windowTitle() or ""
+        radios = dialog.findChildren(QRadioButton)
+        if "Help improve this plugin?" not in title or not radios:
+            self.unexpected.append(title)
+            return 0
+        self.titles.append(title)
+        self.bodies.append(" ".join(l.text() for l in dialog.findChildren(QLabel)))
+        name = next((n for n in WALLET_NAMES if n in title), None)
+        assert name is not None, \
+            f"the consent screen does not name a wallet: {title!r}"
+        level = CONSENT_ANSWERS[name]
+        for button in radios:
+            text = button.text()
+            if level == 0 and text.startswith("No thanks"):
+                button.setChecked(True)
+            elif level != 0 and text.startswith(f"{level} "):
+                button.setChecked(True)
+        self.hook(name)
+        return 1                    # "Save my choice"
+
+    def count_for(self, name: str) -> int:
+        return sum(1 for title in self.titles if name in title)
+
 
 @pytest.fixture(scope="module")
-def gui():
+def gui(request):
     """A real Qt GUI over a real (offline) daemon, with the plugin enabled.
 
     Module-scoped: one Electrum process' worth of state, which is exactly the
     subject under test -- several wallets sharing one plugin instance.
     """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    monkeypatch = MonkeyPatch()
+    request.addfinalizer(monkeypatch.undo)
+
     from electrum import constants
     from electrum.simple_config import SimpleConfig
+    from electrum.plugins.inbound_liquidity import (  # type: ignore
+        USAGE_STATS_ALLOW_REGTEST_ENV, USAGE_STATS_ENDPOINT_ENV,
+    )
+
+    # Open both gates that would otherwise skip the consent screen: these are
+    # regtest wallets (suppressed), and the shipped endpoint is the live one,
+    # which must never be contacted from a test.
+    monkeypatch.setenv(USAGE_STATS_ALLOW_REGTEST_ENV, "1")
+    monkeypatch.setenv(USAGE_STATS_ENDPOINT_ENV, DEAD_USAGE_ENDPOINT)
 
     datadir = tempfile.mkdtemp(prefix="liq-gui-e2e-")
     config = SimpleConfig({"electrum_path": datadir, "regtest": True, "offline": True})
@@ -116,12 +203,16 @@ def gui():
                                    encrypt_file=False)["wallet"]
         if not wallet.has_lightning():
             wallet.init_lightning(password=None)
-        # Pre-answer the plugin's update-check opt-in, ON THE WALLET. It is a
-        # per-wallet setting, so setting it on the config would not reach any of
-        # these wallets and each window would come up behind a modal with nobody
-        # to click it -- which hung this module for its whole timeout.
+        # Pre-answer the plugin's OTHER one-time prompts, ON THE WALLET. They
+        # are per-wallet settings, so setting them on the config would not
+        # reach any of these wallets and each window would come up behind a
+        # modal with nobody to click it -- which hung this module for its whole
+        # timeout. The analytics consent screen is deliberately NOT pre-
+        # answered: it is what the last section of this module tests, and
+        # _ConsentDriver is what clicks it.
         wallet.db.put(SETTINGS_DB_KEY, {"_v": SETTINGS_STORE_VERSION,
-                                        "UPDATE_CHECK_PROMPTED": True})
+                                        "UPDATE_CHECK_PROMPTED": True,
+                                        "TRAMPOLINE_WARNED": True})
         wallet.save_db()
         paths.append(path)
 
@@ -143,8 +234,11 @@ def gui():
     from electrum.gui.qt import ElectrumGui
     gui_object = ElectrumGui(config=config, daemon=daemon, plugins=plugins)
 
+    driver = _ConsentDriver()
+    driver.install(monkeypatch)
+
     yield _Harness(gui_object=gui_object, plugin=plugin, paths=paths,
-                   config=config, plugins=plugins)
+                   config=config, plugins=plugins, driver=driver)
 
     # Teardown, in the reverse order of the bring-up. This has to happen: the
     # asyncio loop runs on a NON-daemon thread (see
@@ -186,13 +280,33 @@ def gui():
 
 
 class _Harness:
-    def __init__(self, *, gui_object, plugin, paths, config, plugins) -> None:
+    def __init__(self, *, gui_object, plugin, paths, config, plugins,
+                 driver) -> None:
         self.gui = gui_object
         self.plugin = plugin
         self.paths = paths
         self.config = config
         self.plugins = plugins
+        self.driver = driver
         self._opened: Dict[str, object] = {}
+
+    def wallet_named(self, name: str):
+        for window in self.gui.windows:
+            if window.wallet.basename() == name:
+                return window.wallet
+        raise AssertionError(f"{name} is not open; have "
+                             f"{[w.wallet.basename() for w in self.gui.windows]}")
+
+    def pump(self) -> None:
+        """Let the posted consent-queue drain timer fire.
+
+        ``_schedule_usage_consent_drain`` goes through ``QTimer.singleShot(0)``
+        rather than opening the next dialog directly, so nothing happens until
+        the event loop runs -- which, in a test, means saying so.
+        """
+        from PyQt6.QtWidgets import QApplication
+        for _ in range(5):
+            QApplication.processEvents()
 
     def open(self, index: int):
         """Open wallet ``index`` in a new window, as the user would."""
@@ -471,3 +585,161 @@ def test_the_green_apply_writes_to_the_real_wallet_file(gui) -> None:
     finally:
         strict_cb.setChecked(False)
         _apply_of(plugin, wallet, 2).click()
+
+
+# --- the analytics consent screen, once per wallet -------------------------
+#
+# The consent screen came up as each of the three windows was opened, back in
+# the first tests of this module, and _ConsentDriver answered each one. These
+# tests read back what that left behind.
+#
+# The claims, in descending order of how much they matter:
+#
+#   * EVERY WALLET IS ASKED. The in-session guard used to be one flag for the
+#     whole process, so only the first wallet opened was ever offered the
+#     screen. The others sent nothing -- but they had never been given the
+#     choice, which is not the same thing as having declined, and is not what
+#     the screen says happens.
+#   * EACH ANSWER LANDS IN ITS OWN WALLET FILE, read back out of a real
+#     WalletDB: the level, the consent flag, and a distinct install id, with
+#     the wallet that declined left with no identifier at all.
+#   * NO ANSWER LEAKS SIDEWAYS, in either direction.
+#   * ONE SCREEN AT A TIME: a wallet opened while another's screen is up waits
+#     its turn, and really is offered the screen once the first one closes.
+
+def _stored(wallet) -> Dict[str, object]:
+    """This wallet's plugin settings as they sit in its real WalletDB."""
+    from electrum.plugins.inbound_liquidity import SETTINGS_DB_KEY  # type: ignore
+    return dict(wallet.db.get(SETTINGS_DB_KEY) or {})
+
+
+def test_every_wallet_was_offered_the_consent_screen(gui) -> None:
+    for name in WALLET_NAMES:
+        assert gui.driver.count_for(name) == 1, \
+            f"{name} was offered the consent screen {gui.driver.count_for(name)} times"
+
+
+def test_no_unrecognised_modal_was_driven(gui) -> None:
+    """If some other dialog opened and was rejected, the answers these tests
+    read back are not the ones they think they are."""
+    assert gui.driver.unexpected == [], gui.driver.unexpected
+
+
+def test_the_consent_screen_named_the_wallet_it_was_asking_about(gui) -> None:
+    """By now the user has been asked three times, so each screen has to say
+    which wallet it is for -- in the title and in the body."""
+    for name in WALLET_NAMES:
+        assert any(name in title for title in gui.driver.titles), name
+        assert any(name in body for body in gui.driver.bodies), \
+            f"the body of {name}'s consent screen did not name it"
+
+
+def test_each_wallet_holds_the_level_it_was_given(gui) -> None:
+    plugin = gui.plugin
+    levels = {name: plugin.usage_stats_level(gui.wallet_named(name))
+              for name in WALLET_NAMES}
+    assert levels == CONSENT_ANSWERS, levels
+    for name in WALLET_NAMES:
+        assert plugin.usage_stats_prompted(gui.wallet_named(name)), name
+
+
+def test_each_answer_is_in_that_wallets_real_db(gui) -> None:
+    """Through a REAL WalletDB, not a dict stand-in: the record has to survive
+    Electrum's own put/save semantics, since it is what the next start reads."""
+    for name, level in CONSENT_ANSWERS.items():
+        stored = _stored(gui.wallet_named(name))
+        assert stored.get("USAGE_STATS_LEVEL") == level, (name, stored)
+        assert stored.get("USAGE_STATS_PROMPTED") is True, (name, stored)
+
+
+def test_only_the_opted_in_wallets_have_an_install_id(gui) -> None:
+    """A wallet that declined never gets one -- nothing to leak, nothing to
+    correlate. The two that opted in do not share one: three wallets are three
+    installs, deliberately (see the note on the ConfigVar)."""
+    from electrum.plugins.inbound_liquidity import usage_stats as us  # type: ignore
+    plugin = gui.plugin
+    declined = gui.wallet_named("liq_gui_b")
+    assert plugin.usage_stats_install_id(declined) is None
+    assert not _stored(declined).get("USAGE_STATS_INSTALL_ID")
+
+    ids = [plugin.usage_stats_install_id(gui.wallet_named(n))
+           for n in ("liq_gui_a", "liq_gui_c")]
+    assert all(us.is_install_id(i) for i in ids), ids
+    assert ids[0] != ids[1], f"two wallets are sharing an install id: {ids}"
+
+
+def test_loading_every_wallet_again_does_not_ask_again(gui) -> None:
+    """What the Plugins dialog's ``reload_windows()`` does to this plugin: fire
+    ``load_wallet`` for every open window a second time. All three have
+    answered by now, so the persisted per-wallet flag is what keeps the screen
+    away -- and it has to do so for each of them, not just the first.
+
+    Dispatched through Electrum's own ``run_hook``, the way the real reload
+    does it, rather than by calling the method: that is the path a wrong hook
+    registration would break.
+    """
+    from electrum.plugin import run_hook
+
+    before = len(gui.driver.titles)
+    for window in list(gui.gui.windows):
+        run_hook('load_wallet', window.wallet, window)
+    gui.pump()
+    assert len(gui.driver.titles) == before, \
+        "a wallet that had already answered was asked again"
+    levels = {name: gui.plugin.usage_stats_level(gui.wallet_named(name))
+              for name in WALLET_NAMES}
+    assert levels == CONSENT_ANSWERS, levels
+
+
+def test_a_wallet_opened_behind_the_screen_waits_its_turn(gui, monkeypatch) -> None:
+    """The dialog runs a blocking ``exec()`` inside the ``load_wallet`` hook, so
+    a wallet opened while it is up must be queued rather than stack a second
+    copy of a long modal -- and must really be offered the screen afterwards,
+    through the posted timer.
+
+    Driven by re-opening the question on two wallets that have already answered
+    (clearing the consent flag, which a user cannot do from the UI but is
+    exactly the state a fresh pair of wallets is in).
+    """
+    from electrum.plugins.inbound_liquidity import usage_stats as us  # type: ignore
+
+    plugin = gui.plugin
+    first = gui.wallet_named(WALLET_NAMES[0])
+    second = gui.wallet_named(WALLET_NAMES[1])
+    windows = {w.wallet: w for w in gui.gui.windows}
+    for wallet in (first, second):
+        plugin.set_setting(wallet, "INBOUND_LIQUIDITY_USAGE_STATS_PROMPTED", False)
+        plugin.set_setting(wallet, "INBOUND_LIQUIDITY_USAGE_STATS_LEVEL",
+                           us.LEVEL_OFF)
+    plugin._usage_consent_asked.clear()
+
+    seen: List[str] = []
+    # Recorded rather than asserted inside the hook: the prompt catches every
+    # exception out of the dialog, so a bare assert in here would be swallowed
+    # into a log line instead of failing this test.
+    mid: Dict[str, object] = {}
+
+    def _hook(name: str) -> None:
+        seen.append(name)
+        if name != WALLET_NAMES[0]:
+            return
+        # As if the user opened the second wallet while the first's screen was
+        # up: its load_wallet path reaches the consent prompt, which must queue
+        # rather than open a second dialog.
+        plugin._maybe_prompt_usage_consent(windows[second], second)
+        mid["seen"] = list(seen)
+        mid["queued"] = list(plugin._usage_consent_queue)
+
+    monkeypatch.setattr(gui.driver, "hook", _hook)
+    plugin._maybe_prompt_usage_consent(windows[first], first)
+    assert mid.get("seen") == [WALLET_NAMES[0]], \
+        f"the second wallet's screen was stacked on the first's: {mid.get('seen')}"
+    assert mid.get("queued") == [second], mid.get("queued")
+    gui.pump()                      # lets the posted drain run
+    assert seen == [WALLET_NAMES[0], WALLET_NAMES[1]], \
+        f"the queued wallet was never offered the screen: {seen}"
+    assert plugin._usage_consent_queue == []
+    # And each of them still recorded its OWN answer, through the queue.
+    for name in WALLET_NAMES[:2]:
+        assert plugin.usage_stats_level(gui.wallet_named(name)) \
+            == CONSENT_ANSWERS[name], name

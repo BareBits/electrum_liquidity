@@ -107,7 +107,7 @@ and the shipped default for everything else. See
 | `preferred_partners` | Channel partners | Ordered list of channel partners (`node_id@host:port`) to try opening to **first**, before the peers Electrum suggests (up to 50 suggestions are tried in turn if one refuses the open) | `""` |
 | `banned_partners` | Channel partners | Channel partners (by node id) never opened to | `""` |
 | `partners_strict` | Channel partners | Only ever open to preferred partners (never fall back to a suggestion) | `false` |
-| `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once, by dialog, the first time the plugin loads. Nothing is ever downloaded or installed | `false` |
+| `update_check_enabled` | Advanced | Ask GitHub once a day whether a newer release of this plugin exists, and show it in the **Status** footer. Off until you say otherwise — you are asked once per wallet, by dialog, the first time that wallet loads. Nothing is ever downloaded or installed | `false` |
 | `trampoline_warned` | — | Bookkeeping, not a preference: whether this wallet has been told that trampoline routing undercuts the plugin. Set once the dialog has been answered, either way, so the question is asked once per wallet and never again. See [Trampoline routing](#trampoline-routing) | `false` |
 
 When a reverse swap fires it swaps out **the maximum the provider allows**
@@ -686,8 +686,14 @@ The plugin can send us a small report so we know how many people run it, which
 settings matter, and how much liquidity it actually provisions. It is **off
 until you choose a level**, and the plugin behaves identically either way.
 
-You are asked once, on a consent screen that shows **the exact report** each
-level would send. That is not a description of the report — the preview is
+You are asked once **per wallet**, on a consent screen that shows **the exact
+report** each level would send. Per wallet because the choice is: the level, the
+consent record and the install id all live in the wallet's own file, so opening a
+second wallet puts the question to that wallet too, and the screen names which
+wallet it is asking about. The consequence is deliberate — a user running three
+wallets makes three decisions and appears in the data as three installs. Only one
+screen is on at a time; a wallet opened while another's is up is asked as soon as
+that one is answered. The preview is not a description of the report: it is
 rendered by the same function that builds the real one, so what you are shown is
 what would be sent. Pick a level and press *Save my choice*; *Ask me later*
 records nothing at all, and so do Escape and the close button. Change or revoke
@@ -1241,8 +1247,9 @@ installed editable. `e2e/setup.sh` builds one at `e2e/.venv-electrum`.
 # unit (pure rules engine) + Electrum-glue tests — from this plugin directory
 e2e/.venv-electrum/bin/python -m pytest tests/ -q
 
-# multi-wallet GUI test: several wallets in one REAL Electrum Qt process
-# (offline + offscreen, no rig, seconds to run) -- from the e2e directory
+# multi-wallet GUI test: several wallets in one REAL Electrum Qt process --
+# a Liquidity tab and its own settings per wallet, and its own analytics
+# consent screen (offline + offscreen, no rig, seconds to run), from e2e/
 cd e2e && RUN_GUI_E2E=1 .venv-electrum/bin/python -m pytest \
     tests/test_multi_wallet_gui_e2e.py -q
 

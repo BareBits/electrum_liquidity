@@ -332,11 +332,15 @@ def _make_plugin() -> qt_mod.Plugin:
     p._tick_status = {}
     p.wallets = {}
     p._send_warning_refreshers = {}
-    # The once-per-session prompt guards. Set here because this factory
-    # bypasses __init__ (it builds the plugin without Electrum's constructor
-    # arguments), so anything __init__ would have initialised has to be named.
-    p._update_opt_in_asked = False
-    p._usage_consent_asked = False
+    # The once-per-wallet-per-session prompt guards. Sets of wallet session
+    # keys, not flags: each wallet is asked in its own right (see
+    # qt._wallet_session_key). Set here because this factory bypasses __init__
+    # (it builds the plugin without Electrum's constructor arguments), so
+    # anything __init__ would have initialised has to be named.
+    p._update_opt_in_asked = set()
+    p._usage_consent_asked = set()
+    p._usage_consent_on_screen = False
+    p._usage_consent_queue = []
     # The Log tab reads both of these; a fresh buffer per plugin keeps tests
     # isolated, and the capture is left detached (no global handler installed).
     p.log_buffer = LogRingBuffer()

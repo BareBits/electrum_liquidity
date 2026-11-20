@@ -87,8 +87,9 @@ jobs:
         # freshly created regtest wallets, so there is no bitcoind, no server
         # and no Docker -- 4 seconds, against a real ElectrumGui with real
         # windows. It is the regression test for "the Liquidity tab only shows
-        # up in one of my open wallets", so it belongs in the PR CI rather than
-        # in the opt-in rig workflow.
+        # up in one of my open wallets" and for "only the first wallet opened is
+        # ever asked for analytics consent", so it belongs in the PR CI rather
+        # than in the opt-in rig workflow.
         run: timeout 300 python -m pytest e2e/tests/test_multi_wallet_gui_e2e.py -q -rs
 
   build:
