@@ -2025,6 +2025,35 @@ def _wallet_basename(wallet: 'Abstract_Wallet') -> str:
         return "?"
 
 
+# Keys already reported by warn_once. Bounded by the number of distinct call
+# sites, not by how often they fire.
+_WARNED_ONCE: Set[str] = set()
+
+
+def warn_once(logger, key: str, message: str) -> None:
+    """Log ``message`` the first time ``key`` is seen, then stay quiet.
+
+    For a failure on a path that repeats on its own schedule -- the GUI's
+    status-bar repaint runs many times a second -- where the FIRST occurrence
+    carries the whole diagnostic value and every repetition is noise that fills
+    the user's log and rotates the useful lines out of it.
+
+    Learned the hard way: a plain debug line on that path flooded Electrum's own
+    rotating log hard enough to push the lines an e2e test greps for into a
+    rotated-out file, and tripled that test's runtime.
+
+    Takes the logger rather than using one here so the message is attributed to
+    the module that noticed, which is what makes a log line findable.
+    """
+    if key in _WARNED_ONCE:
+        return
+    _WARNED_ONCE.add(key)
+    try:
+        logger.warning(message, exc_info=True)
+    except Exception:
+        pass        # a logging failure must never be the thing that breaks a repaint
+
+
 def _coerce_setting(cv: ConfigVar, value: Any) -> Any:
     """Fit ``value`` to a ConfigVar's declared type, or raise ValueError.
 
@@ -4029,12 +4058,23 @@ class LiquidityPlugin(BasePlugin):
         ``self.wallets`` is the managed set, so this tracks the plugin being
         stopped/started on a wallet without any extra bookkeeping.
         """
+        # Deliberately silent on the unmanaged path and on success: this is
+        # called from the status-bar repaint, many times a second, and an
+        # unmanaged wallet is the steady state for anyone not using the plugin.
+        # Logging either would fill the user's log and rotate the lines that
+        # matter out of it. Only the failure below says anything.
         try:
             if wallet not in self.wallets:
                 return 0
             return goal_buffer_sat(self.read_config(wallet))
-        except Exception:
-            # Never let a config or wallet-state problem break a repaint.
+        except Exception as e:
+            # Never let a config or wallet-state problem break a repaint -- but
+            # say so, rather than reporting a reassuring 0. Once, not per
+            # repaint: this is on the repaint path, and a config problem that
+            # raises will raise every time (see warn_once).
+            warn_once(self.logger, "goal-buffer-failed",
+                      f"could not compute the goal buffer for "
+                      f"{_wallet_basename(wallet)}: {e!r}")
             return 0
 
     def goal_buffer_split(self, wallet: 'Abstract_Wallet', *,

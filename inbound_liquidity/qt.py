@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from electrum.i18n import _
+from electrum.logging import get_logger
 from electrum.plugin import hook
 
 from electrum.gui.qt.util import read_QIcon
@@ -35,7 +36,7 @@ from . import (
     DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT, DEFAULT_DEV_FEE_PCT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
     DEFAULT_MAX_CHANNEL_SIZE_SAT,
-    PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
+    PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status, warn_once,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
     _plugin_config_vars,
 )
@@ -289,10 +290,25 @@ def _buffer_split_for(wallet: 'Abstract_Wallet', *, onchain_sat: int,
     inside Electrum's status-bar repaint."""
     provider = _BUFFER_PROVIDER
     buffer_sat = 0
+    # NB no log on the "no provider installed" path, and none on success. This
+    # function runs inside Electrum's status-bar repaint -- many times a second
+    # -- and "no plugin has claimed the chart" is the steady state for every
+    # wallet without this plugin, so logging it would be pure noise at a rate
+    # that fills the user's log and rotates the useful lines out of it. Only the
+    # exception below is logged: it is rare, and it is the one case where a
+    # buffer of 0 does not mean what it appears to mean.
     if provider is not None:
         try:
             buffer_sat = int(provider(wallet))
-        except Exception:
+        except Exception as e:
+            # Still swallowed -- a repaint must not break -- but no longer
+            # indistinguishable from a genuine zero, which is what made a
+            # missing buffer slice impossible to tell from "no goal set".
+            # Once, not per repaint: a provider that raises will raise every
+            # time, and the first traceback says everything the hundredth would.
+            _warn_once("buffer-provider-failed",
+                       f"buffer provider failed for {_wallet_name(wallet)}; "
+                       f"treating the buffer as 0: {e!r}")
             buffer_sat = 0
     return split_goal_buffer(onchain_sat=onchain_sat, lightning_sat=lightning_sat,
                              buffer_sat=buffer_sat)
@@ -430,9 +446,16 @@ def _patch_status_bar_piechart() -> bool:
         from electrum.gui.qt.main_window import ElectrumWindow
     except Exception:
         return False
-    if getattr(ElectrumWindow.update_status, "_inbound_liquidity_patched", False):
+    state = _patch_state(ElectrumWindow.update_status)
+    if state == "ours":
         return True
-    orig_update_status = ElectrumWindow.update_status
+    if state == "stale":
+        # Patched by an older copy of this module, whose globals this process can
+        # no longer reach. Re-wrap Electrum's own method so the live patch reads
+        # OUR globals -- see the note on _PATCH_OWNER.
+        _logger.info("re-installing the status-bar pie patch over one left by a "
+                     "previous load of this plugin")
+    orig_update_status = _unwrap_stale(ElectrumWindow.update_status)
 
     def update_status(self) -> None:
         orig_update_status(self)
@@ -471,7 +494,8 @@ def _patch_status_bar_piechart() -> bool:
             except Exception:
                 pass
 
-    update_status._inbound_liquidity_patched = True
+    setattr(update_status, _PATCHED_ATTR, True)
+    setattr(update_status, _OWNER_ATTR, _PATCH_OWNER)
     # Kept reachable so a caller can still get at Electrum's own implementation
     # once the class attribute is ours -- the assumption guards read its source
     # to notice if Electrum ever stops building the pie the way we match on.
@@ -550,26 +574,41 @@ def _install_goal_view(dialog, wallet: 'Abstract_Wallet') -> bool:
     The dialog is built in full by Electrum first and only then amended, so
     nothing about how the chart is computed or painted is duplicated here.
     """
+    # Every bail below says why. Two levels, because the reasons are not alike:
+    # "this wallet has no buffer to draw" is the ordinary answer for most
+    # wallets and belongs at debug, while "Electrum's dialog is not shaped the
+    # way this patch expects" means the feature is silently off for everyone and
+    # is worth a warning. Before this, every one of these returned a bare False
+    # and the slices simply never appeared, with nothing logged anywhere.
     try:
         from electrum.gui.qt.balance_dialog import PieChartWidget
-    except Exception:
+    except Exception as e:
+        _logger.warning(f"no PieChartWidget to amend; Electrum's balance_dialog "
+                        f"may have moved: {e!r}")
         return False
     piechart = dialog.findChild(PieChartWidget)
     if piechart is None:
+        _logger.warning("balance dialog has no PieChartWidget child")
         return False
     # Electrum's own entries, kept as the reference rendering: unticking the box
     # has to restore exactly this, and re-ticking it has to re-derive from it
     # rather than from an already-reduced list.
     stock = list(getattr(piechart, "_list", None) or [])
     if not stock:
+        _logger.warning("balance dialog's pie chart has no entries to amend")
         return False
     # Read regardless of the checkbox: a goal that exists but is hidden still
     # needs its checkbox on screen, or there would be no way to bring it back.
     split = _goal_buffer_split(stock, wallet)
     if split is None:
+        # The ordinary case: no goal set, an unmanaged wallet, or a balance the
+        # buffer cannot be carved out of. Nothing is wrong.
+        _logger.debug(f"no liquidity-goal buffer to draw for "
+                      f"{_wallet_name(wallet)}; leaving Electrum's chart alone")
         return False
     grid = dialog.findChild(QGridLayout)
     if grid is None:
+        _logger.warning("balance dialog has no QGridLayout to put the legend in")
         return False
     config = dialog.config
     fx = getattr(dialog, "fx", None)
@@ -632,20 +671,34 @@ def _patch_balance_dialog() -> bool:
         from electrum.gui.qt.balance_dialog import BalanceDialog
     except Exception:
         return False
-    if getattr(BalanceDialog.__init__, "_inbound_liquidity_patched", False):
+    state = _patch_state(BalanceDialog.__init__)
+    if state == "ours":
         return True
-    orig_init = BalanceDialog.__init__
+    if state == "stale":
+        # Patched by an older copy of this module. Left alone, that patch keeps
+        # running and keeps reading the OLD copy's _BUFFER_PROVIDER -- which this
+        # copy cannot set -- so the goal slices silently never appear. See the
+        # note on _PATCH_OWNER.
+        _logger.info("re-installing the balance-dialog patch over one left by a "
+                     "previous load of this plugin")
+    orig_init = _unwrap_stale(BalanceDialog.__init__)
 
     def __init__(self, parent, *, wallet, **kwargs) -> None:
         orig_init(self, parent, wallet=wallet, **kwargs)
         try:
             _install_goal_view(self, wallet)
-        except Exception:
-            # An amended legend is a nicety; a dialog that cannot open is not.
-            pass
+        except Exception as e:
+            # An amended legend is a nicety; a dialog that cannot open is not --
+            # so this still swallows. But it no longer swallows SILENTLY: the
+            # goal slices going missing used to leave no trace anywhere, which
+            # makes "my buffer is not on the chart" undiagnosable from a log and
+            # cost real time to track down from the outside.
+            _logger.warning(f"could not add the liquidity-goal view to the "
+                            f"balance dialog: {e!r}", exc_info=True)
 
-    __init__._inbound_liquidity_patched = True
-    __init__._inbound_liquidity_orig = orig_init
+    setattr(__init__, _PATCHED_ATTR, True)
+    setattr(__init__, _OWNER_ATTR, _PATCH_OWNER)
+    setattr(__init__, _ORIG_ATTR, orig_init)
     BalanceDialog.__init__ = __init__
     return True
 
@@ -1284,6 +1337,76 @@ def _safe_filename(wallet: 'Abstract_Wallet') -> str:
 # casefolded, and no real name can reach here containing U+FFFF: it is not
 # printable, so `clean_display_name` strips it out.
 _NO_NAME_SORT_KEY = "\uffff"
+
+# Module-level logger, for the handful of helpers here that are not methods on
+# the Plugin (which has its own ``self.logger``). The monkeypatch installers and
+# the chart rewrites are deliberately total -- they must never break a repaint or
+# stop a dialog opening -- so when one of them declines to do its job, this is
+# the only way the user or a maintainer ever hears about it.
+_logger = get_logger(__name__)
+
+
+def _warn_once(key: str, message: str) -> None:
+    """This module's logger, bound to the shared once-only warning helper -- see
+    :func:`~electrum.plugins.inbound_liquidity.warn_once` for why the repaint
+    path may only ever report a repeating failure once."""
+    warn_once(_logger, key, message)
+
+
+# --- which copy of this module owns an installed monkeypatch ---------------
+# This module's patches are closures over its OWN globals (`_BUFFER_PROVIDER`,
+# `_GOAL_VISIBILITY`, ...). That is fine while there is one copy of the module,
+# and silently broken when there are two -- the live patch goes on reading the
+# globals of whichever copy installed it, and the other copy can set its own
+# `_BUFFER_PROVIDER` all day without the chart ever noticing.
+#
+# Two copies is not hypothetical. Electrum re-imports a plugin's modules when
+# the user disables and re-enables it, which leaves the patch installed by the
+# FIRST import still wrapping the method while every live `Plugin` instance
+# belongs to the second. The visible symptom is that the liquidity-goal slices
+# quietly stop appearing on the balance chart until Electrum is restarted --
+# with nothing logged, because an un-set provider is indistinguishable from a
+# wallet that has no goal. (The e2e suite hits the same thing from the other
+# direction: two test modules each purge `electrum*` out of `sys.modules` and
+# re-import, so the second one's patch request used to be answered "already
+# patched" by the first one's.)
+#
+# So "already patched" is not a yes/no question, it is "patched BY WHOM". A
+# module-unique object answers it: identity comparison is exact, it cannot
+# collide across copies the way a name or an id() can be reused, and holding a
+# reference to it from the patched function keeps it alive for exactly as long
+# as the patch is installed.
+_PATCH_OWNER = object()
+_OWNER_ATTR = "_inbound_liquidity_owner"
+_PATCHED_ATTR = "_inbound_liquidity_patched"
+_ORIG_ATTR = "_inbound_liquidity_orig"
+
+
+def _patch_state(func) -> str:
+    """Whether ``func`` is unpatched, patched by this copy of the module, or
+    patched by another copy: ``"clean"``, ``"ours"`` or ``"stale"``."""
+    if not getattr(func, _PATCHED_ATTR, False):
+        return "clean"
+    return "ours" if getattr(func, _OWNER_ATTR, None) is _PATCH_OWNER else "stale"
+
+
+def _unwrap_stale(func):
+    """The original, unpatched callable under a patch installed by an older copy
+    of this module -- so a re-patch wraps Electrum's own method rather than
+    stacking on top of a wrapper that reads dead globals.
+
+    Walks the chain rather than unwrapping once: nothing stops a third copy from
+    having been loaded, and two stacked stale wrappers would otherwise leave the
+    innermost one still in the call path.
+    """
+    seen = 0
+    while _patch_state(func) == "stale" and seen < 10:
+        original = getattr(func, _ORIG_ATTR, None)
+        if original is None:
+            break
+        func = original
+        seen += 1
+    return func
 
 # Longest tooltip we will build out of outside text. A tooltip is a floating
 # window sized to its content, so an unbounded one is a screenful.

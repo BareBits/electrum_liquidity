@@ -47,6 +47,7 @@ from electrum.gui.qt.amountedit import BTCAmountEdit  # noqa: E402
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     LiquidityPlugin, format_goal_buffer_warning,
 )
+from electrum.plugins import inbound_liquidity as il_mod  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity import qt as qt_mod  # type: ignore  # noqa: E402
 
 from test_goal_buffer_glue import (  # type: ignore  # noqa: E402
@@ -1262,3 +1263,216 @@ def test_refresh_send_warnings_survives_a_dead_widget(qapp) -> None:
     p._send_warning_refreshers = {object(): _dead, w: lambda: fired.append(1)}
     p._refresh_send_warnings()               # must not raise
     assert fired == [1]
+
+
+# --- a patch left behind by an EARLIER copy of this module -----------------
+# The patches installed here are closures over this module's own globals
+# (``_BUFFER_PROVIDER`` and friends). Two copies of the module can exist in one
+# process -- Electrum re-imports a plugin's modules when the user disables and
+# re-enables it -- and then the patch installed by the first copy goes on
+# reading the first copy's globals, which the second copy cannot set. The
+# visible symptom is the goal slices quietly never appearing until Electrum is
+# restarted.
+#
+# A foreign patch is simulated rather than actually re-importing the module: a
+# second import would give the test two sets of globals too, and then the
+# assertions could not tell which copy they were reading. Stamping a stand-in
+# wrapper the way another copy would isolates the one behaviour under test --
+# that ``_patch_state`` distrusts a patch it did not install, and that
+# re-installing unwraps rather than stacks.
+def _foreign_patch(original):
+    """A wrapper stamped as patched, but owned by somebody else."""
+    def wrapper(*args, **kwargs):
+        return original(*args, **kwargs)
+    setattr(wrapper, qt_mod._PATCHED_ATTR, True)
+    setattr(wrapper, qt_mod._OWNER_ATTR, object())      # NOT our _PATCH_OWNER
+    setattr(wrapper, qt_mod._ORIG_ATTR, original)
+    return wrapper
+
+
+def test_patch_state_tells_ours_from_a_stranger_and_from_clean(qapp) -> None:
+    def plain():
+        pass
+
+    assert qt_mod._patch_state(plain) == "clean"
+    assert qt_mod._patch_state(_foreign_patch(plain)) == "stale"
+    qt_mod._patch_balance_dialog()
+    assert qt_mod._patch_state(BalanceDialog.__init__) == "ours"
+
+
+def test_a_stale_balance_dialog_patch_is_replaced_not_accepted(qapp) -> None:
+    qt_mod._patch_balance_dialog()
+    ours = BalanceDialog.__init__
+    stock = getattr(ours, qt_mod._ORIG_ATTR)
+    try:
+        BalanceDialog.__init__ = _foreign_patch(stock)
+        # The bug: this used to answer "already patched" and leave the stranger
+        # in place, so the chart read globals nothing could set.
+        assert qt_mod._patch_balance_dialog() is True
+        assert qt_mod._patch_state(BalanceDialog.__init__) == "ours"
+        # And it wrapped Electrum's own __init__, not the stranger -- otherwise
+        # the stale closure stays in the call path under ours.
+        assert getattr(BalanceDialog.__init__, qt_mod._ORIG_ATTR) is stock
+    finally:
+        BalanceDialog.__init__ = ours
+
+
+def test_a_replaced_stale_patch_actually_draws_the_slice_again(qapp) -> None:
+    """The point of all of it: after replacing a stale patch, a dialog built
+    through it honours THIS copy's buffer provider."""
+    qt_mod._patch_balance_dialog()
+    ours = BalanceDialog.__init__
+    stock = getattr(ours, qt_mod._ORIG_ATTR)
+    try:
+        BalanceDialog.__init__ = _foreign_patch(stock)
+        qt_mod._patch_balance_dialog()
+
+        wallet = _DialogWallet(_FakePiechartBalance(confirmed=500_000,
+                                                   lightning=100_000))
+        p = _glue_plugin(managed=wallet, INBOUND_LIQUIDITY_GOAL_SAT=100_000)
+        qt_mod._set_buffer_provider(p.goal_buffer_sat)
+        try:
+            dialog = BalanceDialog(_dialog_parent(qapp, wallet), wallet=wallet)
+            piechart = dialog.findChild(PieChartWidget)
+            assert piechart is not None
+            # A linear scan, not a dict: the entry list mixes QColor with
+            # Qt.GlobalColor and QColor is not hashable.
+            onchain = [a for _n, c, a in piechart._list
+                       if c == qt_mod.COLOR_GOAL_BUFFER_ONCHAIN]
+            assert onchain == [100_000], piechart._list
+        finally:
+            qt_mod._set_buffer_provider(None)
+    finally:
+        BalanceDialog.__init__ = ours
+
+
+def test_stacked_stale_patches_are_all_unwrapped(qapp) -> None:
+    # Nothing stops a third copy being loaded; unwrapping only one layer would
+    # leave an inner stale wrapper still running.
+    qt_mod._patch_balance_dialog()
+    ours = BalanceDialog.__init__
+    stock = getattr(ours, qt_mod._ORIG_ATTR)
+    try:
+        BalanceDialog.__init__ = _foreign_patch(_foreign_patch(stock))
+        qt_mod._patch_balance_dialog()
+        assert getattr(BalanceDialog.__init__, qt_mod._ORIG_ATTR) is stock
+    finally:
+        BalanceDialog.__init__ = ours
+
+
+def test_a_stale_status_bar_patch_is_replaced_not_accepted(qapp) -> None:
+    from electrum.gui.qt.main_window import ElectrumWindow
+
+    qt_mod._patch_status_bar_piechart()
+    ours = ElectrumWindow.update_status
+    stock = getattr(ours, qt_mod._ORIG_ATTR)
+    try:
+        ElectrumWindow.update_status = _foreign_patch(stock)
+        assert qt_mod._patch_status_bar_piechart() is True
+        assert qt_mod._patch_state(ElectrumWindow.update_status) == "ours"
+        assert getattr(ElectrumWindow.update_status, qt_mod._ORIG_ATTR) is stock
+    finally:
+        ElectrumWindow.update_status = ours
+
+
+# --- the repaint path must not log ----------------------------------------
+# These helpers run inside Electrum's status-bar repaint, many times a second.
+# A log line on that path -- even at debug -- fills the user's log and rotates
+# the lines that matter out of it. That is not theoretical: a debug line here
+# once flooded Electrum's rotating log hard enough that an e2e test could no
+# longer find the swap line it greps for, because the newest log file no longer
+# contained it.
+def test_the_status_bar_repaint_logs_nothing_when_idle(qapp, caplog) -> None:
+    """The steady state -- no plugin loaded -- must be completely silent."""
+    import logging
+
+    w = _FakeWallet()
+    qt_mod._set_buffer_provider(None)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(50):
+            qt_mod._rewrite_piechart_entries(_stock_entries(confirmed=100), w)
+    ours = [r for r in caplog.records if "inbound_liquidity" in r.name]
+    assert not ours, [r.getMessage() for r in ours]
+
+
+def test_the_status_bar_repaint_logs_nothing_on_the_happy_path(qapp, caplog) -> None:
+    """Nor may a working buffer narrate itself once per repaint."""
+    import logging
+
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=10)
+    qt_mod._set_buffer_provider(p.goal_buffer_sat)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(50):
+            out = qt_mod._rewrite_piechart_entries(_stock_entries(confirmed=100), w)
+    assert _amount_of(out, ONCHAIN_BLUE) == 10, "the slice stopped being drawn"
+    ours = [r for r in caplog.records if "inbound_liquidity" in r.name]
+    assert not ours, [r.getMessage() for r in ours]
+
+
+def test_an_unmanaged_wallet_does_not_narrate_every_repaint(qapp, caplog) -> None:
+    """An unmanaged wallet is the steady state for anyone not using the plugin,
+    so `goal_buffer_sat` returning 0 for it must also be silent."""
+    import logging
+
+    managed, other = _FakeWallet(), _FakeWallet()
+    p = _glue_plugin(managed=managed, INBOUND_LIQUIDITY_GOAL_SAT=10)
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(50):
+            assert p.goal_buffer_sat(other) == 0
+    ours = [r for r in caplog.records if "inbound_liquidity" in r.name]
+    assert not ours, [r.getMessage() for r in ours]
+
+
+def test_a_failing_provider_is_reported_once_not_every_repaint(qapp, caplog) -> None:
+    """The one thing the repaint path DOES log. It has to arrive -- a buffer of
+    0 that means "something broke" is otherwise indistinguishable from one that
+    means "no goal set" -- but exactly once, for the reason above."""
+    import logging
+
+    w = _FakeWallet()
+
+    def exploding(_wallet):
+        raise RuntimeError("no config for you")
+
+    il_mod._WARNED_ONCE.discard("buffer-provider-failed")
+    qt_mod._set_buffer_provider(exploding)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(50):
+                out = qt_mod._rewrite_piechart_entries(
+                    _stock_entries(confirmed=100), w)
+        # The chart still renders, untouched, rather than breaking the repaint.
+        assert _amount_of(out, COLOR_CONFIRMED) == 100
+        warnings = [r for r in caplog.records
+                    if "inbound_liquidity" in r.name and r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert "no config for you" in warnings[0].getMessage()
+    finally:
+        il_mod._WARNED_ONCE.discard("buffer-provider-failed")
+
+
+def test_a_broken_config_is_reported_once_not_every_repaint(qapp, caplog) -> None:
+    """The same trap one level down. `goal_buffer_sat` is itself on the repaint
+    path, so its own exception handler must not narrate every repaint either --
+    which is exactly what it did before `warn_once`."""
+    import logging
+
+    w = _FakeWallet()
+    p = _glue_plugin(managed=w, INBOUND_LIQUIDITY_GOAL_SAT=10)
+
+    def exploding(_wallet):
+        raise RuntimeError("unreadable settings")
+
+    p.read_config = exploding
+    il_mod._WARNED_ONCE.discard("goal-buffer-failed")
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(50):
+                assert p.goal_buffer_sat(w) == 0
+        warnings = [r for r in caplog.records
+                    if "inbound_liquidity" in r.name and r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert "unreadable settings" in warnings[0].getMessage()
+    finally:
+        il_mod._WARNED_ONCE.discard("goal-buffer-failed")
