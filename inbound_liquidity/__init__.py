@@ -1182,6 +1182,11 @@ DEV_FEE_PAYOUT_THRESHOLD_SAT = 1_000
 DEV_FEE_DAILY_CAP_SAT = 10_000
 # Upper bound on the user-configurable fee percentage (0-5%).
 DEV_FEE_MAX_PCT = 5.0
+# The shipped fee percentage. Named rather than written inline on the ConfigVar
+# below because the Settings tab quotes it back in a worked example ("at the
+# default 0.1%, draining 100,000 sat accrues 100 sat"), and an example that
+# disagreed with what a fresh wallet actually charges would be worse than none.
+DEFAULT_DEV_FEE_PCT = 0.1
 # After a failed payout attempt, wait at least this long before retrying, so a
 # persistently failing address (offline, no route) doesn't hammer the network on
 # every evaluation tick. The fee stays owed across the backoff.
@@ -1372,11 +1377,24 @@ SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
 SimpleConfig.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = ConfigVar(
     'plugins.inbound_liquidity.onchain_reserve_sat', default=10_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("On-chain reserve when opening (sat)"),
-    long_desc=lambda: _("When opening a channel, fund with the maximum available, leaving this much on-chain."))
+    long_desc=lambda: _("When opening a channel, fund with the maximum available, leaving "
+                        "this much on-chain. The channel's funding mining fee is deducted "
+                        "on top of this, so the reserve survives the open.\n\n"
+                        "Keep it non-zero: closing a channel or claiming a reverse swap "
+                        "both need on-chain coins to pay their own mining fee, and a "
+                        "wallet with nothing left on-chain cannot pay either."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNELS = ConfigVar(
     'plugins.inbound_liquidity.max_channels', default=2, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Maximum number of channels"),
-    long_desc=lambda: _("Never hold more than this many channels."))
+    long_desc=lambda: _("Never hold more than this many Lightning channels. Once the "
+                        "count is reached the plugin opens no more, and a channel it "
+                        "opened that is below the liquidity goal is replaced rather "
+                        "than added to.\n\n"
+                        "Channels you opened by hand count toward the total, even when "
+                        "the plugin is told not to manage them. A channel whose peer "
+                        "has gone dark can stop counting, so a replacement may be "
+                        "opened alongside it -- see \"Treat a channel as offline "
+                        "after\" on the Advanced tab."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT = ConfigVar(
     'plugins.inbound_liquidity.max_channel_size_sat', default=DEFAULT_MAX_CHANNEL_SIZE_SAT,
     type_=int, plugin=_PLUGIN_NAME,
@@ -1430,11 +1448,12 @@ SimpleConfig.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = ConfigVar(
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.max_swap_fee_pct', default=0.9, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
-    long_desc=lambda: _("Do not swap Lightning -> on-chain if the effective all-in cost "
+    long_desc=lambda: _("Do not swap Lightning → on-chain if the effective all-in cost "
                         "(percentage fee + provider mining fee + on-chain claim fee, as a "
                         "share of the amount) exceeds this."))
 SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_PCT = ConfigVar(
-    'plugins.inbound_liquidity.dev_fee_pct', default=0.1, type_=float, plugin=_PLUGIN_NAME,
+    'plugins.inbound_liquidity.dev_fee_pct', default=DEFAULT_DEV_FEE_PCT, type_=float,
+    plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Dev fee (% of amount drained)"),
     long_desc=lambda: _("Optional fee to support plugin development, charged on what the plugin "
                         "drains from a channel: the on-chain amount received from a reverse "
@@ -2004,6 +2023,35 @@ def _wallet_basename(wallet: 'Abstract_Wallet') -> str:
         return wallet.basename()
     except Exception:
         return "?"
+
+
+# Keys already reported by warn_once. Bounded by the number of distinct call
+# sites, not by how often they fire.
+_WARNED_ONCE: Set[str] = set()
+
+
+def warn_once(logger, key: str, message: str) -> None:
+    """Log ``message`` the first time ``key`` is seen, then stay quiet.
+
+    For a failure on a path that repeats on its own schedule -- the GUI's
+    status-bar repaint runs many times a second -- where the FIRST occurrence
+    carries the whole diagnostic value and every repetition is noise that fills
+    the user's log and rotates the useful lines out of it.
+
+    Learned the hard way: a plain debug line on that path flooded Electrum's own
+    rotating log hard enough to push the lines an e2e test greps for into a
+    rotated-out file, and tripled that test's runtime.
+
+    Takes the logger rather than using one here so the message is attributed to
+    the module that noticed, which is what makes a log line findable.
+    """
+    if key in _WARNED_ONCE:
+        return
+    _WARNED_ONCE.add(key)
+    try:
+        logger.warning(message, exc_info=True)
+    except Exception:
+        pass        # a logging failure must never be the thing that breaks a repaint
 
 
 def _coerce_setting(cv: ConfigVar, value: Any) -> Any:
@@ -4010,12 +4058,23 @@ class LiquidityPlugin(BasePlugin):
         ``self.wallets`` is the managed set, so this tracks the plugin being
         stopped/started on a wallet without any extra bookkeeping.
         """
+        # Deliberately silent on the unmanaged path and on success: this is
+        # called from the status-bar repaint, many times a second, and an
+        # unmanaged wallet is the steady state for anyone not using the plugin.
+        # Logging either would fill the user's log and rotate the lines that
+        # matter out of it. Only the failure below says anything.
         try:
             if wallet not in self.wallets:
                 return 0
             return goal_buffer_sat(self.read_config(wallet))
-        except Exception:
-            # Never let a config or wallet-state problem break a repaint.
+        except Exception as e:
+            # Never let a config or wallet-state problem break a repaint -- but
+            # say so, rather than reporting a reassuring 0. Once, not per
+            # repaint: this is on the repaint path, and a config problem that
+            # raises will raise every time (see warn_once).
+            warn_once(self.logger, "goal-buffer-failed",
+                      f"could not compute the goal buffer for "
+                      f"{_wallet_basename(wallet)}: {e!r}")
             return 0
 
     def goal_buffer_split(self, wallet: 'Abstract_Wallet', *,
