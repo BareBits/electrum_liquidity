@@ -23,8 +23,9 @@ pytest.importorskip("PyQt6.QtWidgets")
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 pytest.importorskip("electrum.gui.qt.util")
 
+from PyQt6.QtCore import Qt  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
-    QApplication, QLabel, QPushButton, QTabWidget,
+    QApplication, QLabel, QPushButton, QScrollArea, QTabWidget,
 )
 
 from electrum.gui.qt.amountedit import AmountEdit, BTCAmountEdit  # noqa: E402
@@ -324,3 +325,105 @@ def test_signal_after_the_tab_is_gone_does_not_raise(qapp) -> None:
     from PyQt6 import sip
     sip.delete(goal_e)                  # as Qt does when the tab is torn down
     window.app.refresh_amount_edits_signal.emit()   # must not raise
+
+
+# --- where the fiat companion sits ---------------------------------------
+# The fiat box restates the amount beside it, so it has to read as part of that
+# field. It used to sit in its own grid column, which put it most of a window
+# width to the right of the sats it was restating -- and nothing was stretching
+# it there: Electrum's AmountEdit is a fixed ~144px while the plain QLineEdits
+# on the rows above expand, so column 1 was sized by THEM and column 2 began
+# after the whole empty remainder. The gap therefore GREW with the window, which
+# is why these cases measure a default-sized window and a roomy one: at 840px
+# the old layout was wrong by ~236px, at 1280px by ~690px, and a single-size
+# test could have been satisfied by a fix that still drifted apart on a big
+# screen.
+#
+# Measuring needs a real layout pass, which needs some care -- see the header of
+# test_no_clipped_text_qt for why WA_DontShowOnScreen is how that is had under
+# the offscreen platform.
+MAX_PAIR_GAP_PX = 24            # a layout spacing, not a column's remainder
+
+
+def _laid_out_goal_row(qapp, width: int, height: int):
+    """``(sat box, fiat box)`` from a Settings tab laid out for real."""
+    fx = _FakeFx(enabled=True, ccy="USD")
+    p = _make_plugin()
+    window, wallet = _FakeWindow(decimal_point=SAT, fx=fx), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tabs = p._tabs[wallet].container.findChild(QTabWidget)
+
+    host = window.tabs
+    host.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    host.show()
+    host.resize(width, height)
+    tabs.setCurrentIndex(0)
+    for _ in range(5):
+        qapp.processEvents()
+
+    page = tabs.widget(0)
+    body = page.findChild(QScrollArea)
+    scope = body.widget() if body is not None else page
+    sat_box = scope.findChildren(BTCAmountEdit)[0]
+    fiat_box = [e for e in scope.findChildren(AmountEdit)
+                if not isinstance(e, BTCAmountEdit)][0]
+    return sat_box, fiat_box
+
+
+@pytest.mark.parametrize("width,height", [(840, 400), (1280, 1024)])
+def test_fiat_box_sits_immediately_beside_the_sat_box(qapp, width, height) -> None:
+    sat_box, fiat_box = _laid_out_goal_row(qapp, width, height)
+    sat_right = sat_box.mapTo(sat_box.window(), sat_box.rect().topRight()).x()
+    fiat_left = fiat_box.mapTo(fiat_box.window(), fiat_box.rect().topLeft()).x()
+    gap = fiat_left - sat_right
+    assert 0 <= gap <= MAX_PAIR_GAP_PX, (
+        f"fiat box is {gap}px from the sat box at {width}x{height}")
+
+
+def test_the_two_boxes_share_a_row(qapp) -> None:
+    # Beside it, not under it: a gap measured horizontally means nothing if the
+    # layout has wrapped the fiat box onto the next line.
+    sat_box, fiat_box = _laid_out_goal_row(qapp, 1280, 1024)
+    sat_mid = sat_box.mapTo(sat_box.window(), sat_box.rect().center()).y()
+    fiat_mid = fiat_box.mapTo(fiat_box.window(), fiat_box.rect().center()).y()
+    assert abs(sat_mid - fiat_mid) <= 2
+
+
+def test_the_gap_does_not_grow_with_the_window(qapp) -> None:
+    """The regression itself: the old layout's gap was column 1's unused
+    remainder, so it widened as the window did. A fix that merely narrowed it at
+    one size would still fail here."""
+    _, _ = _laid_out_goal_row(qapp, 840, 400)
+    gaps = []
+    for width, height in [(840, 400), (1280, 1024)]:
+        sat_box, fiat_box = _laid_out_goal_row(qapp, width, height)
+        sat_right = sat_box.mapTo(sat_box.window(), sat_box.rect().topRight()).x()
+        fiat_left = fiat_box.mapTo(fiat_box.window(), fiat_box.rect().topLeft()).x()
+        gaps.append(fiat_left - sat_right)
+    assert gaps[0] == gaps[1], f"gap moved with the window: {gaps}"
+
+
+def test_the_sat_box_does_not_move_when_fiat_is_off(qapp) -> None:
+    """A hidden widget is ignored by the layout, so switching fiat off must
+    leave the row exactly where it was rather than re-centring it."""
+    with_fiat, _ = _laid_out_goal_row(qapp, 1280, 1024)
+    x_with = with_fiat.mapTo(with_fiat.window(),
+                             with_fiat.rect().topLeft()).x()
+
+    p = _make_plugin()
+    window, wallet = _FakeWindow(decimal_point=SAT,
+                                 fx=_FakeFx(enabled=False)), _FakeWallet()
+    p._add_liquidity_tab(window, wallet)
+    tabs = p._tabs[wallet].container.findChild(QTabWidget)
+    host = window.tabs
+    host.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    host.show()
+    host.resize(1280, 1024)
+    tabs.setCurrentIndex(0)
+    for _ in range(5):
+        qapp.processEvents()
+    page = tabs.widget(0)
+    body = page.findChild(QScrollArea)
+    scope = body.widget() if body is not None else page
+    without = scope.findChildren(BTCAmountEdit)[0]
+    assert without.mapTo(without.window(), without.rect().topLeft()).x() == x_with

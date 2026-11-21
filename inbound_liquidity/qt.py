@@ -26,19 +26,22 @@ import asyncio
 import contextlib
 import html
 import logging
+import math
 import re
 import time
 
 from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
-    DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
+    DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT, DEFAULT_DEV_FEE_PCT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
     DEFAULT_MAX_CHANNEL_SIZE_SAT,
     PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
+    _plugin_config_vars,
 )
 from .liquidity_manager import (
-    BufferSplit, normalize_node_id, scrub_text, split_goal_buffer,
+    BufferSplit, compute_dev_fee, normalize_node_id, scrub_text,
+    split_goal_buffer,
 )
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
 from .qt_widgets import (
@@ -1286,6 +1289,13 @@ _NO_NAME_SORT_KEY = "\uffff"
 # window sized to its content, so an unbounded one is a screenful.
 MAX_TOOLTIP_CHARS = 400
 
+# Largest value a swap-out trigger tooltip will quote back. Past this the number
+# is not a threshold anyone typed on purpose -- it is above the total bitcoin
+# supply in sats -- and rendering it would put a 17-digit figure in a floating
+# window. The setting itself is clamped by the engine, not here; this only
+# governs what the sentence is willing to say.
+_MAX_TRIGGER_VALUE = 21_000_000 * 100_000_000
+
 
 def _literal_tooltip(text: object) -> str:
     """A tooltip that renders ``text`` exactly as written.
@@ -1306,6 +1316,51 @@ def _literal_tooltip(text: object) -> str:
     if len(body) > MAX_TOOLTIP_CHARS:
         body = body[:MAX_TOOLTIP_CHARS - 1] + "\u2026"
     return f"<div style='white-space:pre-wrap'>{html.escape(body)}</div>"
+
+
+def _setting_help(attr: str) -> str:
+    """The canonical explanation for one setting, for use as hover help.
+
+    Read off the ``ConfigVar`` that declares the setting (its ``long_desc``)
+    rather than written out again here, because that declaration is already the
+    single place a setting is introduced and described -- the same reason
+    :func:`~electrum.plugins.inbound_liquidity._plugin_config_vars` reads the
+    ConfigVars off SimpleConfig instead of keeping a hand-written list.
+
+    Two things follow from that, both wanted. A setting whose wording is
+    improved in one place improves on the form too, so the config docs and the
+    hover help cannot drift apart; and a setting added later arrives with hover
+    help already attached, which is what keeps
+    ``test_settings_tooltips_qt`` from becoming a list to remember to extend.
+
+    Returns "" for a setting with no ``long_desc`` (the internal bookkeeping
+    vars -- timestamps, the install id, the "already prompted" flags -- none of
+    which has a field on any form), so a caller can fall back or skip. Never
+    raises: a tab that fails to build is far worse than a missing tooltip.
+    """
+    try:
+        cvar = _plugin_config_vars().get(attr)
+        if cvar is None:
+            return ""
+        return (cvar.get_long_desc() or "").strip()
+    except Exception:
+        return ""
+
+
+def _apply_setting_help(attr: str, *widgets: QWidget) -> str:
+    """Give every widget of one settings row the explanation for ``attr``.
+
+    Both halves of a row get it -- the label and the input -- because a user
+    hovering over a setting should not have to find the right half of it to get
+    an answer. Returns the text used (""  if the setting has none), so a caller
+    can tell whether a row ended up with help.
+    """
+    tip = _setting_help(attr)
+    if not tip:
+        return ""
+    for widget in widgets:
+        widget.setToolTip(tip)
+    return tip
 
 
 def _fmt_age(ts: float) -> str:
@@ -3087,15 +3142,27 @@ class Plugin(LiquidityPlugin):
         # Named for the same reason the three above are: the tooltip table below
         # is keyed by label text, so any row that wants one needs a name.
         dev_fee_label_text = _("Dev fee (%, 0–{:g}; 0 = off)").format(DEV_FEE_MAX_PCT)
-        # (label, current value as text, parser, setter) for each tunable kept on
-        # the main Settings tab. Power-user knobs (on-chain reserve, reliability
-        # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
-        # and the feature on/off toggles live on the Advanced sub-tab instead.
+        # The two swap-out triggers. Named because each carries a tooltip that
+        # quotes the value currently in its own box (see `live_tooltips` below),
+        # so the row has to be identifiable after the build loop has run.
+        trigger_pct_label_text = _("Swap-out trigger (% of capacity)")
+        trigger_sat_label_text = _("Swap-out trigger (sat)")
+        # (label, config attribute, current value as text, parser, setter) for
+        # each tunable kept on the main Settings tab. Power-user knobs (on-chain
+        # reserve, reliability tuning, offline auto-close, log retention,
+        # diagnostics, daily ceilings) and the feature on/off toggles live on the
+        # Advanced sub-tab instead.
+        #
+        # The attribute is carried alongside the setter -- which already closes
+        # over it -- so each row can find the ConfigVar that declares it and
+        # inherit that declaration's own explanation as hover help (see
+        # :func:`_setting_help`). Without it, every row's help would have to be
+        # written out a second time here, free to drift from the first.
         fields = [
-            (min_onchain_label_text,
+            (min_onchain_label_text, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT',
              str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', v)),
-            (_("Maximum number of channels"),
+            (_("Maximum number of channels"), 'INBOUND_LIQUIDITY_MAX_CHANNELS',
              str(c.INBOUND_LIQUIDITY_MAX_CHANNELS), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', v)),
             # Sits with the other two channel-shape knobs (how many, how big, what
@@ -3103,23 +3170,24 @@ class Plugin(LiquidityPlugin):
             # a channel with the whole on-chain balance, so it is a first-order
             # safety bound, not a tuning knob. Third in the list on purpose --
             # index 0/1 of the tab's line-edits stay min-on-chain and max-channels.
-            (max_size_label_text,
+            (max_size_label_text, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
              str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
                          DEFAULT_MAX_CHANNEL_SIZE_SAT)), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT', max(0, int(v)))),
             (_("Max fee to move LN → on-chain (%, all-in)"),
+             'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT',
              str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT', v)),
-            (_("Swap-out trigger (% of capacity)"),
+            (trigger_pct_label_text, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT',
              str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT', v)),
-            (_("Swap-out trigger (sat)"),
+            (trigger_sat_label_text, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT',
              str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT', v)),
             # Optional development fee, charged on the on-chain amount received
             # from plugin-initiated reverse swaps (clamped to 0..DEV_FEE_MAX_PCT).
             # The payout address is fixed (not user-editable) — see __init__.py.
-            (dev_fee_label_text,
+            (dev_fee_label_text, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
              str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
                                max(0.0, min(float(v), DEV_FEE_MAX_PCT)))),
@@ -3128,31 +3196,49 @@ class Plugin(LiquidityPlugin):
             # that cannot be resolved is refused rather than saved, because a
             # silently-bad sink would look configured while every drain quietly
             # fell back to a swap.
-            (sink_label_text,
+            (sink_label_text, 'INBOUND_LIQUIDITY_SINK_ADDRESS',
              str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''), str,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
         tooltips = {
             # Hovering the dev-fee row should answer "what is this charging me,
-            # on what, and where does it go" without sending anyone to the
-            # README. Condensed from the ConfigVar's long_desc (see __init__.py),
-            # which is the canonical wording.
+            # on what, how is the number arrived at, and where does it go"
+            # without sending anyone to the README. Condensed from the
+            # ConfigVar's long_desc (see __init__.py), which is the canonical
+            # wording, and then given the arithmetic the long_desc leaves out.
+            #
+            # The worked example is deliberately quoted at the SHIPPED default
+            # rather than at whatever is in the box: it is there to show how the
+            # sum works, and a fee this small is easier to believe as a concrete
+            # "100,000 sat in, 100 sat charged" than as a percentage.
             dev_fee_label_text: _(
                 "An optional contribution to this plugin's development, taken as "
                 "a share of what the plugin drains out of a channel.\n\n"
-                "It is charged only on drains the plugin performs itself — the "
-                "on-chain amount a reverse swap returns, or the amount paid to "
-                "your liquidity sink. Your own payments are never touched, and "
-                "nothing is charged when the plugin does nothing.\n\n"
+                "How it is worked out: fee = amount drained × the percentage "
+                "here, rounded down to whole sats. At the default {default:g}%, "
+                "draining 100,000 sat accrues {example} sat.\n\n"
+                "\"Amount drained\" is what you actually end up with: for a "
+                "reverse swap, the net on-chain amount it returns — after the "
+                "provider's percentage fee, the provider's mining fee and your "
+                "own claim-transaction fee; for a liquidity sink, the amount paid "
+                "to the sink. It is charged only on drains the plugin performs "
+                "itself. Your own payments are never touched, nothing is charged "
+                "when the plugin does nothing, and a swap that fails accrues "
+                "nothing.\n\n"
                 "The fee accrues until at least {thr} sat is owed, then is paid "
                 "automatically over Lightning to the payout address, at most "
                 "{cap} sat per rolling 24 hours. Range 0–{max:g}%; set it to 0 to "
                 "switch it off entirely.").format(
+                    default=DEFAULT_DEV_FEE_PCT,
+                    example=f"{compute_dev_fee(100_000, DEFAULT_DEV_FEE_PCT):,}",
                     thr=f"{DEV_FEE_PAYOUT_THRESHOLD_SAT:,}",
                     cap=f"{DEV_FEE_DAILY_CAP_SAT:,}", max=DEV_FEE_MAX_PCT),
             sink_label_text: _(
-                "Instead of doing a swap-out to obtain inbound liquidity, "
-                "utilize a liquidity sink instead"),
+                "Instead of using swaps to obtain inbound liquidity, just send "
+                "all funds to this address to obtain it.\n\n"
+                "Frees exactly the same inbound capacity as a reverse swap, but "
+                "settles in seconds with no on-chain claim and no swap provider "
+                "— typically your own account elsewhere. Blank = off."),
             max_size_label_text: _(
                 "Never fund a single channel with more than this.\n\n"
                 "The plugin opens channels with the maximum available on-chain "
@@ -3167,13 +3253,116 @@ class Plugin(LiquidityPlugin):
                 "would be replaced as soon as it was opened. 0 = no ceiling, "
                 "bounded only by Electrum's own maximum funding amount."),
         }
+
+        # --- the two swap-out triggers, which quote their own box -----------
+        # These read better with the user's own number in them than with a
+        # placeholder, so each is rebuilt from the text currently in its field
+        # (see the textChanged wiring in the build loop) rather than being
+        # formatted once from the saved value. Formatting it once would leave
+        # the tooltip describing the SAVED threshold while the box on screen
+        # showed an edited one -- hover help that contradicts the form it is
+        # attached to is worse than hover help with an "x" in it.
+        #
+        # Note the asymmetry in the two comparisons, which is the engine's and
+        # not a slip: `over_swap_trigger` fires the percentage trigger at
+        # `local_sat >= pct% * capacity` but the sat trigger at
+        # `local_sat > trigger_sat` -- so the first is "or greater" and the
+        # second is strictly "more than". A channel holding exactly the sat
+        # trigger does not swap.
+        def _trigger_amount(text: str, *, as_int: bool) -> Optional[str]:
+            """The value in a trigger box, formatted for prose, or None if the
+            box does not currently hold a usable number (mid-edit, or empty) --
+            in which case the tooltip falls back to a placeholder.
+
+            Every keystroke reaches this, including the ones that leave the box
+            holding something that is not a threshold, so the rejections matter
+            as much as the formatting:
+
+              * unparseable or negative -- the obvious mid-edit states;
+              * ``nan`` and ``inf``, which ``float()`` accepts quite happily and
+                ``int()`` then refuses (ValueError and OverflowError), raising
+                inside a Qt slot rather than showing a tooltip;
+              * absurdly large but finite, which parses and formats fine and
+                would render a 300-digit number into a floating window.
+
+            A rejected value is not an error -- the user is still typing. It just
+            means the sentence keeps its placeholder for another keystroke.
+            """
+            try:
+                value = float((text or "").strip())
+            except ValueError:
+                return None
+            if not math.isfinite(value) or value < 0 or value > _MAX_TRIGGER_VALUE:
+                return None
+            return f"{int(value):,}" if as_int else f"{value:g}"
+
+        def _trigger_pct_help(text: str) -> str:
+            amount = _trigger_amount(text, as_int=False)
+            return _(
+                "When the channel is {pct} full or greater, trigger a swap out "
+                "to make more inbound liquidity.\n\n"
+                "Measured against the channel's own capacity, counting the "
+                "balance on your side — the outbound that a swap converts into "
+                "inbound. Checked alongside the sat trigger below, and whichever "
+                "is reached first wins.\n\n"
+                "Reaching a trigger starts the attempt; it does not guarantee "
+                "one. The all-in fee ceiling, the minimum swap size and any "
+                "outbound you asked to keep can each still decline it — the "
+                "Declines tab says which."
+            ).format(pct=f"{amount}%" if amount is not None else _("x%"))
+
+        def _trigger_sat_help(text: str) -> str:
+            amount = _trigger_amount(text, as_int=True)
+            return _(
+                "When the channel has more than {sat} in it, trigger a swap out "
+                "to make more inbound liquidity.\n\n"
+                "\"More than\", not \"at least\": a channel holding exactly this "
+                "much does not swap. Counts the balance on your side, and is "
+                "checked alongside the percentage trigger above — whichever is "
+                "reached first wins.\n\n"
+                "Reaching a trigger starts the attempt; it does not guarantee "
+                "one. The all-in fee ceiling, the minimum swap size and any "
+                "outbound you asked to keep can each still decline it — the "
+                "Declines tab says which."
+            ).format(sat=_("{} sat").format(amount) if amount is not None
+                     else _("x sats"))
+
+        live_tooltips: Dict[str, Callable[[str], str]] = {
+            trigger_pct_label_text: _trigger_pct_help,
+            trigger_sat_label_text: _trigger_sat_help,
+        }
+
         edits = []
-        for row, (label, value, parser, setter) in enumerate(fields):
+        for row, (label, attr, value, parser, setter) in enumerate(fields):
             label_w = QLabel(label)
             edit = QLineEdit(value)
-            if label in tooltips:
-                label_w.setToolTip(tooltips[label])
-                edit.setToolTip(tooltips[label])
+            # Three sources, most specific first: a tooltip written for this row
+            # here, one rebuilt from the row's own contents, and -- for every
+            # other row -- the explanation already carried by the ConfigVar that
+            # declares the setting. The fallback is what gives the rows nobody
+            # has written bespoke copy for (and every row added later) hover
+            # help, instead of a bare label the user has to guess at.
+            if label in live_tooltips:
+                render = live_tooltips[label]
+
+                def _retip(text: str, *, _l=label_w, _e=edit, _r=render) -> None:
+                    # Guarded for the same reason _reload_goal is: this is a slot
+                    # on a widget's own signal, so it outlives nothing -- but a
+                    # repopulate during teardown can still reach a deleted label.
+                    try:
+                        tip = _r(text)
+                        _l.setToolTip(tip)
+                        _e.setToolTip(tip)
+                    except RuntimeError:
+                        return
+
+                _retip(value)
+                edit.textChanged.connect(_retip)
+            else:
+                tip = tooltips.get(label) or _setting_help(attr)
+                if tip:
+                    label_w.setToolTip(tip)
+                    edit.setToolTip(tip)
             grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             edits.append((edit, parser, setter, label))
@@ -3186,8 +3375,7 @@ class Plugin(LiquidityPlugin):
         # connect_fields -- exactly the pairing the Send and Receive tabs use.
         # The stored ConfigVar is always sats regardless of what is displayed.
         goal_label_text = _("Liquidity goal")
-        goal_tooltip = _("Automatically close small channels and re-open bigger "
-                         "channels if we have sufficient funds to reach this goal")
+        goal_tooltip = _setting_help('INBOUND_LIQUIDITY_GOAL_SAT')
         goal_row = len(fields)
         goal_label = QLabel(goal_label_text)
         goal_label.setToolTip(goal_tooltip)
@@ -3198,15 +3386,37 @@ class Plugin(LiquidityPlugin):
         goal_e = BTCAmountEdit(get_decimal_point)
         goal_e.setToolTip(goal_tooltip)
         goal_e.setAmount(self._liquidity_goal_sat(wallet))
-        grid.addWidget(goal_e, goal_row, 1)
+        # The amount and its fiat companion share ONE grid cell, side by side,
+        # rather than taking a column each.
+        #
+        # They used to sit in columns 1 and 2, which put the fiat box most of a
+        # window-width away from the sats it restates -- and the gap GREW with
+        # the window, so the roomier the screen the easier the field was to
+        # miss. Nothing was stretching it: Electrum's AmountEdit is a fixed
+        # ~144px, while the plain QLineEdits on the rows above expand, so
+        # column 1 is sized by THEM (374px at Electrum's default 840px window,
+        # 828px at 1280px). The amount box filled 144px of that and column 2
+        # began after the whole empty remainder.
+        #
+        # Pairing them in the cell makes the spacing between the two boxes the
+        # layout's own, independent of what the column is sized to, and the
+        # trailing stretch absorbs the remainder on the right where it is
+        # invisible. Column 2 of this grid is simply unused now.
+        goal_box = QHBoxLayout()
+        goal_box.setContentsMargins(0, 0, 0, 0)
+        goal_box.addWidget(goal_e)
         fx = getattr(window, "fx", None)
         goal_fiat_e = None
         if fx is not None and hasattr(window, "connect_fields"):
             goal_fiat_e = AmountEdit(fx.get_currency)
             goal_fiat_e.setToolTip(goal_tooltip)
+            # A hidden widget is ignored by the layout, so with fiat switched
+            # off the row collapses to just the amount box, as it did before.
             goal_fiat_e.setVisible(bool(fx.is_enabled()))
-            grid.addWidget(goal_fiat_e, goal_row, 2)
+            goal_box.addWidget(goal_fiat_e)
             window.connect_fields(goal_e, goal_fiat_e)
+        goal_box.addStretch(1)
+        grid.addLayout(goal_box, goal_row, 1)
 
         def _reload_goal() -> None:
             """Re-render the goal field from the PERSISTED sat value.
@@ -3750,8 +3960,13 @@ class Plugin(LiquidityPlugin):
         ]
         ceiling_rows = []  # (edit, attr, default, usage_label, kind)
         for (label, attr, default, kind) in ceiling_specs:
-            grid.addWidget(QLabel(label), row, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(str(getattr(c, attr, default)))
+            # Hover help inherited from the ConfigVar that declares the setting,
+            # on both halves of the row -- see _setting_help, and the same
+            # reasoning as the Settings tab's rows.
+            _apply_setting_help(attr, label_w, edit)
+            grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             usage = QLabel("")
             usage.setStyleSheet("color: gray;")
@@ -3863,8 +4078,14 @@ class Plugin(LiquidityPlugin):
             elif attr == RECOVERY_STARTS_AT:
                 target = recovery_grid
             at = next_row[target]
-            target.addWidget(QLabel(label), at, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(str(getattr(c, attr)))
+            # As on the ceilings above: the ConfigVar's own explanation, on both
+            # halves of the row. These are the knobs the tab's own banner warns
+            # to "change only if you understand the effect" -- so the thing that
+            # says what the effect IS belongs on the knob.
+            _apply_setting_help(attr, label_w, edit)
+            target.addWidget(label_w, at, 0)
             target.addWidget(edit, at, 1)
             field_rows.append((edit, attr, parser, setter, label))
             pane_of_field[attr] = pane_of_grid[target]
