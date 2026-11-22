@@ -483,3 +483,85 @@ def test_ensure_marked_does_not_reexec_and_marks_only_this_process(monkeypatch) 
     # Idempotent: calling it again (every rig fixture does) is a no-op.
     run_mod._ensure_marked()
     assert os.environ[paths.MARKER_ENV] == paths.MARKER_VALUE
+
+
+# -- reading a daemon's logs (rotation + restarts) -------------------------
+#
+# These pin the helper every heavy e2e suite greps through. Its predecessor --
+# a `electrum_log_*.log` glob, usually `[-1]` -- could see neither the
+# RotatingFileHandler's backups nor the files an earlier daemon run left, which
+# silently turned `assert "..." not in log` into a pass.
+def _write_logs(directory, names_to_text):
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, text in names_to_text.items():
+        (directory / name).write_text(text)
+
+
+def _fake_inst(tmp_path, monkeypatch):
+    from rig import services
+    inst = services.ElectrumInstance(
+        name="client", datadir=tmp_path / "dd", wallet_name="w")
+    return inst
+
+
+def test_read_electrum_log_orders_rotation_backups_oldest_first(tmp_path, monkeypatch):
+    """A HIGHER rotation suffix is OLDER: rotation renames every backup up one
+    number before opening a fresh live file. So `.log.2` precedes `.log.1`,
+    which precedes the live `.log`."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "newest\n",
+        "electrum_log_20260101T000000Z_10.log.1": "middle\n",
+        "electrum_log_20260101T000000Z_10.log.2": "oldest\n",
+    })
+    assert read_electrum_log(inst) == "oldest\nmiddle\nnewest\n"
+
+
+def test_read_electrum_log_spans_daemon_restarts(tmp_path, monkeypatch):
+    """A restart opens a NEW base name. Reading only the newest file would drop
+    everything before it -- and the rig restarts the client deliberately."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "first run\n",
+        "electrum_log_20260101T010000Z_11.log": "second run\n",
+    })
+    assert read_electrum_log(inst) == "first run\nsecond run\n"
+
+
+def test_read_electrum_log_interleaves_restarts_and_rotation(tmp_path, monkeypatch):
+    """Both axes at once, which is the real shape of a long rig run."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log.1": "a\n",
+        "electrum_log_20260101T000000Z_10.log": "b\n",
+        "electrum_log_20260101T010000Z_11.log.1": "c\n",
+        "electrum_log_20260101T010000Z_11.log": "d\n",
+    })
+    assert read_electrum_log(inst) == "a\nb\nc\nd\n"
+
+
+def test_read_electrum_log_ignores_unrelated_files(tmp_path, monkeypatch):
+    """The log dir is not ours alone; only Electrum's own files may be read."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "mine\n",
+        "something_else.log": "not mine\n",
+        "electrum_log_20260101T000000Z_10.log.bak": "not a rotation suffix\n",
+    })
+    text = read_electrum_log(inst)
+    assert "mine" in text
+    assert "not mine" not in text
+    # A non-numeric suffix is not a rotation backup, but it IS an electrum_log_
+    # file, so it is read rather than silently dropped -- losing log lines is the
+    # failure mode this helper exists to prevent.
+    assert "not a rotation suffix" in text
+
+
+def test_read_electrum_log_missing_dir_is_empty(tmp_path, monkeypatch):
+    """Called before the daemon has ever started; must not raise."""
+    from rig.services import read_electrum_log
+    assert read_electrum_log(_fake_inst(tmp_path, monkeypatch)) == ""

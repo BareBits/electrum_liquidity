@@ -97,6 +97,7 @@ from rig.services import (  # noqa: E402
     wait_lightning_ready,
     wait_wallet_height,
     wallet_path,
+    read_electrum_log,
 )
 
 RELIABILITY_DB_KEY = "inbound_liquidity_provider_reliability"
@@ -166,9 +167,13 @@ def _fault_log() -> List[Dict]:
 
 
 def _client_log_text() -> str:
-    logs = sorted(glob.glob(str(
-        paths.CLIENT_DATADIR / "regtest" / "logs" / "electrum_log_*.log")))
-    return "".join(open(path, errors="replace").read() for path in logs)
+    """Everything the client daemon has logged, oldest first.
+
+    Thin alias for ``rig.services.read_electrum_log``: it reads the rotation
+    backups and the files left by earlier daemon runs, neither of which the
+    ``electrum_log_*.log`` glob this used to do could see.
+    """
+    return read_electrum_log(CLIENT)
 
 
 def _mine(rig, n: int = 1) -> None:
