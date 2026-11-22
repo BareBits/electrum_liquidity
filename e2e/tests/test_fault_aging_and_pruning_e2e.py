@@ -247,16 +247,22 @@ def _arm_swap_config() -> None:
     """Make the plugin want to swap (not open or close), and set the half-life the
     escalation assertion depends on.
 
-    Mirrors ``test_swap_provider_failover_e2e._arm_swap_config``: three channels
-    because ``--second-provider`` adds one, and a permissive fee ceiling because
-    the rig's fixed 45k prepayment makes the honest all-in cost of a ~1M swap
-    several percent, which the default 0.9% gate would rightly decline.
+    Mirrors ``test_swap_provider_failover_e2e._arm_swap_config``: ``max_channels``
+    matches the rig's channel count exactly, so the engine neither closes a
+    channel nor opens another instead of swapping, and a permissive fee ceiling
+    because the rig's fixed 45k prepayment makes the honest all-in cost of a
+    ~760k swap several percent, which the default gate would rightly decline.
+
+    Two channels, not three: ``--second-provider`` no longer gives the client a
+    channel to partner2. That provider's advertised capacity comes from PARTNER
+    now (Rig._open_provider2_supply), which is what makes the failover rigs
+    deterministic -- see that module's docstring.
     """
     _setcfg("plugins.inbound_liquidity.reliability_enabled", "true")
     # The half-life is deliberately left at its shipped default -- see
     # SHIPPED_HALFLIFE_HOURS for why it cannot be shortened from here anyway.
     _setcfg("plugins.inbound_liquidity.one_channel_per_peer", "true")
-    _setcfg("plugins.inbound_liquidity.max_channels", "3")
+    _setcfg("plugins.inbound_liquidity.max_channels", "2")
     _setcfg("plugins.inbound_liquidity.swap_trigger_sat", "100000")
     _setcfg("plugins.inbound_liquidity.swap_trigger_pct", "10")
     _setcfg("plugins.inbound_liquidity.max_swap_fee_pct", "10")

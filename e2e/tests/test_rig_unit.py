@@ -565,3 +565,21 @@ def test_read_electrum_log_missing_dir_is_empty(tmp_path, monkeypatch):
     """Called before the daemon has ever started; must not raise."""
     from rig.services import read_electrum_log
     assert read_electrum_log(_fake_inst(tmp_path, monkeypatch)) == ""
+
+
+# -- second-provider supply channel (R2 topology) --------------------------
+def test_second_provider_supply_is_big_enough_for_every_channel():
+    """partner2's advertised reverse cap is drawn down as the engine plans
+    (``consumed``), so it must cover EVERY client channel in one pass. If it
+    covers only one, which channel gets it is decided by Electrum's random
+    channel-load order -- the coin flip this topology exists to remove."""
+    import run as run_mod  # noqa: PLC0415 -- rig entrypoint, imported lazily
+    args = run_mod.parse_args(["--no-gui", "--second-provider"])
+    # What one 0.02 BTC 50/50 channel can actually have drained out of it, less
+    # the headroom the planner subtracts: ~760k observed on the rig.
+    per_channel_drain_sat = 760_000
+    supply_sat = int(run_mod.PROVIDER2_SUPPLY_BTC * 100_000_000)
+    assert supply_sat >= args.channels * per_channel_drain_sat, (
+        f"{supply_sat} sat of partner2 inbound cannot host {args.channels} "
+        f"swaps of ~{per_channel_drain_sat} sat; the pass would starve and the "
+        f"shuffle would decide which channel failed over")
