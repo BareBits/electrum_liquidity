@@ -638,3 +638,82 @@ def test_every_rig_fixture_follows_the_naming_convention():
         "these fixtures build a Rig but are not named `rig`/`*_rig`, so the "
         "collector cannot give them the rig_e2e deadline and their tests will "
         f"be killed at 300s: {offenders}")
+
+
+# -- batched config writing -------------------------------------------------
+def test_batched_config_matches_the_cli(tmp_path):
+    """``rig.apply_config`` must produce the config file the CLI loop produced.
+
+    This is the whole safety argument for the batching. ``setup_wallet`` used
+    to run ``electrum -o setconfig <key> <value>`` once per pair, which was 25s
+    of a 58s bring-up; it now writes them in one process. That is only a sound
+    swap if the bytes on disk are the same, because every e2e test in this
+    directory takes the resulting daemon's behaviour as its premise -- a value
+    arriving as the string ``"true"`` instead of the bool ``True`` would not
+    fail here, it would fail somewhere else, hours later, as a swap that never
+    happened.
+
+    So: drive both paths over the REAL client pairs and diff the files. The
+    real pairs rather than a sample, because the interesting cases are in them
+    -- ``"true"``/``"false"`` that must survive `literal_eval` as bools, an
+    integer-looking string, a ``server`` value with colons that must NOT be
+    eval'd into something else, and a ``plugins.*.enabled`` key that takes the
+    plugin-enabler branch instead of the ConfigVar one.
+
+    Slow for this file (two interpreter starts per key on the CLI side, ~10s)
+    but it is the only test here that can catch a divergence, and it needs no
+    rig: no bitcoind, no daemon, just two scratch data directories.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess as _sp  # noqa: PLC0415
+
+    from rig.services import _client_config_pairs
+
+    pairs = _client_config_pairs(_endpoints())
+    assert pairs, "no client config pairs to compare"
+
+    old_dir, new_dir = tmp_path / "viacli", tmp_path / "batched"
+    old_dir.mkdir()
+    new_dir.mkdir()
+
+    electrum_bin = paths.VENV_ELECTRUM / "bin" / "electrum"
+    if not electrum_bin.exists():                      # pragma: no cover
+        pytest.skip("no electrum venv here; run e2e/setup.sh")
+
+    for key, value in pairs:
+        done = _sp.run(
+            [str(electrum_bin), "--regtest", f"--dir={old_dir}",
+             "-w", str(old_dir / "wal"), "-o", "setconfig", key, str(value)],
+            capture_output=True, text=True, timeout=120)
+        assert done.returncode == 0, f"CLI setconfig {key} failed: {done.stderr}"
+
+    done = _sp.run(
+        [str(paths.VENV_PYTHON), "-m", "rig.apply_config",
+         "--dir", str(new_dir), "--wallet", str(new_dir / "wal"), "--regtest"],
+        input=_json.dumps([[k, str(v)] for k, v in pairs]),
+        capture_output=True, text=True, timeout=120,
+        cwd=str(paths.RIG_ROOT))
+    assert done.returncode == 0, f"apply_config failed: {done.stderr}"
+
+    via_cli = _json.loads((old_dir / "regtest" / "config").read_text())
+    batched = _json.loads((new_dir / "regtest" / "config").read_text())
+    assert batched == via_cli, (
+        "batched config write diverged from the CLI. Differing keys: "
+        f"{ {k: (via_cli.get(k), batched.get(k)) for k in set(via_cli) | set(batched) if via_cli.get(k) != batched.get(k)} }")
+
+    # Not vacuously equal: every pair really did land. Resolved through the
+    # nesting, because a dotted plugin key is not stored flat -- Electrum
+    # writes `plugins.inbound_liquidity.enabled` as
+    # {"plugins": {"inbound_liquidity": {"enabled": true}}}, which is exactly
+    # the kind of divergence the equality above exists to catch and which a
+    # flat `key in batched` would have mistaken for a missing value.
+    def _resolve(cfg: dict, dotted: str):
+        node = cfg
+        for part in dotted.split("."):
+            assert isinstance(node, dict) and part in node, \
+                f"{dotted} was never written (stopped at {part!r})"
+            node = node[part]
+        return node
+
+    for key, _value in pairs:
+        _resolve(batched, key)
