@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+import conftest                                                   # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rig import paths, ports, trampoline_stub  # noqa: E402
@@ -583,3 +585,56 @@ def test_second_provider_supply_is_big_enough_for_every_channel():
         f"{supply_sat} sat of partner2 inbound cannot host {args.channels} "
         f"swaps of ~{per_channel_drain_sat} sat; the pass would starve and the "
         f"shuffle would decide which channel failed over")
+
+
+# -- the rig-fixture naming convention -------------------------------------
+def test_every_rig_fixture_follows_the_naming_convention():
+    """A fixture that brings the rig up must be named ``rig`` or ``*_rig``.
+
+    This is enforced rather than merely documented because something real
+    depends on it. ``conftest.is_rig_fixture`` decides, at collection time,
+    which tests get the long ``rig_e2e`` deadline instead of the repo-wide
+    300s one -- and nothing about a fixture's name can PROVE it launches
+    bitcoind, so the name is the only signal available there. A rig fixture
+    called ``stack`` or ``harness`` would therefore inherit the 300s default
+    and its test would be SIGALRM'd a few minutes into bring-up, reported as a
+    timeout on whichever line it happened to be on. That is a long afternoon.
+
+    So: find every fixture in this directory that constructs a ``Rig``, and
+    insist it is named so that the collector can see it. Static (``ast``, no
+    import), and it lives in the fast suite on purpose -- a convention policed
+    only by the suite that takes four hours is not policed.
+    """
+    import ast  # noqa: PLC0415 -- only this test needs it
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    offenders: list[str] = []
+    checked = 0
+    for name in sorted(os.listdir(here)):
+        if not (name.startswith("test_") and name.endswith(".py")):
+            continue
+        tree = ast.parse(open(os.path.join(here, name), encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorated = any(
+                "fixture" in ast.unparse(d) for d in node.decorator_list)
+            if not decorated:
+                continue
+            # `run_mod.Rig(...)` or a bare `Rig(...)` anywhere in the body.
+            builds_rig = any(
+                isinstance(call, ast.Call)
+                and (getattr(call.func, "attr", None) == "Rig"
+                     or getattr(call.func, "id", None) == "Rig")
+                for call in ast.walk(node))
+            if not builds_rig:
+                continue
+            checked += 1
+            if not conftest.is_rig_fixture(node.name):
+                offenders.append(f"{name}::{node.name}")
+
+    assert checked, "found no rig-building fixtures at all; has the suite moved?"
+    assert not offenders, (
+        "these fixtures build a Rig but are not named `rig`/`*_rig`, so the "
+        "collector cannot give them the rig_e2e deadline and their tests will "
+        f"be killed at 300s: {offenders}")
