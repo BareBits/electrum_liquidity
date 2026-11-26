@@ -40,10 +40,11 @@ import pytest
 
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
+import electrum.plugins.inbound_liquidity as IL  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     FAULT_LOG_MIN_INTERVAL_SEC,
     MAX_DISCOVERED_PROVIDERS,
-    MAX_LOG_ENTRIES,
+    MAX_FAULT_LOG_SHARE,
     RELIABILITY_DB_KEY,
     RELIABILITY_MAX_ROWS,
 )
@@ -197,16 +198,39 @@ def test_the_ceiling_forgets_the_uninformative_rows_first() -> None:
 
 
 # --- the decision log cannot be flushed ----------------------------------
-def test_a_fault_flood_cannot_evict_the_action_log() -> None:
+def test_a_fault_flood_cannot_evict_the_action_log(monkeypatch) -> None:
     """The log is the record an operator audits with. A party that can provoke
-    faults at will must not be able to push a real action out of it."""
+    faults at will must not be able to push a real action out of it.
+
+    Run against a deliberately tiny ring. The guard is a SHARE of the cap --
+    ``_prune`` holds faults to ``MAX_FAULT_LOG_SHARE`` of whatever the cap is
+    and gives the remainder to everything else -- so overflowing a 50-entry
+    ring proves precisely what overflowing the shipped 2000-entry one does.
+
+    Worth saying why, because the obvious reading is that this weakens the
+    test: at 2000 it was 21.6s, a third of the entire unit suite's runtime, and
+    all of that was the 4000 ``_log_fault`` calls each walking the SINGLE-entry
+    path -- ``_plain_json_copy`` of the whole ring, prune, re-sort, per call.
+    That quadratic cost is real, and it is exactly why ``_append_log_many``
+    exists, but it is a property of the batching API and not the eviction rule
+    under test here. Spending 21s to re-measure it on every run bought nothing.
+    """
+    cap = 50
+    monkeypatch.setattr(IL, "MAX_LOG_ENTRIES", cap)
     p, w = _plugin(), _FakeWallet(None)
     p._log_action(w, kind="swap", amount_sat=400_000, source="1x1x1",
                   dest="on-chain", reason="drain", detail="the real one",
                   state=None)
-    for i in range(MAX_LOG_ENTRIES * 2):
+    for i in range(cap * 2):
         p._log_fault(w, kind="provider", ident=_npub(i),
                      reason="advertised malformed offer", hard=False, soft=True)
+    # Eviction really did happen, so the assertion below is not vacuous: the
+    # 100 faults submitted were cut to the fault budget -- a SHARE of the cap,
+    # which is the whole mechanism. (The leftover headroom is deliberately not
+    # handed to faults; that is what leaves room for the action.)
+    faults = [e for e in p._load_log(w) if e.get("category") == "fault"]
+    assert len(faults) == int(cap * MAX_FAULT_LOG_SHARE), (
+        f"{len(faults)} faults kept; expected the fault budget to bind")
     actions = p.get_decision_log(w, "action")
     assert any(e.get("detail") == "the real one" for e in actions), (
         "a flood of faults evicted a genuine action from the log")

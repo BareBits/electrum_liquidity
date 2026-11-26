@@ -191,8 +191,12 @@ def test_the_wait_gives_up_at_the_attempts_deadline() -> None:
     error: we save and exit, and the attempt's outcome is reconciled next load."""
     p = _plugin()
     wallet = _Wallet()
-    p._note_attempt_started(wallet, _attempt(remaining=0.3))
+    # `started` first: `_attempt(remaining=0.3)` turns that into a deadline off
+    # its OWN clock read, so sampling afterwards starts the measurement part-way
+    # through the window being measured and `elapsed` lands just under 0.3. Same
+    # undershoot as in `test_a_long_wait_shows_the_dialog_once` above.
     started = time.monotonic()
+    p._note_attempt_started(wallet, _attempt(remaining=0.3))
     p._await_shutdown(wallet)               # nothing ever sets the event
     elapsed = time.monotonic() - started
     assert 0.3 <= elapsed < 3.0, f"the wait took {elapsed:.2f}s"
@@ -274,8 +278,10 @@ def test_the_wait_survives_a_qt_without_an_event_loop() -> None:
     original = qt_mod.QApplication.processEvents
     qt_mod.QApplication.processEvents = staticmethod(_boom)
     try:
-        p._note_attempt_started(wallet, _attempt(remaining=0.3))
+        # Clock before the attempt, so the measured span contains the whole
+        # 0.3s deadline `_attempt` derives from its own clock read.
         started = time.monotonic()
+        p._note_attempt_started(wallet, _attempt(remaining=0.3))
         p._await_shutdown(wallet)
     finally:
         qt_mod.QApplication.processEvents = original
@@ -292,8 +298,10 @@ def test_a_dialog_that_cannot_be_shown_does_not_abort_the_wait(monkeypatch) -> N
     monkeypatch.setattr(qt_mod, "SHUTDOWN_DIALOG_DELAY_SEC", 0.05)
     monkeypatch.setattr(qt_mod.Plugin, "_build_shutdown_dialog",
                         lambda self, attempt, deadline: (None, None))
-    p._note_attempt_started(wallet, _attempt(remaining=0.3))
+    # Clock before the attempt -- see the sibling tests; sampling after it puts
+    # `elapsed` under the lower bound on a loaded machine.
     started = time.monotonic()
+    p._note_attempt_started(wallet, _attempt(remaining=0.3))
     p._await_shutdown(wallet)
     assert 0.3 <= time.monotonic() - started < 3.0
 

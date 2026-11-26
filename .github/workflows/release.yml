@@ -56,7 +56,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ./electrum-src
-          pip install cryptography PyQt6 pytest
+          # pytest-xdist   -- parallelises the suite (see "Run tests" below)
+          # pytest-timeout -- enforces pytest.ini's per-test deadline, so a hung
+          #                   test fails with a traceback instead of eating the
+          #                   whole job budget and ending the log mid-test
+          # hypothesis     -- property-based tests over the pure rules engine
+          pip install cryptography PyQt6 pytest pytest-xdist pytest-timeout hypothesis
 
       - name: Symlink plugin into Electrum's plugins dir
         run: ln -s "${GITHUB_WORKSPACE}/inbound_liquidity" electrum-src/electrum/plugins/inbound_liquidity
@@ -77,7 +82,19 @@ jobs:
         # -rs prints the reason for any skip, so a silently-skipped glue module
         # is visible in the log (the verify step above already hard-fails on the
         # import error that would cause such a skip).
-        run: python -m pytest tests -q -rs
+        #
+        # -n auto runs one worker per core. The suite is process-parallel-safe:
+        # the one piece of process-wide state it touches (Electrum's
+        # MIN_FUNDING_SAT module global) is restored by an autouse fixture in
+        # tests/conftest.py, and each xdist worker is its own process anyway.
+        #
+        # --dist loadfile groups every test in a file onto ONE worker rather
+        # than scattering them. Not for speed -- it is barely different -- but
+        # so the distribution is DETERMINISTIC per file: a test that turned out
+        # to depend on a module-level side effect of a sibling would otherwise
+        # pass or fail depending on which worker happened to pick it up, which
+        # is the least debuggable failure mode available.
+        run: python -m pytest tests -q -rs -n auto --dist loadfile
 
       - name: Multi-wallet GUI test (several wallets in one real Electrum)
         env:
