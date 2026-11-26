@@ -83,19 +83,70 @@ marker has to be on the orchestrator and nothing above it; setting it in the
 shell marks the parent shell and any `timeout` wrapper too, and the rig's
 first cleanup sweep will then terminate whatever is holding your test run open.
 
-| Test | Asserts (against the live daemon + real `wallet.db`) |
+### What it costs, and why
+
+Budget **~3-4 hours** for the whole suite. It is ~56 rig bring-ups at ~1 minute
+each, plus the tests themselves — several of which legitimately spend 10-20
+minutes waiting on a real chain.
+
+Most of those bring-ups are one per *test*, not one per file, and that is
+deliberate rather than an oversight waiting to be optimised: nearly every
+multi-test suite below opens channels or pays fees, and then asserts the virgin
+baseline in its opening lines (`len(chans) == 2`, `_dev_fee_charged() == 0`,
+`_plugin_opened() == []`). Sharing a rig across them does not merely fail — in
+the suites that read the daemon's cumulative log it would make waits pass
+*vacuously*, which is worse. If you are looking to speed this up, bring-up
+itself is the tractable target; `rig.apply_config` is an example of that.
+
+Each rig test gets a 45-minute deadline, applied automatically by
+`tests/conftest.py` to anything using a `rig` fixture. A fixture that brings the
+rig up **must** be named `rig` or `*_rig` or it will inherit the repo-wide 300s
+default and be killed mid-bring-up; `test_rig_unit` enforces that statically.
+The suite also refuses `-n`: the rig is a singleton (a fixed `.run` it wipes on
+launch, a fixed nostr container name) so concurrent rigs destroy each other.
+
+### The suites
+
+Flavour is the `run.py` mode each needs; "plain" is `--no-gui`.
+
+| Test | Flavour | Asserts (against the live daemon + real `wallet.db`) |
+|---|---|---|
+| `test_toggle_e2e` | plain | the master `automation_enabled` slider gates all automation |
+| `test_daily_caps_e2e` | plain | the daily open/close ceilings hold and resume |
+| `test_eval_rate_limit_e2e` | plain | an armed, idle plugin does not storm; the resting status says when the next check is due; arriving funds still get an immediate tick |
+| `test_log_and_status_e2e` | plain | the tick status walks its steps and comes to rest; declines carry the arithmetic that explains them; every log entry carries a usable timestamp |
+| `test_offline_autoclose_e2e` | plain | only plugin-opened channels are force-closed when the peer goes offline |
+| `test_manual_close_not_faulted_e2e` | plain | a user-initiated close is not charged to the peer |
+| `test_peer_fault_persistence_e2e` | plain | a channel peer's fault record survives a daemon restart |
+| `test_peer_fault_aging_and_pruning_e2e` | plain | peer faults decay with age and the store is bounded |
+| `test_wedged_open_e2e` | plain | a funding tx merely waiting for blocks is **not** force-closed; a genuinely wedged open is, once the gates pass |
+| `test_suggested_peer_open_e2e` | plain | with no preferred partner and no trampoline nodes, the decline names why — and the plugin opens to Electrum's suggestion when there is one |
+| `test_suggested_peer_loop_safety_e2e` | plain | a failing suggested peer cannot become an open/close loop |
+| `test_max_channel_size_e2e` | plain | the per-channel ceiling bounds a real open and the rest builds out; with the ceiling off the plugin funds the lot |
+| `test_outbound_preservation_e2e` | plain | `manage_plugin_opened_only` leaves wallet-opened channels alone |
+| `test_reverse_swap_e2e` | plain | a real reverse swap **increases inbound liquidity** and accrues a dev fee — which is granted by reconciliation after confirmation, not on first sight of a funding txid |
+| `test_swap_sizing_e2e` | plain | a max-sized swap routes on the FIRST attempt whatever the channel size; a channel too small to swap declines cleanly |
+| `test_sink_goal_gate_e2e` | plain | goal **unmet** → reverse-swap and leave the sink alone; **met** → pay the sink; switch off → pay it either way |
+| `test_liquidity_goal_e2e` | plain | the goal drives build-out, and a goal of 0 switches the rule off entirely |
+| `test_goal_buffer_e2e` | plain | the goal **buffer** on a real wallet: the balance agrees with the daemon, the split loses no satoshi, the warning fires at exactly the real threshold, and Electrum's Balance dialog grows the blue slice |
+| `test_wallet_lock_e2e` | plain | a locked wallet defers rather than failing, and says so |
+| `test_update_check_e2e` | plain | the opt-in update check runs, self-throttles, and reports being behind |
+| `test_usage_stats_e2e` | plain | silent until opted in, then reports; regtest and the kill switch each stop an opted-in wallet |
+| `test_swap_ladder_e2e` | `--channels 1` | a routable swap completes on the top rung; the whole ladder is walked when no rung can route; a provider is faulted once per cascade, not once per rung; the cost ceiling truncates from the bottom |
+| `test_swap_provider_failover_e2e` | `--second-provider` | killing the first-ranked provider still completes the swap via the survivor in the same cycle — including when `createswap` succeeds but the Lightning payment never arrives |
+| `test_provider_profile_e2e` | `--second-provider` | each provider's published name lands on that provider, hostile names are sanitised before caching, and a provider with no profile inherits nothing |
+| `test_offline_discount_e2e` | `--second-provider` | an offline channel frees its slot at a discount |
+| `test_fault_aging_and_pruning_e2e` | `--second-provider` | provider faults decay with age and the reliability store is bounded |
+| `test_liquidity_sink_e2e` | `--gossip --channels 1` | the plugin drains a channel by **paying a Lightning address**, halving until one routes, and honours "disable submarine swaps" |
+| `test_ln_failure_hop_attribution_e2e` | `--deep-hop --channels 1` | a swap payment dying **past** the first hop does not fault the channel peer; one the peer reports itself still does |
+
+Three more need no rig at all, and run in seconds:
+
+| Test | Asserts |
 |---|---|
-| `test_toggle_e2e` | the master `automation_enabled` slider gates all automation |
-| `test_daily_caps_e2e` | the daily open/close ceilings hold and resume |
-| `test_offline_autoclose_e2e` | only plugin-opened channels are force-closed when the peer goes offline |
-| `test_manual_close_not_faulted_e2e` | a user-initiated close is not charged to the peer |
-| `test_reverse_swap_e2e` | the plugin executes a real reverse swap, **increasing inbound liquidity**, and accrues a dev fee |
-| `test_swap_provider_failover_e2e` | killing the first-ranked provider still completes the swap, via the survivor, in the same cycle (`--second-provider`) |
-| `test_liquidity_sink_e2e` | the plugin drains a channel by **paying a Lightning address**, halving the amount until one routes, and honours "disable submarine swaps" (`--gossip`) |
-| `test_sink_goal_gate_e2e` | with the liquidity goal **unmet** the plugin reverse-swaps and leaves a configured sink alone; once it is **met** the same config pays the sink instead — and unticking the switch pays it either way |
-| `test_goal_buffer_e2e` | the liquidity-goal **buffer** on a real wallet: the balance the send warning is measured against agrees with the running daemon, the buffer splits real on-chain/Lightning balances without losing a satoshi, the warning fires at exactly the real threshold, and Electrum's real Balance dialog grows the blue slice |
-| `test_ln_failure_hop_attribution_e2e` | a swap payment that dies **past** the first hop does not fault the channel peer, while one the peer reports itself still does (`--deep-hop`) |
-| `test_rig_unit`, `test_lnurl_stub` | fast rig-plumbing checks (no services launched) |
+| `test_rig_unit` | the rig's pure helpers — ports, endpoints, config pairs, the process-ownership marker, the fixture-naming convention, and that `rig.apply_config` writes byte-identically to the CLI it replaced |
+| `test_lnurl_stub` | the LNURL-pay stub the dev-fee payout path is exercised against |
+| `test_multi_wallet_gui_e2e` | a real `ElectrumGui` with several wallets open, offline and offscreen (`RUN_GUI_E2E=1`). In the PR CI, not here |
 
 ### Gossip mode (`--gossip`)
 
@@ -189,6 +240,12 @@ Two further details:
 
 ## CI note
 
-The standard CI job runs only the fast `../tests` suite. This e2e suite needs
-bitcoind + Fulcrum + Docker and takes several minutes per test, so it is **not**
-part of the default pull-request CI — run it locally with `RUN_RIG_E2E=1`.
+The standard CI job runs the fast `../tests` suite (under `-n auto`, ~20s) plus
+`test_multi_wallet_gui_e2e`, which needs no rig. This e2e suite needs bitcoind +
+Fulcrum + Docker and takes hours, so it is **not** part of the default
+pull-request CI — run it locally with `RUN_RIG_E2E=1`, or by hand from the
+Actions tab (`.github/workflows/e2e.yml`, `workflow_dispatch`).
+
+That workflow is still best-effort: its pinned Bitcoin Core / Fulcrum download
+URLs were written without a live Actions run to validate them, so expect to
+adjust them the first time it is used.

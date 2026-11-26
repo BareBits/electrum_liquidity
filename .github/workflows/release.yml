@@ -61,7 +61,8 @@ jobs:
           #                   test fails with a traceback instead of eating the
           #                   whole job budget and ending the log mid-test
           # hypothesis     -- property-based tests over the pure rules engine
-          pip install cryptography PyQt6 pytest pytest-xdist pytest-timeout hypothesis
+          # mypy           -- static checking of the engine (see mypy.ini)
+          pip install cryptography PyQt6 pytest pytest-xdist pytest-timeout hypothesis mypy
 
       - name: Symlink plugin into Electrum's plugins dir
         run: ln -s "${GITHUB_WORKSPACE}/inbound_liquidity" electrum-src/electrum/plugins/inbound_liquidity
@@ -75,6 +76,13 @@ jobs:
         run: |
           python -c "import electrum.plugins.inbound_liquidity; print('plugin import OK')"
           python -c "import electrum.gui.qt.util; print('electrum qt import OK')"
+
+      - name: Type-check the rules engine
+        # Scoped to liquidity_manager.py -- see mypy.ini for why that is the one
+        # module checked, and what has to happen before __init__.py joins it.
+        # Blocking, not advisory: a check nobody has to fix is a check nobody
+        # reads.
+        run: python -m mypy
 
       - name: Run tests (offscreen Qt)
         env:
