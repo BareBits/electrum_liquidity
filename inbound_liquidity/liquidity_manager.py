@@ -3133,6 +3133,44 @@ def _plan_reverse_swap(
     ), None
 
 
+def drain_order(channels: Sequence[ChannelSnapshot]) -> List[ChannelSnapshot]:
+    """The channels of one planning pass, in the order they get to claim provider
+    capacity: fullest first, ties broken by ``short_id``.
+
+    This exists because a pass is an ALLOCATION, not just a loop. Providers
+    advertise a finite ``max_forward`` and ``_decide_reverse_swaps`` draws it down
+    as it plans (see ``consumed``), so the first channel to be planned takes the
+    cheapest provider's capacity and a later one may find only dearer rungs -- or
+    none that clear the cost gate. Which channel goes first is therefore a real
+    decision about where scarce cheap capacity is spent.
+
+    Unordered, that decision was made by Electrum: ``LNWallet.__init__`` loads the
+    channel dict through ``random_shuffled_copy`` (lnworker.py), and
+    ``build_snapshot`` iterates it as-is -- so on a wallet with several channels
+    over the trigger, a different one won the cheap provider on every restart, and
+    a 200k channel could consume a 2M-capacity provider's whole allowance and push
+    a 2M channel onto a dearer one. Same wallet, same providers, different cost,
+    for no reason the user could see or predict.
+
+    Fullest-first spends that capacity where it buys the most inbound liquidity:
+    the cheapest provider's rungs are priced per sat (``rank_swap_rungs``), so the
+    largest drain extracts the most value from a fixed allowance, and whatever is
+    left still has to clear the gate for the next channel on its own merits. It is
+    also the order a user would expect from "drain my fullest channels".
+
+    ``local_sat`` rather than the planned amount, because the planned amount is not
+    known until the channel has been costed against the providers this order is
+    choosing between -- and it is monotonic in ``local_sat`` anyway (the headroom
+    deductions in ``_plan_reverse_swap`` are per-channel offsets, not reorderings).
+
+    The ``short_id`` tie-break is what makes this reproducible rather than merely
+    deliberate: equal-sized channels are exactly the case Electrum's shuffle used
+    to decide, so leaving ties to input order would preserve the nondeterminism in
+    the case most likely to hit a uniformly-funded wallet.
+    """
+    return sorted(channels, key=lambda c: (-c.local_sat, c.short_id or ""))
+
+
 def _decide_reverse_swaps(
     snapshot: LiquiditySnapshot, config: LiquidityConfig
 ) -> Tuple[List[Action], List[DeclineRecord]]:
@@ -3161,7 +3199,7 @@ def _decide_reverse_swaps(
     # earlier swap but only re-advertises every ~30s). Keyed by npub; the legacy
     # single provider uses "" as its key.
     consumed: Dict[str, int] = {}
-    for chan in snapshot.channels:
+    for chan in drain_order(snapshot.channels):
         trigger = over_swap_trigger(chan, config)
         if trigger is None:
             # Below both triggers: nothing to do, and not a near miss.

@@ -80,8 +80,11 @@ from rig.services import (  # noqa: E402
 # Cap each plugin open small so the plugin opens modest channels and the 12 BTC
 # wallet comfortably funds both of them.
 FUND_CAP_SAT = 1_000_000
-# The rig's own baseline topology with --second-provider.
-BASELINE_CHANNELS = 3
+# The rig's own baseline topology with --second-provider: both of the client's
+# channels go to PARTNER. partner2 is a provider the client can OPEN to -- which
+# is all this test wants from it -- but holds no client channel, because its
+# advertised capacity is supplied by PARTNER instead (Rig._open_provider2_supply).
+BASELINE_CHANNELS = 2
 # One plugin channel on top of the baseline: the ceiling the test starts at.
 MAX_CHANNELS = BASELINE_CHANNELS + 1
 # ...and how far the discount may push past it.

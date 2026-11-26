@@ -92,6 +92,14 @@ DEFAULT_NUM_CHANNELS = 2
 DEFAULT_CHANNEL_BTC = 0.02
 SWAP_FEE_FRACTION = 0.005           # 0.5%
 
+# --- second-provider mode (--second-provider) -----------------------------
+# The PARTNER -> PARTNER2 channel that supplies partner2's advertised reverse
+# capacity. Sized to cover EVERY client channel in one planning pass, which is
+# the whole point of it -- see Rig._open_provider2_supply. At the default two
+# 0.02 BTC channels the pass plans ~760k twice, so ~1.5M is the floor; 0.02 BTC
+# with no push leaves partner2 ~2M of inbound and room for a third channel.
+PROVIDER2_SUPPLY_BTC = 0.02
+
 # --- gossip mode (--gossip) ----------------------------------------------
 # The forwarding hop PARTNER -> PARTNER2, deliberately starved of outbound so a
 # payment routed through it succeeds only below a known size. Sized against the
@@ -175,22 +183,25 @@ class Rig:
         self.partner3_address: Optional[str] = None
         self.partner3_nodeid: Optional[str] = None
         self.deep_hop_channel: Optional[dict] = None
+        self.provider2_supply_channel: Optional[dict] = None
         self._stop = threading.Event()
         self._miner: Optional[threading.Thread] = None
 
     @property
     def needs_partner2(self) -> bool:
         """Whether a third Electrum node is required. ``--second-provider`` wants
-        it as a competing swapserver (with a channel from the client);
-        ``--gossip`` wants it as a routing DESTINATION, deliberately WITHOUT a
-        client channel, so reaching it requires a real multi-hop route."""
+        it as a competing swapserver; ``--gossip`` wants it as a routing
+        DESTINATION. Neither gives it a channel from the CLIENT: in both modes
+        partner2's inbound comes from PARTNER, so the client can never pay it
+        directly (see _open_provider2_supply and _open_forwarding_hop)."""
         return bool(self.args.second_provider or self.args.gossip)
 
     @property
     def needs_partner3(self) -> bool:
-        """Whether the FOURTH node is required. Only ``--deep-hop`` wants it: a
-        provider two forwarding nodes away, so a failed payment can carry a
-        ``sender_idx`` that is not our channel peer's."""
+        """Whether the FOURTH node is required.
+
+        Only ``--deep-hop`` wants it: a provider two forwarding nodes away, so a
+        failed payment can carry a ``sender_idx`` that is not our channel peer's."""
         return bool(self.args.deep_hop)
 
     # -- lifecycle ----------------------------------------------------------
@@ -365,38 +376,36 @@ class Rig:
             self._open_forwarding_hop()
 
         if self.args.second_provider:
-            # The second provider needs a channel from the client for two
-            # reasons: its swapserver advertises max_forward from
-            # num_sats_can_receive(), so with no channel it would advertise a
-            # zero cap and the plugin would never rank it; and a reverse swap's
-            # Lightning leg is pinned to one channel, which (with gossip off)
-            # can only reach the peer it is open to.
-            log("opening Lightning channel (client -> partner2) ...")
-            self.channels = open_channels(
-                ep,
-                opener=CLIENT, peer=PARTNER2,
-                peer_listen_port=ep.ln_listen_partner2,
-                num_channels=1,
-                capacity_btc=self.args.channel_btc,
-                mine_cb=lambda n: mine(ep, self.miner_address, n),
-                log=log,
-                already_open=len(self.channels),
-            )
-            log(f"  {len(self.channels)} channel(s) OPEN in total")
+            self._open_provider2_supply()
 
         log("discovering swap provider over nostr ...")
+        # Every swapserver must be on the relay before a test can rely on which
+        # one the plugin ranks first: two for a failover test, three in deep-hop
+        # mode (where the CHEAPEST, partner3, is the one the swap has to be
+        # planned against).
+        min_providers = (3 if self.args.deep_hop
+                         else 2 if self.args.second_provider else 1)
         try:
             self.swap_npub, self.swap_offer = discover_swap_provider(
                 CLIENT, expected_fee_fraction=SWAP_FEE_FRACTION, log=log,
-                # Every swapserver must be on the relay before a test can rely on
-                # which one the plugin ranks first: two for a failover test,
-                # three in deep-hop mode (where the CHEAPEST, partner3, is the
-                # one the swap has to be planned against).
-                min_providers=(3 if self.args.deep_hop
-                               else 2 if self.args.second_provider else 1))
+                min_providers=min_providers)
         except TimeoutError as exc:
-            # Non-fatal: the core rig (chain, server, relay, channels) is up; the
-            # client can still be pointed at the partner manually. Surface it.
+            # Tolerated for the ONE-provider default: the core rig (chain,
+            # server, relay, channels) is up and the client can still be pointed
+            # at the partner by hand, which is worth more than refusing to start.
+            #
+            # Fatal as soon as a mode asked for a specific provider SET. There,
+            # `swap_npub` is the identity the whole run is predicated on -- the
+            # test asserts the cascade tries it first -- and leaving it None does
+            # not degrade the rig, it just moves the failure somewhere unhelpful:
+            # `rig.swap_npub[:20]` raises TypeError inside an assertion written to
+            # explain something else entirely. A missing provider IS the bug, so
+            # say so here.
+            if min_providers > 1:
+                raise RuntimeError(
+                    f"--second-provider/--deep-hop need {min_providers} "
+                    f"swapserver(s) on the relay before any test can rank them, "
+                    f"and discovery did not find them: {exc}") from exc
             log(f"  WARNING: swap-provider discovery did not complete: {exc}")
 
         self._summary()
@@ -483,6 +492,65 @@ class Rig:
                 log(f"seeded client gossip peer -> {name} {pk[:16]}...")
         set_gossip_seed_peers(CLIENT, seeds)
         log(f"seeded client gossip peer -> partner {pubkey[:16]}...")
+
+    def _open_provider2_supply(self) -> None:
+        """Give the SECOND provider the receive capacity its swapserver
+        advertises -- from PARTNER, not from the client.
+
+        A swapserver advertises ``max_forward = min(num_sats_can_receive(),
+        on-chain balance)`` (submarine_swaps.py), and ``max_forward`` is exactly
+        what caps a client's REVERSE swap, so a provider with no inbound
+        advertises nothing the plugin can rank. The obvious way to give partner2
+        inbound is a channel from the client -- and that is what this rig used to
+        do -- but it makes the rig's outcome depend on a coin flip.
+
+        Why: the engine draws a provider's advertised capacity down as it plans
+        (``_decide_reverse_swaps``'s ``consumed``), and one 0.02 BTC channel only
+        buys ~900k of it -- enough for ONE of the client's ~760k swaps. So exactly
+        one channel per pass could be planned against partner2, and which one was
+        decided by ``LNWallet.__init__``'s ``random_shuffled_copy`` of the channel
+        dict. If the shuffle put the client->partner2 channel first, that channel
+        drained through its OWN direct peer, succeeded, consumed the capacity, and
+        every remaining channel saw only partner1 rungs -- so no payment ever
+        failed and no failover ever happened. One run in three, a different test
+        each time.
+
+        Sourcing the capacity from PARTNER instead fixes it at the root: partner2
+        gets ~2M of inbound (plenty for every channel in the pass), the client
+        holds no channel to partner2 at all, and the shuffle has nothing left to
+        decide -- every client channel is a partner1 channel, every one of them
+        ranks partner2 first on price, and every one of them finds it unpayable.
+
+        Unpayable is the point, and it survives this change: the swap's Lightning
+        leg is pinned to the channel being drained (``pay_invoice(channels=[chan])``),
+        gossip is off here, and both ``lightning_forward_payments`` and
+        ``lightning_forward_trampoline_payments`` default to False (simple_config.py)
+        -- the rig only turns them on in gossip mode. So partner1 relays nothing and
+        this new channel cannot become a route; it is a balance sheet entry for
+        partner2 and nothing else.
+        """
+        assert self.ep is not None
+        ep = self.ep
+        existing = len(json.loads(electrum_cli("list_channels", inst=PARTNER)))
+        log(f"opening provider2 supply channel (partner -> partner2, "
+            f"{PROVIDER2_SUPPLY_BTC} BTC, unannounced, partner holds it all) ...")
+        supply = open_channels(
+            ep,
+            opener=PARTNER, peer=PARTNER2,
+            peer_listen_port=ep.ln_listen_partner2,
+            num_channels=1,
+            capacity_btc=PROVIDER2_SUPPLY_BTC,
+            # No push: every sat stays on PARTNER's side, which is precisely
+            # partner2's inbound and therefore the ceiling it advertises.
+            push_btc=0.0,
+            public=False,
+            mine_cb=lambda n: mine(ep, self.miner_address, n),
+            log=log,
+            already_open=existing,
+        )
+        self.provider2_supply_channel = supply[-1] if supply else None
+        log(f"  provider2 supply channel OPEN; client still holds "
+            f"{len(self.channels)} channel(s), none of them to partner2")
 
     def _first_hop_push_btc(self) -> float:
         """How much the partner can forward toward partner2. Deep-hop mode wants
@@ -812,6 +880,9 @@ class Rig:
             "gossip": bool(self.args.gossip),
             "deep_hop": bool(self.args.deep_hop),
             "deep_hop_channel": self.deep_hop_channel,
+            # Not one of the CLIENT's channels: it is PARTNER -> PARTNER2, and
+            # exists so partner2 advertises capacity the client cannot reach.
+            "provider2_supply_channel": self.provider2_supply_channel,
             "liquidity_sink_address": (
                 self.sink_stub.lightning_address if self.sink_stub else None),
             "liquidity_sink_stub_url": (
