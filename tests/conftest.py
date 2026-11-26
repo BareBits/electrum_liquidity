@@ -10,6 +10,41 @@ if _PKG_DIR not in sys.path:
     sys.path.insert(0, _PKG_DIR)
 
 
+# --- Hypothesis (property-based tests over the pure rules engine) ---------
+#
+# Configured here rather than per module so every property test shares one
+# policy, and in a try/except so the rest of the suite still runs where
+# hypothesis is not installed.
+#
+# Two settings are deliberate:
+#
+#   derandomize -- the same inputs on every run, so a property test is a
+#     regression test rather than a lottery. A fuzzer that finds a counter-
+#     example on one CI run in ten and passes on the other nine produces a red
+#     build nobody can reproduce and everybody learns to re-run. The point of
+#     these tests here is to explore inputs the example-based tests never
+#     thought of, ONCE, reproducibly; widening the search is a deliberate act
+#     (drop this, or raise max_examples) and not something CI should do by
+#     accident.
+#
+#   deadline=None -- Hypothesis otherwise fails a case that takes longer than
+#     200ms, which on a loaded machine (or under `pytest -n auto`, which this
+#     suite runs with) measures the machine and not the code.
+try:
+    from hypothesis import HealthCheck, settings as _hyp_settings
+
+    _hyp_settings.register_profile(
+        "default",
+        derandomize=True,
+        deadline=None,
+        max_examples=200,
+        suppress_health_check=[HealthCheck.too_slow],
+    )
+    _hyp_settings.load_profile("default")
+except ImportError:                                  # pragma: no cover
+    pass
+
+
 # --- configuring a plugin's wallets in a test -----------------------------
 #
 # Settings are per wallet: a wallet reads its own stored values, and the shipped
