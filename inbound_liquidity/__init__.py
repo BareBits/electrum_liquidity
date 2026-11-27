@@ -1327,6 +1327,13 @@ DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS = 4.0
 # Don't re-launch a cooperative close on the same channel more often than this
 # (a cooperative close is async and can take minutes; each tick would otherwise
 # pile on another attempt).
+#
+# This also acts as the FLOOR on the configured cooperative window -- see
+# ``_wedge_params``. The two have to be ordered that way round, because a window
+# shorter than this cooldown silently collapses the whole cooperative phase:
+# ``_request_close`` would be told the window had elapsed and that another
+# attempt was due, ask for one, and have it refused here -- leaving the
+# force-close as the only thing left to do after a single attempt.
 COOP_CLOSE_COOLDOWN_SEC = 300.0
 
 # --- wedged channel-open remediation defaults -----------------------------
@@ -1716,7 +1723,10 @@ SimpleConfig.INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN = ConfigVar(
     long_desc=lambda: _("How long a cooperative close gets to complete before the plugin escalates "
                         "to a force-close, and how long an unreachable peer is given to come back "
                         "before we accept that cooperating with it is impossible. The plugin never "
-                        "force-closes without first trying, or ruling out, a cooperative close."))
+                        "force-closes without first trying, or ruling out, a cooperative close. "
+                        "Values below 5 minutes are raised to 5 minutes: that is the minimum "
+                        "spacing between two cooperative-close attempts on one channel, and a "
+                        "shorter window would leave no room for the retries."))
 SimpleConfig.INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS = ConfigVar(
     'plugins.inbound_liquidity.confirming_freeze_days',
     default=DEFAULT_CONFIRMING_FREEZE_DAYS, type_=float, plugin=_PLUGIN_NAME,
@@ -6065,6 +6075,25 @@ class LiquidityPlugin(BasePlugin):
         wedged open and force-closes it, and they were being read off the
         installation-wide config -- which nothing writes any more, so every one
         of them was pinned to its shipped default however the user set it.
+
+        ``coop_window_sec`` is floored at ``COOP_CLOSE_COOLDOWN_SEC``, which is
+        what keeps ``COOP_MAX_ATTEMPTS`` meaning what it says. The window is how
+        long ONE cooperative close gets before the next attempt is due; the
+        cooldown is how long ``_maybe_cooperative_close`` refuses to launch
+        another on the same channel. Configure the window shorter than the
+        cooldown and the two disagree: ``_request_close`` sees the window
+        elapsed, asks for attempt 2, the cooldown refuses it, and ``_try_coop``
+        returning False drops straight through to the force-close -- so a
+        3-attempt cooperative phase silently became a 1-attempt one. The setting
+        is exposed in minutes and clamped only at 0, so any value under 5
+        reached that state, and the rig's own e2e tests set 1.
+
+        Flooring it (rather than scaling the cooldown down to match) keeps the
+        guarantee that the plugin always gives cooperation a genuine chance
+        before spending a force-close, which is the invariant the whole
+        coop-before-force machinery exists to hold. The cost is that a window
+        configured under 5 minutes -- including 0, which previously meant
+        "escalate as soon as possible" -- now waits out the cooldown instead.
         """
         c = self.settings(wallet)
         return {
@@ -6077,7 +6106,7 @@ class LiquidityPlugin(BasePlugin):
             "min_spread_sec": max(0.0, float(getattr(
                 c, "INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN",
                 WEDGE_MIN_SPREAD_SEC / 60.0)) * 60.0),
-            "coop_window_sec": max(0.0, float(getattr(
+            "coop_window_sec": max(COOP_CLOSE_COOLDOWN_SEC, float(getattr(
                 c, "INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN",
                 COOP_BEFORE_FORCE_WINDOW_SEC / 60.0)) * 60.0),
         }

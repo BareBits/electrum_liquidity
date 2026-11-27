@@ -501,6 +501,44 @@ def test_the_floor_defaults_to_25000_sat() -> None:
     assert make_config().min_swap_sat == 25_000
 
 
+def test_a_swap_above_the_users_floor_but_below_every_provider_minimum() -> None:
+    """The other side of the same fork, which had no test at all: the amount
+    clears the user's own floor, so naming that floor would be wrong -- it is the
+    PROVIDERS' minimums it cannot reach. The fix is a different provider, not a
+    different setting, and the decline has to say so.
+
+    Previously only asserted negatively (test_swap_batching checks the phrase is
+    ABSENT when capacity is the real cause), so nothing ever produced it.
+    """
+    chan = make_channel(capacity_sat=100_000, local_sat=50_000,
+                        spendable_local_sat=40_000)
+    offers = [make_offer("p", pct=0.2, lo=60_000), make_offer("q", pct=0.3, lo=80_000)]
+    result = evaluate(make_snapshot(offers, channels=(chan,)),
+                      make_config(min_swap_sat=25_000))
+    assert not _swap_actions(result)
+    reasons = " | ".join(d.reason for d in result.declines)
+    # The lowest provider minimum is the one worth naming -- it is the bar the
+    # amount has to clear to be swappable anywhere.
+    assert "below provider minimum 60000" in reasons
+    assert "swap amount 40000" in reasons
+    assert "minimum swap size" not in reasons, \
+        "blamed the user's floor for a bound the providers set"
+
+
+def test_the_named_provider_minimum_is_the_lowest_of_them() -> None:
+    """With several providers out of reach, the decline names the nearest bar,
+    so a user can tell how far off the amount actually is."""
+    chan = make_channel(capacity_sat=100_000, local_sat=50_000,
+                        spendable_local_sat=40_000)
+    offers = [make_offer("dear", pct=0.2, lo=500_000),
+              make_offer("near", pct=0.9, lo=45_000)]
+    result = evaluate(make_snapshot(offers, channels=(chan,)),
+                      make_config(min_swap_sat=25_000))
+    assert not _swap_actions(result)
+    assert "below provider minimum 45000" in \
+        " | ".join(d.reason for d in result.declines)
+
+
 def test_capacity_capped_below_the_floor_names_the_floor_not_the_provider() -> None:
     """A swap the channel could afford, pushed back under the user's floor by the
     provider's remaining capacity. The decline must say which bound refused it --

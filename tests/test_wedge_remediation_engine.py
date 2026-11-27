@@ -8,6 +8,8 @@ classification. No Electrum, no clock, no I/O -- ``now`` is passed in.
 """
 from __future__ import annotations
 
+import pytest
+
 from liquidity_manager import (  # type: ignore
     COOP_BEFORE_FORCE_WINDOW_SEC,
     WEDGE_MIN_SPREAD_SEC,
@@ -194,6 +196,119 @@ def test_confirming_never_blocks_swaps_at_any_age() -> None:
         assert _freeze(True, age)[1] is False
 
 
+# --- a corrupt accumulator ------------------------------------------------
+# The strike accumulator is JSON in wallet.db -- the same exposure the uptime
+# accumulator has (see test_uptime_malformed_data), and the same answer: a value
+# that will not coerce must cost the decision, never raise. It is read on the
+# path to a FORCE-CLOSE, so the safe answer is always "do not remediate": a
+# missed remediation leaves funds locked in a channel that another tick will
+# look at again, while a spurious one spends a mining fee and a CSV timelock on
+# a channel that may have been fine.
+#
+# ``record_wedge_strike`` already had this covered; the two predicates that READ
+# the record did not, and nothing exercised a ``first_ts`` of 0 either -- the
+# shape a record gets from a half-written or hand-edited wallet file.
+_BAD_STRIKES = {"strikes": "lots", "first_ts": T0, "last_ts": T0 + SIX_HOURS}
+_BAD_FIRST_TS = {"strikes": 9, "first_ts": "yesterday", "last_ts": T0}
+_BAD_LAST_TS = {"strikes": 9, "first_ts": T0, "last_ts": ["nope"]}
+_ALL_NULL = {"strikes": None, "first_ts": None, "last_ts": None}
+_ALL_DICTS = {"strikes": 9, "first_ts": {}, "last_ts": {}}
+
+MALFORMED = [
+    pytest.param(_BAD_STRIKES, id="strikes-not-a-number"),
+    pytest.param(_BAD_FIRST_TS, id="first_ts-not-a-number"),
+    pytest.param(_BAD_LAST_TS, id="last_ts-not-a-number"),
+    pytest.param(_ALL_NULL, id="all-null"),
+    pytest.param(_ALL_DICTS, id="dicts-where-numbers-go"),
+]
+
+# The subset whose ``first_ts`` is itself unusable. Only these make the wedge
+# CLOCK refuse: it reads nothing but ``first_ts``, so a record with a sound
+# origin and a corrupt strike count has a legitimately expired clock -- and is
+# refused by the strike gate instead. The two predicates are deliberately
+# independent, and ``should_remediate_wedged_open`` needing both is what makes
+# any single corrupt field enough to stop a force-close.
+MALFORMED_ORIGIN = [
+    pytest.param(_BAD_FIRST_TS, id="first_ts-not-a-number"),
+    pytest.param(_ALL_NULL, id="all-null"),
+    pytest.param(_ALL_DICTS, id="dicts-where-numbers-go"),
+]
+
+
+@pytest.mark.parametrize("acc", MALFORMED)
+def test_a_malformed_record_satisfies_no_strike_gate(acc) -> None:
+    assert wedge_strikes_satisfied(acc) is False
+
+
+@pytest.mark.parametrize("acc", MALFORMED_ORIGIN)
+def test_an_unreadable_origin_never_expires_the_wedge_clock(acc) -> None:
+    assert wedge_clock_expired(acc, T0 + 10 * SIX_HOURS, SIX_HOURS) is False
+
+
+@pytest.mark.parametrize("acc", [
+    pytest.param(_BAD_STRIKES, id="strikes-not-a-number"),
+    pytest.param(_BAD_LAST_TS, id="last_ts-not-a-number"),
+])
+def test_a_sound_origin_still_expires_its_clock(acc) -> None:
+    """Documented so the asymmetry above is not read as an oversight: these
+    records have a real ``first_ts``, so the clock answers honestly. The strike
+    gate is what refuses them, and the combined verdict below is what matters.
+    """
+    assert wedge_clock_expired(acc, T0 + 10 * SIX_HOURS, SIX_HOURS) is True
+    assert wedge_strikes_satisfied(acc) is False
+
+
+@pytest.mark.parametrize("acc", MALFORMED)
+def test_a_malformed_record_never_remediates(acc) -> None:
+    """The verdict as the glue asks it: whatever the record says, a force-close
+    is not authorised by a record we cannot read."""
+    assert should_remediate_wedged_open(
+        acc, T0 + 10 * SIX_HOURS, timeout_sec=SIX_HOURS) is False
+
+
+def test_a_first_ts_of_zero_never_expires_the_clock() -> None:
+    """0 is what a missing/half-written timestamp deserialises to, and it is 1970
+    -- so treating it as a real origin would make every such channel instantly
+    past its timeout. It has to read as "no origin recorded" instead."""
+    acc = {"strikes": WEDGE_REQUIRED_STRIKES + 1, "first_ts": 0.0,
+           "last_ts": T0 + WEDGE_MIN_SPREAD_SEC}
+    assert wedge_clock_expired(acc, T0 + 10 * SIX_HOURS, SIX_HOURS) is False
+    # The strike gate is satisfied on its own, so the clock is demonstrably the
+    # only thing refusing -- which is what makes this the deciding guard.
+    assert wedge_strikes_satisfied(acc) is True
+    assert should_remediate_wedged_open(
+        acc, T0 + 10 * SIX_HOURS, timeout_sec=SIX_HOURS) is False
+
+
+def test_a_negative_first_ts_is_refused_too() -> None:
+    """A clock that went backwards far enough to produce a negative stamp is the
+    same class of nonsense as 0, and ``<= 0`` has to catch both."""
+    acc = {"strikes": WEDGE_REQUIRED_STRIKES + 1, "first_ts": -5.0,
+           "last_ts": T0 + WEDGE_MIN_SPREAD_SEC}
+    assert wedge_clock_expired(acc, T0, SIX_HOURS) is False
+
+
+def test_an_empty_record_is_not_a_wedge() -> None:
+    """``{}`` and ``None`` are both "never seen wedged", which must never
+    remediate -- the channel has not even been observed once."""
+    for acc in (None, {}):
+        assert wedge_strikes_satisfied(acc) is False
+        assert wedge_clock_expired(acc, T0 + 10 * SIX_HOURS, SIX_HOURS) is False
+        assert should_remediate_wedged_open(
+            acc, T0 + 10 * SIX_HOURS, timeout_sec=SIX_HOURS) is False
+
+
+def test_a_malformed_record_is_repaired_by_the_next_observation() -> None:
+    """A corrupt record must not wedge the gate shut for good: folding in the
+    next eligible observation rebuilds a usable record, so the channel starts
+    accruing real strikes again from now."""
+    acc = record_wedge_strike({"strikes": "lots", "first_ts": "yesterday"},
+                              T0, True)
+    assert acc == {"strikes": 1, "first_ts": T0, "last_ts": T0}
+    for i in range(1, WEDGE_REQUIRED_STRIKES):
+        acc = record_wedge_strike(acc, T0 + i * WEDGE_MIN_SPREAD_SEC, True)
+    assert wedge_strikes_satisfied(acc) is True
+
+
 if __name__ == "__main__":
-    import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -109,3 +109,15 @@ def test_cheapest_hosting_cost_reports_cheapest_over_ceiling() -> None:
     assert host is not None
     amount, cost_pct = host
     assert amount == 900_000 and cost_pct == pytest.approx(3.0)
+
+
+def test_cheapest_hosting_cost_keeps_the_cheapest_whatever_the_order() -> None:
+    """The same two offers the other way round. Only this order exercises the
+    arm that KEEPS the incumbent, so with the list sorted cheapest-first the
+    comparison could have been inverted and the test above would not have
+    noticed -- it would simply have reported the last offer every time."""
+    offers = [make_offer("b", pct=3.0), make_offer("a", pct=5.0)]
+    host = cheapest_hosting_cost(offers, 900_000, 0, make_config(max_swap_fee_pct=0.6))
+    assert host is not None
+    _amount, cost_pct = host
+    assert cost_pct == pytest.approx(3.0)

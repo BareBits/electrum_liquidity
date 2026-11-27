@@ -848,6 +848,78 @@ def test_a_swap_that_funds_while_the_main_htlc_is_live_stops_the_cascade() -> No
     assert p.committed == []
 
 
+# --- the sliver at the end of the wait ------------------------------------
+# ``_await_htlc_resolution`` polls to its deadline and then asks ONE more time.
+# That last ask is not redundant: the loop's final poll lands somewhere before
+# the deadline, so an HTLC that resolves in the remaining sliver would otherwise
+# be reported as "never resolved" and cost a cascade for nothing -- the exact
+# failure the whole bounded wait exists to avoid.
+#
+# Driven with a zero budget, which skips the poll loop entirely and leaves the
+# post-loop ask as the only thing that can decide. Tying it to a poll COUNT
+# instead would be a race: the number of polls that fit in a budget depends on
+# the machine, so no count reliably lands after the loop and before the deadline.
+def test_htlcs_that_resolve_as_the_wait_expires_still_clear_the_cascade() -> None:
+    """The sliver, cleared. The gate's first reading is a live HTLC; by the time
+    the budget is spent it has failed back, and the cascade must go on to B."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    p._htlc_resolve_wait_sec = 0.0
+    wallet, calls = _main_htlc_wallet(sm, inflight_calls=1)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert calls["n"] >= 2, "the gate never re-asked after the budget expired"
+    assert [n for n, _amt in sm.attempts] == [A, B]
+    assert p.committed == [B]
+
+
+def test_the_expiring_wait_says_the_htlcs_resolved(caplog) -> None:
+    """A verdict reached by the last ask has to be distinguishable in the log
+    from one reached mid-poll, or a cascade that only just survived looks
+    identical to one that never waited."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    p._htlc_resolve_wait_sec = 0.0
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=1)
+    with caplog.at_level(logging.INFO, logger=p.logger.name):
+        asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                    transport=_transport([A, B])))
+    assert "resolved as the wait expired" in caplog.text
+    assert "clear to fail over" in caplog.text
+
+
+def test_a_payment_that_settles_as_the_wait_expires_stops_the_cascade() -> None:
+    """The same sliver, the other way. Patience must not turn a payment that
+    settled at the last moment into a failover: PR_PAID means the swap is live
+    and only its funding txid is lagging, so B must never be tried."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    p._htlc_resolve_wait_sec = 0.0
+    wallet, calls = _main_htlc_wallet(sm, inflight_calls=1, settles=True)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert calls["settled"], "the test never reached the settled branch"
+    assert [n for n, _amt in sm.attempts] == [A]
+    assert p.committed == []
+
+
+def test_htlcs_still_live_when_the_wait_expires_stop_the_cascade() -> None:
+    """The safety property at the boundary: if the last ask still finds an HTLC
+    live, the channel is treated as possibly committed. Unchanged -- the sliver
+    re-ask may only ever turn an UNDECIDED into a decision, never a live HTLC
+    into permission."""
+    sm = _SM({A: _accept_without_funding})
+    p = _plugin()
+    p._htlc_resolve_wait_sec = 0.0
+    wallet, _calls = _main_htlc_wallet(sm, inflight_calls=10_000)
+    asyncio.run(p._reverse_swap(wallet, _action(alternates=(B,)), state={},
+                                transport=_transport([A, B])))
+    assert [n for n, _amt in sm.attempts] == [A]
+    assert p.committed == []
+    assert any("did not resolve in time" in (d.get("reason") or "")
+               for d in p.diags)
+
+
 # --- the gate says WHY ----------------------------------------------------
 # Every COMMITTED verdict is a cascade that ends with providers untried, and
 # before this the gate reached that verdict silently: a live main HTLC, a settled
