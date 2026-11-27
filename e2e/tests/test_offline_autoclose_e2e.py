@@ -62,10 +62,18 @@ FORCE_CLOSE_DAYS = 60.0 / 86400.0
 # chance -- and when the peer is unreachable (exactly this scenario) that means
 # waiting out the whole window before accepting cooperation is impossible. The
 # shipped default is 10 minutes, which no sane test budget can absorb, so turn it
-# down to 1 (the same thing test_wedged_open_e2e does; the window itself is
-# tested there). Without this the watchdog commits to the close and then simply
-# waits, and this test fails with "watchdog never force-closed".
-COOP_BEFORE_FORCE_MIN = 1
+# down (the same thing test_wedged_open_e2e does; the window itself is tested
+# there). Without this the watchdog commits to the close and then simply waits,
+# and this test fails with "watchdog never force-closed".
+#
+# It cannot go below 5 minutes any more, however low it is set here: the window
+# is floored at COOP_CLOSE_COOLDOWN_SEC, which is the minimum spacing between
+# cooperative attempts (see _wedge_params). This used to be 1, and the plugin
+# honoured it -- at the cost of force-closing after a single cooperative attempt
+# instead of the three COOP_MAX_ATTEMPTS promises. Stated at the real effective
+# value so the budget below is derived from something true.
+COOP_BEFORE_FORCE_MIN = 5
+COOP_WINDOW_SEC = COOP_BEFORE_FORCE_MIN * 60.0
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
 
@@ -219,7 +227,12 @@ def test_offline_plugin_channel_is_force_closed(rig):
     # The watchdog commits (uptime below the floor) then force-closes the plugin
     # channel after the deadline. Force-close is offline-safe, so it proceeds
     # without the peer.
-    assert _wait_until(lambda: _is_closing(plugin_cid), rig=rig, timeout=330), \
+    # Budget: the uptime window has to pass before the ratio can commit
+    # (~130s), then the force-close deadline (60s), then the cooperative window
+    # the unreachable peer is given to come back (COOP_WINDOW_SEC, floored at 5
+    # minutes), plus margin for heartbeat granularity on a loaded machine.
+    assert _wait_until(lambda: _is_closing(plugin_cid), rig=rig,
+                       timeout=330 + COOP_WINDOW_SEC), \
         "watchdog never force-closed the offline plugin channel"
 
     # It was logged as a force-close of an offline channel.

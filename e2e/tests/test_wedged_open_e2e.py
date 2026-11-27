@@ -63,11 +63,19 @@ FUND_CAP_SAT = 1_000_000
 CLOSE_TIMEOUT_MIN = 1
 REQUIRED_CHECKS = 3
 CHECK_SPREAD_MIN = 1
-COOP_BEFORE_FORCE_MIN = 1
+# The cooperative window cannot go below 5 minutes however low it is set: it is
+# floored at COOP_CLOSE_COOLDOWN_SEC, the minimum spacing between cooperative
+# attempts (see _wedge_params). This was 1, which the plugin honoured by
+# force-closing after a single cooperative attempt rather than the three
+# COOP_MAX_ATTEMPTS promises. Stated at the effective value so the budgets below
+# are derived from something true.
+COOP_BEFORE_FORCE_MIN = 5
+COOP_WINDOW_SEC = COOP_BEFORE_FORCE_MIN * 60.0
 # How long scenario 1 watches an unconfirmed funding tx before concluding the
 # plugin is genuinely leaving it alone. Comfortably longer than the close
 # timeout + spread + cooperative window above, so a regression would fire.
-CONFIRMING_OBSERVATION_SEC = 200.0
+CONFIRMING_OBSERVATION_SEC = (CLOSE_TIMEOUT_MIN + CHECK_SPREAD_MIN) * 60.0 \
+    + COOP_WINDOW_SEC + 80.0
 
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
@@ -264,7 +272,8 @@ def test_genuinely_wedged_open_is_force_closed_after_the_gates(rig):
 
     # Now the gates: several checks spread over time, then the cooperative
     # window (which cannot be satisfied -- there is no peer), then the force.
-    assert _wait_until(lambda: _is_closing(new_cid), rig=rig, timeout=300), \
+    assert _wait_until(lambda: _is_closing(new_cid), rig=rig,
+                       timeout=300 + COOP_WINDOW_SEC), \
         "watchdog never closed the genuinely wedged channel open"
 
     # It accumulated real evidence rather than firing on one observation.

@@ -73,18 +73,25 @@ STUCK_MIN = 1
 CLOSE_TIMEOUT_MIN = 1
 REQUIRED_CHECKS = 3
 CHECK_SPREAD_MIN = 1
-COOP_BEFORE_FORCE_MIN = 1
+# Floored at 5 minutes whatever is set here -- COOP_CLOSE_COOLDOWN_SEC is the
+# minimum spacing between cooperative attempts (see _wedge_params). Was 1, which
+# the plugin honoured by force-closing after one cooperative attempt instead of
+# the three COOP_MAX_ATTEMPTS promises.
+COOP_BEFORE_FORCE_MIN = 5
+COOP_WINDOW_SEC = COOP_BEFORE_FORCE_MIN * 60.0
 # Budget for the wedge lifecycle: the wedge clock (CLOSE_TIMEOUT_MIN) and the
 # check spread (CHECK_SPREAD_MIN) run concurrently, then the cooperative window
-# (COOP_BEFORE_FORCE_MIN) runs after them -- so ~2 minutes minimum. Aging waits
-# out the first part; the force-close waits below cover the rest, with margin for
-# tick granularity on a loaded machine.
+# (COOP_WINDOW_SEC) runs after them. Aging waits out the first part; the
+# force-close waits below cover the rest, with margin for tick granularity on a
+# loaded machine.
 WEDGE_AGE_WAIT = 150.0
-FORCE_CLOSE_TIMEOUT = 180.0
+FORCE_CLOSE_TIMEOUT = 180.0 + COOP_WINDOW_SEC
 # Once the ceiling is raised the deferred channel escalates promptly: its
 # close-attempt record was stamped on the very first deferred call (before the
 # ceiling check, deliberately), so its cooperative window has already elapsed.
-DEFERRED_CLOSE_TIMEOUT = 120.0
+# The margin still carries a full window: nothing guarantees the deferral lasted
+# longer than one, and if it did not, the release waits out the remainder.
+DEFERRED_CLOSE_TIMEOUT = 120.0 + COOP_WINDOW_SEC
 # Closing/closed channel states as reported by `list_channels`.
 CLOSING_STATES = {
     "SHUTDOWN", "CLOSING", "FORCE_CLOSING", "REQUESTED_FCLOSE", "CLOSED", "REDEEMED"}
