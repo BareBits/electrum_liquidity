@@ -1182,6 +1182,11 @@ DEV_FEE_PAYOUT_THRESHOLD_SAT = 1_000
 DEV_FEE_DAILY_CAP_SAT = 10_000
 # Upper bound on the user-configurable fee percentage (0-5%).
 DEV_FEE_MAX_PCT = 5.0
+# The shipped fee percentage. Named rather than written inline on the ConfigVar
+# below because the Settings tab quotes it back in a worked example ("at the
+# default 0.1%, draining 100,000 sat accrues 100 sat"), and an example that
+# disagreed with what a fresh wallet actually charges would be worse than none.
+DEFAULT_DEV_FEE_PCT = 0.1
 # After a failed payout attempt, wait at least this long before retrying, so a
 # persistently failing address (offline, no route) doesn't hammer the network on
 # every evaluation tick. The fee stays owed across the backoff.
@@ -1322,6 +1327,13 @@ DEFAULT_OFFLINE_DISCOUNT_AFTER_HOURS = 4.0
 # Don't re-launch a cooperative close on the same channel more often than this
 # (a cooperative close is async and can take minutes; each tick would otherwise
 # pile on another attempt).
+#
+# This also acts as the FLOOR on the configured cooperative window -- see
+# ``_wedge_params``. The two have to be ordered that way round, because a window
+# shorter than this cooldown silently collapses the whole cooperative phase:
+# ``_request_close`` would be told the window had elapsed and that another
+# attempt was due, ask for one, and have it refused here -- leaving the
+# force-close as the only thing left to do after a single attempt.
 COOP_CLOSE_COOLDOWN_SEC = 300.0
 
 # --- wedged channel-open remediation defaults -----------------------------
@@ -1372,11 +1384,24 @@ SimpleConfig.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT = ConfigVar(
 SimpleConfig.INBOUND_LIQUIDITY_ONCHAIN_RESERVE_SAT = ConfigVar(
     'plugins.inbound_liquidity.onchain_reserve_sat', default=10_000, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("On-chain reserve when opening (sat)"),
-    long_desc=lambda: _("When opening a channel, fund with the maximum available, leaving this much on-chain."))
+    long_desc=lambda: _("When opening a channel, fund with the maximum available, leaving "
+                        "this much on-chain. The channel's funding mining fee is deducted "
+                        "on top of this, so the reserve survives the open.\n\n"
+                        "Keep it non-zero: closing a channel or claiming a reverse swap "
+                        "both need on-chain coins to pay their own mining fee, and a "
+                        "wallet with nothing left on-chain cannot pay either."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNELS = ConfigVar(
     'plugins.inbound_liquidity.max_channels', default=2, type_=int, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Maximum number of channels"),
-    long_desc=lambda: _("Never hold more than this many channels."))
+    long_desc=lambda: _("Never hold more than this many Lightning channels. Once the "
+                        "count is reached the plugin opens no more, and a channel it "
+                        "opened that is below the liquidity goal is replaced rather "
+                        "than added to.\n\n"
+                        "Channels you opened by hand count toward the total, even when "
+                        "the plugin is told not to manage them. A channel whose peer "
+                        "has gone dark can stop counting, so a replacement may be "
+                        "opened alongside it -- see \"Treat a channel as offline "
+                        "after\" on the Advanced tab."))
 SimpleConfig.INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT = ConfigVar(
     'plugins.inbound_liquidity.max_channel_size_sat', default=DEFAULT_MAX_CHANNEL_SIZE_SAT,
     type_=int, plugin=_PLUGIN_NAME,
@@ -1430,11 +1455,12 @@ SimpleConfig.INBOUND_LIQUIDITY_SHOW_GOAL_IN_PIECHART = ConfigVar(
 SimpleConfig.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT = ConfigVar(
     'plugins.inbound_liquidity.max_swap_fee_pct', default=0.9, type_=float, plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Max fee to move LN → on-chain (%, all-in)"),
-    long_desc=lambda: _("Do not swap Lightning -> on-chain if the effective all-in cost "
+    long_desc=lambda: _("Do not swap Lightning → on-chain if the effective all-in cost "
                         "(percentage fee + provider mining fee + on-chain claim fee, as a "
                         "share of the amount) exceeds this."))
 SimpleConfig.INBOUND_LIQUIDITY_DEV_FEE_PCT = ConfigVar(
-    'plugins.inbound_liquidity.dev_fee_pct', default=0.1, type_=float, plugin=_PLUGIN_NAME,
+    'plugins.inbound_liquidity.dev_fee_pct', default=DEFAULT_DEV_FEE_PCT, type_=float,
+    plugin=_PLUGIN_NAME,
     short_desc=lambda: _("Dev fee (% of amount drained)"),
     long_desc=lambda: _("Optional fee to support plugin development, charged on what the plugin "
                         "drains from a channel: the on-chain amount received from a reverse "
@@ -1697,7 +1723,10 @@ SimpleConfig.INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN = ConfigVar(
     long_desc=lambda: _("How long a cooperative close gets to complete before the plugin escalates "
                         "to a force-close, and how long an unreachable peer is given to come back "
                         "before we accept that cooperating with it is impossible. The plugin never "
-                        "force-closes without first trying, or ruling out, a cooperative close."))
+                        "force-closes without first trying, or ruling out, a cooperative close. "
+                        "Values below 5 minutes are raised to 5 minutes: that is the minimum "
+                        "spacing between two cooperative-close attempts on one channel, and a "
+                        "shorter window would leave no room for the retries."))
 SimpleConfig.INBOUND_LIQUIDITY_CONFIRMING_FREEZE_DAYS = ConfigVar(
     'plugins.inbound_liquidity.confirming_freeze_days',
     default=DEFAULT_CONFIRMING_FREEZE_DAYS, type_=float, plugin=_PLUGIN_NAME,
@@ -2004,6 +2033,35 @@ def _wallet_basename(wallet: 'Abstract_Wallet') -> str:
         return wallet.basename()
     except Exception:
         return "?"
+
+
+# Keys already reported by warn_once. Bounded by the number of distinct call
+# sites, not by how often they fire.
+_WARNED_ONCE: Set[str] = set()
+
+
+def warn_once(logger, key: str, message: str) -> None:
+    """Log ``message`` the first time ``key`` is seen, then stay quiet.
+
+    For a failure on a path that repeats on its own schedule -- the GUI's
+    status-bar repaint runs many times a second -- where the FIRST occurrence
+    carries the whole diagnostic value and every repetition is noise that fills
+    the user's log and rotates the useful lines out of it.
+
+    Learned the hard way: a plain debug line on that path flooded Electrum's own
+    rotating log hard enough to push the lines an e2e test greps for into a
+    rotated-out file, and tripled that test's runtime.
+
+    Takes the logger rather than using one here so the message is attributed to
+    the module that noticed, which is what makes a log line findable.
+    """
+    if key in _WARNED_ONCE:
+        return
+    _WARNED_ONCE.add(key)
+    try:
+        logger.warning(message, exc_info=True)
+    except Exception:
+        pass        # a logging failure must never be the thing that breaks a repaint
 
 
 def _coerce_setting(cv: ConfigVar, value: Any) -> Any:
@@ -4010,12 +4068,23 @@ class LiquidityPlugin(BasePlugin):
         ``self.wallets`` is the managed set, so this tracks the plugin being
         stopped/started on a wallet without any extra bookkeeping.
         """
+        # Deliberately silent on the unmanaged path and on success: this is
+        # called from the status-bar repaint, many times a second, and an
+        # unmanaged wallet is the steady state for anyone not using the plugin.
+        # Logging either would fill the user's log and rotate the lines that
+        # matter out of it. Only the failure below says anything.
         try:
             if wallet not in self.wallets:
                 return 0
             return goal_buffer_sat(self.read_config(wallet))
-        except Exception:
-            # Never let a config or wallet-state problem break a repaint.
+        except Exception as e:
+            # Never let a config or wallet-state problem break a repaint -- but
+            # say so, rather than reporting a reassuring 0. Once, not per
+            # repaint: this is on the repaint path, and a config problem that
+            # raises will raise every time (see warn_once).
+            warn_once(self.logger, "goal-buffer-failed",
+                      f"could not compute the goal buffer for "
+                      f"{_wallet_basename(wallet)}: {e!r}")
             return 0
 
     def goal_buffer_split(self, wallet: 'Abstract_Wallet', *,
@@ -6006,6 +6075,25 @@ class LiquidityPlugin(BasePlugin):
         wedged open and force-closes it, and they were being read off the
         installation-wide config -- which nothing writes any more, so every one
         of them was pinned to its shipped default however the user set it.
+
+        ``coop_window_sec`` is floored at ``COOP_CLOSE_COOLDOWN_SEC``, which is
+        what keeps ``COOP_MAX_ATTEMPTS`` meaning what it says. The window is how
+        long ONE cooperative close gets before the next attempt is due; the
+        cooldown is how long ``_maybe_cooperative_close`` refuses to launch
+        another on the same channel. Configure the window shorter than the
+        cooldown and the two disagree: ``_request_close`` sees the window
+        elapsed, asks for attempt 2, the cooldown refuses it, and ``_try_coop``
+        returning False drops straight through to the force-close -- so a
+        3-attempt cooperative phase silently became a 1-attempt one. The setting
+        is exposed in minutes and clamped only at 0, so any value under 5
+        reached that state, and the rig's own e2e tests set 1.
+
+        Flooring it (rather than scaling the cooldown down to match) keeps the
+        guarantee that the plugin always gives cooperation a genuine chance
+        before spending a force-close, which is the invariant the whole
+        coop-before-force machinery exists to hold. The cost is that a window
+        configured under 5 minutes -- including 0, which previously meant
+        "escalate as soon as possible" -- now waits out the cooldown instead.
         """
         c = self.settings(wallet)
         return {
@@ -6018,7 +6106,7 @@ class LiquidityPlugin(BasePlugin):
             "min_spread_sec": max(0.0, float(getattr(
                 c, "INBOUND_LIQUIDITY_WEDGE_CHECK_SPREAD_MIN",
                 WEDGE_MIN_SPREAD_SEC / 60.0)) * 60.0),
-            "coop_window_sec": max(0.0, float(getattr(
+            "coop_window_sec": max(COOP_CLOSE_COOLDOWN_SEC, float(getattr(
                 c, "INBOUND_LIQUIDITY_COOP_BEFORE_FORCE_MIN",
                 COOP_BEFORE_FORCE_WINDOW_SEC / 60.0)) * 60.0),
         }

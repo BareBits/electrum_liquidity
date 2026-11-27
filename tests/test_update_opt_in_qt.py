@@ -65,7 +65,7 @@ def _plugin() -> qt_mod.Plugin:
     p = object.__new__(qt_mod.Plugin)
     p.config = _FakeConfig()
     p.logger = logging.getLogger("test.inbound_liquidity.update_opt_in")
-    p._update_opt_in_asked = False
+    p._update_opt_in_asked = set()
     p.checks: List[object] = []
     p._request_update_check = lambda wallet: p.checks.append(wallet)
     # Settings are per wallet now; hand this plugin's wallets what its
@@ -121,7 +121,7 @@ def test_a_user_who_declined_is_not_asked_again(qapp):
     p._maybe_prompt_update_opt_in(first, w)
 
     # A later session: the flag is persisted, the in-session guard is not.
-    p._update_opt_in_asked = False
+    p._update_opt_in_asked = set()
     second = _FakeWindow(answer=True)
     p._maybe_prompt_update_opt_in(second, w)
     assert second.asked == []
@@ -136,15 +136,55 @@ def test_enabling_it_from_advanced_settings_stops_the_question(qapp):
     assert window.asked == []
 
 
-def test_a_second_wallet_does_not_stack_a_second_dialog(qapp):
-    # Electrum can open several wallets at once; the config flag is only written
-    # after the first dialog is answered, so the in-session guard is what stops
-    # two dialogs racing onto the screen.
-    p, window = _plugin(), _FakeWindow()
-    p._maybe_prompt_update_opt_in(window, _FakeWallet())
-    p.config.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = False   # as if unanswered
-    p._maybe_prompt_update_opt_in(window, _FakeWallet())
+def test_the_same_wallet_is_not_asked_twice_in_one_session(qapp):
+    # The persisted flag records the answer; the in-session guard is what stops
+    # a second load_wallet for the SAME wallet (the Plugins dialog's
+    # reload_windows(), a window replaced without a close hook) putting a
+    # second dialog on screen before the first is answered.
+    p, w, window = _plugin(), _FakeWallet(), _FakeWindow()
+    p._maybe_prompt_update_opt_in(window, w)
+    p.set_setting(w, "INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED", False)  # as if unanswered
+    p._maybe_prompt_update_opt_in(window, w)
     assert len(window.asked) == 1
+
+
+def test_every_wallet_is_asked_in_its_own_right(qapp):
+    """Electrum can hold several wallets open in one process, and this opt-in
+    is a PER-WALLET setting -- so a second wallet is a second decision. The
+    guard used to be one flag for the whole process, which meant the first
+    wallet opened was asked and every other wallet was silently skipped for the
+    rest of the session."""
+    p, window = _plugin(), _FakeWindow()
+    a, b, c = _FakeWallet(), _FakeWallet(), _FakeWallet()
+    for wallet in (a, b, c):
+        p._maybe_prompt_update_opt_in(window, wallet)
+    assert len(window.asked) == 3, \
+        "a wallet after the first was never asked whether it may check GitHub"
+
+
+def test_one_wallets_answer_does_not_answer_for_another(qapp):
+    p = _plugin()
+    a, b = _FakeWallet(), _FakeWallet()
+    p._maybe_prompt_update_opt_in(_FakeWindow(answer=True), a)
+    p._maybe_prompt_update_opt_in(_FakeWindow(answer=False), b)
+    assert p.settings(a).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is True
+    assert p.settings(b).INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED is False
+    assert p.checks == [a], "the wallet that declined was checked anyway"
+
+
+def test_a_failed_prompt_leaves_the_other_wallets_askable(qapp):
+    """The retry has to be scoped to the wallet whose dialog failed: clearing
+    one process-wide flag used to make the failure the only thing that could
+    re-open the question for anyone."""
+    p = _plugin()
+    a, b = _FakeWallet(), _FakeWallet()
+    p._maybe_prompt_update_opt_in(_FakeWindow(raises=True), a)
+    window = _FakeWindow(answer=False)
+    p._maybe_prompt_update_opt_in(window, b)
+    assert len(window.asked) == 1
+    retry = _FakeWindow(answer=False)
+    p._maybe_prompt_update_opt_in(retry, a)
+    assert len(retry.asked) == 1, "the wallet whose dialog failed was not re-asked"
 
 
 # --- failure is harmless --------------------------------------------------

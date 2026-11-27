@@ -14,7 +14,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from . import paths
 from .procman import ProcessManager
@@ -317,6 +317,67 @@ PROVIDERS: tuple[ElectrumInstance, ...] = (PARTNER, PARTNER2, PARTNER3)
 
 def wallet_path(inst: ElectrumInstance) -> str:
     return str(inst.datadir / "regtest" / "wallets" / inst.wallet_name)
+
+
+def log_dir(inst: ElectrumInstance) -> Path:
+    return inst.datadir / "regtest" / "logs"
+
+
+def _log_sort_key(path: Path) -> tuple[str, int]:
+    """Order one instance's log files oldest-first.
+
+    Electrum names the live file ``electrum_log_<utc-timestamp>_<pid>.log`` and
+    lets ``RotatingFileHandler`` move it aside as ``.log.1``, ``.log.2``, ... --
+    where a HIGHER suffix is OLDER, because rotation renames every backup up one
+    number before starting a fresh live file. So within one base name the
+    chronological order is ``.log.N`` ... ``.log.1``, ``.log``, which is what
+    negating the suffix gives. The live file sorts last, as suffix 0.
+
+    Across base names the leading UTC timestamp is fixed-width, so a plain string
+    compare on the base is already chronological; the pid tie-break only matters
+    for two daemons started in the same second, where either order is defensible.
+    """
+    suffix = 0
+    name = path.name
+    if ".log." in name:
+        base, _, tail = name.rpartition(".")
+        try:
+            suffix = int(tail)
+            name = base
+        except ValueError:      # not a rotation backup after all
+            pass
+    return (name, -suffix)
+
+
+def read_electrum_log(inst: ElectrumInstance) -> str:
+    """Every line this instance has logged, oldest first.
+
+    Deliberately reads MORE than "the newest log file", which is what each e2e
+    suite used to do for itself, because that answer is wrong twice over:
+
+    * Electrum's file handler is a ``RotatingFileHandler`` (logging.py) whose
+      backups are named ``....log.1``. A ``electrum_log_*.log`` glob cannot match
+      those, and rotation RENAMES the live file -- so the moment a run rotates,
+      everything before that instant vanishes from the test's view. It bites
+      hardest on NEGATIVE assertions (``assert "..." not in log``), which do not
+      fail when evidence disappears; they pass, and the regression ships.
+    * a daemon restart opens a NEW base name, so "the newest file" also drops
+      everything logged before the restart -- and the rig restarts the client
+      deliberately (see ``_restart_client_for_gossip``) as well as on recovery.
+
+    Note the file handler is pinned at DEBUG and ``electrum_logger`` is DEBUG, so
+    verbosity flags do not bound how fast this grows; the 40MB rotation threshold
+    is reachable by a chatty run, which is exactly when a test most needs the
+    history.
+    """
+    directory = log_dir(inst)
+    if not directory.is_dir():
+        return ""
+    files = [p for p in directory.iterdir()
+             if p.is_file() and p.name.startswith("electrum_log_")]
+    return "".join(
+        path.read_text(errors="replace")
+        for path in sorted(files, key=_log_sort_key))
 
 
 def _electrum_base(inst: ElectrumInstance) -> list[str]:
@@ -663,10 +724,43 @@ def setup_wallet(ep: Endpoints, inst: ElectrumInstance, *,
     pairs = (_partner_config_pairs(ep, inst, gossip=gossip, forwarding=forwarding)
              if inst in PROVIDERS
              else _client_config_pairs(ep, gossip=gossip))
-    for key, value in pairs:
-        electrum_cli("setconfig", key, value, inst=inst, offline=True)
+    apply_config_pairs(inst, pairs)
 
     return electrum_cli("getunusedaddress", inst=inst, offline=True)
+
+
+def apply_config_pairs(inst: ElectrumInstance,
+                       pairs: Sequence[tuple[str, str]]) -> None:
+    """Write every config pair for ``inst`` in ONE process.
+
+    This was a loop of ``electrum -o setconfig <key> <value>``, which is a
+    correct but very expensive way to write a JSON file: each iteration is an
+    interpreter start plus Electrum's whole import graph, ~0.8s, and there are
+    13 pairs for the client and 15 for each provider. Measured on the rig that
+    was 25s of a 58s bring-up -- over 40%, spent importing Electrum 28 times to
+    set 28 values -- and the e2e suite pays it on every one of its ~56 launches.
+    Batched it is 0.46s per wallet instead of 9.6s.
+
+    ``rig.apply_config`` does the writing, in a subprocess rather than in here,
+    because choosing the chain rebinds the process-wide ``constants.net``; see
+    that module for why the orchestrator should not be the process that does
+    it. Its value handling is Electrum's own, and
+    ``test_rig_unit.test_batched_config_matches_the_cli`` pins that the config
+    file it produces is byte-identical to the one the CLI loop produced.
+    """
+    argv = [
+        str(paths.VENV_PYTHON), "-m", "rig.apply_config",
+        "--dir", str(inst.datadir),
+        "--wallet", wallet_path(inst),
+        "--regtest",
+    ]
+    result = subprocess.run(
+        argv, input=json.dumps([[k, str(v)] for k, v in pairs]),
+        capture_output=True, text=True, cwd=str(paths.RIG_ROOT), timeout=120.0,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"applying config for {inst.name} failed: {result.stderr.strip()}")
 
 
 # -- daemon / GUI lifecycle -------------------------------------------------

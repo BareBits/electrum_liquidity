@@ -5,6 +5,10 @@ labels cannot explain -- the dev fee and the liquidity sink -- so each carries a
 tooltip, on BOTH halves of its row: a user hovering over a section should not
 have to find the right half of it to get an answer.
 
+This file pins the WORDING of those two, which is hand-written for them.
+Coverage -- that every settings row has hover help at all, bespoke or inherited
+from its ConfigVar -- is pinned separately, in test_settings_tooltips_qt.
+
 Also pinned here is the Channel partners tab's description of its own table,
 which used to claim the rows were peers you already have a channel with. They
 are not: the table also lists peers with a fault history and no channel, which
@@ -34,8 +38,8 @@ from test_qt_tab import (  # noqa: E402,F401
 SETTINGS_TAB = 0
 PARTNERS_TAB = 2
 
-SINK_HELP = ("Instead of doing a swap-out to obtain inbound liquidity, "
-             "utilize a liquidity sink instead")
+SINK_HELP_OPENING = ("Instead of using swaps to obtain inbound liquidity, just "
+                     "send all funds to this address to obtain it.")
 
 
 def _tab(plugin, wallet, index):
@@ -114,8 +118,25 @@ def test_the_dev_fee_readout_carries_the_same_explanation(qapp):
 def test_the_liquidity_sink_row_explains_itself(qapp):
     p, wallet = _built()
     label, field = _row_widgets(_tab(p, wallet, SETTINGS_TAB), "Liquidity sink")
-    assert label.toolTip() == SINK_HELP
-    assert field.toolTip() == SINK_HELP
+    assert label.toolTip().startswith(SINK_HELP_OPENING)
+    assert field.toolTip() == label.toolTip()
+
+
+def test_the_sink_help_leads_with_what_the_field_is_for(qapp):
+    """The first thing a hover says is the alternative the field offers -- not
+    the mechanics of how it differs from a swap. A user who stops reading after
+    one sentence should still know what the box does."""
+    p, wallet = _built()
+    label, _field = _row_widgets(_tab(p, wallet, SETTINGS_TAB), "Liquidity sink")
+    first_line = label.toolTip().split("\n", 1)[0]
+    assert first_line == SINK_HELP_OPENING
+
+
+def test_the_sink_help_says_how_to_turn_it_off(qapp):
+    # An empty address is the off switch, which is not guessable from the label.
+    p, wallet = _built()
+    label, _field = _row_widgets(_tab(p, wallet, SETTINGS_TAB), "Liquidity sink")
+    assert "Blank = off" in label.toolTip()
 
 
 def test_the_sink_help_is_on_the_input_a_user_would_hover(qapp):
@@ -123,7 +144,7 @@ def test_the_sink_help_is_on_the_input_a_user_would_hover(qapp):
     p, wallet = _built()
     _label, field = _row_widgets(_tab(p, wallet, SETTINGS_TAB), "Liquidity sink")
     assert isinstance(field, QLineEdit)
-    assert field.toolTip() == SINK_HELP
+    assert field.toolTip().startswith(SINK_HELP_OPENING)
 
 
 def test_the_sink_switches_keep_their_own_fuller_help(qapp):
@@ -135,7 +156,8 @@ def test_the_sink_switches_keep_their_own_fuller_help(qapp):
              if "liquidity sink" in cb.text() or "submarine swaps" in cb.text()]
     assert len(boxes) == 2
     for cb in boxes:
-        assert cb.toolTip() and cb.toolTip() != SINK_HELP
+        assert cb.toolTip()
+        assert not cb.toolTip().startswith(SINK_HELP_OPENING)
 
 
 # --- the channel partners table's description ----------------------------

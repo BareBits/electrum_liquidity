@@ -59,6 +59,23 @@ def _neutral_environment(monkeypatch):
                         SimpleNamespace(NET_NAME="mainnet"), raising=False)
 
 
+class _NamedWallet(_FakeWallet):
+    """A wallet double that has a name and a file, like a real one.
+
+    The consent screen names the wallet it is asking about, and the plugin
+    remembers which wallets it has asked by FILE path (qt._wallet_session_key),
+    so the tests about either of those need a wallet that has both.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._name = name
+        self.storage = SimpleNamespace(path=f"/tmp/wallets/{name}")
+
+    def basename(self) -> str:
+        return self._name
+
+
 class _QtWindow(QWidget):
     """A real QWidget standing in for ElectrumWindow.
 
@@ -538,17 +555,204 @@ def test_ask_me_later_records_nothing_at_all(qapp, monkeypatch):
     assert p.usage_stats_install_id(wallet) is None
 
 
-def test_the_screen_is_offered_only_once_per_session(qapp, monkeypatch):
-    """A second wallet opening must not stack a second copy of a long dialog."""
+def _closeable(p) -> None:
+    """Let ``close_wallet`` run on a plugin built without BasePlugin.__init__.
+
+    Only the part of the teardown these tests are about: the full
+    ``stop_wallet`` wants heartbeat and evaluation state this double does not
+    have, and none of it bears on the consent screen. Same idiom as
+    test_multi_wallet_tab.py.
+    """
+    p.stop_wallet = p._forget_wallet
+    p._unlock_declined_at, p._unlock_prompting = {}, set()
+
+
+def _watch_consent(p, monkeypatch, *, answer: Optional[int] = None):
+    """Record which wallets are offered the screen, without building a dialog.
+
+    Returns the list of wallets, in the order they were asked.
+    """
+    opened: List[object] = []
+
+    def _ask(window, wallet):
+        opened.append(wallet)
+        return answer
+
+    monkeypatch.setattr(p, "_ask_usage_consent", _ask)
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    return opened
+
+
+def test_every_wallet_is_offered_the_screen(qapp, monkeypatch):
+    """The whole point: consent is per wallet, so each open wallet is asked.
+
+    This guard used to be a single flag for the whole process, so only the
+    FIRST wallet opened in a session was ever offered the screen -- the others
+    reported nothing while never having been given the choice, which is not the
+    same thing as having declined.
+    """
     p = _make_plugin()
-    opened = []
+    opened = _watch_consent(p, monkeypatch)
+    window = _QtWindow()
+    wallets = [_NamedWallet("a"), _NamedWallet("b"), _NamedWallet("c")]
+    for wallet in wallets:
+        p._maybe_prompt_usage_consent(window, wallet)
+    assert opened == wallets, \
+        "a wallet after the first was never offered the consent screen"
+
+
+def test_one_wallet_is_offered_the_screen_only_once_per_session(qapp, monkeypatch):
+    """Not re-asked when load_wallet fires again for the same wallet -- the
+    Plugins dialog's reload_windows(), or a window replaced without a close
+    hook -- which would stack a second copy of a long dialog."""
+    p = _make_plugin()
+    opened = _watch_consent(p, monkeypatch)
+    window, wallet = _QtWindow(), _NamedWallet("a")
+    p._maybe_prompt_usage_consent(window, wallet)
+    p._maybe_prompt_usage_consent(window, wallet)
+    assert len(opened) == 1
+
+
+def test_deferring_survives_closing_and_reopening_the_wallet(qapp, monkeypatch):
+    """Deferring records nothing, so only the in-session guard keeps the screen
+    away -- and it is keyed by wallet FILE, so a user switching between two
+    wallets does not meet the longest dialog in the plugin every time."""
+    p = _make_plugin()
+    _closeable(p)
+    opened = _watch_consent(p, monkeypatch)
+    first = _NamedWallet("payments")
+    p._maybe_prompt_usage_consent(_QtWindow(), first)
+    assert len(opened) == 1
+    p.close_wallet(first)
+    # Reopened: a different wallet OBJECT over the same wallet file.
+    reopened = _NamedWallet("payments")
+    p._maybe_prompt_usage_consent(_QtWindow(), reopened)
+    assert len(opened) == 1, "the deferred screen came back on a reopen"
+
+
+def test_each_wallets_answer_is_stored_against_that_wallet(qapp, monkeypatch):
+    """Three wallets, three different answers, three separate records -- level,
+    consent flag and install id. Nothing may arrive from another wallet or from
+    the installation-wide config."""
+    p = _make_plugin()
+    window = _QtWindow()
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    chosen = {"a": us.LEVEL_COUNT, "b": us.LEVEL_OFF, "c": us.LEVEL_LIQUIDITY}
+    wallets = {name: _NamedWallet(name) for name in chosen}
 
     monkeypatch.setattr(p, "_ask_usage_consent",
-                        lambda window, wallet: opened.append(wallet) or None)
+                        lambda win, wallet: chosen[wallet.basename()])
+    for wallet in wallets.values():
+        p._maybe_prompt_usage_consent(window, wallet)
+
+    for name, level in chosen.items():
+        assert p.usage_stats_level(wallets[name]) == level, name
+        assert p.usage_stats_prompted(wallets[name]), name
+    # An opted-in wallet has an identifier of its own; the one that declined
+    # has none at all, and the two that opted in do not share theirs.
+    assert p.usage_stats_install_id(wallets["b"]) is None
+    ids = {p.usage_stats_install_id(wallets[n]) for n in ("a", "c")}
+    assert len(ids) == 2 and all(us.is_install_id(i) for i in ids), ids
+
+
+def test_one_wallet_opting_in_does_not_report_for_another(qapp, monkeypatch):
+    p = _make_plugin()
+    reported: List[object] = []
+    monkeypatch.setattr(p, "_request_usage_report",
+                        lambda wallet, **kw: reported.append(wallet))
+    a, b = _NamedWallet("a"), _NamedWallet("b")
+    monkeypatch.setattr(
+        p, "_ask_usage_consent",
+        lambda win, wallet: us.LEVEL_COUNT if wallet is a else us.LEVEL_OFF)
     window = _QtWindow()
-    p._maybe_prompt_usage_consent(window, _FakeWallet())
-    p._maybe_prompt_usage_consent(window, _FakeWallet())
-    assert len(opened) == 1
+    p._maybe_prompt_usage_consent(window, a)
+    p._maybe_prompt_usage_consent(window, b)
+    assert reported == [a]
+    assert p.usage_stats_level(b) == us.LEVEL_OFF
+
+
+# --- one screen at a time -------------------------------------------------
+
+def test_a_wallet_opening_behind_the_screen_is_queued_not_stacked(qapp, monkeypatch):
+    """The dialog runs a blocking exec() inside load_wallet, so a wallet opened
+    while it is up must wait rather than stack a second long modal."""
+    p = _make_plugin()
+    window = _QtWindow()
+    a, b = _NamedWallet("a"), _NamedWallet("b")
+    opened: List[object] = []
+
+    # Recorded rather than asserted inside the callback: the prompt catches
+    # every exception out of the dialog, so a bare assert in here would be
+    # swallowed into a log line instead of failing this test.
+    mid: dict = {}
+
+    def _ask(win, wallet):
+        opened.append(wallet)
+        if wallet is a:
+            # As if the user opened wallet b while a's screen was on screen.
+            p._maybe_prompt_usage_consent(window, b)
+            mid["opened"] = list(opened)
+            mid["queued"] = list(p._usage_consent_queue)
+        return us.LEVEL_OFF
+
+    monkeypatch.setattr(p, "_ask_usage_consent", _ask)
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    p._tabs[b] = SimpleNamespace(window=window, refresh=lambda: None)
+    p._maybe_prompt_usage_consent(window, a)
+    assert mid.get("opened") == [a], \
+        f"b's screen was stacked on top of a's: {mid.get('opened')}"
+    assert mid.get("queued") == [b], mid.get("queued")
+    p._drain_usage_consent_queue()          # what the posted timer runs
+    assert opened == [a, b], "the queued wallet was never offered the screen"
+    assert p._usage_consent_queue == []
+
+
+def test_a_queued_wallet_closed_before_its_turn_is_dropped(qapp, monkeypatch):
+    p = _make_plugin()
+    _closeable(p)
+    window = _QtWindow()
+    a, b = _NamedWallet("a"), _NamedWallet("b")
+    opened = _watch_consent(p, monkeypatch, answer=us.LEVEL_OFF)
+    p._tabs[b] = SimpleNamespace(window=window, refresh=lambda: None)
+    p._usage_consent_on_screen = True           # as if a's screen were up
+    p._maybe_prompt_usage_consent(window, b)
+    assert p._usage_consent_queue == [b]
+    p._usage_consent_on_screen = False
+    p.close_wallet(b)
+    p._drain_usage_consent_queue()              # must not raise
+    assert opened == [], "a closed wallet was still shown the screen"
+    assert not p.usage_stats_prompted(b)
+
+
+def test_a_wallet_closed_while_the_screen_is_up_records_nothing(qapp, monkeypatch):
+    """Answering for a wallet nobody is holding open any more would write a
+    choice into a file that is on its way out, and start a report for it."""
+    p = _make_plugin()
+    _closeable(p)
+    window, wallet = _QtWindow(), _NamedWallet("a")
+    reported: List[object] = []
+    monkeypatch.setattr(p, "_request_usage_report",
+                        lambda w, **kw: reported.append(w))
+    p._tabs[wallet] = SimpleNamespace(window=window, refresh=lambda: None)
+
+    def _ask(win, w):
+        p.close_wallet(w)           # the user closed it behind the dialog
+        return us.LEVEL_LIQUIDITY
+
+    monkeypatch.setattr(p, "_ask_usage_consent", _ask)
+    p._maybe_prompt_usage_consent(window, wallet)
+    assert not p.usage_stats_prompted(wallet)
+    assert p.usage_stats_level(wallet) == us.LEVEL_OFF
+    assert reported == []
+
+
+def test_the_screen_is_not_queued_twice_for_the_same_wallet(qapp, monkeypatch):
+    p = _make_plugin()
+    window, wallet = _QtWindow(), _NamedWallet("a")
+    p._usage_consent_on_screen = True
+    p._maybe_prompt_usage_consent(window, wallet)
+    p._maybe_prompt_usage_consent(window, wallet)
+    assert p._usage_consent_queue == [wallet]
 
 
 def test_an_already_answered_wallet_is_not_asked_again(qapp, monkeypatch):
@@ -588,7 +792,7 @@ def test_the_screen_is_skipped_when_nothing_could_be_sent(qapp, monkeypatch):
     monkeypatch.delenv(USAGE_STATS_ENDPOINT_ENV)
     from electrum import constants
     monkeypatch.setattr(constants, "net", SimpleNamespace(NET_NAME="regtest"))
-    p._usage_consent_asked = False
+    p._usage_consent_asked = set()
     p._maybe_prompt_usage_consent(_QtWindow(), _FakeWallet())
     assert opened == []
 
@@ -601,11 +805,36 @@ def test_a_dialog_failure_never_breaks_loading_a_wallet(qapp, monkeypatch):
         raise RuntimeError("no display")
 
     monkeypatch.setattr(p, "_ask_usage_consent", _explode)
-    wallet = _FakeWallet()
+    wallet = _NamedWallet("a")
     p._maybe_prompt_usage_consent(_QtWindow(), wallet)      # must not raise
     assert not p.usage_stats_prompted(wallet)
     assert not p._usage_consent_asked, \
         "a failed prompt should be retried, not marked as shown"
+    assert not p._usage_consent_on_screen, \
+        "a dialog that never opened would silence every other wallet"
+
+
+def test_a_dialog_failure_leaves_the_other_wallets_askable(qapp, monkeypatch):
+    """The retry is scoped to the wallet that failed; the rest of the session's
+    wallets must neither be skipped nor dragged into the retry."""
+    p = _make_plugin()
+    a, b = _NamedWallet("a"), _NamedWallet("b")
+    opened: List[object] = []
+
+    def _ask(window, wallet):
+        opened.append(wallet)
+        if wallet is a and len(opened) == 1:
+            raise RuntimeError("no display")
+        return us.LEVEL_OFF
+
+    monkeypatch.setattr(p, "_ask_usage_consent", _ask)
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    window = _QtWindow()
+    p._maybe_prompt_usage_consent(window, a)        # fails
+    p._maybe_prompt_usage_consent(window, b)        # unaffected
+    p._maybe_prompt_usage_consent(window, a)        # retried
+    assert opened == [a, b, a]
+    assert p.usage_stats_prompted(a) and p.usage_stats_prompted(b)
 
 
 def test_opting_in_from_the_screen_sends_one_report(qapp, monkeypatch):
@@ -657,7 +886,42 @@ def test_the_screen_says_the_choice_is_only_for_this_wallet(qapp, monkeypatch):
     lowered = " ".join(captured["labels"]).lower()
     assert "per-wallet" in lowered, \
         "the consent screen does not say the choice is per wallet"
-    assert "this specific wallet" in lowered
+    assert "every other wallet is asked separately" in lowered
+
+
+def test_the_screen_names_the_wallet_it_is_asking_about(qapp, monkeypatch):
+    """The screen is offered once per wallet, so a user with three wallets sees
+    three of them. Naming the wallet is what makes each one answerable: without
+    it they are three identical dialogs for three different decisions."""
+    p = _make_plugin()
+    captured = _drive_consent(monkeypatch, pick=None, accept=False)
+    monkeypatch.setattr(p, "_request_usage_report", lambda w, **kw: None)
+    p._maybe_prompt_usage_consent(_QtWindow(), _NamedWallet("payments_wallet"))
+    assert "payments_wallet" in captured["title"], captured["title"]
+    assert any("payments_wallet" in text for text in captured["labels"]), \
+        "the body of the consent screen does not name the wallet"
+
+
+@pytest.mark.parametrize("name", ["<b>bold", "a<br>b", "<img src=x>"])
+def test_a_wallet_name_full_of_markup_stays_verbatim(qapp, monkeypatch, name):
+    """A wallet name is a file name the user chose, and it lands in a QLabel
+    whose default AutoText would render it as rich text."""
+    from PyQt6.QtCore import Qt as _Qt
+    from PyQt6.QtWidgets import QLabel
+
+    p = _make_plugin()
+    formats: List[object] = []
+
+    def _capture(dialog):
+        for label in dialog.findChildren(QLabel):
+            if name in label.text():
+                formats.append(label.textFormat())
+        return 0
+
+    monkeypatch.setattr(WindowModalDialog, "exec", _capture, raising=False)
+    p._maybe_prompt_usage_consent(_QtWindow(), _NamedWallet(name))
+    assert formats, f"no label carried the wallet name {name!r} verbatim"
+    assert all(fmt == _Qt.TextFormat.PlainText for fmt in formats), formats
 
 
 def test_the_screen_offers_off_plus_the_three_levels(qapp, monkeypatch):

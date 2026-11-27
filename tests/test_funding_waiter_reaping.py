@@ -247,6 +247,121 @@ def test_an_unfunded_swap_with_no_waiter_does_report_shape_change(caplog) -> Non
     asyncio.run(go())
 
 
+def test_reaping_outside_an_event_loop_is_a_no_op() -> None:
+    """``asyncio.all_tasks()`` raises without a running loop. The reaper runs in
+    the ``finally`` of a call that may just have created a swap, so it has to
+    bail out quietly rather than let that exception escape over the top of
+    whatever the swap attempt was returning."""
+    sm = _FakeSwapManager()
+    p = _plugin()
+    sm._swaps[A] = SimpleNamespace(funding_txid=None,
+                                   payment_hash=bytes.fromhex(A))
+    # Deliberately not inside asyncio.run(): that is the condition under test.
+    assert p._reap_funding_waiters(sm, set()) == 0
+
+
+def _live_waiter_hashes() -> Set[str]:
+    """The payment hash of every live funding waiter, read the way the reaper
+    reads it. Lets a test say WHICH waiter survived rather than only how many,
+    which is the whole point of the scoping rule."""
+    out: Set[str] = set()
+    for task in _live_waiters():
+        frame = getattr(task.get_coro(), "cr_frame", None)
+        swap = frame.f_locals.get("swap") if frame is not None else None
+        ph = getattr(swap, "payment_hash", None)
+        if ph is not None:
+            out.add(ph.hex())
+    return out
+
+
+def test_only_our_own_swaps_waiter_is_cancelled() -> None:
+    """The scoping rule, actually exercised.
+
+    ``test_a_concurrent_swaps_waiter_is_left_alone`` above builds its other
+    waiter by hand, and the task it ends up with has the qualname of the
+    *wrapper* -- so it is filtered out by the qualname match and never reaches
+    the ``payment_hash not in new_hashes`` check at all. That test therefore
+    passes whether or not the hash scoping exists.
+
+    Here the other waiter comes from the fake's own ``reverse_swap``, so it has
+    the matching qualname and the hash is the only thing that can spare it:
+    delete the scoping and B's waiter is cancelled along with A's.
+    """
+    async def go():
+        sm = _FakeSwapManager()
+        p = _plugin()
+        # B was started earlier and lost its own race, so its waiter is still
+        # polling -- a user-initiated swap running while we attempt ours.
+        assert await sm.reverse_swap(payment_hash_hex=B) is None
+        assert _live_waiter_hashes() == {B}
+
+        before: Set[str] = set(sm._swaps)            # {B}: not ours to reap
+        assert await p._call_reverse_swap(
+            sm, {"payment_hash_hex": A}, before) is None
+        await _drain()
+
+        assert _live_waiter_hashes() == {B}, \
+            "the concurrent swap's waiter was cancelled with ours"
+        for task in _live_waiters():
+            task.cancel()
+
+    asyncio.run(go())
+
+
+def test_reaping_counts_only_the_waiters_it_cancelled() -> None:
+    """A matching waiter that belongs to somebody else must not be counted as
+    reaped either -- the count is what the debug line reports, and an inflated
+    one would hide the shape-change warning this file's last test relies on."""
+    async def go():
+        sm = _FakeSwapManager()
+        p = _plugin()
+        assert await sm.reverse_swap(payment_hash_hex=B) is None
+        before: Set[str] = set(sm._swaps)
+        await sm.reverse_swap(payment_hash_hex=A)     # ours: leaves a waiter
+        assert p._reap_funding_waiters(sm, before) == 1
+        await _drain()
+        assert _live_waiter_hashes() == {B}
+        for task in _live_waiters():
+            task.cancel()
+
+    asyncio.run(go())
+
+
+def test_an_unreadable_waiter_is_skipped_rather_than_raising(caplog) -> None:
+    """Introspecting a third-party closure is inherently brittle, so a waiter we
+    cannot read must cost nothing. Here reading the swap's payment hash raises --
+    the reaper has to step over it and leave the swap unharmed, because this runs
+    in the ``finally`` of a call that may just have committed funds."""
+    async def go():
+        sm = _FakeSwapManager()
+        p = _plugin()
+
+        class _Hostile:
+            funding_txid = None
+
+            @property
+            def payment_hash(self):
+                raise ValueError("cannot be read")
+
+        async def reverse_swap():                     # matching qualname shape
+            async def wait_for_funding(swap):
+                while swap.funding_txid is None:
+                    await asyncio.sleep(0.01)
+            return asyncio.create_task(wait_for_funding(_Hostile()))
+
+        leaked = await reverse_swap()
+        await asyncio.sleep(0.02)
+        sm._swaps[A] = SimpleNamespace(funding_txid=None,
+                                       payment_hash=bytes.fromhex(A))
+        with caplog.at_level(logging.DEBUG, logger=p.logger.name):
+            assert p._reap_funding_waiters(sm, set()) == 0
+        assert "could not inspect a task" in caplog.text
+        assert not leaked.done(), "an unreadable waiter must be left alone"
+        leaked.cancel()
+
+    asyncio.run(go())
+
+
 def test_a_changed_upstream_shape_degrades_to_a_no_op() -> None:
     """If Electrum restructures reverse_swap the match stops firing. That must
     put the leak back, not raise -- the swap itself is never at risk."""

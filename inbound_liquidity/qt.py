@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple,
+)
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -17,6 +19,7 @@ from PyQt6.QtWidgets import (
 )
 
 from electrum.i18n import _
+from electrum.logging import get_logger
 from electrum.plugin import hook
 
 from electrum.gui.qt.util import read_QIcon
@@ -26,19 +29,22 @@ import asyncio
 import contextlib
 import html
 import logging
+import math
 import re
 import time
 
 from . import (
     LiquidityPlugin, MAX_LOG_RETENTION_DAYS, DEV_FEE_MAX_PCT,
-    DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT,
+    DEV_FEE_PAYOUT_THRESHOLD_SAT, DEV_FEE_DAILY_CAP_SAT, DEFAULT_DEV_FEE_PCT,
     DEFAULT_LOG_BUFFER_LINES, MAX_LOG_BUFFER_LINES, MIN_LOG_BUFFER_LINES,
     DEFAULT_MAX_CHANNEL_SIZE_SAT,
-    PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status,
+    PLUGIN_OPENED_CHANNELS_DB_KEY, is_terminal_status, warn_once,
     _parse_npub_set, _parse_partner_list, _parse_banned_partners,
+    _plugin_config_vars,
 )
 from .liquidity_manager import (
-    BufferSplit, normalize_node_id, scrub_text, split_goal_buffer,
+    BufferSplit, compute_dev_fee, normalize_node_id, scrub_text,
+    split_goal_buffer,
 )
 from .log_buffer import LEVEL_CHOICES, LogCapture, clamp_max_lines
 from .qt_widgets import (
@@ -286,10 +292,25 @@ def _buffer_split_for(wallet: 'Abstract_Wallet', *, onchain_sat: int,
     inside Electrum's status-bar repaint."""
     provider = _BUFFER_PROVIDER
     buffer_sat = 0
+    # NB no log on the "no provider installed" path, and none on success. This
+    # function runs inside Electrum's status-bar repaint -- many times a second
+    # -- and "no plugin has claimed the chart" is the steady state for every
+    # wallet without this plugin, so logging it would be pure noise at a rate
+    # that fills the user's log and rotates the useful lines out of it. Only the
+    # exception below is logged: it is rare, and it is the one case where a
+    # buffer of 0 does not mean what it appears to mean.
     if provider is not None:
         try:
             buffer_sat = int(provider(wallet))
-        except Exception:
+        except Exception as e:
+            # Still swallowed -- a repaint must not break -- but no longer
+            # indistinguishable from a genuine zero, which is what made a
+            # missing buffer slice impossible to tell from "no goal set".
+            # Once, not per repaint: a provider that raises will raise every
+            # time, and the first traceback says everything the hundredth would.
+            _warn_once("buffer-provider-failed",
+                       f"buffer provider failed for {_wallet_name(wallet)}; "
+                       f"treating the buffer as 0: {e!r}")
             buffer_sat = 0
     return split_goal_buffer(onchain_sat=onchain_sat, lightning_sat=lightning_sat,
                              buffer_sat=buffer_sat)
@@ -427,9 +448,16 @@ def _patch_status_bar_piechart() -> bool:
         from electrum.gui.qt.main_window import ElectrumWindow
     except Exception:
         return False
-    if getattr(ElectrumWindow.update_status, "_inbound_liquidity_patched", False):
+    state = _patch_state(ElectrumWindow.update_status)
+    if state == "ours":
         return True
-    orig_update_status = ElectrumWindow.update_status
+    if state == "stale":
+        # Patched by an older copy of this module, whose globals this process can
+        # no longer reach. Re-wrap Electrum's own method so the live patch reads
+        # OUR globals -- see the note on _PATCH_OWNER.
+        _logger.info("re-installing the status-bar pie patch over one left by a "
+                     "previous load of this plugin")
+    orig_update_status = _unwrap_stale(ElectrumWindow.update_status)
 
     def update_status(self) -> None:
         orig_update_status(self)
@@ -468,7 +496,8 @@ def _patch_status_bar_piechart() -> bool:
             except Exception:
                 pass
 
-    update_status._inbound_liquidity_patched = True
+    setattr(update_status, _PATCHED_ATTR, True)
+    setattr(update_status, _OWNER_ATTR, _PATCH_OWNER)
     # Kept reachable so a caller can still get at Electrum's own implementation
     # once the class attribute is ours -- the assumption guards read its source
     # to notice if Electrum ever stops building the pie the way we match on.
@@ -547,26 +576,41 @@ def _install_goal_view(dialog, wallet: 'Abstract_Wallet') -> bool:
     The dialog is built in full by Electrum first and only then amended, so
     nothing about how the chart is computed or painted is duplicated here.
     """
+    # Every bail below says why. Two levels, because the reasons are not alike:
+    # "this wallet has no buffer to draw" is the ordinary answer for most
+    # wallets and belongs at debug, while "Electrum's dialog is not shaped the
+    # way this patch expects" means the feature is silently off for everyone and
+    # is worth a warning. Before this, every one of these returned a bare False
+    # and the slices simply never appeared, with nothing logged anywhere.
     try:
         from electrum.gui.qt.balance_dialog import PieChartWidget
-    except Exception:
+    except Exception as e:
+        _logger.warning(f"no PieChartWidget to amend; Electrum's balance_dialog "
+                        f"may have moved: {e!r}")
         return False
     piechart = dialog.findChild(PieChartWidget)
     if piechart is None:
+        _logger.warning("balance dialog has no PieChartWidget child")
         return False
     # Electrum's own entries, kept as the reference rendering: unticking the box
     # has to restore exactly this, and re-ticking it has to re-derive from it
     # rather than from an already-reduced list.
     stock = list(getattr(piechart, "_list", None) or [])
     if not stock:
+        _logger.warning("balance dialog's pie chart has no entries to amend")
         return False
     # Read regardless of the checkbox: a goal that exists but is hidden still
     # needs its checkbox on screen, or there would be no way to bring it back.
     split = _goal_buffer_split(stock, wallet)
     if split is None:
+        # The ordinary case: no goal set, an unmanaged wallet, or a balance the
+        # buffer cannot be carved out of. Nothing is wrong.
+        _logger.debug(f"no liquidity-goal buffer to draw for "
+                      f"{_wallet_name(wallet)}; leaving Electrum's chart alone")
         return False
     grid = dialog.findChild(QGridLayout)
     if grid is None:
+        _logger.warning("balance dialog has no QGridLayout to put the legend in")
         return False
     config = dialog.config
     fx = getattr(dialog, "fx", None)
@@ -629,20 +673,34 @@ def _patch_balance_dialog() -> bool:
         from electrum.gui.qt.balance_dialog import BalanceDialog
     except Exception:
         return False
-    if getattr(BalanceDialog.__init__, "_inbound_liquidity_patched", False):
+    state = _patch_state(BalanceDialog.__init__)
+    if state == "ours":
         return True
-    orig_init = BalanceDialog.__init__
+    if state == "stale":
+        # Patched by an older copy of this module. Left alone, that patch keeps
+        # running and keeps reading the OLD copy's _BUFFER_PROVIDER -- which this
+        # copy cannot set -- so the goal slices silently never appear. See the
+        # note on _PATCH_OWNER.
+        _logger.info("re-installing the balance-dialog patch over one left by a "
+                     "previous load of this plugin")
+    orig_init = _unwrap_stale(BalanceDialog.__init__)
 
     def __init__(self, parent, *, wallet, **kwargs) -> None:
         orig_init(self, parent, wallet=wallet, **kwargs)
         try:
             _install_goal_view(self, wallet)
-        except Exception:
-            # An amended legend is a nicety; a dialog that cannot open is not.
-            pass
+        except Exception as e:
+            # An amended legend is a nicety; a dialog that cannot open is not --
+            # so this still swallows. But it no longer swallows SILENTLY: the
+            # goal slices going missing used to leave no trace anywhere, which
+            # makes "my buffer is not on the chart" undiagnosable from a log and
+            # cost real time to track down from the outside.
+            _logger.warning(f"could not add the liquidity-goal view to the "
+                            f"balance dialog: {e!r}", exc_info=True)
 
-    __init__._inbound_liquidity_patched = True
-    __init__._inbound_liquidity_orig = orig_init
+    setattr(__init__, _PATCHED_ATTR, True)
+    setattr(__init__, _OWNER_ATTR, _PATCH_OWNER)
+    setattr(__init__, _ORIG_ATTR, orig_init)
     BalanceDialog.__init__ = __init__
     return True
 
@@ -1261,6 +1319,30 @@ def _wallet_name(wallet: 'Abstract_Wallet') -> str:
         return "?"
 
 
+def _wallet_session_key(wallet: 'Abstract_Wallet') -> str:
+    """A stable identity for ``wallet`` for the duration of this process.
+
+    Used to remember which wallets have already been offered a one-time prompt
+    (the update-check opt-in, the usage-statistics consent screen) in this
+    session. Keyed on the wallet FILE rather than the wallet object, so closing
+    and reopening a wallet is still "already asked": a long consent dialog that
+    came back because the user toggled between two wallets would be read as the
+    plugin nagging, not as the plugin honouring "ask me later".
+
+    Always a string, so it can never fail to go into a set -- a wallet with no
+    storage path (an in-memory wallet, or a harness double) falls back to its
+    object identity, which is good enough: such a wallet has no file for the
+    answer to be remembered in either.
+    """
+    try:
+        path = wallet.storage.path
+    except Exception:
+        path = None
+    if isinstance(path, str) and path:
+        return path
+    return f"id:{id(wallet)}"
+
+
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -1282,9 +1364,86 @@ def _safe_filename(wallet: 'Abstract_Wallet') -> str:
 # printable, so `clean_display_name` strips it out.
 _NO_NAME_SORT_KEY = "\uffff"
 
+# Module-level logger, for the handful of helpers here that are not methods on
+# the Plugin (which has its own ``self.logger``). The monkeypatch installers and
+# the chart rewrites are deliberately total -- they must never break a repaint or
+# stop a dialog opening -- so when one of them declines to do its job, this is
+# the only way the user or a maintainer ever hears about it.
+_logger = get_logger(__name__)
+
+
+def _warn_once(key: str, message: str) -> None:
+    """This module's logger, bound to the shared once-only warning helper -- see
+    :func:`~electrum.plugins.inbound_liquidity.warn_once` for why the repaint
+    path may only ever report a repeating failure once."""
+    warn_once(_logger, key, message)
+
+
+# --- which copy of this module owns an installed monkeypatch ---------------
+# This module's patches are closures over its OWN globals (`_BUFFER_PROVIDER`,
+# `_GOAL_VISIBILITY`, ...). That is fine while there is one copy of the module,
+# and silently broken when there are two -- the live patch goes on reading the
+# globals of whichever copy installed it, and the other copy can set its own
+# `_BUFFER_PROVIDER` all day without the chart ever noticing.
+#
+# Two copies is not hypothetical. Electrum re-imports a plugin's modules when
+# the user disables and re-enables it, which leaves the patch installed by the
+# FIRST import still wrapping the method while every live `Plugin` instance
+# belongs to the second. The visible symptom is that the liquidity-goal slices
+# quietly stop appearing on the balance chart until Electrum is restarted --
+# with nothing logged, because an un-set provider is indistinguishable from a
+# wallet that has no goal. (The e2e suite hits the same thing from the other
+# direction: two test modules each purge `electrum*` out of `sys.modules` and
+# re-import, so the second one's patch request used to be answered "already
+# patched" by the first one's.)
+#
+# So "already patched" is not a yes/no question, it is "patched BY WHOM". A
+# module-unique object answers it: identity comparison is exact, it cannot
+# collide across copies the way a name or an id() can be reused, and holding a
+# reference to it from the patched function keeps it alive for exactly as long
+# as the patch is installed.
+_PATCH_OWNER = object()
+_OWNER_ATTR = "_inbound_liquidity_owner"
+_PATCHED_ATTR = "_inbound_liquidity_patched"
+_ORIG_ATTR = "_inbound_liquidity_orig"
+
+
+def _patch_state(func) -> str:
+    """Whether ``func`` is unpatched, patched by this copy of the module, or
+    patched by another copy: ``"clean"``, ``"ours"`` or ``"stale"``."""
+    if not getattr(func, _PATCHED_ATTR, False):
+        return "clean"
+    return "ours" if getattr(func, _OWNER_ATTR, None) is _PATCH_OWNER else "stale"
+
+
+def _unwrap_stale(func):
+    """The original, unpatched callable under a patch installed by an older copy
+    of this module -- so a re-patch wraps Electrum's own method rather than
+    stacking on top of a wrapper that reads dead globals.
+
+    Walks the chain rather than unwrapping once: nothing stops a third copy from
+    having been loaded, and two stacked stale wrappers would otherwise leave the
+    innermost one still in the call path.
+    """
+    seen = 0
+    while _patch_state(func) == "stale" and seen < 10:
+        original = getattr(func, _ORIG_ATTR, None)
+        if original is None:
+            break
+        func = original
+        seen += 1
+    return func
+
 # Longest tooltip we will build out of outside text. A tooltip is a floating
 # window sized to its content, so an unbounded one is a screenful.
 MAX_TOOLTIP_CHARS = 400
+
+# Largest value a swap-out trigger tooltip will quote back. Past this the number
+# is not a threshold anyone typed on purpose -- it is above the total bitcoin
+# supply in sats -- and rendering it would put a 17-digit figure in a floating
+# window. The setting itself is clamped by the engine, not here; this only
+# governs what the sentence is willing to say.
+_MAX_TRIGGER_VALUE = 21_000_000 * 100_000_000
 
 
 def _literal_tooltip(text: object) -> str:
@@ -1306,6 +1465,51 @@ def _literal_tooltip(text: object) -> str:
     if len(body) > MAX_TOOLTIP_CHARS:
         body = body[:MAX_TOOLTIP_CHARS - 1] + "\u2026"
     return f"<div style='white-space:pre-wrap'>{html.escape(body)}</div>"
+
+
+def _setting_help(attr: str) -> str:
+    """The canonical explanation for one setting, for use as hover help.
+
+    Read off the ``ConfigVar`` that declares the setting (its ``long_desc``)
+    rather than written out again here, because that declaration is already the
+    single place a setting is introduced and described -- the same reason
+    :func:`~electrum.plugins.inbound_liquidity._plugin_config_vars` reads the
+    ConfigVars off SimpleConfig instead of keeping a hand-written list.
+
+    Two things follow from that, both wanted. A setting whose wording is
+    improved in one place improves on the form too, so the config docs and the
+    hover help cannot drift apart; and a setting added later arrives with hover
+    help already attached, which is what keeps
+    ``test_settings_tooltips_qt`` from becoming a list to remember to extend.
+
+    Returns "" for a setting with no ``long_desc`` (the internal bookkeeping
+    vars -- timestamps, the install id, the "already prompted" flags -- none of
+    which has a field on any form), so a caller can fall back or skip. Never
+    raises: a tab that fails to build is far worse than a missing tooltip.
+    """
+    try:
+        cvar = _plugin_config_vars().get(attr)
+        if cvar is None:
+            return ""
+        return (cvar.get_long_desc() or "").strip()
+    except Exception:
+        return ""
+
+
+def _apply_setting_help(attr: str, *widgets: QWidget) -> str:
+    """Give every widget of one settings row the explanation for ``attr``.
+
+    Both halves of a row get it -- the label and the input -- because a user
+    hovering over a setting should not have to find the right half of it to get
+    an answer. Returns the text used (""  if the setting has none), so a caller
+    can tell whether a row ended up with help.
+    """
+    tip = _setting_help(attr)
+    if not tip:
+        return ""
+    for widget in widgets:
+        widget.setToolTip(tip)
+    return tip
 
 
 def _fmt_age(ts: float) -> str:
@@ -1343,14 +1547,29 @@ class Plugin(LiquidityPlugin):
         self._unlock_prompting: set = set()
         # Instance attribute so tests can shrink it.
         self._unlock_prompt_cooldown_sec: float = UNLOCK_PROMPT_COOLDOWN_SEC
-        # Whether the update-check opt-in has been put on screen in this session.
-        # The persisted flag records the *answer*; this guards against opening a
-        # second wallet stacking a second dialog before the first is answered.
-        self._update_opt_in_asked: bool = False
-        # Same guard for the usage-statistics consent screen, for the same
-        # reason -- and more so here, since that dialog is a long one to find
-        # stacked twice.
-        self._usage_consent_asked: bool = False
+        # Wallets whose one-time prompts have been put on screen in this
+        # session, keyed by _wallet_session_key. The persisted flag records the
+        # *answer*; these record that the question was asked, so a wallet that
+        # deferred is not asked again until the next start.
+        #
+        # Per WALLET and not a single flag per process, which is what these
+        # were: every one of these prompts is about a per-wallet setting, so a
+        # user running three wallets has three of each decision to make. A
+        # process-wide flag meant the first wallet opened was asked and the
+        # second and third were silently skipped for the rest of the session --
+        # which, for the usage-statistics screen, is consent never offered at
+        # all for those wallets rather than consent offered and declined.
+        self._update_opt_in_asked: Set[str] = set()
+        self._usage_consent_asked: Set[str] = set()
+        # Whether a usage-statistics consent dialog is on screen right now, and
+        # the wallets waiting their turn behind it. That dialog runs a blocking
+        # `exec()` inside the load_wallet hook, so a second wallet opening while
+        # it is up would stack a second copy of a long modal on top of the
+        # first; instead the second wallet is queued and offered the screen as
+        # soon as the first one closes. The short prompts are not queued -- see
+        # _maybe_prompt_update_opt_in.
+        self._usage_consent_on_screen: bool = False
+        self._usage_consent_queue: List['Abstract_Wallet'] = []
         # One Send-tab buffer-warning refresher per open wallet. Keyed by wallet
         # rather than window because that is the key the buffer itself is looked
         # up by, and Electrum opens one window per wallet.
@@ -1549,17 +1768,24 @@ class Plugin(LiquidityPlugin):
         remembered -- "prompted" is stored separately from "enabled" so that
         declining is final rather than being re-asked at every startup.
 
+        Asked once PER WALLET, not once per installation: the opt-in is a
+        per-wallet setting, so a second wallet is a second decision to make.
+        Not queued behind the consent screen the way that dialog queues behind
+        itself -- this is a one-line question box, so two of them on screen is
+        a smaller harm than a wallet that is never asked at all.
+
         Never blocks or breaks wallet load: a failure to show the dialog leaves
         the flag unset (it will be offered again next time) and nothing else.
         """
+        key = _wallet_session_key(wallet)
         c = self.settings(wallet)
         if bool(c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED):
             return
         if bool(getattr(c, 'INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED', False)):
             return          # already switched on from Advanced; nothing to ask
-        if self._update_opt_in_asked:
-            return          # a second wallet opening in the same session
-        self._update_opt_in_asked = True
+        if key in self._update_opt_in_asked:
+            return          # this wallet already had its turn this session
+        self._update_opt_in_asked.add(key)
         try:
             enable = bool(window.question(
                 ' '.join([
@@ -1575,7 +1801,7 @@ class Plugin(LiquidityPlugin):
         except Exception:
             # A prompt is a convenience; never let it break loading a wallet.
             self.logger.exception("could not show the update-check opt-in prompt")
-            self._update_opt_in_asked = False
+            self._update_opt_in_asked.discard(key)
             return
         c.INBOUND_LIQUIDITY_UPDATE_CHECK_PROMPTED = True
         c.INBOUND_LIQUIDITY_UPDATE_CHECK_ENABLED = enable
@@ -1586,11 +1812,19 @@ class Plugin(LiquidityPlugin):
             self._request_update_check(wallet)
 
     def _maybe_prompt_usage_consent(self, window: 'ElectrumWindow',
-                                    wallet: 'Abstract_Wallet') -> None:
-        """Offer the anonymous-usage-statistics choice ONCE, with previews.
+                                    wallet: 'Abstract_Wallet') -> bool:
+        """Offer the anonymous-usage-statistics choice ONCE PER WALLET, with
+        previews. Returns whether the dialog was put on screen for ``wallet``.
 
         Everything about this is built around not manufacturing consent:
 
+          * Offered **once per wallet**, because the choice IS per wallet: the
+            level, the consent flag and the install id all live in the wallet's
+            own file. A single process-wide "already asked" flag -- which is
+            what this used to be -- meant that only the first wallet opened in
+            a session was ever asked, and every other wallet reported nothing
+            while never having been given the choice. The question is now put
+            to each wallet, and the answers stay independent.
           * The dialog opens on **Off**. The only way to end up sharing anything
             is to deliberately select a level and press Save, so an impatient
             Return or a reflexive click leaves reporting off.
@@ -1610,25 +1844,55 @@ class Plugin(LiquidityPlugin):
         """
         from . import usage_stats
 
+        key = _wallet_session_key(wallet)
         if self.usage_stats_prompted(wallet):
-            return
+            return False
         if self.usage_stats_level(wallet) != usage_stats.LEVEL_OFF:
-            return      # already switched on from Advanced; nothing to ask
+            return False    # already switched on from Advanced; nothing to ask
         if self.usage_stats_blocked_reason() is not None:
-            return      # nothing could be sent regardless; see the docstring
-        if self._usage_consent_asked:
-            return      # a second wallet opening in the same session
-        self._usage_consent_asked = True
+            return False    # nothing could be sent regardless; see the docstring
+        if key in self._usage_consent_asked:
+            return False    # this wallet already had its turn this session
+        if self._usage_consent_on_screen:
+            # Another wallet's consent screen is up. Wait for it rather than
+            # stacking a second long modal on top; _drain_usage_consent_queue
+            # comes back for this wallet as soon as that one is answered.
+            self._queue_usage_consent(wallet)
+            return False
+        self._usage_consent_asked.add(key)
+        self._usage_consent_on_screen = True
+        # Whether Electrum had this wallet open when the screen went up, so the
+        # check after it closes can tell "the user closed the wallet while the
+        # dialog was on screen" from "this caller never registered a tab at
+        # all" (every harness in the test suite, and any future non-tab path).
+        was_open = self._wallet_is_open(wallet)
         try:
             chosen = self._ask_usage_consent(window, wallet)
         except Exception:
             # A prompt is a convenience; never let it break loading a wallet.
             self.logger.exception("could not show the usage-statistics consent screen")
-            self._usage_consent_asked = False
-            return
+            self._usage_consent_asked.discard(key)
+            return False
+        finally:
+            # Before anything below can return, and before the queue is
+            # drained: a dialog left recorded as on screen would silence the
+            # screen for every other wallet for the rest of the session, which
+            # is the bug this whole path exists to not have.
+            self._usage_consent_on_screen = False
+            self._schedule_usage_consent_drain()
         if chosen is None:
-            self.logger.info("usage-statistics consent deferred ('ask me later')")
-            return
+            self.logger.info(
+                f"usage-statistics consent deferred ('ask me later') "
+                f"for {_wallet_name(wallet)}")
+            return True
+        # Only now that the dialog has closed: a wallet closed while its screen
+        # was up must not have a choice written into a file nobody is holding
+        # open any more, and must not start reporting on its way out.
+        if was_open and not self._wallet_is_open(wallet):
+            self.logger.info(
+                f"usage-statistics consent discarded: {_wallet_name(wallet)} "
+                f"was closed before the choice was saved")
+            return True
         self.set_usage_stats_choice(wallet, chosen)
         if chosen != usage_stats.LEVEL_OFF:
             # Don't make the user wait a week to see that it works.
@@ -1641,6 +1905,93 @@ class Plugin(LiquidityPlugin):
                 state.refresh()
             except Exception:
                 self.logger.debug("could not refresh the tab after the consent choice")
+        return True
+
+    def _wallet_is_open(self, wallet: 'Abstract_Wallet') -> bool:
+        """Whether a window still holds this wallet's Liquidity tab.
+
+        Read off the tab handles rather than ``self.wallets``, because that set
+        holds only the wallets the plugin MANAGES -- a wallet without Lightning
+        has a Liquidity tab and a settings store but is not managed, and its
+        consent choice is still worth saving. ``_tabs`` is keyed by wallet and
+        dropped in ``close_wallet``/``on_close_window``, so it is exactly the
+        "a window still has this wallet" question.
+        """
+        try:
+            return wallet in self._tabs
+        except TypeError:
+            return False    # unhashable double; it has no tab either way
+
+    def _consent_queue(self) -> List['Abstract_Wallet']:
+        """The wallets waiting for the consent screen, created on first use.
+
+        Tolerant of its own absence for the same reason as
+        ``_per_wallet_store``: the test harnesses build a plugin via
+        ``object.__new__`` without the constructor, and failing to track a
+        queued dialog must never become an AttributeError out of the middle of
+        closing a wallet.
+        """
+        queue = getattr(self, "_usage_consent_queue", None)
+        if not isinstance(queue, list):
+            queue = []
+            self._usage_consent_queue = queue
+        return queue
+
+    def _queue_usage_consent(self, wallet: 'Abstract_Wallet') -> None:
+        """Remember that ``wallet`` is still owed the consent screen."""
+        key = _wallet_session_key(wallet)
+        queue = self._consent_queue()
+        if any(_wallet_session_key(queued) == key for queued in queue):
+            return          # already waiting; one turn each
+        queue.append(wallet)
+        self.logger.debug(
+            f"usage-statistics consent screen queued for {_wallet_name(wallet)} "
+            f"behind another wallet's")
+
+    def _schedule_usage_consent_drain(self) -> None:
+        """Ask Qt to offer the screen to the next waiting wallet.
+
+        Through a zero-delay timer rather than a direct call: this runs as the
+        consent dialog's blocking ``exec()`` unwinds, inside the ``load_wallet``
+        hook of the wallet that was just asked. Showing the next dialog from
+        here would nest a second ``exec()`` inside the first one's unwind and
+        hold up that hook; posting it to the event loop lets the current load
+        finish first, which is also the order the user sees.
+        """
+        if not self._consent_queue():
+            return
+        try:
+            QTimer.singleShot(0, self._drain_usage_consent_queue)
+        except Exception:
+            # No event loop to post to (a harness, or a Qt that is shutting
+            # down). The queued wallets keep their turn for the next start.
+            self.logger.debug("could not schedule the consent-screen queue drain")
+
+    def _drain_usage_consent_queue(self) -> None:
+        """Offer the consent screen to the first waiting wallet still open.
+
+        One wallet per run: the call below blocks on its dialog and schedules
+        the next drain on the way out, so the queue empties one screen at a
+        time. Wallets that were closed while waiting, or that answered from the
+        Advanced pane in the meantime, are dropped and asked again next session
+        rather than being chased.
+        """
+        queue = self._consent_queue()
+        while queue:
+            if self._usage_consent_on_screen:
+                return      # someone else got in first; their drain continues
+            wallet = queue.pop(0)
+            state = self._tabs.get(wallet)
+            if state is None:
+                self.logger.debug(
+                    f"dropping the queued consent screen for "
+                    f"{_wallet_name(wallet)}: no longer open")
+                continue
+            window = getattr(state, "window", None)
+            if window is None:
+                continue
+            if self._maybe_prompt_usage_consent(window, wallet):
+                return      # its own drain picks up whatever is still queued
 
     def _ask_usage_consent(self, window: 'ElectrumWindow',
                            wallet: 'Abstract_Wallet') -> Optional[int]:
@@ -1650,7 +2001,15 @@ class Plugin(LiquidityPlugin):
         from . import usage_stats
 
         descriptions = usage_stats.level_descriptions()
-        dialog = WindowModalDialog(window, _("Help improve this plugin?"))
+        # The wallet is named in the title AND in the opening paragraph, because
+        # this screen is now offered once per wallet: a user with three wallets
+        # sees three of these, and a consent screen that does not say what it is
+        # consenting FOR is not one. A window title is painted as plain text, so
+        # a wallet name full of markup is safe here; the label below is pinned to
+        # plain text for the same reason.
+        name = _wallet_name(wallet)
+        dialog = WindowModalDialog(
+            window, _("Help improve this plugin? — {wallet}").format(wallet=name))
         # Wide enough that a 50-field JSON preview is readable without the user
         # having to resize the dialog to find out what they are agreeing to.
         dialog.setMinimumWidth(620)
@@ -1669,7 +2028,7 @@ class Plugin(LiquidityPlugin):
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
-        layout.addWidget(_wrapped_label(_(
+        intro = _wrapped_label(_(
             "Would you help us understand how many people run the Inbound "
             "Liquidity plugin, which settings matter, and how much liquidity it "
             "actually provisions?\n\n"
@@ -1677,8 +2036,14 @@ class Plugin(LiquidityPlugin):
             "not to participate, no data will be sent to us. The plugin "
             "behaves exactly the same either way. If you say yes, this wallet "
             "sends one small report weekly. You can opt in or out on a "
-            "per-wallet basis, this consent screen is only for this specific "
-            "wallet.")))
+            "per-wallet basis: this consent screen is only for the wallet "
+            "\"{wallet}\", and every other wallet is asked separately."
+        ).format(wallet=name))
+        # A wallet name is a file name the user chose, so it is not markup --
+        # and must not be able to become markup. QLabel's default AutoText would
+        # interpret a name like "<b>x" as rich text.
+        intro.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(intro)
 
         layout.addWidget(_wrapped_label(_("We never send, at any level:")))
         for label in _bullet_labels([_(item) for item in usage_stats.never_sent_items()]):
@@ -1878,6 +2243,18 @@ class Plugin(LiquidityPlugin):
         # should not silence the prompt for a wallet the user just opened.
         self._unlock_declined_at.pop(wallet, None)
         self._unlock_prompting.discard(wallet)
+        # A wallet waiting its turn for the consent screen has stopped waiting.
+        # In place rather than rebound: a drain already running holds a
+        # reference to this list, and leaving it a stale copy would let it offer
+        # the screen to a wallet that has since closed.
+        #
+        # The "already asked this session" record is deliberately NOT dropped
+        # here, unlike the unlock prompt above. It is keyed by wallet file so
+        # that "ask me later" survives a close and reopen -- otherwise the
+        # longest dialog in the plugin would come back every time the user
+        # switches between two wallets.
+        queue = self._consent_queue()
+        queue[:] = [queued for queued in queue if queued is not wallet]
         # Drop the Send tab's refresher with its window; the class patches stay
         # installed (they are global and idempotent) but go inert once the last
         # wallet closes and the provider is cleared.
@@ -3087,15 +3464,27 @@ class Plugin(LiquidityPlugin):
         # Named for the same reason the three above are: the tooltip table below
         # is keyed by label text, so any row that wants one needs a name.
         dev_fee_label_text = _("Dev fee (%, 0–{:g}; 0 = off)").format(DEV_FEE_MAX_PCT)
-        # (label, current value as text, parser, setter) for each tunable kept on
-        # the main Settings tab. Power-user knobs (on-chain reserve, reliability
-        # tuning, offline auto-close, log retention, diagnostics, daily ceilings)
-        # and the feature on/off toggles live on the Advanced sub-tab instead.
+        # The two swap-out triggers. Named because each carries a tooltip that
+        # quotes the value currently in its own box (see `live_tooltips` below),
+        # so the row has to be identifiable after the build loop has run.
+        trigger_pct_label_text = _("Swap-out trigger (% of capacity)")
+        trigger_sat_label_text = _("Swap-out trigger (sat)")
+        # (label, config attribute, current value as text, parser, setter) for
+        # each tunable kept on the main Settings tab. Power-user knobs (on-chain
+        # reserve, reliability tuning, offline auto-close, log retention,
+        # diagnostics, daily ceilings) and the feature on/off toggles live on the
+        # Advanced sub-tab instead.
+        #
+        # The attribute is carried alongside the setter -- which already closes
+        # over it -- so each row can find the ConfigVar that declares it and
+        # inherit that declaration's own explanation as hover help (see
+        # :func:`_setting_help`). Without it, every row's help would have to be
+        # written out a second time here, free to drift from the first.
         fields = [
-            (min_onchain_label_text,
+            (min_onchain_label_text, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT',
              str(c.INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MIN_ONCHAIN_TO_OPEN_SAT', v)),
-            (_("Maximum number of channels"),
+            (_("Maximum number of channels"), 'INBOUND_LIQUIDITY_MAX_CHANNELS',
              str(c.INBOUND_LIQUIDITY_MAX_CHANNELS), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNELS', v)),
             # Sits with the other two channel-shape knobs (how many, how big, what
@@ -3103,23 +3492,24 @@ class Plugin(LiquidityPlugin):
             # a channel with the whole on-chain balance, so it is a first-order
             # safety bound, not a tuning knob. Third in the list on purpose --
             # index 0/1 of the tab's line-edits stay min-on-chain and max-channels.
-            (max_size_label_text,
+            (max_size_label_text, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
              str(getattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT',
                          DEFAULT_MAX_CHANNEL_SIZE_SAT)), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_CHANNEL_SIZE_SAT', max(0, int(v)))),
             (_("Max fee to move LN → on-chain (%, all-in)"),
+             'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT',
              str(c.INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_MAX_SWAP_FEE_PCT', v)),
-            (_("Swap-out trigger (% of capacity)"),
+            (trigger_pct_label_text, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT',
              str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_PCT', v)),
-            (_("Swap-out trigger (sat)"),
+            (trigger_sat_label_text, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT',
              str(c.INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT), int,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SWAP_TRIGGER_SAT', v)),
             # Optional development fee, charged on the on-chain amount received
             # from plugin-initiated reverse swaps (clamped to 0..DEV_FEE_MAX_PCT).
             # The payout address is fixed (not user-editable) — see __init__.py.
-            (dev_fee_label_text,
+            (dev_fee_label_text, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
              str(c.INBOUND_LIQUIDITY_DEV_FEE_PCT), float,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_DEV_FEE_PCT',
                                max(0.0, min(float(v), DEV_FEE_MAX_PCT)))),
@@ -3128,31 +3518,49 @@ class Plugin(LiquidityPlugin):
             # that cannot be resolved is refused rather than saved, because a
             # silently-bad sink would look configured while every drain quietly
             # fell back to a swap.
-            (sink_label_text,
+            (sink_label_text, 'INBOUND_LIQUIDITY_SINK_ADDRESS',
              str(c.INBOUND_LIQUIDITY_SINK_ADDRESS or ''), str,
              lambda v: setattr(c, 'INBOUND_LIQUIDITY_SINK_ADDRESS', (v or '').strip())),
         ]
         tooltips = {
             # Hovering the dev-fee row should answer "what is this charging me,
-            # on what, and where does it go" without sending anyone to the
-            # README. Condensed from the ConfigVar's long_desc (see __init__.py),
-            # which is the canonical wording.
+            # on what, how is the number arrived at, and where does it go"
+            # without sending anyone to the README. Condensed from the
+            # ConfigVar's long_desc (see __init__.py), which is the canonical
+            # wording, and then given the arithmetic the long_desc leaves out.
+            #
+            # The worked example is deliberately quoted at the SHIPPED default
+            # rather than at whatever is in the box: it is there to show how the
+            # sum works, and a fee this small is easier to believe as a concrete
+            # "100,000 sat in, 100 sat charged" than as a percentage.
             dev_fee_label_text: _(
                 "An optional contribution to this plugin's development, taken as "
                 "a share of what the plugin drains out of a channel.\n\n"
-                "It is charged only on drains the plugin performs itself — the "
-                "on-chain amount a reverse swap returns, or the amount paid to "
-                "your liquidity sink. Your own payments are never touched, and "
-                "nothing is charged when the plugin does nothing.\n\n"
+                "How it is worked out: fee = amount drained × the percentage "
+                "here, rounded down to whole sats. At the default {default:g}%, "
+                "draining 100,000 sat accrues {example} sat.\n\n"
+                "\"Amount drained\" is what you actually end up with: for a "
+                "reverse swap, the net on-chain amount it returns — after the "
+                "provider's percentage fee, the provider's mining fee and your "
+                "own claim-transaction fee; for a liquidity sink, the amount paid "
+                "to the sink. It is charged only on drains the plugin performs "
+                "itself. Your own payments are never touched, nothing is charged "
+                "when the plugin does nothing, and a swap that fails accrues "
+                "nothing.\n\n"
                 "The fee accrues until at least {thr} sat is owed, then is paid "
                 "automatically over Lightning to the payout address, at most "
                 "{cap} sat per rolling 24 hours. Range 0–{max:g}%; set it to 0 to "
                 "switch it off entirely.").format(
+                    default=DEFAULT_DEV_FEE_PCT,
+                    example=f"{compute_dev_fee(100_000, DEFAULT_DEV_FEE_PCT):,}",
                     thr=f"{DEV_FEE_PAYOUT_THRESHOLD_SAT:,}",
                     cap=f"{DEV_FEE_DAILY_CAP_SAT:,}", max=DEV_FEE_MAX_PCT),
             sink_label_text: _(
-                "Instead of doing a swap-out to obtain inbound liquidity, "
-                "utilize a liquidity sink instead"),
+                "Instead of using swaps to obtain inbound liquidity, just send "
+                "all funds to this address to obtain it.\n\n"
+                "Frees exactly the same inbound capacity as a reverse swap, but "
+                "settles in seconds with no on-chain claim and no swap provider "
+                "— typically your own account elsewhere. Blank = off."),
             max_size_label_text: _(
                 "Never fund a single channel with more than this.\n\n"
                 "The plugin opens channels with the maximum available on-chain "
@@ -3167,13 +3575,116 @@ class Plugin(LiquidityPlugin):
                 "would be replaced as soon as it was opened. 0 = no ceiling, "
                 "bounded only by Electrum's own maximum funding amount."),
         }
+
+        # --- the two swap-out triggers, which quote their own box -----------
+        # These read better with the user's own number in them than with a
+        # placeholder, so each is rebuilt from the text currently in its field
+        # (see the textChanged wiring in the build loop) rather than being
+        # formatted once from the saved value. Formatting it once would leave
+        # the tooltip describing the SAVED threshold while the box on screen
+        # showed an edited one -- hover help that contradicts the form it is
+        # attached to is worse than hover help with an "x" in it.
+        #
+        # Note the asymmetry in the two comparisons, which is the engine's and
+        # not a slip: `over_swap_trigger` fires the percentage trigger at
+        # `local_sat >= pct% * capacity` but the sat trigger at
+        # `local_sat > trigger_sat` -- so the first is "or greater" and the
+        # second is strictly "more than". A channel holding exactly the sat
+        # trigger does not swap.
+        def _trigger_amount(text: str, *, as_int: bool) -> Optional[str]:
+            """The value in a trigger box, formatted for prose, or None if the
+            box does not currently hold a usable number (mid-edit, or empty) --
+            in which case the tooltip falls back to a placeholder.
+
+            Every keystroke reaches this, including the ones that leave the box
+            holding something that is not a threshold, so the rejections matter
+            as much as the formatting:
+
+              * unparseable or negative -- the obvious mid-edit states;
+              * ``nan`` and ``inf``, which ``float()`` accepts quite happily and
+                ``int()`` then refuses (ValueError and OverflowError), raising
+                inside a Qt slot rather than showing a tooltip;
+              * absurdly large but finite, which parses and formats fine and
+                would render a 300-digit number into a floating window.
+
+            A rejected value is not an error -- the user is still typing. It just
+            means the sentence keeps its placeholder for another keystroke.
+            """
+            try:
+                value = float((text or "").strip())
+            except ValueError:
+                return None
+            if not math.isfinite(value) or value < 0 or value > _MAX_TRIGGER_VALUE:
+                return None
+            return f"{int(value):,}" if as_int else f"{value:g}"
+
+        def _trigger_pct_help(text: str) -> str:
+            amount = _trigger_amount(text, as_int=False)
+            return _(
+                "When the channel is {pct} full or greater, trigger a swap out "
+                "to make more inbound liquidity.\n\n"
+                "Measured against the channel's own capacity, counting the "
+                "balance on your side — the outbound that a swap converts into "
+                "inbound. Checked alongside the sat trigger below, and whichever "
+                "is reached first wins.\n\n"
+                "Reaching a trigger starts the attempt; it does not guarantee "
+                "one. The all-in fee ceiling, the minimum swap size and any "
+                "outbound you asked to keep can each still decline it — the "
+                "Declines tab says which."
+            ).format(pct=f"{amount}%" if amount is not None else _("x%"))
+
+        def _trigger_sat_help(text: str) -> str:
+            amount = _trigger_amount(text, as_int=True)
+            return _(
+                "When the channel has more than {sat} in it, trigger a swap out "
+                "to make more inbound liquidity.\n\n"
+                "\"More than\", not \"at least\": a channel holding exactly this "
+                "much does not swap. Counts the balance on your side, and is "
+                "checked alongside the percentage trigger above — whichever is "
+                "reached first wins.\n\n"
+                "Reaching a trigger starts the attempt; it does not guarantee "
+                "one. The all-in fee ceiling, the minimum swap size and any "
+                "outbound you asked to keep can each still decline it — the "
+                "Declines tab says which."
+            ).format(sat=_("{} sat").format(amount) if amount is not None
+                     else _("x sats"))
+
+        live_tooltips: Dict[str, Callable[[str], str]] = {
+            trigger_pct_label_text: _trigger_pct_help,
+            trigger_sat_label_text: _trigger_sat_help,
+        }
+
         edits = []
-        for row, (label, value, parser, setter) in enumerate(fields):
+        for row, (label, attr, value, parser, setter) in enumerate(fields):
             label_w = QLabel(label)
             edit = QLineEdit(value)
-            if label in tooltips:
-                label_w.setToolTip(tooltips[label])
-                edit.setToolTip(tooltips[label])
+            # Three sources, most specific first: a tooltip written for this row
+            # here, one rebuilt from the row's own contents, and -- for every
+            # other row -- the explanation already carried by the ConfigVar that
+            # declares the setting. The fallback is what gives the rows nobody
+            # has written bespoke copy for (and every row added later) hover
+            # help, instead of a bare label the user has to guess at.
+            if label in live_tooltips:
+                render = live_tooltips[label]
+
+                def _retip(text: str, *, _l=label_w, _e=edit, _r=render) -> None:
+                    # Guarded for the same reason _reload_goal is: this is a slot
+                    # on a widget's own signal, so it outlives nothing -- but a
+                    # repopulate during teardown can still reach a deleted label.
+                    try:
+                        tip = _r(text)
+                        _l.setToolTip(tip)
+                        _e.setToolTip(tip)
+                    except RuntimeError:
+                        return
+
+                _retip(value)
+                edit.textChanged.connect(_retip)
+            else:
+                tip = tooltips.get(label) or _setting_help(attr)
+                if tip:
+                    label_w.setToolTip(tip)
+                    edit.setToolTip(tip)
             grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             edits.append((edit, parser, setter, label))
@@ -3186,8 +3697,7 @@ class Plugin(LiquidityPlugin):
         # connect_fields -- exactly the pairing the Send and Receive tabs use.
         # The stored ConfigVar is always sats regardless of what is displayed.
         goal_label_text = _("Liquidity goal")
-        goal_tooltip = _("Automatically close small channels and re-open bigger "
-                         "channels if we have sufficient funds to reach this goal")
+        goal_tooltip = _setting_help('INBOUND_LIQUIDITY_GOAL_SAT')
         goal_row = len(fields)
         goal_label = QLabel(goal_label_text)
         goal_label.setToolTip(goal_tooltip)
@@ -3198,15 +3708,37 @@ class Plugin(LiquidityPlugin):
         goal_e = BTCAmountEdit(get_decimal_point)
         goal_e.setToolTip(goal_tooltip)
         goal_e.setAmount(self._liquidity_goal_sat(wallet))
-        grid.addWidget(goal_e, goal_row, 1)
+        # The amount and its fiat companion share ONE grid cell, side by side,
+        # rather than taking a column each.
+        #
+        # They used to sit in columns 1 and 2, which put the fiat box most of a
+        # window-width away from the sats it restates -- and the gap GREW with
+        # the window, so the roomier the screen the easier the field was to
+        # miss. Nothing was stretching it: Electrum's AmountEdit is a fixed
+        # ~144px, while the plain QLineEdits on the rows above expand, so
+        # column 1 is sized by THEM (374px at Electrum's default 840px window,
+        # 828px at 1280px). The amount box filled 144px of that and column 2
+        # began after the whole empty remainder.
+        #
+        # Pairing them in the cell makes the spacing between the two boxes the
+        # layout's own, independent of what the column is sized to, and the
+        # trailing stretch absorbs the remainder on the right where it is
+        # invisible. Column 2 of this grid is simply unused now.
+        goal_box = QHBoxLayout()
+        goal_box.setContentsMargins(0, 0, 0, 0)
+        goal_box.addWidget(goal_e)
         fx = getattr(window, "fx", None)
         goal_fiat_e = None
         if fx is not None and hasattr(window, "connect_fields"):
             goal_fiat_e = AmountEdit(fx.get_currency)
             goal_fiat_e.setToolTip(goal_tooltip)
+            # A hidden widget is ignored by the layout, so with fiat switched
+            # off the row collapses to just the amount box, as it did before.
             goal_fiat_e.setVisible(bool(fx.is_enabled()))
-            grid.addWidget(goal_fiat_e, goal_row, 2)
+            goal_box.addWidget(goal_fiat_e)
             window.connect_fields(goal_e, goal_fiat_e)
+        goal_box.addStretch(1)
+        grid.addLayout(goal_box, goal_row, 1)
 
         def _reload_goal() -> None:
             """Re-render the goal field from the PERSISTED sat value.
@@ -3750,8 +4282,13 @@ class Plugin(LiquidityPlugin):
         ]
         ceiling_rows = []  # (edit, attr, default, usage_label, kind)
         for (label, attr, default, kind) in ceiling_specs:
-            grid.addWidget(QLabel(label), row, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(str(getattr(c, attr, default)))
+            # Hover help inherited from the ConfigVar that declares the setting,
+            # on both halves of the row -- see _setting_help, and the same
+            # reasoning as the Settings tab's rows.
+            _apply_setting_help(attr, label_w, edit)
+            grid.addWidget(label_w, row, 0)
             grid.addWidget(edit, row, 1)
             usage = QLabel("")
             usage.setStyleSheet("color: gray;")
@@ -3863,8 +4400,14 @@ class Plugin(LiquidityPlugin):
             elif attr == RECOVERY_STARTS_AT:
                 target = recovery_grid
             at = next_row[target]
-            target.addWidget(QLabel(label), at, 0)
+            label_w = QLabel(label)
             edit = QLineEdit(str(getattr(c, attr)))
+            # As on the ceilings above: the ConfigVar's own explanation, on both
+            # halves of the row. These are the knobs the tab's own banner warns
+            # to "change only if you understand the effect" -- so the thing that
+            # says what the effect IS belongs on the knob.
+            _apply_setting_help(attr, label_w, edit)
+            target.addWidget(label_w, at, 0)
             target.addWidget(edit, at, 1)
             field_rows.append((edit, attr, parser, setter, label))
             pane_of_field[attr] = pane_of_grid[target]

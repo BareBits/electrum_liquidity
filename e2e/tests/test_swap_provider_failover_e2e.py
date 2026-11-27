@@ -14,6 +14,33 @@ offers as fresh for 3600s), so the plugin still ranks it first, tries it, times
 out its createswap RPC -- and must then fall back to the surviving provider and
 complete a REAL reverse swap, without waiting out the cooldown.
 
+WHY THE CLIENT HAS NO CHANNEL TO PARTNER2, which every test here depends on.
+
+Partner2's advertised reverse cap comes from PARTNER, over a channel the client
+is not party to (``Rig._open_provider2_supply``). It used to come from a channel
+the CLIENT held, and that made this whole file fail roughly one run in three, a
+different test each time:
+
+  * a swapserver advertises ``max_forward = num_sats_can_receive()``, and one
+    0.02 BTC channel is only worth ~900k of it -- enough for ONE of the client's
+    ~760k swaps;
+  * the engine draws that cap down as it plans (``_decide_reverse_swaps``'s
+    ``consumed``), so exactly one channel per pass could be planned against
+    partner2 and the rest fell back to partner1 with their rungs re-priced;
+  * which channel got it was decided by ``LNWallet.__init__``'s
+    ``random_shuffled_copy`` of the channel dict -- a fresh coin flip per daemon
+    start.
+
+When the shuffle put the client->partner2 channel first, that channel drained
+through its OWN direct peer, succeeded, consumed the cap, and no payment failed
+anywhere in the run -- so the three tests below that open by waiting for a failed
+payment waited out their full timeout. Sourcing partner2's capacity from PARTNER
+removes the choice entirely: every client channel is a partner1 channel, every
+one of them ranks partner2 first on price, and every one of them finds it
+unpayable. (The engine now also fixes its own half of this -- ``drain_order``
+plans the fullest channel first instead of taking Electrum's shuffle -- but the
+rig must not depend on that to be deterministic.)
+
 What is asserted:
   * the dead provider is tried first and collects a reliability fault,
   * the swap nevertheless completes, via the OTHER provider, in the same cycle
@@ -24,8 +51,10 @@ A second test covers the failure on the OTHER side of that RPC: a provider that
 answers createswap normally but cannot be paid over Lightning. It reaches the
 executor as ``reverse_swap`` returning None, which used to be misread as "the
 provider accepted, funding is pending" and ended the cascade with nothing done.
-That one needs no sabotage -- the rig's topology already pins a swap's Lightning
-leg to a channel from which the cheapest provider is unroutable.
+That one needs no sabotage either: partner2 is reachable over nostr and has real
+capacity, so it answers createswap normally, but the client holds no channel to
+it, gossip is off and Electrum nodes do not forward as trampolines -- so the
+Lightning leg, pinned to a partner1 channel, can find no route at any size.
 
 That same test now also pins the reason the cascade still went nowhere in
 practice: at the instant ``reverse_swap`` returns, BOTH of a swap's HTLCs are
@@ -47,13 +76,34 @@ failing ~126s apart: the first read as "nothing committed" and correctly retried
 smaller, the second as "may have committed funds", ending the cascade with four
 ranked providers untried.
 
-Note this rig hid both for a long while: its providers are direct channel peers,
-so HTLCs resolve fast enough that the old code sometimes got past the gate anyway.
+Note this rig hid both for a long while: the surviving provider is a direct
+channel peer, so HTLCs resolve fast enough that the old code sometimes got past
+the gate anyway.
 
-Two further tests cover the rest of the fix: a provider whose payment failed is
-retried once at 90% of the amount before we move on (a swap sized to what Electrum
-can SEND is not necessarily one the graph can ROUTE), and a swap that never funded
-is never written to the decision log as a completed action.
+A final test covers the rest of the fix: a swap that never funded is never
+written to the decision log as a completed action.
+
+WHAT IS DELIBERATELY NOT HERE: the SIZE LADDER. A test in this file used to
+demand that a provider whose payment failed be retried at a smaller size, and it
+could not pass on this topology for a reason that has nothing to do with
+failover. Rungs are ordered by cost per sat, and the fixed mining fee makes a
+small swap dear per sat -- so the surviving provider's FULL-size rung (6.425%)
+sorts ahead of every reduced rung (6.684% and up), and being a direct channel
+peer it settles. The ladder is therefore never descended here, and the test only
+ever passed when an unrelated capacity clamp happened to shrink some rung.
+
+That behaviour is covered where it can be made deterministic, and already was:
+
+  * ``tests/test_swap_ladder_e2e.py`` -- the whole ladder walked when no rung can
+    route, its sizes pinned to ``SWAP_LADDER_FACTORS``, descending, no repeats,
+    only sub-planned rungs labelled "reduced", cost per sat rising as size falls,
+    and one fault per cascade rather than one per rung. It gets determinism from
+    the ``preferred_npubs`` whitelist, which keeps the direct peer out of the
+    ranking -- the move this file cannot make, since the direct peer IS the
+    failover target under test;
+  * ``tests/test_swap_ladder_cascade_glue.py`` -- a smaller rung of the same
+    provider being the one that works, which that file records as un-stageable on
+    any of these rigs after three separate attempts.
 
 Heavy and slow (~8-12 min each); needs the electrum venv + docker. Function-scoped
 rig (wipes .run, kills any previous rig), so it must NOT run while a manual
@@ -64,13 +114,12 @@ Run:  RUN_RIG_E2E=1 .venv-electrum/bin/python -m pytest \
 """
 from __future__ import annotations
 
-import glob
 import re
 import json
 import os
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import pytest
 
@@ -81,7 +130,6 @@ if os.environ.get("RUN_RIG_E2E") != "1":
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import run as run_mod  # noqa: E402
-from rig import paths  # noqa: E402
 from rig.services import (  # noqa: E402
     set_client_plugin_setting,
     CLIENT,
@@ -92,6 +140,7 @@ from rig.services import (  # noqa: E402
     stop_daemon,
     wait_wallet_height,
     wallet_path,
+    read_electrum_log,
 )
 
 
@@ -140,12 +189,13 @@ def _max_inbound() -> int:
 
 
 def _client_log_text() -> str:
-    logs = sorted(glob.glob(str(
-        paths.CLIENT_DATADIR / "regtest" / "logs" / "electrum_log_*.log")))
-    if not logs:
-        return ""
-    with open(logs[-1], errors="replace") as fh:
-        return fh.read()
+    """Everything the client daemon has logged, oldest first.
+
+    Thin alias for ``rig.services.read_electrum_log``: it reads the rotation
+    backups and the files left by earlier daemon runs, neither of which the
+    ``electrum_log_*.log`` glob this used to do could see.
+    """
+    return read_electrum_log(CLIENT)
 
 
 # One "reverse swap via <provider>… (rung N of M…): <amount> sat" line per
@@ -155,79 +205,6 @@ _ATTEMPT_RE = re.compile(r"reverse swap via (\S+?)…? \(rung \d+ of \d+")
 
 # The provider recorded on a completed swap's decision-log entry.
 _ACTION_NPUB_RE = re.compile(r"provider (npub1[0-9a-z]+)")
-
-
-# --- reading cascades out of the client log -------------------------------
-#
-# A cascade is ONE channel's drain inside ONE evaluation, and the log marks both
-# boundaries:
-#
-#   * every evaluation opens with "<wallet>: onchain=... channels=...";
-#   * every attempt announces itself with "attempting swap with <provider>
-#     (rung N of M) (<amount> sat from channel <short_id>)".
-#
-# The failed-rung and fault lines name the provider but not the channel, so they
-# are attributed to the most recent attempt -- which is the cascade they belong
-# to by construction, since a cascade runs its rungs in sequence.
-#
-# NB the rung index is NOT a cascade boundary: it is the position of the
-# (provider, size) ENTRY in the ranked list, and every ladder rung of one entry
-# reuses it, so "rung 1 of N" recurs within a single cascade.
-_NPUB_KEY_LEN = 12
-_TICK_RE = re.compile(r": onchain=\d+ channels=\d+")
-_ATTEMPT_CHANNEL_RE = re.compile(
-    r"attempting swap with .*? sat from channel (\S+?)\)")
-_RUNG_FAILED_RE = re.compile(
-    r"reverse swap via (\S+?)…? produced no funding: "
-    r"the Lightning payment failed")
-# `provider <npub>… [soft ]fault #N (total M): <reason>` -- anchored on
-# "provider" so the identically-shaped channel-PEER fault line cannot be counted
-# as a provider's, and carrying the reason because only ONE kind of fault is
-# charged once per cascade. A provider can legitimately collect two faults in
-# one cascade for two different observations (unreachable, then a failed
-# payment); what `charged_npubs` guarantees is that the PAYMENT failure is
-# charged once however many of that provider's rungs it kills.
-_PROVIDER_FAULT_RE = re.compile(
-    r"provider (\S+?)…? (?:soft )?fault #\d+ \(total \d+\): (.+)$")
-# `_charge_payment_failure`'s reason, verbatim.
-_PAYMENT_FAULT_REASON = "reverse-swap Lightning payment failed"
-
-
-def _cascades() -> Dict[Tuple[int, str], Dict[str, Dict[str, int]]]:
-    """Per-cascade, per-provider tallies of failed rungs and faults charged.
-
-    Keyed by ``(evaluation number, channel)`` -- see the note above. Each value
-    maps a provider key (the npub truncated to the shortest width the plugin
-    logs) to ``{"failures": n, "faults": n, "payment_faults": n}``.
-    """
-    cascades: Dict[Tuple[int, str], Dict[str, Dict[str, int]]] = {}
-    tick = 0
-    current: Optional[Tuple[int, str]] = None
-    for line in _client_log_text().splitlines():
-        if _TICK_RE.search(line):
-            tick += 1
-            current = None
-        channel = _ATTEMPT_CHANNEL_RE.search(line)
-        if channel:
-            current = (tick, channel.group(1))
-            cascades.setdefault(current, {})
-        if current is None:
-            continue
-        failed = _RUNG_FAILED_RE.search(line)
-        if failed:
-            _tally(cascades[current], failed.group(1))["failures"] += 1
-        fault = _PROVIDER_FAULT_RE.search(line)
-        if fault:
-            tally = _tally(cascades[current], fault.group(1))
-            tally["faults"] += 1
-            if fault.group(2).strip() == _PAYMENT_FAULT_REASON:
-                tally["payment_faults"] += 1
-    return cascades
-
-
-def _tally(cascade: Dict[str, Dict[str, int]], provider: str) -> Dict[str, int]:
-    return cascade.setdefault(provider[:_NPUB_KEY_LEN],
-                              {"failures": 0, "faults": 0, "payment_faults": 0})
 
 
 def _attempted_providers() -> List[str]:
@@ -267,23 +244,73 @@ def _wait_until(cond: Callable[[], bool], *, rig, timeout: float,
 def _arm_swap_config() -> None:
     """Make the plugin swap rather than open or close.
 
-    ``max_channels`` is 3 here (not the usual 2) because ``--second-provider``
-    adds a third channel -- leaving it at 2 would have the engine trying to close
-    one instead of swapping. The fee ceiling is deliberately permissive: the
-    rig's providers charge a fixed 45k prepayment on ~1M swaps, so the honest
-    all-in cost is several percent and the gate would otherwise (correctly)
-    decline every swap before the failover under test could run.
+    ``max_channels`` matches the rig's channel count exactly. Too low and the
+    engine tries to CLOSE one instead of swapping; too high and it tries to OPEN
+    another, since the client still holds ~11.9 BTC on-chain. Either way the
+    cascade under test never runs. ``--second-provider`` gives the client two
+    channels, both to partner1 -- partner2's capacity comes from PARTNER, not
+    from a channel of ours (see the module docstring).
+
+    The fee ceiling is deliberately permissive: the rig's providers charge a
+    fixed 45k prepayment on ~760k swaps, so the honest all-in cost is several
+    percent and the gate would otherwise (correctly) decline every swap before
+    the failover under test could run.
     """
     _setcfg("plugins.inbound_liquidity.one_channel_per_peer", "true")
-    _setcfg("plugins.inbound_liquidity.max_channels", "3")
+    _setcfg("plugins.inbound_liquidity.max_channels", "2")
     _setcfg("plugins.inbound_liquidity.swap_trigger_sat", "100000")
     _setcfg("plugins.inbound_liquidity.swap_trigger_pct", "10")
     _setcfg("plugins.inbound_liquidity.max_swap_fee_pct", "10")
-    # The dead provider's channel goes offline with it; that is the test's own
-    # doing, not a peer fault worth force-closing over.
+    # Killing partner2 is the test's own doing. It no longer costs the client a
+    # channel (we hold none to it), but the setting stays off so a slow peer
+    # reconnect cannot turn into a force-close mid-test.
     _setcfg("plugins.inbound_liquidity.offline_autoclose_enabled", "false")
     _setcfg("plugins.inbound_liquidity.liquidity_goal_sat", "0")
     _setcfg("plugins.inbound_liquidity.max_opens_per_day", "0")
+
+
+def _assert_no_client_channel_to_partner2(rig, chans: List[Dict]) -> None:
+    """The topology invariant this whole file rests on.
+
+    Two things have to be true at once, and they used to be in tension:
+
+      * partner2 must advertise enough reverse capacity to host EVERY channel's
+        swap in one planning pass, or the engine's ``consumed`` draw-down starves
+        the later channels and which one failed over became a coin flip;
+      * the client must not be able to PAY partner2, or the cheapest provider
+        simply succeeds and there is no failover to observe.
+
+    A client->partner2 channel would satisfy the first and destroy the second, so
+    the capacity comes from PARTNER instead. Asserted rather than assumed: it is
+    one ``open_channels`` call away from silently reverting, and if it did, this
+    file would go back to failing one run in three for reasons that look like
+    Lightning flakiness.
+    """
+    p2_pubkey = rig.partner2_nodeid.split("@", 1)[0].lower()
+    assert not [c for c in chans if c["remote_pubkey"].lower() == p2_pubkey], \
+        ("the client holds a channel to partner2, so its swaps would be payable "
+         "and no failover could be observed; partner2's capacity must come from "
+         "PARTNER (see Rig._open_provider2_supply)")
+
+
+def _assert_partner2_can_host_every_channel(rig, chans: List[Dict]) -> None:
+    """...and the first half of that invariant: partner2's advertised cap has to
+    cover the whole pass, not just one channel.
+
+    ``max_forward_sat`` is what bounds a client REVERSE swap (the plugin reads
+    it, not ``max_reverse_sat`` -- see liquidity_manager.ProviderOffer). If it
+    only covers one channel, the engine plans the rest against partner1 and they
+    never reach the failover path at all.
+    """
+    offer = rig.swap_offer or {}
+    cap = int(offer.get("max_forward_sat") or 0)
+    # What one channel actually gets planned for, less the headroom the planner
+    # subtracts: ~760k on a 0.02 BTC 50/50 channel.
+    needed = len(chans) * 760_000
+    assert cap >= needed, (
+        f"partner2 advertises {cap} sat of reverse capacity but the pass needs "
+        f"{needed} for {len(chans)} channel(s); the later channels would fall "
+        f"back to partner1 and never exercise the failover")
 
 
 @pytest.fixture
@@ -304,8 +331,11 @@ def test_dead_provider_is_skipped_and_the_swap_completes_via_the_next_one(rig):
     # The rig pins swapserver_npub to the CHEAPEST provider, which is partner2 --
     # the one we are about to kill. Confirm the topology before relying on it.
     assert rig.partner2_nodeid, "rig did not bring up a second provider"
+    assert rig.swap_npub, "rig did not pin a cheapest provider to kill"
     chans = _channels()
-    assert len(chans) == 3, f"expected 2 partner + 1 partner2 channels, got {len(chans)}"
+    assert len(chans) == 2, \
+        f"expected 2 client->partner channels, got {len(chans)}"
+    _assert_no_client_channel_to_partner2(rig, chans)
     baseline_inbound = _max_inbound()
     assert baseline_inbound <= 1_100_000, "baseline channels are not ~50/50"
 
@@ -389,31 +419,34 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
     ``PAYMENT_TIMEOUT`` of 120s plus the createswap round trip) followed by
     ``reverse swap funding txid: None`` and no second attempt.
 
-    No sabotage is needed -- the rig's own topology produces it. The engine emits
-    a swap action per over-trigger channel and ranks providers by cost, so a
-    channel to partner1 is planned against the CHEAPER provider, partner2. That
-    provider holds an open channel of its own, so it advertises real capacity and
-    answers createswap normally. But the swap's Lightning leg is pinned to the
-    channel being drained (a partner1 channel), gossip is off, and Electrum nodes
-    do not forward as trampolines -- so there is no route to partner2 and the
-    payment cannot land. The failover provider, partner1, sits at the far end of
-    that very channel, so the second attempt completes a real swap.
+    No sabotage is needed -- the rig's own topology produces it, for EVERY channel
+    rather than for a lucky one. The engine emits a swap action per over-trigger
+    channel and ranks providers by cost, and all of the client's channels go to
+    partner1, so every one of them is planned against the CHEAPER provider,
+    partner2. That provider has ample inbound -- over a channel from PARTNER, not
+    from us -- so it advertises real capacity and answers createswap normally. But
+    the swap's Lightning leg is pinned to the channel being drained, gossip is
+    off, and Electrum nodes do not forward as trampolines -- so the client has no
+    route to partner2 at any size and the payment cannot land. The failover
+    provider, partner1, sits at the far end of the very channel being drained, so
+    the second attempt completes a real swap.
 
     An earlier version of this test closed the client's channel to partner2 to
-    force the failure. That does not reach this path at all: with no channel
-    partner2 has no receive capacity, so it REJECTS createswap and the
+    force the failure. That does not reach this path at all: a provider with no
+    inbound ANYWHERE has no receive capacity, so it REJECTS createswap and the
     pre-existing SwapServerError arm handles it -- which is why the assertions
-    below check the classification, not merely that some failover happened.
+    below check the classification, not merely that some failover happened. The
+    rig now gets this right by construction: partner2 has ample inbound (from
+    PARTNER, so it accepts) and the client has no way to reach it (so the payment
+    then fails). Both halves are asserted below, because the test is vacuous if
+    either slips.
     """
     assert rig.partner2_nodeid, "rig did not bring up a second provider"
     chans = _channels()
-    assert len(chans) == 3, f"expected 2 partner + 1 partner2 channels, got {len(chans)}"
-    # `nodeid` returns "<pubkey_hex>@<listen_addr>"; list_channels reports the bare
-    # hex, so strip the address before matching.
-    p2_pubkey = rig.partner2_nodeid.split("@", 1)[0].lower()
-    assert [c for c in chans if c["remote_pubkey"].lower() == p2_pubkey], \
-        "partner2 has no channel, so it would reject createswap instead of " \
-        "accepting a swap whose payment then fails"
+    assert len(chans) == 2, \
+        f"expected 2 client->partner channels, got {len(chans)}"
+    _assert_no_client_channel_to_partner2(rig, chans)
+    _assert_partner2_can_host_every_channel(rig, chans)
 
     baseline_inbound = _max_inbound()
 
@@ -593,122 +626,6 @@ def test_failed_lightning_payment_fails_over_to_the_next_provider(rig):
         f"inbound liquidity did not increase (max remote_balance={_max_inbound()})"
 
 
-def test_a_failed_payment_retries_the_same_provider_at_a_smaller_size(rig):
-    """A provider whose Lightning payment failed is tried again at a smaller size.
-
-    This is the other half of why swaps were not completing. Sizing already asks
-    Electrum what it can send (``num_sats_can_send`` minus a fee-reserve headroom),
-    but "can I afford to send this" and "does the graph have a route for this" are
-    different questions. On mainnet a 95,468 sat swap out of a 109,921 sat channel
-    failed 29 route attempts in a row -- every failure a TEMPORARY_CHANNEL_FAILURE or
-    UNKNOWN_NEXT_PEER from downstream, several reported by our own channel peer,
-    which simply could not forward that much onward. No provider choice fixes that;
-    a smaller amount can.
-
-    Asserted on the log rather than on an outcome, because whether the smaller rung
-    SUCCEEDS depends on the rig's liquidity at that moment -- what must hold is that
-    it is attempted, at a ladder size. The rig's permissive 10% fee ceiling (see
-    _arm_swap_config) guarantees the smaller amounts still clear the cost gate, so
-    the rungs are always priced here; the refusal case is unit-tested, where the
-    arithmetic can be pinned exactly.
-
-    NB what this NO LONGER asserts. Under the size ladder the smaller rung is not
-    bolted onto the provider that just failed -- it is an independent entry in one
-    cost-ordered list, so another provider's full-size swap legitimately runs first
-    whenever it is cheaper per sat. "Smaller size before the next provider" was an
-    artefact of the old providers-outer walk and is not a property worth preserving;
-    what IS still true, and is checked here, is that the same provider is retried
-    smaller somewhere in the walk, at a size off the ladder.
-    """
-    assert rig.partner2_nodeid, "rig did not bring up a second provider"
-
-    _arm_swap_config()
-    _setcfg("plugins.inbound_liquidity.automation_enabled", "true")   # arm last
-
-    # Wait for a payment failure -- the only arm that earns a reduced retry.
-    assert _wait_until(
-        lambda: "the Lightning payment failed (no funds committed)"
-                in _client_log_text(), rig=rig, timeout=600), \
-        "no swap reached the failed-payment arm, so no reduced retry was possible"
-
-    # A rung below the planned size really ran, labelled as such.
-    assert _wait_until(
-        lambda: "reduced size" in _client_log_text(), rig=rig, timeout=420), \
-        "no rung below the planned size was ever attempted"
-
-    # Recover every attempted rung as (provider, amount) and find a provider that
-    # was tried at more than one size.
-    rungs = re.findall(
-        r"reverse swap via (\S+?)…? \(rung \d+ of \d+(?:, reduced size)?\): (\d+) sat",
-        _client_log_text())
-    by_provider = {}
-    for npub, amount in rungs:
-        by_provider.setdefault(npub, []).append(int(amount))
-    retried = {n: a for n, a in by_provider.items() if len(a) > 1}
-    assert retried, (
-        f"no provider was retried at a second size; rungs seen: {by_provider}")
-
-    # The sizes are the engine's ladder steps off the planned amount, never numbers
-    # the executor invented: each is some SWAP_LADDER_FACTORS fraction of the
-    # largest size that provider was tried at, and they descend.
-    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
-        SWAP_LADDER_FACTORS)
-    for npub, amounts in retried.items():
-        assert amounts == sorted(amounts, reverse=True), \
-            f"{npub} rungs are not descending: {amounts}"
-        planned = amounts[0]
-        allowed = {int(planned * f) for f in SWAP_LADDER_FACTORS}
-        assert set(amounts) <= allowed, (
-            f"{npub} was tried at {amounts}, which is not a subset of the ladder "
-            f"{sorted(allowed, reverse=True)} off {planned}")
-
-    # One observation, one fault: a provider whose payment failed on two rungs of
-    # the SAME cascade must be charged ONE payment-failure fault, not one per rung.
-    #
-    # Only the payment-failure reason is counted. A provider can legitimately
-    # collect more than one fault in a cascade when the observations differ --
-    # unreachable on one rung, a failed payment on another -- and an earlier
-    # version of this check, which counted faults of every kind, failed on
-    # exactly that (1 failed rung, 2 faults, the other one a timeout).
-    #
-    # Scoped to a cascade deliberately. This used to compare the reliability
-    # store's cumulative ``fault_count`` against the log's cumulative count of
-    # failed rungs -- and both accumulate over every evaluation cycle the test
-    # happens to witness. Two cycles that each fail one rung and correctly charge
-    # one fault give "2 faults against 2 failures", which it read as a violation.
-    # So it was measuring how many cycles had elapsed before the waits above
-    # returned, not how faults are charged: it failed on main and passed on other
-    # branches for no better reason than timing. Per cascade, the invariant holds
-    # however many cycles run.
-    assert _wait_until(
-        lambda: any(int(s.get("fault_count", 0)) > 0
-                    for s in _reliability().values()),
-        rig=rig, timeout=240), f"no provider fault recorded: {_reliability()}"
-    cascades = _cascades()
-    assert cascades, "no swap cascade was found in the log"
-    offenders = [
-        (where, provider, tally)
-        for where, cascade in cascades.items()
-        for provider, tally in cascade.items()
-        if tally["payment_faults"] > 1
-    ]
-    assert not offenders, (
-        f"a provider was charged more than one payment-failure fault in a "
-        f"single cascade: {offenders}")
-
-    # Whether the two-failures-in-one-cascade case actually AROSE is the rig's
-    # timing to decide (the second rung often succeeds), so it is reported rather
-    # than demanded -- the same treatment the HTLC gate gets above. The charging
-    # arithmetic itself is pinned in tests/test_swap_provider_failover_glue.py.
-    doubled = [(where, p, t) for where, c in _cascades().items()
-               for p, t in c.items() if t["failures"] > 1]
-    if doubled:
-        print(f"once-per-provider charging exercised: {doubled}")
-    else:
-        print("no cascade failed the same provider twice this run; the "
-              "once-per-cascade rule was not exercised (see the glue tests)")
-
-
 def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):
     """A swap that produced no on-chain funding must never appear in Actions.
 
@@ -720,6 +637,13 @@ def test_an_unfunded_swap_is_not_recorded_as_a_completed_action(rig):
     did work, which is precisely the confusion that made "no swaps are completing"
     hard to see.
     """
+    # This test is built on a swap whose payment fails, so the topology that
+    # guarantees one is checked up front -- otherwise a reverted rig shows up as
+    # a 600s timeout on the wait below rather than as the topology error it is.
+    chans = _channels()
+    _assert_no_client_channel_to_partner2(rig, chans)
+    _assert_partner2_can_host_every_channel(rig, chans)
+
     _arm_swap_config()
     _setcfg("plugins.inbound_liquidity.automation_enabled", "true")
 

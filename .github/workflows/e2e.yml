@@ -25,7 +25,18 @@ env:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The whole suite is ~3-4 hours: ~56 rig bring-ups (most tests want a
+    # virgin rig and say so, by asserting the baseline topology in their first
+    # lines), at ~1 minute of bring-up each plus the test itself, several of
+    # which legitimately wait 10-20 minutes on a real chain.
+    #
+    # This was 60, which could not fit the default `e2e/tests` input and would
+    # have killed the run part-way with no indication that the deadline rather
+    # than the code was at fault. 300 leaves room on a slower runner; a single
+    # test's own deadline is enforced separately and much more tightly by
+    # `rig_e2e` in e2e/tests/conftest.py, so a genuine hang still fails fast
+    # with a traceback instead of sitting here for five hours.
+    timeout-minutes: 300
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v4

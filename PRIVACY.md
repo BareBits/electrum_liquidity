@@ -27,9 +27,12 @@ The plugin can send us a small report so we know how many people use it, which s
 matter, and how much liquidity it actually provisions. It is **off until you choose
 otherwise**, and the plugin behaves identically whether you switch it on or not.
 
-You are asked once, on a consent screen that shows **the exact report** each level would
-send — built by the same code that builds the real report, so what you are shown is what
-would be sent. You can change or revoke your choice at any time under
+You are asked once **per wallet**, on a consent screen that shows **the exact report**
+each level would send — built by the same code that builds the real report, so what you
+are shown is what would be sent. The choice belongs to the wallet, not to the
+installation: it is stored in that wallet's own file, every wallet you open is asked in
+its own right, and the screen names the wallet it is asking about. Answering on one
+wallet neither opts in nor opts out any other. You can change or revoke your choice at any time under
 **Wallet → Inbound Liquidity → Advanced → Usage statistics**, which shows the same live
 preview.
 

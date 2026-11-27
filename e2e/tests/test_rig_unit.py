@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+import conftest                                                   # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rig import paths, ports, trampoline_stub  # noqa: E402
@@ -483,3 +485,235 @@ def test_ensure_marked_does_not_reexec_and_marks_only_this_process(monkeypatch) 
     # Idempotent: calling it again (every rig fixture does) is a no-op.
     run_mod._ensure_marked()
     assert os.environ[paths.MARKER_ENV] == paths.MARKER_VALUE
+
+
+# -- reading a daemon's logs (rotation + restarts) -------------------------
+#
+# These pin the helper every heavy e2e suite greps through. Its predecessor --
+# a `electrum_log_*.log` glob, usually `[-1]` -- could see neither the
+# RotatingFileHandler's backups nor the files an earlier daemon run left, which
+# silently turned `assert "..." not in log` into a pass.
+def _write_logs(directory, names_to_text):
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, text in names_to_text.items():
+        (directory / name).write_text(text)
+
+
+def _fake_inst(tmp_path, monkeypatch):
+    from rig import services
+    inst = services.ElectrumInstance(
+        name="client", datadir=tmp_path / "dd", wallet_name="w")
+    return inst
+
+
+def test_read_electrum_log_orders_rotation_backups_oldest_first(tmp_path, monkeypatch):
+    """A HIGHER rotation suffix is OLDER: rotation renames every backup up one
+    number before opening a fresh live file. So `.log.2` precedes `.log.1`,
+    which precedes the live `.log`."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "newest\n",
+        "electrum_log_20260101T000000Z_10.log.1": "middle\n",
+        "electrum_log_20260101T000000Z_10.log.2": "oldest\n",
+    })
+    assert read_electrum_log(inst) == "oldest\nmiddle\nnewest\n"
+
+
+def test_read_electrum_log_spans_daemon_restarts(tmp_path, monkeypatch):
+    """A restart opens a NEW base name. Reading only the newest file would drop
+    everything before it -- and the rig restarts the client deliberately."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "first run\n",
+        "electrum_log_20260101T010000Z_11.log": "second run\n",
+    })
+    assert read_electrum_log(inst) == "first run\nsecond run\n"
+
+
+def test_read_electrum_log_interleaves_restarts_and_rotation(tmp_path, monkeypatch):
+    """Both axes at once, which is the real shape of a long rig run."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log.1": "a\n",
+        "electrum_log_20260101T000000Z_10.log": "b\n",
+        "electrum_log_20260101T010000Z_11.log.1": "c\n",
+        "electrum_log_20260101T010000Z_11.log": "d\n",
+    })
+    assert read_electrum_log(inst) == "a\nb\nc\nd\n"
+
+
+def test_read_electrum_log_ignores_unrelated_files(tmp_path, monkeypatch):
+    """The log dir is not ours alone; only Electrum's own files may be read."""
+    from rig.services import read_electrum_log
+    inst = _fake_inst(tmp_path, monkeypatch)
+    _write_logs(inst.datadir / "regtest" / "logs", {
+        "electrum_log_20260101T000000Z_10.log": "mine\n",
+        "something_else.log": "not mine\n",
+        "electrum_log_20260101T000000Z_10.log.bak": "not a rotation suffix\n",
+    })
+    text = read_electrum_log(inst)
+    assert "mine" in text
+    assert "not mine" not in text
+    # A non-numeric suffix is not a rotation backup, but it IS an electrum_log_
+    # file, so it is read rather than silently dropped -- losing log lines is the
+    # failure mode this helper exists to prevent.
+    assert "not a rotation suffix" in text
+
+
+def test_read_electrum_log_missing_dir_is_empty(tmp_path, monkeypatch):
+    """Called before the daemon has ever started; must not raise."""
+    from rig.services import read_electrum_log
+    assert read_electrum_log(_fake_inst(tmp_path, monkeypatch)) == ""
+
+
+# -- second-provider supply channel (R2 topology) --------------------------
+def test_second_provider_supply_is_big_enough_for_every_channel():
+    """partner2's advertised reverse cap is drawn down as the engine plans
+    (``consumed``), so it must cover EVERY client channel in one pass. If it
+    covers only one, which channel gets it is decided by Electrum's random
+    channel-load order -- the coin flip this topology exists to remove."""
+    import run as run_mod  # noqa: PLC0415 -- rig entrypoint, imported lazily
+    args = run_mod.parse_args(["--no-gui", "--second-provider"])
+    # What one 0.02 BTC 50/50 channel can actually have drained out of it, less
+    # the headroom the planner subtracts: ~760k observed on the rig.
+    per_channel_drain_sat = 760_000
+    supply_sat = int(run_mod.PROVIDER2_SUPPLY_BTC * 100_000_000)
+    assert supply_sat >= args.channels * per_channel_drain_sat, (
+        f"{supply_sat} sat of partner2 inbound cannot host {args.channels} "
+        f"swaps of ~{per_channel_drain_sat} sat; the pass would starve and the "
+        f"shuffle would decide which channel failed over")
+
+
+# -- the rig-fixture naming convention -------------------------------------
+def test_every_rig_fixture_follows_the_naming_convention():
+    """A fixture that brings the rig up must be named ``rig`` or ``*_rig``.
+
+    This is enforced rather than merely documented because something real
+    depends on it. ``conftest.is_rig_fixture`` decides, at collection time,
+    which tests get the long ``rig_e2e`` deadline instead of the repo-wide
+    300s one -- and nothing about a fixture's name can PROVE it launches
+    bitcoind, so the name is the only signal available there. A rig fixture
+    called ``stack`` or ``harness`` would therefore inherit the 300s default
+    and its test would be SIGALRM'd a few minutes into bring-up, reported as a
+    timeout on whichever line it happened to be on. That is a long afternoon.
+
+    So: find every fixture in this directory that constructs a ``Rig``, and
+    insist it is named so that the collector can see it. Static (``ast``, no
+    import), and it lives in the fast suite on purpose -- a convention policed
+    only by the suite that takes four hours is not policed.
+    """
+    import ast  # noqa: PLC0415 -- only this test needs it
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    offenders: list[str] = []
+    checked = 0
+    for name in sorted(os.listdir(here)):
+        if not (name.startswith("test_") and name.endswith(".py")):
+            continue
+        tree = ast.parse(open(os.path.join(here, name), encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorated = any(
+                "fixture" in ast.unparse(d) for d in node.decorator_list)
+            if not decorated:
+                continue
+            # `run_mod.Rig(...)` or a bare `Rig(...)` anywhere in the body.
+            builds_rig = any(
+                isinstance(call, ast.Call)
+                and (getattr(call.func, "attr", None) == "Rig"
+                     or getattr(call.func, "id", None) == "Rig")
+                for call in ast.walk(node))
+            if not builds_rig:
+                continue
+            checked += 1
+            if not conftest.is_rig_fixture(node.name):
+                offenders.append(f"{name}::{node.name}")
+
+    assert checked, "found no rig-building fixtures at all; has the suite moved?"
+    assert not offenders, (
+        "these fixtures build a Rig but are not named `rig`/`*_rig`, so the "
+        "collector cannot give them the rig_e2e deadline and their tests will "
+        f"be killed at 300s: {offenders}")
+
+
+# -- batched config writing -------------------------------------------------
+def test_batched_config_matches_the_cli(tmp_path):
+    """``rig.apply_config`` must produce the config file the CLI loop produced.
+
+    This is the whole safety argument for the batching. ``setup_wallet`` used
+    to run ``electrum -o setconfig <key> <value>`` once per pair, which was 25s
+    of a 58s bring-up; it now writes them in one process. That is only a sound
+    swap if the bytes on disk are the same, because every e2e test in this
+    directory takes the resulting daemon's behaviour as its premise -- a value
+    arriving as the string ``"true"`` instead of the bool ``True`` would not
+    fail here, it would fail somewhere else, hours later, as a swap that never
+    happened.
+
+    So: drive both paths over the REAL client pairs and diff the files. The
+    real pairs rather than a sample, because the interesting cases are in them
+    -- ``"true"``/``"false"`` that must survive `literal_eval` as bools, an
+    integer-looking string, a ``server`` value with colons that must NOT be
+    eval'd into something else, and a ``plugins.*.enabled`` key that takes the
+    plugin-enabler branch instead of the ConfigVar one.
+
+    Slow for this file (two interpreter starts per key on the CLI side, ~10s)
+    but it is the only test here that can catch a divergence, and it needs no
+    rig: no bitcoind, no daemon, just two scratch data directories.
+    """
+    import json as _json  # noqa: PLC0415
+    import subprocess as _sp  # noqa: PLC0415
+
+    from rig.services import _client_config_pairs
+
+    pairs = _client_config_pairs(_endpoints())
+    assert pairs, "no client config pairs to compare"
+
+    old_dir, new_dir = tmp_path / "viacli", tmp_path / "batched"
+    old_dir.mkdir()
+    new_dir.mkdir()
+
+    electrum_bin = paths.VENV_ELECTRUM / "bin" / "electrum"
+    if not electrum_bin.exists():                      # pragma: no cover
+        pytest.skip("no electrum venv here; run e2e/setup.sh")
+
+    for key, value in pairs:
+        done = _sp.run(
+            [str(electrum_bin), "--regtest", f"--dir={old_dir}",
+             "-w", str(old_dir / "wal"), "-o", "setconfig", key, str(value)],
+            capture_output=True, text=True, timeout=120)
+        assert done.returncode == 0, f"CLI setconfig {key} failed: {done.stderr}"
+
+    done = _sp.run(
+        [str(paths.VENV_PYTHON), "-m", "rig.apply_config",
+         "--dir", str(new_dir), "--wallet", str(new_dir / "wal"), "--regtest"],
+        input=_json.dumps([[k, str(v)] for k, v in pairs]),
+        capture_output=True, text=True, timeout=120,
+        cwd=str(paths.RIG_ROOT))
+    assert done.returncode == 0, f"apply_config failed: {done.stderr}"
+
+    via_cli = _json.loads((old_dir / "regtest" / "config").read_text())
+    batched = _json.loads((new_dir / "regtest" / "config").read_text())
+    assert batched == via_cli, (
+        "batched config write diverged from the CLI. Differing keys: "
+        f"{ {k: (via_cli.get(k), batched.get(k)) for k in set(via_cli) | set(batched) if via_cli.get(k) != batched.get(k)} }")
+
+    # Not vacuously equal: every pair really did land. Resolved through the
+    # nesting, because a dotted plugin key is not stored flat -- Electrum
+    # writes `plugins.inbound_liquidity.enabled` as
+    # {"plugins": {"inbound_liquidity": {"enabled": true}}}, which is exactly
+    # the kind of divergence the equality above exists to catch and which a
+    # flat `key in batched` would have mistaken for a missing value.
+    def _resolve(cfg: dict, dotted: str):
+        node = cfg
+        for part in dotted.split("."):
+            assert isinstance(node, dict) and part in node, \
+                f"{dotted} was never written (stopped at {part!r})"
+            node = node[part]
+        return node
+
+    for key, _value in pairs:
+        _resolve(batched, key)

@@ -750,13 +750,16 @@ def test_the_wedge_watchdogs_timers_come_from_the_wallet() -> None:
         STUCK_OPEN_CLOSE_TIMEOUT_MIN=2,
         WEDGE_REQUIRED_CHECKS=3,
         WEDGE_CHECK_SPREAD_MIN=1,
-        COOP_BEFORE_FORCE_MIN=4,
+        # Above COOP_CLOSE_COOLDOWN_SEC: the window is floored at the cooldown
+        # (see _wedge_params), so a value under 5 minutes would prove the clamp
+        # rather than that the setting was read off the wallet at all.
+        COOP_BEFORE_FORCE_MIN=8,
     )
     params = p._wedge_params(w)
     assert params["close_timeout_sec"] == 2 * 60.0
     assert params["required_strikes"] == 3
     assert params["min_spread_sec"] == 1 * 60.0
-    assert params["coop_window_sec"] == 4 * 60.0
+    assert params["coop_window_sec"] == 8 * 60.0
 
 
 def test_the_offline_autoclose_timers_come_from_the_wallet() -> None:

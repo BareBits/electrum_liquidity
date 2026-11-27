@@ -399,8 +399,14 @@ def test_teardown_waits_for_the_attempt_then_proceeds() -> None:
         finished_at.append(time.monotonic())
         p._note_attempt_finished(wallet)
 
-    threading.Thread(target=_finish_shortly, daemon=True).start()
+    # `started` is sampled BEFORE the thread is launched, not after. The 0.2s
+    # sleep begins the moment the thread is scheduled, so a clock read after
+    # `.start()` can already be part-way into it -- and under a loaded machine
+    # (or `pytest -n`) "part-way" was enough to put `returned_at - started`
+    # below 0.2 and fail the lower bound. Sampling first makes the elapsed span
+    # provably contain the whole sleep.
     started = time.monotonic()
+    threading.Thread(target=_finish_shortly, daemon=True).start()
     p.stop_wallet(wallet)
     returned_at = time.monotonic()
 
@@ -418,12 +424,17 @@ def test_teardown_gives_up_at_the_attempts_own_deadline() -> None:
     p = _plugin()
     wallet = _Wallet(_SM({}))
     p.wallets[wallet] = "lock"
+    # One clock read for both the deadline and the measurement, so the 0.2s
+    # being asserted is exactly the 0.2s the deadline was set to. Reading the
+    # clock twice let the deadline start running before `started` was sampled,
+    # which on a loaded machine put `elapsed` under the lower bound -- the same
+    # undershoot the sibling test above now avoids.
+    started = time.monotonic()
     p._note_attempt_started(wallet, _InflightAttempt(
         short_id="1x1x1", provider_npub=A, amount_sat=400_000,
-        started_at=time.monotonic(),
-        deadline=time.monotonic() + 0.2))     # nothing ever sets the event
+        started_at=started,
+        deadline=started + 0.2))              # nothing ever sets the event
 
-    started = time.monotonic()
     p.stop_wallet(wallet)
     elapsed = time.monotonic() - started
     assert 0.2 <= elapsed < 3.0, f"teardown took {elapsed:.2f}s"

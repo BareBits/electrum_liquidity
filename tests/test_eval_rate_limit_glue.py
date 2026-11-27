@@ -26,6 +26,7 @@ Heavy Electrum objects are faked; skipped outside the electrum venv.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,7 @@ from conftest import seed_settings  # noqa: E402
 
 pytest.importorskip("electrum.plugins.inbound_liquidity")
 
+import electrum.plugins.inbound_liquidity as IL  # type: ignore  # noqa: E402
 from electrum.plugins.inbound_liquidity import (  # type: ignore  # noqa: E402
     AUTO_EVAL_BACKOFF_FACTOR,
     MAX_AUTO_EVAL_INTERVAL_SEC,
@@ -55,6 +57,34 @@ from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: igno
     LiquidityConfig,
     LiquiditySnapshot,
 )
+
+
+# --- helpers --------------------------------------------------------------
+@contextlib.contextmanager
+def _frozen_monotonic(monkeypatch):
+    """Hold ``_auto_eval_wait_sec``'s clock still inside the block.
+
+    Replaces the ``time`` NAME in the plugin's own module -- not
+    ``time.monotonic`` itself. Patching the stdlib function would freeze the
+    clock for asyncio's event loop too, and the tests that use this then go on
+    to ``await asyncio.sleep(...)`` and would hang forever.
+    """
+    real = IL.time
+
+    class _Held:
+        _at = real.monotonic()
+
+        def __getattr__(self, name):      # everything else is the real module
+            return getattr(real, name)
+
+        def monotonic(self) -> float:
+            return self._at
+
+    monkeypatch.setattr(IL, "time", _Held())
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(IL, "time", real)
 
 
 # --- fakes ----------------------------------------------------------------
@@ -380,7 +410,8 @@ def test_an_event_inside_the_window_is_deferred_not_dropped() -> None:
     _run(main())
 
 
-def test_many_events_inside_one_window_coalesce_onto_one_trailing_run() -> None:
+def test_many_events_inside_one_window_coalesce_onto_one_trailing_run(
+        monkeypatch) -> None:
     """The storm case: a burst of triggers must cost exactly one extra run."""
     p = _plugin()
     wallet = _FakeWallet()
@@ -391,9 +422,20 @@ def test_many_events_inside_one_window_coalesce_onto_one_trailing_run() -> None:
         p._min_auto_eval_interval_sec = 0.05
         p._max_auto_eval_interval_sec = 0.05
         await p._evaluate_rate_limited(wallet)
-        for _ in range(20):
-            await p._evaluate_rate_limited(wallet)
-        assert runs == ["ran"]
+        # Hold the clock the rate limit reads still for the duration of the
+        # burst. "Inside the window" is this test's PREMISE, not its subject:
+        # the window is 50ms and the burst is 20 awaits, so on a loaded machine
+        # the burst can outlast the window, at which point a later trigger
+        # legitimately runs and the exact-count assertion fails for a reason
+        # that has nothing to do with coalescing. (Observed: one failure in
+        # seven full-suite runs.) Freezing makes the premise true by
+        # construction and leaves the property under test untouched.
+        with _frozen_monotonic(monkeypatch):
+            for _ in range(20):
+                await p._evaluate_rate_limited(wallet)
+            assert runs == ["ran"], "a trigger inside the window must not run"
+            assert wallet in p._trailing_eval_tasks, "the burst queued nothing"
+        # Clock released: the one queued run fires, and it is the only one.
         await asyncio.sleep(0.2)
         assert runs == ["ran", "ran"], "20 triggers must not mean 20 runs"
     _run(main())
