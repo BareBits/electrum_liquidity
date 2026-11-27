@@ -79,13 +79,29 @@ CHECK_SPREAD_MIN = 1
 # the three COOP_MAX_ATTEMPTS promises.
 COOP_BEFORE_FORCE_MIN = 5
 COOP_WINDOW_SEC = COOP_BEFORE_FORCE_MIN * 60.0
-# Budget for the wedge lifecycle: the wedge clock (CLOSE_TIMEOUT_MIN) and the
-# check spread (CHECK_SPREAD_MIN) run concurrently, then the cooperative window
-# (COOP_WINDOW_SEC) runs after them. Aging waits out the first part; the
-# force-close waits below cover the rest, with margin for tick granularity on a
-# loaded machine.
+# Budget for the wedge lifecycle. Three gates run in sequence, and the whole
+# chain has to fit inside the force-close wait below -- NOT inside the aging
+# loop, which is why this is derived rather than guessed:
+#
+#   1. the wedge clock (CLOSE_TIMEOUT_MIN), from the first eligible observation;
+#   2. the strike spread (CHECK_SPREAD_MIN), which needs REQUIRED_CHECKS
+#      observations separated by real time, so it overlaps (1) but can outlast it;
+#   3. only once those clear does `_request_close` stamp its record -- and the
+#      cooperative window (COOP_WINDOW_SEC) then runs from THAT moment, not from
+#      the channel being wedged.
+#
+# WEDGE_AGE_WAIT counts from t0, which is taken before the two channel opens, so
+# the opens themselves can consume most or all of it -- the aging loop cannot be
+# relied on to have retired gates 1 and 2 by the time the wait starts. A budget
+# of 180 + COOP_WINDOW_SEC assumed it had, and timed out ~60s short on a loaded
+# machine once the window became 5 minutes.
+#
+# Generous on purpose: `_wait_until` polls every 1.5s and returns the moment the
+# channel starts closing, so headroom costs nothing on a healthy run and is the
+# difference between a flake and a diagnosis on a slow one.
 WEDGE_AGE_WAIT = 150.0
-FORCE_CLOSE_TIMEOUT = 180.0 + COOP_WINDOW_SEC
+FORCE_CLOSE_TIMEOUT = ((CLOSE_TIMEOUT_MIN + CHECK_SPREAD_MIN) * 60.0
+                       + COOP_WINDOW_SEC + 180.0)
 # Once the ceiling is raised the deferred channel escalates promptly: its
 # close-attempt record was stamped on the very first deferred call (before the
 # ceiling check, deliberately), so its cooperative window has already elapsed.
