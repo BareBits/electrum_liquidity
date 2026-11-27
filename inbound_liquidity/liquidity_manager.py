@@ -94,7 +94,10 @@ _NPUB_RE = re.compile(r"\Anpub1[a-zA-Z0-9]{20,120}\Z")
 
 def looks_like_hex_pubkey(s: Optional[str]) -> bool:
     """True iff ``s`` is exactly 64 hex characters (a raw 32-byte pubkey)."""
-    return bool(s) and bool(_HEX64_RE.match(s))
+    # `s is not None` rather than `bool(s)`: identical behaviour (the empty
+    # string fails the pattern anyway) but it narrows Optional[str] to str, so
+    # the `.match` call type-checks without needing an ignore.
+    return s is not None and bool(_HEX64_RE.match(s))
 
 
 def clean_npub(raw: Optional[str]) -> str:
@@ -372,7 +375,7 @@ def clamp_sat(value: object, *, default: int = 0,
     setting rather than the whole evaluation.
     """
     try:
-        number = int(value)  # type: ignore[arg-type]
+        number = int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError, OverflowError):
         return default
     return max(0, min(max_sat, number))
@@ -1152,7 +1155,8 @@ _NODE_ID_RE = re.compile(r"^[0-9a-f]{66}$")
 def looks_like_node_id(normalized: Optional[str]) -> bool:
     """True iff ``normalized`` (output of :func:`normalize_node_id`) has the
     shape of a Lightning node id."""
-    return bool(normalized) and bool(_NODE_ID_RE.match(normalized))
+    # See looks_like_hex_pubkey: `is not None` narrows where `bool()` does not.
+    return normalized is not None and bool(_NODE_ID_RE.match(normalized))
 
 
 def normalize_node_id(connect_str: Optional[str]) -> str:
@@ -1539,12 +1543,17 @@ def validate_offer(npub: str, percentage_fee: object, mining_fee_sat: object,
     from raising and taking out the whole evaluation. Pure and unit-testable."""
     if not npub:
         return None
+    # The parameters are typed `object` because they arrive from a nostr
+    # announcement -- an unauthenticated stranger's JSON -- so coercing them is
+    # the point of the function, and the except clause below is what makes it
+    # safe. mypy cannot see that, hence the ignores; they are asserting
+    # "deliberately coercing an unknown", not papering over a type error.
     try:
-        pct = float(percentage_fee)
-        mining = int(mining_fee_sat)
-        min_amt = int(min_amount_sat)
-        max_rev = int(max_reverse_sat)
-        pow_b = int(pow_bits)
+        pct = float(percentage_fee)      # type: ignore[arg-type]
+        mining = int(mining_fee_sat)     # type: ignore[call-overload]
+        min_amt = int(min_amount_sat)    # type: ignore[call-overload]
+        max_rev = int(max_reverse_sat)   # type: ignore[call-overload]
+        pow_b = int(pow_bits)            # type: ignore[call-overload]
     except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(pct) or not (0.0 <= pct <= _MAX_PERCENTAGE_FEE):

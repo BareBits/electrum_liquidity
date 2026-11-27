@@ -14,7 +14,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from . import paths
 from .procman import ProcessManager
@@ -724,10 +724,43 @@ def setup_wallet(ep: Endpoints, inst: ElectrumInstance, *,
     pairs = (_partner_config_pairs(ep, inst, gossip=gossip, forwarding=forwarding)
              if inst in PROVIDERS
              else _client_config_pairs(ep, gossip=gossip))
-    for key, value in pairs:
-        electrum_cli("setconfig", key, value, inst=inst, offline=True)
+    apply_config_pairs(inst, pairs)
 
     return electrum_cli("getunusedaddress", inst=inst, offline=True)
+
+
+def apply_config_pairs(inst: ElectrumInstance,
+                       pairs: Sequence[tuple[str, str]]) -> None:
+    """Write every config pair for ``inst`` in ONE process.
+
+    This was a loop of ``electrum -o setconfig <key> <value>``, which is a
+    correct but very expensive way to write a JSON file: each iteration is an
+    interpreter start plus Electrum's whole import graph, ~0.8s, and there are
+    13 pairs for the client and 15 for each provider. Measured on the rig that
+    was 25s of a 58s bring-up -- over 40%, spent importing Electrum 28 times to
+    set 28 values -- and the e2e suite pays it on every one of its ~56 launches.
+    Batched it is 0.46s per wallet instead of 9.6s.
+
+    ``rig.apply_config`` does the writing, in a subprocess rather than in here,
+    because choosing the chain rebinds the process-wide ``constants.net``; see
+    that module for why the orchestrator should not be the process that does
+    it. Its value handling is Electrum's own, and
+    ``test_rig_unit.test_batched_config_matches_the_cli`` pins that the config
+    file it produces is byte-identical to the one the CLI loop produced.
+    """
+    argv = [
+        str(paths.VENV_PYTHON), "-m", "rig.apply_config",
+        "--dir", str(inst.datadir),
+        "--wallet", wallet_path(inst),
+        "--regtest",
+    ]
+    result = subprocess.run(
+        argv, input=json.dumps([[k, str(v)] for k, v in pairs]),
+        capture_output=True, text=True, cwd=str(paths.RIG_ROOT), timeout=120.0,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"applying config for {inst.name} failed: {result.stderr.strip()}")
 
 
 # -- daemon / GUI lifecycle -------------------------------------------------

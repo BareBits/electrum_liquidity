@@ -141,3 +141,101 @@ def test_day_from_ts_is_utc() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# --- robustness of the paths that touch the filesystem --------------------
+#
+# Everything below is an error branch, and the module's whole contract is that
+# none of them can reach the plugin: `write` is called from inside an
+# evaluation, so an exception escaping here would abort a tick that is moving
+# money. They were the last uncovered lines in the file, which is the wrong
+# state for a set of branches whose entire job is to not propagate.
+def test_prune_survives_an_unreadable_folder(tmp_path) -> None:
+    """`os.listdir` fails -- the folder was removed under us, or is not a
+    folder at all. Pruning simply does nothing; the alternative is an exception
+    on the write path."""
+    log = DiagLog(str(tmp_path))
+    (tmp_path / "w").write_text("i am a file, not a folder", encoding="utf-8")
+    log._prune("w", datetime.date(2026, 7, 2))      # must not raise
+
+
+def test_prune_skips_a_file_whose_date_is_not_a_date(tmp_path) -> None:
+    """The filename pattern matches digit groups, not real dates, so
+    `inbound_liquidity-2026-13-45.log` reaches the date parse and raises
+    ValueError. It must be left alone rather than taking pruning down -- and
+    leaving it alone is also the safe choice: we cannot say how old it is, so
+    we cannot say it is expired."""
+    log = DiagLog(str(tmp_path), retention_days=1)
+    folder = tmp_path / "w"
+    folder.mkdir()
+    impossible = folder / "inbound_liquidity-2026-13-45.log"
+    impossible.write_text("not a real date\n", encoding="utf-8")
+    (folder / "inbound_liquidity-2020-01-01.log").write_text("old\n", encoding="utf-8")
+
+    log.write("w", _entry(_ts(2026, 7, 2)))
+
+    assert impossible.exists(), "a file with an unparseable date was deleted"
+    assert not (folder / "inbound_liquidity-2020-01-01.log").exists(), \
+        "the unparseable name stopped pruning reaching a genuinely old file"
+
+
+def test_prune_survives_a_file_it_cannot_delete(tmp_path) -> None:
+    """Deletion is refused (read-only directory, or the file is held open on
+    another platform). Pruning must carry on and the write must still succeed:
+    failing to free disk is not a reason to stop recording diagnostics."""
+    log = DiagLog(str(tmp_path), retention_days=1)
+    folder = tmp_path / "w"
+    folder.mkdir()
+    old = folder / "inbound_liquidity-2020-01-01.log"
+    old.write_text("old\n", encoding="utf-8")
+    # Pre-create today's file, because a read-only folder also forbids creating
+    # one -- and it is the REMOVE that is under test here, not the create.
+    today = folder / "inbound_liquidity-2026-07-02.log"
+    today.write_text("", encoding="utf-8")
+
+    os.chmod(folder, 0o500)                       # r-x: listable, not writable
+    try:
+        assert log.write("w", _entry(_ts(2026, 7, 2))) is True, \
+            "an undeletable old file must not stop today's entry being written"
+        assert old.exists(), "the test did not actually prevent deletion"
+    finally:
+        os.chmod(folder, 0o700)                   # so pytest can clean up
+
+
+def test_the_capped_notice_never_raises_when_it_cannot_be_written(tmp_path) -> None:
+    """The notice is itself a write, so it has the same duty not to propagate.
+    Pointed at a path under a file, which cannot be opened."""
+    log = DiagLog(str(tmp_path))
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file", encoding="utf-8")
+    log._write_capped_notice(str(blocker / "nope" / "x.log"), _ts(2026, 7, 2))
+
+
+def test_read_day_tolerates_blank_and_truncated_lines(tmp_path) -> None:
+    """A crash or a full disk mid-write leaves a partial last line, and the
+    reader must return the entries that ARE intact rather than nothing.
+
+    This is the case that matters for the file's purpose: the whole reason to
+    keep diagnostics on disk is to read them after something went wrong, which
+    is exactly the circumstance that truncates the last line.
+    """
+    log = DiagLog(str(tmp_path))
+    day = datetime.date(2026, 7, 2)
+    log.write("w", _entry(_ts(2026, 7, 2), reason="first"))
+    log.write("w", _entry(_ts(2026, 7, 2), reason="second"))
+    path = tmp_path / "w" / "inbound_liquidity-2026-07-02.log"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n")                             # a blank line
+        fh.write('{"ts": 123, "reason": "trunca')  # and a half-written one
+
+    rows = log.read_day("w", day)
+    assert [r["reason"] for r in rows] == ["first", "second"], (
+        f"a truncated tail lost the intact entries before it: {rows}")
+
+
+def test_list_day_files_on_an_unreadable_folder_is_empty(tmp_path) -> None:
+    """Read by the GUI to offer the user a day to look at; an unreadable folder
+    is "no days", not an error dialog."""
+    log = DiagLog(str(tmp_path))
+    (tmp_path / "w").write_text("i am a file", encoding="utf-8")
+    assert log.list_day_files("w") == []
