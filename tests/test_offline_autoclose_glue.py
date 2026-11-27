@@ -418,6 +418,122 @@ def test_disabled_does_nothing(clock) -> None:
     assert forced == []
 
 
+# --- the states the scan steps over ---------------------------------------
+# A managed channel is not always OPEN, and each non-OPEN state has to be
+# handled differently. These three arms had no test: the scan's behaviour on a
+# channel that has finished closing, on one that is mid-close, and on one
+# holding an intent it can no longer act on.
+def test_a_closed_channel_drops_its_close_intent(clock) -> None:
+    """Once a channel reaches CLOSED the watchdog's work on it is done, and the
+    intent must go with it -- otherwise the store keeps a row for a channel that
+    no longer exists, and (while the channel object lingers at CLOSED/REDEEMED)
+    the offline discount would keep crediting its freed slot off a stale intent.
+    """
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    _tag(p, w, CID)
+    assert _drive_to_commit(p, w, chan, clock=clock)
+    assert CID in w.db.get(CLOSE_INTENT_DB_KEY, {})
+    # The close completes: the channel is still in lnworker.channels (it only
+    # drops out at REDEEMED) but there is nothing left to decide about it.
+    chan.state = _state("CLOSED")
+    p._scan_offline_autoclose(w)
+    assert CID not in w.db.get(CLOSE_INTENT_DB_KEY, {}), \
+        "a CLOSED channel kept its close intent"
+    assert forced == []
+
+
+def test_a_closed_channel_is_no_longer_sampled(clock) -> None:
+    """The uptime metric judges a healthy channel's availability. Sampling one
+    that has closed would charge its peer for being gone after we stopped
+    caring, and the ratio is what justifies a force-close."""
+    chan = _Chan(_state("CLOSED"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    _tag(p, w, CID)
+    _scan_n(p, w, clock=clock, n=6)
+    assert CID not in w.db.get(CHANNEL_UPTIME_DB_KEY, {})
+    assert w.db.get(CLOSE_INTENT_DB_KEY, {}) == {}
+    assert forced == []
+
+
+def test_a_closing_channel_is_not_sampled_either(clock) -> None:
+    """Between SHUTDOWN and CLOSED the channel is on its way out. It still gets
+    its intent handled (the force-close deadline may yet need to escalate a
+    stalled cooperative close), but its peer's availability is no longer being
+    measured -- the metric only judges healthy-state uptime."""
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, _forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    _tag(p, w, CID)
+    assert _drive_to_commit(p, w, chan, clock=clock)
+    before = dict(w.db.get(CHANNEL_UPTIME_DB_KEY, {}))[CID]
+    chan.state = _state("CLOSING")
+    _scan_n(p, w, clock=clock, n=4)
+    assert w.db.get(CHANNEL_UPTIME_DB_KEY, {})[CID] == before, \
+        "kept sampling a channel that is already closing"
+
+
+def test_a_closing_channel_is_not_asked_to_cooperate(clock) -> None:
+    """Pre-deadline, the cheaper cooperative close is only attempted while the
+    channel is still OPEN. A channel already in SHUTDOWN has a close under way;
+    asking for another would be a second close request for the same channel."""
+    chan = _Chan(_state("OPEN"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    calls: List[str] = []
+    p._maybe_cooperative_close = lambda wal, ch, cid, nid, now, **kw: calls.append(cid) or True
+    _tag(p, w, CID)
+    assert _drive_to_commit(p, w, chan, clock=clock)
+    # The peer is reachable again -- which on an OPEN channel is exactly what
+    # triggers a cooperative attempt (see the test above) -- but this one is
+    # already closing.
+    chan.state = _state("SHUTDOWN")
+    chan.active = True
+    p._scan_offline_autoclose(w)
+    assert calls == [], "asked a closing channel to close cooperatively"
+    assert forced == []
+
+
+def test_a_channel_already_closing_never_gains_an_intent(clock) -> None:
+    """A close the user (or the peer) started is not the watchdog's to claim.
+    Committing an intent to it would make the plugin's own force-close deadline
+    start ticking on somebody else's close.
+
+    The uptime record is seeded directly rather than sampled: the scan only
+    samples an OPEN channel, so there is no way to be mid-close AND still
+    accumulating the evidence that would commit. Seeding it is what makes the
+    ``not already_closing`` guard the only thing standing between a damning
+    ratio and an intent.
+    """
+    from electrum.plugins.inbound_liquidity.liquidity_manager import (  # type: ignore
+        record_uptime_sample,
+        should_commit_offline_close,
+        uptime_ratio,
+    )
+    chan = _Chan(_state("CLOSING"), active=False)
+    ln, forced, _ = _lnworker_with([chan])
+    p, w = _plugin(), _FakeWallet(ln)
+    _tag(p, w, CID)
+    acc = None
+    t = clock.t
+    for _ in range(5):
+        acc = record_uptime_sample(acc, t, False, window_sec=WINDOW_SEC)
+        t += 60.0
+    w.db.put(CHANNEL_UPTIME_DB_KEY, {CID: acc})
+    clock.t = t
+    # Positive control: this record WOULD commit a close on an open channel.
+    assert should_commit_offline_close(
+        uptime_ratio(acc, clock.t, WINDOW_SEC), min_uptime_pct=10.0), \
+        "the seeded record is not damning enough to prove anything"
+
+    _scan_n(p, w, clock=clock, n=6)
+    assert w.db.get(CLOSE_INTENT_DB_KEY, {}) == {}, \
+        "the watchdog adopted a close it did not start"
+    assert forced == []
+
+
 # --- cleanup --------------------------------------------------------------
 def test_stores_cleaned_when_channel_gone(clock) -> None:
     chan = _Chan(_state("OPEN"), active=False)
